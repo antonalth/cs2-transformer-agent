@@ -1,1 +1,0 @@
-python orchestrator_win.py --generate-data --demodir data/demos --jsondir data/jsons --datadir data/img_label --demo-load-wait 25 --seek-wait 1 --spectate-wait 0.5 --jpeg-quality 75

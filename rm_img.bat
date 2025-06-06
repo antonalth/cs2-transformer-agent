@@ -1,0 +1,1 @@
+del /q data\img_label\* 

@@ -32,7 +32,7 @@ class MirvClient:
         )
         self._thread = threading.Thread(target=self._ws_app.run_forever)
         self._thread.start()
-        time.sleep(1)
+        time.sleep(10)
         self._connected = True
 
     def _on_message(self, ws, message: str):

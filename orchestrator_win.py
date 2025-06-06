@@ -163,20 +163,24 @@ def mode_generate_data(args: argparse.Namespace) -> None:
         # play & pause (use full Windows path)
         full_path = str(demo_file.resolve())
         conn.sendCommand(f'playdemo "{full_path}"')
+        if(args.debug): LOG.info(f"Ran command: 'playdemo {full_path}")
         LOG.info("loading demo %s", demo_filename)
         time.sleep(args.demo_load_wait)
         conn.sendCommand("demo_pause")
+        if(args.debug): LOG.info(f"Ran command: 'demo_pause'")
         time.sleep(0.05)
 
         for tick_obj in meta["ticks"]:
             tick = tick_obj["tick"]
             conn.sendCommand(f"demo_gototick {tick}")
+            if(args.debug): LOG.info(f"Ran command: 'demo_gototick {tick}")
             time.sleep(args.seek_wait)
             for pov in tick_obj["players"]:
                 uid = pov["userId"]
                 if not pov["visible"]:
                     continue
                 conn.sendCommand(pov["spectate_command"])
+                if(args.debug): LOG.info(f"Ran command: '{pov["spectate_command"]}")
                 time.sleep(args.spectate_wait)
                 img_name = f"{tick}_{uid}.jpg"
                 lbl_name = f"{tick}_{uid}.txt"
@@ -231,6 +235,7 @@ def mode_visualize_data(args: argparse.Namespace) -> None:
         lbl = path.parent.parent / "LBL" / f"{path.stem}.txt"
         frame = cv2.imread(str(path))
         frame = draw_boxes(frame, lbl)
+        if(args.debug): LOG.info(f"Looking at frame: {path.stem}")
         cv2.imshow("dataset", frame)
         key = cv2.waitKey(0) & 0xFF
         if key in (ord("q"), 27):
@@ -271,6 +276,7 @@ def main() -> None:
     ap.add_argument("--force", action="store_true")
 
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--debug",action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(
