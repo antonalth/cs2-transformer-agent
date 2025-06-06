@@ -1,0 +1,2 @@
+cd "C:\Program Files (x86)\HLAE"
+hlae.exe -customLoader -noGui -autoStart -hookDllPath "C:\Program Files (x86)\HLAE\x64\AfxHookSource2.dll" -programPath "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe" -cmdLine "-steam -insecure +sv_lan 1 -window -console -game csgo -w 1280 -h 720 +mirv_script_load \"\\wsl.localhost\FedoraLinux-42\home\unknonw\advancedfx-main\misc\mirv-script\dist\4-advanced-websockets\index.mjs\""
