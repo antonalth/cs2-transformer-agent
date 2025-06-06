@@ -37,17 +37,14 @@ from awpy.data import TRIS_DIR
 
 from libs.window_capture import capture
 from libs.mirv_client import connect
-from bbox_algs.alg1 import BoundingBoxCS2 as bboxAlg1
-from bbox_algs.alg2 import BoundingBoxCS2 as bboxAlg2
-# add near the other imports
-from bbox_algs.alg3 import DefaultBBoxAlg as bboxAlg3 
 from bbox_algs.alg4 import CS2BBox as bboxAlg4
 from bbox_algs.alg5 import DefaultBBoxAlg as bboxAlg5
+from bbox_algs.alg6 import DefaultBBoxAlg as bboxAlg6
 
 BB_ALGORITHMS = [
-    bboxAlg3,
     bboxAlg4,
-    bboxAlg5
+    bboxAlg5,
+    bboxAlg6
 ]
 
 # ───────── constants ─────────
@@ -203,10 +200,10 @@ def main() -> None:
     vis_checker = load_vis(demo.header.get("map_name", ""))
 
     tdone = time.time()
-    if(tdone-tload < 25):
+    if(tdone-tload < 20):
         #make sure that cs2 is actually loaded + node
         print("sleeping additionally")
-        time.sleep(math.ceil(25-(tdone-tload)))
+        time.sleep(math.ceil(20-(tdone-tload)))
 
     # Initialize MIRV client (will block ~10s to connect)
     print("[bbxdbg] Connecting to MIRV WebSocket...")
@@ -220,7 +217,7 @@ def main() -> None:
     #load demofile (hacky sleep)
     full_path = str(args.demofile.resolve())
     mirv.sendCommand(f'playdemo "{full_path}"')
-    time.sleep(25)
+    time.sleep(15)
     mirv.sendCommand("demo_pause")
     time.sleep(1)
 

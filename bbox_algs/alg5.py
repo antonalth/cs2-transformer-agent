@@ -45,13 +45,13 @@ __all__ = [
 # ────────────────── Player model & optics constants ────────────────────
 STAND_Z: float = 72.0          # eye height of a standing player (UU)
 CROUCH_Z: float = 54.0         # eye height when crouched (UU)
-HITBOX_HALF_W: float = 16.0    # half‑width of the 32×32 UU head/torso box
-HITBOX_H: float = 73.0         # total hit‑box height (UU)
+HITBOX_HALF_W: float = 14 #16.0    # half‑width of the 32×32 UU head/torso box
+HITBOX_H: float = 76 #73.0         # total hit‑box height (UU)
 
 # ───────────────────── Edge‑correction coefficients ────────────────────
 # Tuned on a 16:9 1920×1080 setup; adjust if you use a very different FOV.
-EDGE_CORR_H: float = 4    # pixel‑shift per degree horizontally
-EDGE_CORR_V: float = 1    # pixel‑shift per degree vertically
+EDGE_CORR_H: float = 3.45    # pixel‑shift per degree horizontally
+EDGE_CORR_V: float = 2   # pixel‑shift per degree vertically
 
 # ───────────────────────── Helper functions ────────────────────────────
 
