@@ -332,7 +332,7 @@ def main() -> None:
 
         # spectate_command: “spec_goto <userId> <adjusted_z>”
         base_z = p["z"] + (CROUCH_Z_OFFSET if p["crouching"] else STAND_Z_OFFSET)
-        p["spectate_command"] = f"spec_goto {p['userId']} {p['x']: .2f} {p['y']: 2.f} {base_z:.2f} {p['pitch']: .2f} {p['yaw']: .2f}"
+        p["spectate_command"] = f"spec_goto {p['userId']} {p['x']: .2f} {p['y']: .2f} {base_z:.2f} {p['pitch']: .2f} {p['yaw']: .2f}"
 
     # Output JSON
     output: Dict[str, Any] = {

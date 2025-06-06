@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-tick_bbxdbg.py — interactive CLI to debug bounding-box generation from a CS-2 demo
--------------------------------------------------------------------------------
+tick_bbxdbg.py — interactive CLI to debug and compare multiple bounding-box algorithms
+------------------------------------------------------------------------------------
 
 Usage:
     ./tick_bbxdbg.py --demofile PATH.dem
@@ -10,19 +10,13 @@ Commands:
     seek TICKNUM    Seek to a specific tick in the demo; list POVs with non-empty visible lists.
     quit            Exit the tool.
 
-Workflow for "seek TICKNUM":
-    1. Compute all POVs at TICKNUM that have at least one visible target.
-    2. Display:
-           demo_gototick TICKNUM
-       once, then list options 1..N:
-           [i] spec_goto X Y Z PITCH YAW
-    3. Prompt the user to select an index (1..N). Once selected:
-         • Automatically send “demo_gototick <tick>” and the chosen “spec_goto …” to the game via MIRV WebSocket.
-         • Wait a moment for the game to update.
-         • Capture a screenshot of the window "Counter-Strike 2" using libs/window_capture.py.
-         • Draw the calculated bounding boxes on the image and display it using cv2 at 1280×720.
-         • Press 'q' in the OpenCV window to close the image and return to the console.
-    4. Back at the CLI, you can "seek" again or "quit" to exit.
+For each selected POV:
+    • Sends `demo_gototick` & `spec_goto` via MIRV,
+    • Captures a screenshot of "Counter-Strike 2",
+    • Runs each bounding‐box algorithm on every visible target,
+      drawing boxes in different colors and labeling them with algorithm index,
+    • Displays the overlaid image in a 1280×720 OpenCV window,
+    • Press 'q' in the image window to return to the CLI.
 """
 from __future__ import annotations
 
@@ -34,16 +28,27 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
+import subprocess
 import cv2
 import polars as pl
 from awpy import Demo
 from awpy.vector import Vector3
 from awpy.data import TRIS_DIR
 
-# Import the capture function from libs/window_capture.py
 from libs.window_capture import capture
-# Import the MIRV client to send commands to CS2
 from libs.mirv_client import connect
+from bbox_algs.alg1 import BoundingBoxCS2 as bboxAlg1
+from bbox_algs.alg2 import BoundingBoxCS2 as bboxAlg2
+# add near the other imports
+from bbox_algs.alg3 import DefaultBBoxAlg as bboxAlg3 
+from bbox_algs.alg4 import CS2BBox as bboxAlg4
+from bbox_algs.alg5 import DefaultBBoxAlg as bboxAlg5
+
+BB_ALGORITHMS = [
+    bboxAlg3,
+    bboxAlg4,
+    bboxAlg5
+]
 
 # ───────── constants ─────────
 SIG_EVENTS = {"player_hurt", "player_death", "weapon_fire", "flashbang_detonate"}
@@ -72,35 +77,50 @@ HITBOX_H = 73.0       # height in UU
 
 SCR_W, SCR_H = 1280, 720  # assumed screenshot resolution (Client area)
 
-# ───────── helpers ─────────
-def first(row: dict[str, Any], keys: Sequence[str]) -> Any | None:
-    for k in keys:
-        if k in row and row[k] is not None:
-            return row[k]
-    return None
+# ───────── Colors for drawing each algorithm’s boxes ─────────
+COLORS: List[Tuple[int, int, int]] = [
+    (0, 0, 255),    # A0: red
+    (0, 255, 0),    # A1: green
+    (255, 0, 0),    # A2: blue
+    (0, 255, 255),  # A3: yellow
+    (255, 255, 0),  # A4: cyan
+    (255, 0, 255),  # A5: magenta
+]
 
-
+# ───────── helper functions ─────────
 def ypr_to_vec(yaw: float, pitch: float) -> Vector3:
     """Convert yaw & pitch (degrees) to a forward unit vector."""
-    y, p = math.radians(yaw), math.radians(pitch)
+    y = math.radians(yaw)
+    p = math.radians(pitch)
     return Vector3(
         math.cos(p) * math.cos(y),
         math.cos(p) * math.sin(y),
         -math.sin(p),
     )
 
+def build_axes(yaw: float, pitch: float) -> Tuple[Vector3, Vector3, Vector3]:
+    """Return (forward, right, up) basis from yaw/pitch."""
+    f = ypr_to_vec(yaw, pitch).normalize()
+    r = f.cross(Vector3(0, 0, 1)).normalize()
+    u = r.cross(f)
+    return f, r, u
 
 def angle_error(eye: Vector3, fwd: Vector3, tgt: Vector3) -> Tuple[float, float]:
     """Compute horizontal (yaw) and vertical (pitch) angular error between forward vector and target."""
     d = (tgt - eye).normalize()
     f_h = Vector3(fwd.x, fwd.y, 0).normalize()
     d_h = Vector3(d.x, d.y, 0).normalize()
-    yaw = math.degrees(math.acos(max(-1, min(1, f_h.dot(d_h)))))
+    yaw_err = math.degrees(math.acos(max(-1, min(1, f_h.dot(d_h)))))
     dot = max(-1, min(1, fwd.dot(d)))
     tot = math.degrees(math.acos(dot))
-    pitch = math.sqrt(max(0, tot * tot - yaw * yaw))
-    return yaw, pitch
+    pitch_err = math.sqrt(max(0, tot * tot - yaw_err * yaw_err))
+    return yaw_err, pitch_err
 
+def first(row: dict[str, Any], keys: Sequence[str]) -> Any | None:
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return None
 
 def crouched(row: dict[str, Any]) -> bool:
     """Determine if player is crouching based on properties."""
@@ -109,14 +129,12 @@ def crouched(row: dict[str, Any]) -> bool:
     amt = row.get("duckAmount")
     return isinstance(amt, (int, float)) and float(amt) > 0.5
 
-
 def uid_of(row: dict[str, Any], lut: dict[int, int]) -> int:
     """Return in-game userId or fallback to lut mapping from steamid to userId."""
     for k in ("userId", "user_id", "userid"):
         if k in row and row[k] not in (None, -1, ""):
             return int(row[k])
     return lut.get(int(row["steamid"]), -1)
-
 
 def load_vis(map_name: str):
     """Attempt to load Awpy's VisibilityChecker from a .tri mesh; return None if unavailable."""
@@ -135,87 +153,10 @@ def load_vis(map_name: str):
         return None
 
 
-# ── 3-D → 2-D projection helpers (for boundingbox) ────────────────────
-ASPECT_INV = 1 / ASPECT
-TAN_HALF_FOV = math.tan(math.radians(V_FOV_DEG) / 2)  # ==1 at 90°
-
-
-def build_axes(yaw: float, pitch: float) -> Tuple[Vector3, Vector3, Vector3]:
-    """Return camera basis (forward, right, up) from yaw/pitch."""
-    f = ypr_to_vec(yaw, pitch).normalize()
-    r = f.cross(Vector3(0, 0, 1)).normalize()
-    u = r.cross(f)
-    return f, r, u
-
-
-def world_to_cam(pt: Vector3, eye: Vector3, r: Vector3, u: Vector3, f: Vector3) -> Tuple[float, float, float]:
-    """Transform world point into camera-space coords (x_c, y_c, z_c)."""
-    d = pt - eye
-    x_c = d.dot(r)
-    y_c = d.dot(u)
-    z_c = d.dot(f)
-    return x_c, y_c, z_c
-
-
-def cam_to_ndc(x_c: float, y_c: float, z_c: float) -> Tuple[float | None, float | None]:
-    """Project camera-space (x_c, y_c, z_c) to normalized device coords (NDC)."""
-    if z_c <= 0:
-        return None, None
-    x_ndc = (x_c / z_c) * ASPECT_INV / TAN_HALF_FOV
-    y_ndc = (y_c / z_c) / TAN_HALF_FOV
-    return x_ndc, y_ndc
-
-
-def ndc_to_px(x_ndc: float, y_ndc: float) -> Tuple[float, float]:
-    """Convert NDC coords to pixel coords on a SCR_W × SCR_H image."""
-    x_px = (x_ndc + 1) * SCR_W / 2
-    y_px = (1 - y_ndc) * SCR_H / 2
-    return x_px, y_px
-
-
-def bbox_for_target(
-    pov_eye: Vector3,
-    r: Vector3,
-    u: Vector3,
-    f: Vector3,
-    tgt_x: float,
-    tgt_y: float,
-    tgt_z: float,
-) -> Tuple[Tuple[float, float, float, float] | None, List[dict]]:
-    """
-    Compute 2D bounding box for a target's axis-aligned 32×73 UU hitbox.
-    Returns (bbox, debug_list). If bbox is None, debug_list contains per-corner info.
-    """
-    pts_px: List[Tuple[float, float]] = []
-    dbg: List[dict] = []
-    for dx in (-HITBOX_HALF_W, +HITBOX_HALF_W):
-        for dy in (-HITBOX_HALF_W, +HITBOX_HALF_W):
-            for dz in (0.0, HITBOX_H):
-                world_pt = Vector3(tgt_x + dx, tgt_y + dy, tgt_z + dz)
-                x_c, y_c, z_c = world_to_cam(world_pt, pov_eye, r, u, f)
-                x_ndc, y_ndc = cam_to_ndc(x_c, y_c, z_c)
-                if x_ndc is None or y_ndc is None:
-                    dbg.append({"cam": (x_c, y_c, z_c), "ndc": None})
-                    continue
-                px, py = ndc_to_px(x_ndc, y_ndc)
-                pts_px.append((px, py))
-                dbg.append({"cam": (x_c, y_c, z_c), "ndc": (x_ndc, y_ndc), "px": (px, py)})
-
-    if not pts_px:
-        return None, dbg
-
-    xs, ys = zip(*pts_px)
-    xmin = max(0, min(xs))
-    ymin = max(0, min(ys))
-    xmax = min(SCR_W, max(xs))
-    ymax = min(SCR_H, max(ys))
-    return (xmin, ymin, xmax, ymax), dbg
-
-
 # ───────── main CLI logic ─────────
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Interactive bounding-box debugger for CS-2 demo, with auto-commands via MIRV."
+        description="Interactive bounding-box debugger for CS-2 demo, supporting multiple algorithms."
     )
     parser.add_argument(
         "--demofile",
@@ -228,6 +169,10 @@ def main() -> None:
     if not args.demofile.exists():
         parser.error(f"Demo file not found: {args.demofile}")
 
+    
+    subprocess.Popen("python s1a_restart_all.py", creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    tload = time.time()
     # Parse the demo
     print(f"[bbxdbg] Loading demo: {args.demofile} ...")
     demo = Demo(path=args.demofile, verbose=False)
@@ -257,6 +202,12 @@ def main() -> None:
 
     vis_checker = load_vis(demo.header.get("map_name", ""))
 
+    tdone = time.time()
+    if(tdone-tload < 25):
+        #make sure that cs2 is actually loaded + node
+        print("sleeping additionally")
+        time.sleep(math.ceil(25-(tdone-tload)))
+
     # Initialize MIRV client (will block ~10s to connect)
     print("[bbxdbg] Connecting to MIRV WebSocket...")
     try:
@@ -265,6 +216,19 @@ def main() -> None:
     except Exception as e:
         print(f"[bbxdbg] Failed to connect MIRV: {e}")
         mirv = None
+
+    #load demofile (hacky sleep)
+    full_path = str(args.demofile.resolve())
+    mirv.sendCommand(f'playdemo "{full_path}"')
+    time.sleep(25)
+    mirv.sendCommand("demo_pause")
+    time.sleep(1)
+
+    # Instantiate each bounding‐box algorithm once
+    algorithms = [
+        cls(fov_deg=V_FOV_DEG, screen_w=SCR_W, screen_h=SCR_H)
+        for cls in BB_ALGORITHMS
+    ]
 
     print("[bbxdbg] Ready. Type 'seek TICKNUM' to inspect a tick, or 'quit' to exit.")
     while True:
@@ -361,6 +325,9 @@ def main() -> None:
                 print(f"[bbxdbg] No POVs at tick {tick} have any visible targets.")
                 continue
 
+            mirv.sendCommand(f"demo_gototick {tick}")
+            time.sleep(1)
+
             # Display demo_gototick once and list POV options
             print(f"\n--- demo_gototick {tick} ---")
             print("Choose which spectate command to send:")
@@ -381,8 +348,6 @@ def main() -> None:
             # Send commands via MIRV
             if mirv:
                 try:
-                    mirv.sendCommand(f"demo_gototick {tick}")
-                    time.sleep(1)
                     mirv.sendCommand(chosen_pov["spectate_command"])
                     print("[bbxdbg] Sent demo_gototick and spectate_command to the game.")
                 except Exception as e:
@@ -393,7 +358,7 @@ def main() -> None:
                 print(f"    {chosen_pov['spectate_command']}")
 
             # Wait for the game to update
-            time.sleep(1)
+            time.sleep(0.5)
 
             # Capture screenshot and draw bounding boxes
             tmp_path = Path("bbxdbg_capture.jpg")
@@ -418,19 +383,34 @@ def main() -> None:
                 print(f"[bbxdbg] Could not read captured image at {tmp_path}\n")
                 continue
 
-            # Draw rectangles for each visible target
+            # Draw rectangles for each visible target and each algorithm
             for vis in chosen_pov["visible"]:
-                tgt_x, tgt_y, tgt_z = vis["x"], vis["y"], vis["z"]
-                bbox, dbg = bbox_for_target(
-                    pov_eye, r_cam, u_cam, f_cam,
-                    tgt_x, tgt_y, tgt_z
-                )
-                if bbox:
-                    xmin, ymin, xmax, ymax = map(int, bbox)
-                    cv2.rectangle(img_bgr, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+                tx, ty, tz = vis["x"], vis["y"], vis["z"]
+                tgt_yaw, tgt_pitch, tgt_crouch = vis["yaw"], vis["pitch"], vis["crouching"]
+
+                from_tuple = (px, py, pz, yaw, pitch, crouch)
+                to_tuple   = (tx, ty, tz, tgt_yaw, tgt_pitch, tgt_crouch)
+
+                for alg_idx, alg in enumerate(algorithms):
+                    bb = alg.calcbb(from_tuple, to_tuple)
+                    if bb is not None:
+                        xmin, ymin, xmax, ymax = bb
+                        color = COLORS[alg_idx % len(COLORS)]
+                        cv2.rectangle(img_bgr, (xmin, ymin), (xmax, ymax), color, 2)
+                        label = f"A{alg_idx}"
+                        cv2.putText(
+                            img_bgr,
+                            label,
+                            (xmin, max(0, ymin - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            1,
+                            cv2.LINE_AA
+                        )
 
             # Display with OpenCV at fixed size 1280×720 and wait for 'q'
-            window_name = f"Tick {tick} — POV {sel}"
+            window_name = f"Tick {tick}, POV {sel_idx}"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(window_name, SCR_W, SCR_H)
             cv2.imshow(window_name, img_bgr)

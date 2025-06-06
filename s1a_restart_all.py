@@ -4,8 +4,12 @@ import os
 
 def main():
     try:
+        subprocess.run(r'wsl bash -c "pkill node"', check=False)
+
+        time.sleep(1)
+
         # Run stop_cs2.bat
-        subprocess.run(r".\stop_cs2.bat", check=False)
+        subprocess.run(r"taskkill /f -im cs2.exe", check=False)
 
         # Wait for 1 second
         time.sleep(1)
