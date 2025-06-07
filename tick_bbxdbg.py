@@ -37,8 +37,8 @@ from awpy.data import TRIS_DIR
 
 from libs.window_capture import capture
 from libs.mirv_client import connect
-from bbox_algs.deprecated.alg1 import BoundingBoxCS2 as bboxAlg1
-from bbox_algs.alg4 import CS2BBox as bboxAlg4
+#from bbox_algs.deprecated.alg1 import BoundingBoxCS2 as bboxAlg1
+#from bbox_algs.deprecated.alg4 import CS2BBox as bboxAlg4
 from bbox_algs.alg5 import DefaultBBoxAlg as bboxAlg5
 from bbox_algs.alg6 import DefaultBBoxAlg as bboxAlg6
 

@@ -134,8 +134,8 @@ def mode_generate_data(args: argparse.Namespace) -> None:
         return
 
     # Establish MIRV connection and wait for it to become active
-    conn = mirv_connect()
-    time.sleep(10)  # give WebSocket time to connect
+    #conn = mirv_connect()
+    #time.sleep(10)  # give WebSocket time to connect
 
     demodir, jsondir, datadir = map(Path, (args.demodir, args.jsondir, args.datadir))
 
@@ -160,6 +160,12 @@ def mode_generate_data(args: argparse.Namespace) -> None:
         with jpath.open("r", encoding="utf-8") as f:
             meta = json.load(f)
 
+        #restart cs2 to playdemo
+        LOG.info("restarting cs2+hlae")
+        subprocess.Popen("python s1a_restart_all.py", creationflags=subprocess.CREATE_NEW_CONSOLE)
+        time.sleep(15)
+        conn = mirv_connect()
+        
         # play & pause (use full Windows path)
         full_path = str(demo_file.resolve())
         conn.sendCommand(f'playdemo "{full_path}"')
@@ -167,16 +173,22 @@ def mode_generate_data(args: argparse.Namespace) -> None:
         LOG.info("loading demo %s", demo_filename)
         time.sleep(args.demo_load_wait)
         conn.sendCommand("demo_pause")
+        time.sleep(0.5)
+        conn.sendCommand("cl_drawhud 0")
+        time.sleep(0.5)
+        conn.sendCommand("demoui")
         if(args.debug): LOG.info(f"Ran command: 'demo_pause'")
         time.sleep(0.05)
 
-        for tick_obj in meta["ticks"]:
+        #for tick_obj in meta["ticks"]:
+        for tick_obj in meta:
             tick = tick_obj["tick"]
             conn.sendCommand(f"demo_gototick {tick}")
             if(args.debug): LOG.info(f"Ran command: 'demo_gototick {tick}")
             time.sleep(args.seek_wait)
-            for pov in tick_obj["players"]:
-                uid = pov["userId"]
+            #for pov in tick_obj["players"]:
+            for pov in tick_obj["povs"]:
+                uid = pov["uid"]
                 if not pov["visible"]:
                     continue
                 conn.sendCommand(pov["spectate_command"])
@@ -194,15 +206,17 @@ def mode_generate_data(args: argparse.Namespace) -> None:
                 for tgt in pov["visible"]:
                     if "bbox" not in tgt:
                         continue
-                    cls = team_to_class(tgt["team"])
+                    #cls = team_to_class(tgt["team"])
+                    cls = team_to_class(tgt["side"])
                     cx, cy, w, h = bbox_to_yolo(tgt["bbox"])
                     rows.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
                 lbl_path.write_text("\n".join(rows))
 
         shutil.copy2(jpath, demo_out / "meta.json")
         LOG.info("finished %s", demo_name)
+        conn.close()
 
-    conn.close()
+    #conn.close()
 
 
 def draw_boxes(img, lbl_path: Path):
