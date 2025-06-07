@@ -36,7 +36,7 @@ from awpy.data import TRIS_DIR
 from awpy.vector import Vector3
 
 # ── NEW: proven bounding-box algorithm ────────────────────────────────────
-from bbox_algs.alg6 import DefaultBBoxAlg as BBoxAlg
+from bbox_algs.alg5 import DefaultBBoxAlg as BBoxAlg
 
 # ── constants ─────────────────────────────────────────────────────────────
 SIG_EVENTS = {"player_hurt", "player_death", "weapon_fire", "flashbang_detonate"}
