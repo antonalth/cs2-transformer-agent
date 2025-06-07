@@ -11,7 +11,7 @@ Commands:
     quit            Exit the tool.
 
 For each selected POV:
-    • Sends `demo_gototick` & `spec_goto` via MIRV,
+    • Sends `demo_gototick` & `spec_player` via MIRV,
     • Captures a screenshot of "Counter-Strike 2",
     • Runs each bounding‐box algorithm on every visible target,
       drawing boxes in different colors and labeling them with algorithm index,
@@ -37,15 +37,10 @@ from awpy.data import TRIS_DIR
 
 from libs.window_capture import capture
 from libs.mirv_client import connect
+from bbox_algs.deprecated.alg1 import BoundingBoxCS2 as bboxAlg1
 from bbox_algs.alg4 import CS2BBox as bboxAlg4
 from bbox_algs.alg5 import DefaultBBoxAlg as bboxAlg5
 from bbox_algs.alg6 import DefaultBBoxAlg as bboxAlg6
-
-BB_ALGORITHMS = [
-    bboxAlg4,
-    bboxAlg5,
-    bboxAlg6
-]
 
 # ───────── constants ─────────
 SIG_EVENTS = {"player_hurt", "player_death", "weapon_fire", "flashbang_detonate"}
@@ -60,6 +55,7 @@ PLAYER_PROPS = [
     "health", "X", "Y", "Z",
     "yaw", "pitch",
     "ducking", "isDucked", "duckAmount",
+    "name",                # ← add this to retrieve in-game username
 ]
 
 MARGIN = 6
@@ -150,7 +146,6 @@ def load_vis(map_name: str):
         return None
 
 
-# ───────── main CLI logic ─────────
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive bounding-box debugger for CS-2 demo, supporting multiple algorithms."
@@ -166,16 +161,15 @@ def main() -> None:
     if not args.demofile.exists():
         parser.error(f"Demo file not found: {args.demofile}")
 
-    
+    # Restart CS2 + node script
     subprocess.Popen("python s1a_restart_all.py", creationflags=subprocess.CREATE_NEW_CONSOLE)
 
     tload = time.time()
-    # Parse the demo
     print(f"[bbxdbg] Loading demo: {args.demofile} ...")
     demo = Demo(path=args.demofile, verbose=False)
     demo.parse(events=EVENTS, player_props=PLAYER_PROPS, other_props=None)
 
-    # Build SteamID → userId map from kills/damages
+    # Build SteamID → userId map
     uid_map: dict[int, int] = {}
     for df in (demo.kills, demo.damages):
         if df is None:
@@ -189,9 +183,8 @@ def main() -> None:
                 for sid, uidv in zip(df[sid_col], df[uid_col]):
                     uid_map[int(sid)] = int(uidv)
 
-    # Build buckets: tick → list of tick-row dicts
     print("[bbxdbg] Building tick buckets ...")
-    ticks_df = demo.ticks  # Polars DataFrame
+    ticks_df = demo.ticks
     buckets: dict[int, List[dict]] = defaultdict(list)
     for row in ticks_df.iter_rows(named=True):
         t = int(row["tick"])
@@ -200,12 +193,9 @@ def main() -> None:
     vis_checker = load_vis(demo.header.get("map_name", ""))
 
     tdone = time.time()
-    if(tdone-tload < 20):
-        #make sure that cs2 is actually loaded + node
-        print("sleeping additionally")
-        time.sleep(math.ceil(20-(tdone-tload)))
+    if (tdone - tload) < 20:
+        time.sleep(math.ceil(20 - (tdone - tload)))
 
-    # Initialize MIRV client (will block ~10s to connect)
     print("[bbxdbg] Connecting to MIRV WebSocket...")
     try:
         mirv = connect()
@@ -214,17 +204,19 @@ def main() -> None:
         print(f"[bbxdbg] Failed to connect MIRV: {e}")
         mirv = None
 
-    #load demofile (hacky sleep)
     full_path = str(args.demofile.resolve())
-    mirv.sendCommand(f'playdemo "{full_path}"')
+    if mirv:
+        mirv.sendCommand(f'playdemo "{full_path}"')
+    else:
+        print(f"[bbxdbg] Please run: playdemo \"{full_path}\"")
     time.sleep(15)
-    mirv.sendCommand("demo_pause")
+    if mirv:
+        mirv.sendCommand("demo_pause")
     time.sleep(1)
 
-    # Instantiate each bounding‐box algorithm once
     algorithms = [
         cls(fov_deg=V_FOV_DEG, screen_w=SCR_W, screen_h=SCR_H)
-        for cls in BB_ALGORITHMS
+        for cls in (bboxAlg5, bboxAlg6)
     ]
 
     print("[bbxdbg] Ready. Type 'seek TICKNUM' to inspect a tick, or 'quit' to exit.")
@@ -237,11 +229,9 @@ def main() -> None:
 
         if not cmd:
             continue
-
         if cmd.lower() == "quit":
             print("[bbxdbg] Quitting.")
             break
-
         if cmd.lower().startswith("seek "):
             parts = cmd.split()
             if len(parts) != 2 or not parts[1].isdigit():
@@ -257,7 +247,6 @@ def main() -> None:
                 print(f"[bbxdbg] No data for tick {tick}.")
                 continue
 
-            # Build POV entries and geometry list for this tick
             povs: List[Dict[str, Any]] = []
             geom: List[tuple[int, Vector3, Vector3]] = []
 
@@ -279,11 +268,13 @@ def main() -> None:
                     "steamid": int(r["steamid"]),
                     "userId": uid,
                     "team": first(r, ("side", "team_name", "team")),
-                    "health": int(r["health"]),
+                    "health": health,
                     "x": px, "y": py, "z": pz,
                     "yaw": yaw, "pitch": pitch,
                     "crouching": crouch,
-                    "spectate_command": f"spec_goto {px:.1f} {py:.1f} {eye_z:.1f} {pitch:.1f} {yaw:.1f}",
+                    "name": r.get("name", "unknown"),  # username
+                    # use spec_player with the in-game username
+                    "spectate_command": f'spec_player "{r.get("name", "unknown")}"',
                     "visible": []
                 }
                 povs.append(pov)
@@ -291,7 +282,6 @@ def main() -> None:
 
             uid_to_pov = {p["userId"]: p for p in povs}
 
-            # Determine visibility for each (pov, target) pair
             for pov_uid, eye, fwd in geom:
                 pov_entry = uid_to_pov[pov_uid]
                 f_cam, r_cam, u_cam = build_axes(pov_entry["yaw"], pov_entry["pitch"])
@@ -316,24 +306,24 @@ def main() -> None:
                     }
                     pov_entry["visible"].append(vis_entry)
 
-            # Filter POVs with non-empty visible list
             povs = [p for p in povs if p["visible"]]
             if not povs:
                 print(f"[bbxdbg] No POVs at tick {tick} have any visible targets.")
                 continue
 
-            mirv.sendCommand(f"demo_gototick {tick}")
+            if mirv:
+                mirv.sendCommand(f"demo_gototick {tick}")
+            else:
+                print(f"    demo_gototick {tick}")
             time.sleep(1)
 
-            # Display demo_gototick once and list POV options
             print(f"\n--- demo_gototick {tick} ---")
-            print("Choose which spectate command to send:")
+            print("Choose which player to spectate by username:")
             for i, p in enumerate(povs, start=1):
-                print(f"  [{i}] {p['spectate_command']}")
+                print(f"  [{i}] {p['name']}")
 
-            # Prompt user to select one
             sel = input(f"Select POV (1–{len(povs)}) or 'c' to cancel: ").strip()
-            if sel.lower() == "c":
+            if sel.lower() == 'c':
                 print()
                 continue
             if not sel.isdigit() or not (1 <= int(sel) <= len(povs)):
@@ -342,11 +332,10 @@ def main() -> None:
             sel_idx = int(sel) - 1
             chosen_pov = povs[sel_idx]
 
-            # Send commands via MIRV
             if mirv:
                 try:
                     mirv.sendCommand(chosen_pov["spectate_command"])
-                    print("[bbxdbg] Sent demo_gototick and spectate_command to the game.")
+                    print("[bbxdbg] Sent demo_gototick and spec_player to the game.")
                 except Exception as e:
                     print(f"[bbxdbg] Error sending to MIRV: {e}")
             else:
@@ -354,10 +343,8 @@ def main() -> None:
                 print(f"    demo_gototick {tick}")
                 print(f"    {chosen_pov['spectate_command']}")
 
-            # Wait for the game to update
             time.sleep(0.5)
 
-            # Capture screenshot and draw bounding boxes
             tmp_path = Path("bbxdbg_capture.jpg")
             try:
                 capture("Counter-Strike 2", str(tmp_path), 85)
@@ -374,17 +361,14 @@ def main() -> None:
             pov_eye = Vector3(px, py, eye_z)
             f_cam, r_cam, u_cam = build_axes(yaw, pitch)
 
-            # Load the screenshot with OpenCV
             img_bgr = cv2.imread(str(tmp_path))
             if img_bgr is None:
                 print(f"[bbxdbg] Could not read captured image at {tmp_path}\n")
                 continue
 
-            # Draw rectangles for each visible target and each algorithm
             for vis in chosen_pov["visible"]:
                 tx, ty, tz = vis["x"], vis["y"], vis["z"]
                 tgt_yaw, tgt_pitch, tgt_crouch = vis["yaw"], vis["pitch"], vis["crouching"]
-
                 from_tuple = (px, py, pz, yaw, pitch, crouch)
                 to_tuple   = (tx, ty, tz, tgt_yaw, tgt_pitch, tgt_crouch)
 
@@ -406,16 +390,14 @@ def main() -> None:
                             cv2.LINE_AA
                         )
 
-            # Display with OpenCV at fixed size 1280×720 and wait for 'q'
-            window_name = f"Tick {tick}, POV {sel_idx}"
+            window_name = f"Tick {tick}, POV {sel_idx} ({chosen_pov['name']})"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(window_name, SCR_W, SCR_H)
             cv2.imshow(window_name, img_bgr)
             print("[bbxdbg] Press 'q' in the image window to return to CLI.")
             while True:
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
+                if key == ord('q'): break
             cv2.destroyWindow(window_name)
             print("[bbxdbg] Returning to prompt.\n")
 
@@ -424,7 +406,6 @@ def main() -> None:
             print("  seek TICKNUM  — Inspect bounding boxes at a given tick")
             print("  quit          — Exit the tool\n")
 
-    # Clean up MIRV connection on exit
     if mirv:
         mirv.close()
 

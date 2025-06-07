@@ -21,12 +21,12 @@ __all__ = [
 # ────────────────── Player model & optics constants ────────────────────
 STAND_Z: float = 72.0          # eye height of a standing player (UU)
 CROUCH_Z: float = 54.0         # eye height when crouched (UU)
-HITBOX_HALF_W: float = 14      # half-width of the 32×32 UU head/torso box
-HITBOX_H: float = 76           # total hit-box height (UU)
+HITBOX_HALF_W: float = 16      # half-width of the 32×32 UU head/torso box
+HITBOX_H: float = 73           # total hit-box height (UU)
 
 # ───────────────────── Edge-correction coefficients ────────────────────
 EDGE_CORR_H: float = 3.45    # pixel-shift per degree horizontally
-EDGE_CORR_V: float = 2       # pixel-shift per degree vertically
+EDGE_CORR_V: float = 1.77       # pixel-shift per degree vertically
 
 # ───────────────────────── Helper functions ────────────────────────────
 
@@ -195,9 +195,10 @@ class DefaultBBoxAlg:
     def adjust_x(self, theta_h: float, x_px: float, distance: float) -> float:
         """Horizontal edge-correction with distance parameter."""
         # Default: ignore distance
-        return x_px + self.k_h * theta_h
+        return x_px + self.k_h * theta_h 
 
     def adjust_y(self, theta_v: float, y_px: float, distance: float) -> float:
         """Vertical edge-correction with distance parameter."""
         # Default: ignore distance
-        return y_px - self.k_v * theta_v
+        scaled_distance = distance/200
+        return y_px - self.k_v * theta_v * scaled_distance
