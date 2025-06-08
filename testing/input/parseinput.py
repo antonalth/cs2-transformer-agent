@@ -32,32 +32,41 @@ KEY_MAPPING = {
 def extract_buttons(bitfield: int) -> List[str]:
     return [name for bit, name in KEY_MAPPING.items() if bitfield & (1 << bit)]
 
+# ---- util ---------------------------------------------------------------
+def canonicalise_steam_id(df):
+    for cand in ("steam_id", "steamId", "steamid", "player_steamid"):
+        if cand in df.columns:
+            if cand != "steam_id":
+                df = df.rename(columns={cand: "steam_id"})
+            return df
+    raise KeyError(
+        "Could not find any steam-ID column. "
+        "Run parser.list_updated_fields() to see what the demo exposes."
+    )
 
 # ---- one-off parsing -------------------------------------------------------
 
-def parse_demo(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (tick_df, buy_df)."""
+def parse_demo(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     parser = DemoParser(str(path))
 
-    # ---- per-tick data
-    tick_df = parser.parse_ticks(
-        wanted_props=["buttons", "pitch", "yaw", "inventory", "name", "steam_id"]
-    )
+    wanted = ["buttons", "pitch", "yaw", "inventory", "name", "steam_id"]
+    tick_df = parser.parse_ticks(wanted_props=wanted)
+    tick_df = canonicalise_steam_id(tick_df)        # ← ensures column exists/renamed
 
-    # decode keys & mouse deltas
-    tick_df["keys"] = tick_df["buttons"].fillna(0).astype(int).apply(extract_buttons)
+    tick_df["keys"]    = tick_df["buttons"].fillna(0).astype(int).apply(extract_buttons)
     tick_df["d_yaw"]   = tick_df.groupby("steam_id")["yaw"].diff()
     tick_df["d_pitch"] = tick_df.groupby("steam_id")["pitch"].diff()
 
-    # ---- store buys (freeze-time only)
+    event_name = "item_purchase" if "item_purchase" in parser.event_types else "item_pickup"
     buy_df = parser.parse_event(
-        "item_purchase" if "item_purchase" in parser.event_types else "item_pickup",
-        ["weapon", "price"],
-        ["tick", "steam_id", "is_freeze_period"]
+        event_name, ["weapon", "price"],
+        ["tick", "steam_id", "is_freeze_period"],
     )
+    buy_df = canonicalise_steam_id(buy_df)
     buy_df = buy_df[buy_df["is_freeze_period"] == True]
 
     return tick_df, buy_df
+
 
 
 # ---- tiny REPL -------------------------------------------------------------
