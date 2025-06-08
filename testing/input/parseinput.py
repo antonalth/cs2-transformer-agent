@@ -72,17 +72,20 @@ def main() -> None:
         .pipe(pd.DataFrame)      # polars → pandas
     )
 
-    # 2)  Forward-fill so EVERY (tick, steamid) pair exists once
+    # ── forward-fill so EVERY (tick, steamid) pair exists once ──────────────
     tick_df.sort_values(["steamid", "tick"], inplace=True)
+
     tick_df = (
         tick_df
         .set_index("tick")
-        .groupby("steamid")
+        .groupby("steamid", group_keys=False)           # ← keeps steamid as column
         .apply(lambda g: g
-               .reindex(range(g.index.min(), g.index.max() + 1))
-               .ffill())
-        .reset_index()           # brings back both “steamid” & “tick”
+            .reindex(range(g.index.min(), g.index.max() + 1))
+            .ffill()
+        )
+        .reset_index()                                  # only “tick” comes from index
     )
+
 
     # 3)  Mouse movement deltas
     tick_df["d_yaw"]   = tick_df.groupby("steamid")["yaw"].diff().fillna(0)
