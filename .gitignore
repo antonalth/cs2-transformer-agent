@@ -8,3 +8,4 @@ libs/__pycache__/**/ */
 /libs/__pycache__
 *.jpeg
 .DS_Store
+*.db

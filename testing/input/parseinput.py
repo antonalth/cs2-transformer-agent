@@ -6,33 +6,107 @@ Prompt commands
 ---------------
 seek <tick>   jump to that server tick, pick a player, view inputs & buys
 quit | exit   leave
+
+New option (2025-06-08)
+----------------------
+--sqlout <file.db>    parse demo and write a SQLite DB instead of opening the CLI
 """
 
 from __future__ import annotations
-import argparse, sys
+import argparse, sys, sqlite3, json
 from pathlib import Path
 import pandas as pd
 from demoparser2 import DemoParser
 
-
-# ── helper: decode 'buttons' bit-field ─────────────────────────────────────────
+# ── helper: decode "buttons" bit-field ────────────────────────────────────────
 _KEYS = {
-    0: "IN_ATTACK", 1: "IN_JUMP", 2: "IN_DUCK", 3: "IN_FORWARD",
-    4: "IN_BACK", 5: "IN_USE", 6: "IN_CANCEL", 7: "IN_LEFT",
-    8: "IN_RIGHT", 9: "IN_MOVELEFT", 10: "IN_MOVERIGHT", 11: "IN_ATTACK2",
-    12: "IN_RUN", 13: "IN_RELOAD", 16: "IN_SPEED", 17: "IN_WALK", 18: "IN_ZOOM",
+    0:  "IN_ATTACK",   1:  "IN_JUMP",    2:  "IN_DUCK",      3:  "IN_FORWARD",
+    4:  "IN_BACK",     5:  "IN_USE",     6:  "IN_CANCEL",    7:  "IN_LEFT",
+    8:  "IN_RIGHT",    9:  "IN_MOVELEFT",10: "IN_MOVERIGHT",11: "IN_ATTACK2",
+    12: "IN_RUN",     13: "IN_RELOAD", 16: "IN_SPEED",    17: "IN_WALK",
+    18: "IN_ZOOM",
 }
+
 def extract_buttons(bits: int) -> list[str]:
+    """Return list of key names held in the bit-field *bits*."""
     return [name for bit, name in _KEYS.items() if bits & (1 << bit)]
 
+# ── helpers: SQLite export ────────────────────────────────────────────────────
+def _sanitize_inventory(inv):
+    """Convert *inv* to a JSON string SQLite can store (lists/tuples → JSON)."""
+    if isinstance(inv, (list, tuple, set)):
+        try:
+            return json.dumps(list(inv))
+        except TypeError:
+            return ",".join(map(str, inv))
+    return str(inv)
 
-# ── CLI setup ──────────────────────────────────────────────────────────────────
+def _export_sqlite(db_path: Path, tick_df: pd.DataFrame, buys: pd.DataFrame) -> None:
+    """Write combined *tick_df* + *buys* info into an SQLite DB at *db_path*."""
+    df = tick_df.copy()
+
+    # readable keyboard input
+    df["keyboard_input"] = df["buttons"].apply(lambda b: ",".join(extract_buttons(int(b))))
+
+    # mouse delta as "dYaw,dPitch" string
+    df["mouse"] = df.apply(lambda r: f"{r['d_yaw']:+.2f},{r['d_pitch']:+.2f}", axis=1)
+
+    # stringify inventory lists
+    df["inventory"] = df["inventory"].apply(_sanitize_inventory)
+
+    # purchases per (tick, steamid)
+    buy_col = next((c for c in ("weapon", "item", "weapon_name") if c in buys.columns), None)
+    if buy_col and "steamid" in buys.columns and not buys.empty:
+        buys_agg = (
+            buys
+            .dropna(subset=["steamid"])[["tick", "steamid", buy_col]]
+            .groupby(["tick", "steamid"], as_index=False)
+            .agg({buy_col: lambda s: ",".join(s.astype(str))})
+            .rename(columns={buy_col: "buy"})
+        )
+        df = df.merge(buys_agg, on=["tick", "steamid"], how="left")
+    else:
+        df["buy"] = ""
+
+    df["buy"] = df["buy"].fillna("")
+
+    # final shape
+    df.rename(columns={"name": "playername"}, inplace=True)
+    df = df[["tick", "steamid", "playername", "keyboard_input", "inventory", "mouse", "buy"]]
+
+    # write to DB
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inputs (
+            tick INTEGER NOT NULL,
+            steamid INTEGER NOT NULL,
+            playername TEXT,
+            keyboard_input TEXT,
+            inventory TEXT,
+            mouse TEXT,
+            buy TEXT,
+            PRIMARY KEY (tick, steamid)
+        )
+        """
+    )
+    cur.executemany(
+        "INSERT OR REPLACE INTO inputs VALUES (?,?,?,?,?,?,?)",
+        df.to_records(index=False).tolist(),
+    )
+    con.commit()
+    con.close()
+
+# ── CLI setup ────────────────────────────────────────────────────────────────
 def cli() -> argparse.ArgumentParser:
-    c = argparse.ArgumentParser(description="Tiny CS-2 demo inspector")
-    c.add_argument("demofile", type=Path, help="Path to .dem file")
-    return c
+    p = argparse.ArgumentParser(description="Tiny CS-2 demo inspector / exporter")
+    p.add_argument("demofile", type=Path, help="Path to .dem file")
+    p.add_argument("--sqlout", type=Path, metavar="FILE.db",
+                   help="Write results to SQLite DB instead of opening the CLI")
+    return p
 
-
+# ── main logic ───────────────────────────────────────────────────────────────
 def main() -> None:
     args = cli().parse_args()
     if not args.demofile.exists():
@@ -41,78 +115,61 @@ def main() -> None:
     print("[loading demo – one-off parse, please wait …]")
     dp = DemoParser(args.demofile.as_posix())
 
-    # 1) per-tick table ---------------------------------------------------------
+    # 1) per-tick table
     tick_df = (
         dp.parse_ticks(
             wanted_props=[
-                "tick", "steamid", "name",
+                "tick", "steamid", "userid", "name",
                 "buttons", "pitch", "yaw", "inventory",
             ]
-        )
-        .pipe(pd.DataFrame)
+        ).pipe(pd.DataFrame)
     )
 
-    # 2) gap-fill so every (tick,steamid) exists --------------------------------
+    # 2) gap-fill so every (tick,steamid) exists
     tick_df.sort_values(["steamid", "tick"], inplace=True)
     tick_df = (
         tick_df
         .set_index("tick")
-        .groupby("steamid", group_keys=False)        # keep steamid as column
-        .apply(lambda g: g
-               .reindex(range(g.index.min(), g.index.max() + 1))
-               .ffill())
-        .reset_index()                               # only 'tick' comes from index
+        .groupby("steamid", group_keys=False)
+        .apply(lambda g: g.reindex(range(g.index.min(), g.index.max() + 1)).ffill())
+        .reset_index()
     )
 
-    # 3) mouse deltas -----------------------------------------------------------
+    # 3) mouse deltas
     tick_df["d_yaw"]   = tick_df.groupby("steamid")["yaw"].diff().fillna(0)
     tick_df["d_pitch"] = tick_df.groupby("steamid")["pitch"].diff().fillna(0)
 
-    # 4) purchases – try ➊, fall back to ➋, then ➌ ------------------------------
+    # 4) purchases – trial different API signatures
     def get_buys():
-        try:  # ➊ new style: (event, event_props, wanted_props)
-            return dp.parse_event(
-                "item_pickup",
-                ["weapon", "price"],
-                ["tick", "steamid"],
-            )
+        try:
+            return dp.parse_event("item_pickup", ["weapon", "price"], ["tick", "steamid"])
         except TypeError:
-            try:  # ➋ mid-old: (event, wanted_props)
-                return dp.parse_event(
-                    "item_pickup",
-                    ["tick", "steamid", "weapon", "price"],
-                )
+            try:
+                return dp.parse_event("item_pickup", ["tick", "steamid", "weapon", "price"])
             except TypeError:
-                raw = dp.parse_event("item_pickup")  # ➌ oldest
-                cols = [c for c in raw.columns
-                        if c in {"tick", "steamid", "weapon", "price"}]
+                raw = dp.parse_event("item_pickup")
+                cols = [c for c in raw.columns if c in {"tick", "steamid", "userid", "weapon", "item", "price"}]
                 return raw[cols]
 
-        # ---------------------------------------------------------------------
-    # after we’ve built `tick_df` but before we enter the REPL
-    # ---------------------------------------------------------------------
     raw_buys = get_buys().pipe(pd.DataFrame)
 
-    # If the parser already gave us 'steamid', great:
+    # ensure we have a steamid column
     if "steamid" in raw_buys.columns:
         buys = raw_buys
-
-    # Older parser builds → only 'userid' present
     elif "userid" in raw_buys.columns:
-        id_map = (
-            tick_df[["userid", "steamid"]]    # extract once
-            .drop_duplicates()
-        )
+        id_map = tick_df[["userid", "steamid"]].drop_duplicates()
         buys = raw_buys.merge(id_map, on="userid", how="left")
-
     else:
-        # unexpected schema – safest fallback: no purchase info
-        print("Warning: no steam/ user id columns in item_pickup events; "
-            "purchase list will be empty.")
+        print("Warning: no steam / user id columns in item_pickup events; purchase list will be empty.")
         buys = raw_buys.assign(steamid=pd.NA)
 
+    # ── SQLite export path ────────────────────────────────────────────────────
+    if args.sqlout:
+        _export_sqlite(args.sqlout, tick_df, buys)
+        print(f"✓ wrote {args.sqlout} – done")
+        return
 
-    # 5) tiny REPL --------------------------------------------------------------
+    # 5) tiny REPL
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
     while True:
         try:
@@ -146,7 +203,7 @@ def main() -> None:
         if not sel.isdigit() or not (1 <= int(sel) <= len(players)):
             print("Invalid choice.")
             continue
-        sid = players.iloc[int(sel) - 1]["steamid"]
+        sid = players.iloc[int(sel)-1]["steamid"]
 
         r = rows.loc[rows["steamid"] == sid].iloc[-1]
         keys = extract_buttons(int(r["buttons"]))
@@ -154,17 +211,18 @@ def main() -> None:
             f"\nTick {tgt_tick} – {r['name']}:\n"
             f"  Keys held : {', '.join(keys) or '(none)'}\n"
             f"  Mouse Δ   : yaw {r['d_yaw']:+.2f}°, pitch {r['d_pitch']:+.2f}°\n"
-            f"  Inventory : {r['inventory']}"
+            f"  Inventory : {_sanitize_inventory(r['inventory'])}"
         )
 
         b = buys.query("tick == @tgt_tick and steamid == @sid")
-        if not b.empty:
+        buy_col = next((c for c in ("weapon", "item", "weapon_name") if c in b.columns), None)
+        if not b.empty and buy_col:
             for _, ev in b.iterrows():
-                print(f"  Bought    : {ev['weapon']}  (-${ev['price']})")
+                price = ev.get("price", "??")
+                print(f"  Bought    : {ev[buy_col]}  (-${price})")
         else:
             print("  Bought    : (nothing this tick)")
         print()
-
 
 if __name__ == "__main__":
     main()
