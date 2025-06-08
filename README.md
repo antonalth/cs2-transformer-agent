@@ -1,7 +1,40 @@
 Plan for extracting training data:
 
+folder structure:
+    data/
+        transformer/
+            staging/
+                demo00001_name/
+                    info.json #tick info about every round (start, stop); streamid:name mapping
+                    video_pov_segments.db #see below
+                    user_input.db #per tick: tick, steamid (together primary key), W, A, S, D, buy..., Attack, Zoom, mouse_dX, mouse_dY (correct? if Attack + Rifle?)
+                    rounds/
+                        1/
+                            roundinfo.json #fromtick - totick
+                            pov_STEAMID.mp4
+                            audio_STEAMID.wav
+                            pov_STEAMID/ (debug, not actually on disk?)
+                                frame_0000X.jpeg #quality 80?
+                                frame_X.spectrogram #64 mel bins
+                                frame_X.userinput
+                        ...
+            compact/
+                demo00002_name/
+                    info.json
+                    round_X_t.lmdb
+                        -internally store as frame:pov -> sizes,jpeg,spectrogram,inputdata,other
+                        -there are 5 povs per round. some stop early
+                    round_X_ct.lmdb
+Required Algorithms:
+- Segment round into player spectate segments (round start - death/round end): round#, team, steamid, playername, starttick, endtick, isdeath
+    -> output video__pov_segments.db //leave column is_recorded = false
+- Record Rounds from video_segments.db , set is_recorded=true
+- Extract player information to user_input.db #for entire game,
+            
+
 Step 1: Extract player input + buy commands for each tick from demo
     -> what storage format for quick access? sqlite?
+    -> separate script to extract per demo/per player per tick
 Step 2: For each round (each team):
     -> figure out tick for round_start, round_end, player_death?
     -> Record each player pov until death
