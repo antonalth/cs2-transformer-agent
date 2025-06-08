@@ -97,7 +97,12 @@ def main() -> None:
     tick_df["d_pitch"] = tick_df.groupby("steamid")["pitch"].diff().fillna(0)
 
     # grab all item_pickup events (includes weapon and price)
-    buys = dp.parse_event("item_pickup").pipe(pd.DataFrame)
+    #buys = dp.parse_event("item_pickup").pipe(pd.DataFrame)
+    buys = dp.parse_event(
+        "item_pickup",
+        event_props=["weapon", "price"],        # keep only what we really need
+        wanted_props=["tick", "steamid"],       # <-- add these!
+    ).pipe(pd.DataFrame)
 
     # ── interactive prompt ────────────────────────────────────────────────────────
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
