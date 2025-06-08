@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-demo_cli.py – jump to any tick in a CS-2 demo and inspect a player’s inputs
+demo_cli.py – tiny CLI to inspect player inputs in a CS-2 demo
 
-Usage:
-    python demo_cli.py path/to/match.dem
+Commands inside the prompt:
+    seek <tick>   – jump to that server-tick, pick a player, see keys/mouse/buys
+    quit | exit   – leave
 """
 
 from __future__ import annotations
-import argparse
-import sys
+import argparse, sys
 from pathlib import Path
 
 import pandas as pd
 from demoparser2 import DemoParser
 
-# ------------------------------------------------------------------ helpers
-
-# Valve’s IN_* bit constants (extend as needed)
+# ────────────────────────────────────────────────────────────────────────────────
+# Helper: decode the 64-bit “buttons” bit-field into IN_* strings.
+# Extend the _KEYS map if you need more constants.
 _KEYS = {
     0: "IN_ATTACK",
     1: "IN_JUMP",
@@ -32,113 +32,70 @@ _KEYS = {
     11: "IN_ATTACK2",
     12: "IN_RUN",
     13: "IN_RELOAD",
-    16: "IN_SPEED",
-    17: "IN_WALK",
+    16: "IN_SPEED",     # Shift (walk) in CS-2
+    17: "IN_WALK",      # legacy name for older demos
     18: "IN_ZOOM",
-    # …add more bits if you need them…
 }
-
 def extract_buttons(bits: int) -> list[str]:
-    """
-    Decode the 64-bit 'buttons' bitfield into a list of IN_* names.
-    """
     return [name for bit, name in _KEYS.items() if bits & (1 << bit)]
+# ────────────────────────────────────────────────────────────────────────────────
 
-
-# ------------------------------------------------------------------ CLI setup
 
 def build_cli() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(
+        description="CS-2 demo inspector: seek a tick, pick a player, "
+                    "see keys / mouse Δ / purchases",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="CS-2 demo inspector: seek a tick and view a player’s inputs"
     )
-    cli.add_argument(
-        "demofile",
-        type=Path,
-        help="Path to the .dem file to inspect"
-    )
+    cli.add_argument("demofile", type=Path, help="Path to .dem file")
     return cli
 
 
 def main() -> None:
     args = build_cli().parse_args()
     if not args.demofile.exists():
-        sys.exit(f"Demo not found: {args.demofile!r}")
+        sys.exit(f"Demo not found: {args.demofile}")
 
-    print("[loading demo – this takes a few seconds …]")
-    dp = DemoParser(args.demofile.as_posix())
+    print("[loading demo — this can take a few seconds …]")
+    parser = DemoParser(args.demofile.as_posix())
 
-    # parse_ticks: include 'steamid', 'tick', 'name', plus our extras
+    # 1)  Per-tick DataFrame ────────────────────────────────────────────────
     tick_df = (
-        dp.parse_ticks(
+        parser.parse_ticks(
             wanted_props=[
-                "tick", "steamid", "name",
+                "tick",      # always include to make queries easy
+                "steamid",   # 64-bit Steam-ID  (no underscore!)
+                "name",      # player nickname
                 "buttons", "pitch", "yaw", "inventory",
             ]
         )
-        .pipe(pd.DataFrame)  # convert polars → pandas
+        .pipe(pd.DataFrame)      # polars → pandas
     )
 
-    # forward-fill so every server tick has a row for each player
+    # 2)  Forward-fill so EVERY (tick, steamid) pair exists once
     tick_df.sort_values(["steamid", "tick"], inplace=True)
     tick_df = (
         tick_df
         .set_index("tick")
         .groupby("steamid")
-        .apply(
-            lambda g: g
-                .reindex(range(g.index.min(), g.index.max() + 1))
-                .ffill(),
-            include_groups=False
-        )
-        .reset_index(level=0, drop=True)
-        .reset_index()
+        .apply(lambda g: g
+               .reindex(range(g.index.min(), g.index.max() + 1))
+               .ffill())
+        .reset_index()           # brings back both “steamid” & “tick”
     )
 
-    # compute mouse deltas
+    # 3)  Mouse movement deltas
     tick_df["d_yaw"]   = tick_df.groupby("steamid")["yaw"].diff().fillna(0)
     tick_df["d_pitch"] = tick_df.groupby("steamid")["pitch"].diff().fillna(0)
 
-    # ── purchases: robust parse_event + inventory-diff fallback ──────
-    try:
-        # try the newer API: keyword-only wanted_props
-        buys = (
-            dp.parse_event(
-                "item_pickup",
-                wanted_props=["tick", "steamid"]
-            )
-            .pipe(pd.DataFrame)
-        )
-        # ensure columns exist
-        if not {"tick", "steamid"}.issubset(buys.columns):
-            raise ValueError
+    # 4)  Purchases (“item_pickup” event) with essential columns
+    buys = parser.parse_event(
+        "item_pickup",
+        ["weapon", "price"],         # event-specific fields
+        ["tick", "steamid"],         # carry over for joins / filtering
+    ).pipe(pd.DataFrame)
 
-    except (TypeError, ValueError):
-        # fallback to legacy or incomplete parse_event
-        try:
-            tmp = dp.parse_event("item_pickup").pipe(pd.DataFrame)
-        except TypeError:
-            tmp = pd.DataFrame()
-        if {"tick", "steamid"}.issubset(tmp.columns):
-            buys = tmp
-        else:
-            # inventory-diff fallback
-            inv = (
-                tick_df[["tick", "steamid", "inventory"]]
-                .sort_values(["steamid", "tick"])
-                .assign(prev=lambda df: df.groupby("steamid")["inventory"].shift(1))
-            )
-            buys = (
-                inv.assign(new=lambda r: (
-                    r["inventory"].apply(set) - r["prev"].apply(lambda x: set(x or []))
-                ))
-                .explode("new")
-                .dropna(subset=["new"])
-                .rename(columns={"new": "weapon"})
-            )
-            buys["price"] = None
-
-    # ── interactive prompt ────────────────────────────────────────────────────────
+    # ── Interactive prompt ────────────────────────────────────────────────
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
     while True:
         try:
@@ -147,11 +104,11 @@ def main() -> None:
             print()
             break
 
-        if cmd in ("quit", "exit"): 
+        if cmd in {"quit", "exit"}:
             break
 
         if cmd.startswith("seek"):
-            parts = cmd.split()
+            parts = cmd.split(maxsplit=1)
             if len(parts) != 2 or not parts[1].isdigit():
                 print("Usage: seek <tick_number>")
                 continue
@@ -174,21 +131,23 @@ def main() -> None:
             if not sel.isdigit() or not (1 <= int(sel) <= len(players)):
                 print("Invalid choice.")
                 continue
-            sid = players.iloc[int(sel)-1]["steamid"]
+            steamid = players.iloc[int(sel) - 1]["steamid"]
 
-            row = rows[rows["steamid"] == sid].iloc[-1]
-            keys = extract_buttons(int(row["buttons"]))
+            # last row for that player at this tick
+            r = rows.loc[rows["steamid"] == steamid].iloc[-1]
+
+            keys = extract_buttons(int(r["buttons"]))
             print(
-                f"\nTick {tgt_tick} – {row['name']}:\n"
+                f"\nTick {tgt_tick} – {r['name']}:\n"
                 f"  Keys held : {', '.join(keys) or '(none)'}\n"
-                f"  Mouse Δ   : yaw {row['d_yaw']:+.2f}°, pitch {row['d_pitch']:+.2f}°\n"
-                f"  Inventory : {row['inventory']}"
+                f"  Mouse Δ   : yaw {r['d_yaw']:+.2f}°, pitch {r['d_pitch']:+.2f}°\n"
+                f"  Inventory : {r['inventory']}"
             )
 
-            b = buys.query("tick == @tgt_tick and steamid == @sid")
+            b = buys.query("tick == @tgt_tick and steamid == @steamid")
             if not b.empty:
                 for _, ev in b.iterrows():
-                    print(f"  Bought    : {ev.get('weapon')}  (-${ev.get('price')})")
+                    print(f"  Bought    : {ev['weapon']}  (-${ev['price']})")
             else:
                 print("  Bought    : (nothing this tick)")
             print()
