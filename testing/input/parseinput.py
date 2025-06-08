@@ -7,7 +7,8 @@ Usage:
 """
 
 from __future__ import annotations
-import argparse, sys
+import argparse
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -67,7 +68,7 @@ def main() -> None:
     print("[loading demo – this takes a few seconds …]")
     dp = DemoParser(args.demofile.as_posix())
 
-    # parse_ticks: include 'steamid' (no underscore), 'tick', 'name', plus our extras
+    # parse_ticks: include 'steamid', 'tick', 'name', plus our extras
     tick_df = (
         dp.parse_ticks(
             wanted_props=[
@@ -84,9 +85,11 @@ def main() -> None:
         tick_df
         .set_index("tick")
         .groupby("steamid")
-        .apply(lambda g: g
-               .reindex(range(g.index.min(), g.index.max() + 1))
-               .ffill()
+        .apply(
+            lambda g: g
+                .reindex(range(g.index.min(), g.index.max() + 1))
+                .ffill(),
+            include_groups=False
         )
         .reset_index(level=0, drop=True)
         .reset_index()
@@ -96,13 +99,44 @@ def main() -> None:
     tick_df["d_yaw"]   = tick_df.groupby("steamid")["yaw"].diff().fillna(0)
     tick_df["d_pitch"] = tick_df.groupby("steamid")["pitch"].diff().fillna(0)
 
-    # grab all item_pickup events (includes weapon and price)
-    #buys = dp.parse_event("item_pickup").pipe(pd.DataFrame)
-    buys = dp.parse_event(
-        "item_pickup",
-        ["weapon", "price"],        # keep only what we really need
-        ["tick", "steamid"],       # <-- add these!
-    ).pipe(pd.DataFrame)
+    # ── purchases: robust parse_event + inventory-diff fallback ──────
+    try:
+        # try the newer API: keyword-only wanted_props
+        buys = (
+            dp.parse_event(
+                "item_pickup",
+                wanted_props=["tick", "steamid"]
+            )
+            .pipe(pd.DataFrame)
+        )
+        # ensure columns exist
+        if not {"tick", "steamid"}.issubset(buys.columns):
+            raise ValueError
+
+    except (TypeError, ValueError):
+        # fallback to legacy or incomplete parse_event
+        try:
+            tmp = dp.parse_event("item_pickup").pipe(pd.DataFrame)
+        except TypeError:
+            tmp = pd.DataFrame()
+        if {"tick", "steamid"}.issubset(tmp.columns):
+            buys = tmp
+        else:
+            # inventory-diff fallback
+            inv = (
+                tick_df[["tick", "steamid", "inventory"]]
+                .sort_values(["steamid", "tick"])
+                .assign(prev=lambda df: df.groupby("steamid")["inventory"].shift(1))
+            )
+            buys = (
+                inv.assign(new=lambda r: (
+                    r["inventory"].apply(set) - r["prev"].apply(lambda x: set(x or []))
+                ))
+                .explode("new")
+                .dropna(subset=["new"])
+                .rename(columns={"new": "weapon"})
+            )
+            buys["price"] = None
 
     # ── interactive prompt ────────────────────────────────────────────────────────
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
@@ -113,7 +147,7 @@ def main() -> None:
             print()
             break
 
-        if cmd in ("quit", "exit"):
+        if cmd in ("quit", "exit"): 
             break
 
         if cmd.startswith("seek"):
@@ -140,10 +174,9 @@ def main() -> None:
             if not sel.isdigit() or not (1 <= int(sel) <= len(players)):
                 print("Invalid choice.")
                 continue
-            steamid = players.iloc[int(sel)-1]["steamid"]
+            sid = players.iloc[int(sel)-1]["steamid"]
 
-            # fetch the last row for that player at this tick
-            row = rows[rows["steamid"] == steamid].iloc[-1]
+            row = rows[rows["steamid"] == sid].iloc[-1]
             keys = extract_buttons(int(row["buttons"]))
             print(
                 f"\nTick {tgt_tick} – {row['name']}:\n"
@@ -152,15 +185,16 @@ def main() -> None:
                 f"  Inventory : {row['inventory']}"
             )
 
-            b = buys.query("tick == @tgt_tick and steamid == @steamid")
+            b = buys.query("tick == @tgt_tick and steamid == @sid")
             if not b.empty:
                 for _, ev in b.iterrows():
-                    print(f"  Bought    : {ev['weapon']}  (-${ev['price']})")
+                    print(f"  Bought    : {ev.get('weapon')}  (-${ev.get('price')})")
             else:
                 print("  Bought    : (nothing this tick)")
             print()
         else:
             print("Unknown command. Use 'seek <tick>' or 'quit'.")
+
 
 if __name__ == "__main__":
     main()
