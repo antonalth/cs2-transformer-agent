@@ -7,3 +7,4 @@ libs/__pycache__/**/ */
 /bbox_algs/deprecated/__pycache__
 /libs/__pycache__
 *.jpeg
+.DS_Store

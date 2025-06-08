@@ -88,7 +88,29 @@ def main() -> None:
                         if c in {"tick", "steamid", "weapon", "price"}]
                 return raw[cols]
 
-    buys = get_buys().pipe(pd.DataFrame)
+        # ---------------------------------------------------------------------
+    # after we’ve built `tick_df` but before we enter the REPL
+    # ---------------------------------------------------------------------
+    raw_buys = get_buys().pipe(pd.DataFrame)
+
+    # If the parser already gave us 'steamid', great:
+    if "steamid" in raw_buys.columns:
+        buys = raw_buys
+
+    # Older parser builds → only 'userid' present
+    elif "userid" in raw_buys.columns:
+        id_map = (
+            tick_df[["userid", "steamid"]]    # extract once
+            .drop_duplicates()
+        )
+        buys = raw_buys.merge(id_map, on="userid", how="left")
+
+    else:
+        # unexpected schema – safest fallback: no purchase info
+        print("Warning: no steam/ user id columns in item_pickup events; "
+            "purchase list will be empty.")
+        buys = raw_buys.assign(steamid=pd.NA)
+
 
     # 5) tiny REPL --------------------------------------------------------------
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
