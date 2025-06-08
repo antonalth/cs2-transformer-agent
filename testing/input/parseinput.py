@@ -100,8 +100,8 @@ def main() -> None:
     #buys = dp.parse_event("item_pickup").pipe(pd.DataFrame)
     buys = dp.parse_event(
         "item_pickup",
-        event_props=["weapon", "price"],        # keep only what we really need
-        wanted_props=["tick", "steamid"],       # <-- add these!
+        ["weapon", "price"],        # keep only what we really need
+        ["tick", "steamid"],       # <-- add these!
     ).pipe(pd.DataFrame)
 
     # ── interactive prompt ────────────────────────────────────────────────────────
