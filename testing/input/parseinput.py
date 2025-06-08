@@ -1,50 +1,39 @@
 #!/usr/bin/env python3
 """
-demo_cli.py – tiny CLI to inspect player inputs in a CS-2 demo
+demo_cli.py – inspect a CS-2 demo from the terminal
 
-Commands inside the prompt:
-    seek <tick>   – jump to that server-tick, pick a player, see keys/mouse/buys
-    quit | exit   – leave
+Prompt commands
+---------------
+seek <tick>   jump to that server tick, choose a player, see keys / mouse Δ / buys
+quit | exit   leave
 """
 
 from __future__ import annotations
 import argparse, sys
 from pathlib import Path
+import inspect
 
 import pandas as pd
 from demoparser2 import DemoParser
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Helper: decode the 64-bit “buttons” bit-field into IN_* strings.
-# Extend the _KEYS map if you need more constants.
+
+# ── helper: decode 64-bit “buttons” bit-field ──────────────────────────────────
 _KEYS = {
-    0: "IN_ATTACK",
-    1: "IN_JUMP",
-    2: "IN_DUCK",
-    3: "IN_FORWARD",
-    4: "IN_BACK",
-    5: "IN_USE",
-    6: "IN_CANCEL",
-    7: "IN_LEFT",
-    8: "IN_RIGHT",
-    9: "IN_MOVELEFT",
-    10: "IN_MOVERIGHT",
-    11: "IN_ATTACK2",
-    12: "IN_RUN",
-    13: "IN_RELOAD",
-    16: "IN_SPEED",     # Shift (walk) in CS-2
-    17: "IN_WALK",      # legacy name for older demos
+    0: "IN_ATTACK",   1: "IN_JUMP",    2: "IN_DUCK",   3: "IN_FORWARD",
+    4: "IN_BACK",     5: "IN_USE",     6: "IN_CANCEL", 7: "IN_LEFT",
+    8: "IN_RIGHT",    9: "IN_MOVELEFT", 10: "IN_MOVERIGHT", 11: "IN_ATTACK2",
+    12: "IN_RUN",    13: "IN_RELOAD", 16: "IN_SPEED", 17: "IN_WALK",
     18: "IN_ZOOM",
 }
 def extract_buttons(bits: int) -> list[str]:
+    """turn the buttons bit-field into IN_* names"""
     return [name for bit, name in _KEYS.items() if bits & (1 << bit)]
-# ────────────────────────────────────────────────────────────────────────────────
 
 
+# ── CLI parsing ────────────────────────────────────────────────────────────────
 def build_cli() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(
-        description="CS-2 demo inspector: seek a tick, pick a player, "
-                    "see keys / mouse Δ / purchases",
+        description="Tiny CS-2 demo inspector (keys / mouse / buys)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     cli.add_argument("demofile", type=Path, help="Path to .dem file")
@@ -57,54 +46,56 @@ def main() -> None:
         sys.exit(f"Demo not found: {args.demofile}")
 
     print("[loading demo — this can take a few seconds …]")
-    parser = DemoParser(args.demofile.as_posix())
+    dp = DemoParser(args.demofile.as_posix())
 
-    # 1)  Per-tick DataFrame ────────────────────────────────────────────────
+    # ── 1) per-tick DataFrame ────────────────────────────────────────────────
     tick_df = (
-        parser.parse_ticks(
+        dp.parse_ticks(
             wanted_props=[
-                "tick",      # always include to make queries easy
-                "steamid",   # 64-bit Steam-ID  (no underscore!)
-                "name",      # player nickname
+                "tick",
+                "steamid",          # 64-bit ID (no underscore!)
+                "name",
                 "buttons", "pitch", "yaw", "inventory",
             ]
         )
-        .pipe(pd.DataFrame)      # polars → pandas
+        .pipe(pd.DataFrame)         # polars → pandas
     )
 
-    # ── forward-fill so EVERY (tick, steamid) pair exists once ──────────────
+    # ── 2) forward-fill so EVERY (tick,steamid) exists once ─────────────────
     tick_df.sort_values(["steamid", "tick"], inplace=True)
-
     tick_df = (
         tick_df
         .set_index("tick")
-        .groupby("steamid", group_keys=False)           # ← keeps steamid as column
+        .groupby("steamid", group_keys=False)      # keep steamid as column
         .apply(lambda g: g
-            .reindex(range(g.index.min(), g.index.max() + 1))
-            .ffill()
-        )
-        .reset_index()                                  # only “tick” comes from index
+               .reindex(range(g.index.min(), g.index.max() + 1))
+               .ffill())
+        .reset_index()                             # only “tick” comes from index
     )
 
-
-    # 3)  Mouse movement deltas
+    # ── 3) mouse deltas ──────────────────────────────────────────────────────
     tick_df["d_yaw"]   = tick_df.groupby("steamid")["yaw"].diff().fillna(0)
     tick_df["d_pitch"] = tick_df.groupby("steamid")["pitch"].diff().fillna(0)
 
-    # 4)  Purchases (“item_pickup” event) with essential columns
-    buys = parser.parse_event(
-        "item_pickup",
-        ["weapon", "price"],         # event-specific fields
-        ["tick", "steamid"],         # carry over for joins / filtering
-    ).pipe(pd.DataFrame)
+    # ── 4) purchases (“item_pickup”) — cope with 2-arg *or* 3-arg signature ─
+    sig = inspect.signature(dp.parse_event)
+    if len(sig.parameters) >= 3:          # new API: (name, event_props, wanted_props)
+        buys = dp.parse_event(
+            "item_pickup",
+            ["weapon", "price"],          # event-specific columns
+            ["tick", "steamid"],          # attach for joins/filters
+        ).pipe(pd.DataFrame)
+    else:                                 # old API: (name, wanted_props)
+        raw = dp.parse_event("item_pickup").pipe(pd.DataFrame)
+        buys = raw[["tick", "steamid", "weapon", "price"]]
 
-    # ── Interactive prompt ────────────────────────────────────────────────
-    print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
+    # ── 5) REPL ──────────────────────────────────────────────────────────────
+    print("\nCommands:\n  seek <tick>   jump to that tick\n  quit | exit   leave\n")
     while True:
         try:
             cmd = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            print()             # newline before exiting
             break
 
         if cmd in {"quit", "exit"}:
@@ -115,8 +106,8 @@ def main() -> None:
             if len(parts) != 2 or not parts[1].isdigit():
                 print("Usage: seek <tick_number>")
                 continue
-
             tgt_tick = int(parts[1])
+
             rows = tick_df.query("tick == @tgt_tick")
             if rows.empty:
                 print(f"No data at tick {tgt_tick}.")
@@ -134,11 +125,9 @@ def main() -> None:
             if not sel.isdigit() or not (1 <= int(sel) <= len(players)):
                 print("Invalid choice.")
                 continue
-            steamid = players.iloc[int(sel) - 1]["steamid"]
+            sid = players.iloc[int(sel) - 1]["steamid"]
 
-            # last row for that player at this tick
-            r = rows.loc[rows["steamid"] == steamid].iloc[-1]
-
+            r = rows.loc[rows["steamid"] == sid].iloc[-1]
             keys = extract_buttons(int(r["buttons"]))
             print(
                 f"\nTick {tgt_tick} – {r['name']}:\n"
@@ -147,7 +136,7 @@ def main() -> None:
                 f"  Inventory : {r['inventory']}"
             )
 
-            b = buys.query("tick == @tgt_tick and steamid == @steamid")
+            b = buys.query("tick == @tgt_tick and steamid == @sid")
             if not b.empty:
                 for _, ev in b.iterrows():
                     print(f"  Bought    : {ev['weapon']}  (-${ev['price']})")
