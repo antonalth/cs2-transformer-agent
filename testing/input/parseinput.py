@@ -49,7 +49,7 @@ def _export_sqlite(db_path: Path, tick_df: pd.DataFrame, buys: pd.DataFrame) -> 
     df["keyboard_input"] = df["buttons"].apply(lambda b: ",".join(extract_buttons(int(b))))
 
     # mouse delta as "dYaw,dPitch" string
-    df["mouse"] = df.apply(lambda r: f"{r['d_yaw']:+.2f},{r['d_pitch']:+.2f}", axis=1)
+    df["mouse"] = df.apply(lambda r: f"{r['d_yaw']:+.5f},{r['d_pitch']:+.5f}", axis=1)
 
     # stringify inventory lists
     df["inventory"] = df["inventory"].apply(_sanitize_inventory)

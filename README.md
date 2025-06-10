@@ -30,7 +30,17 @@ Required Algorithms:
     -> output video__pov_segments.db //leave column is_recorded = false
 - Record Rounds from video_segments.db , set is_recorded=true
 - Extract player information to user_input.db #for entire game,
-            
+    - WASD, Space, Jump, CTRL
+    - dX, dY, lClick, rClick
+    - usePrimary, useSecondary, useKnife, useFlash, useHE, useMolo, useSmoke
+    - actions: (defuse, plant, open door)
+    - Reloading switch primary/secondary/knife,buy/drop/buydrop/switch weapons, actions (plant, defusing, open door)
+    = rewrite self: https://github.com/LaihoE/demoparser/tree/main/documentation/python
+    -  player attr: player_name, player_steamid, team_num, is_alive, active_weapon, weapon_purchases_this_round?, is_defusing, buttons?, pitch, yaw, balance?
+    - usercmd: usercmd_mouse_dx, usercmd_mouse_dy? + m_sensitivity usercmd_weapon_select? usercmd_input_histr
+
+TF notes:
+ - feed in frame, audio, etc + last keyboard input.
 
 Step 1: Extract player input + buy commands for each tick from demo
     -> what storage format for quick access? sqlite?
