@@ -14,6 +14,51 @@ from pathlib import Path
 import pandas as pd
 from demoparser2 import DemoParser
 
+# ── helper: define weapon categories for switch inference ─────────────────────
+# Maps common in-game weapon names (as seen in `active_weapon_name` from demoparser)
+# to a specific SWITCH key.
+# This allows us to infer a weapon switch "button press" when the active weapon changes.
+WEAPON_CATEGORIES = {
+    # SWITCH_1: Primary Weapons (Rifles, SMGs, Shotguns, LMGs)
+    "AK-47": "SWITCH_1", "M4A4": "SWITCH_1", "M4A1-S": "SWITCH_1",
+    "Galil AR": "SWITCH_1", "FAMAS": "SWITCH_1", "AUG": "SWITCH_1",
+    "SG 553": "SWITCH_1", "AWP": "SWITCH_1", "SSG 08": "SWITCH_1",
+    "G3SG1": "SWITCH_1", "SCAR-20": "SWITCH_1", "MP9": "SWITCH_1",
+    "MAC-10": "SWITCH_1", "MP7": "SWITCH_1", "MP5-SD": "SWITCH_1",
+    "UMP-45": "SWITCH_1", "P90": "SWITCH_1", "PP-Bizon": "SWITCH_1",
+    "Nova": "SWITCH_1", "XM1014": "SWITCH_1", "MAG-7": "SWITCH_1",
+    "Sawed-Off": "SWITCH_1", "M249": "SWITCH_1", "Negev": "SWITCH_1",
+
+    # SWITCH_2: Secondary Weapons (Pistols)
+    "Glock-18": "SWITCH_2", "USP-S": "SWITCH_2", "P250": "SWITCH_2",
+    "P2000": "SWITCH_2", "Dual Berettas": "SWITCH_2", "Five-SeveN": "SWITCH_2",
+    "Tec-9": "SWITCH_2", "CZ75-Auto": "SWITCH_2", "Desert Eagle": "SWITCH_2",
+    "R8 Revolver": "SWITCH_2",
+
+    # SWITCH_3: Melee Weapons (Knives often just show "Knife" but can sometimes be more specific)
+    "knife":"SWITCH_3","knife_ct": "SWITCH_3", "knife_t": "SWITCH_3", "Bayonet": "SWITCH_3", "Flip Knife": "SWITCH_3",
+    "Gut Knife": "SWITCH_3", "Karambit": "SWITCH_3", "M9 Bayonet": "SWITCH_3",
+    "Huntsman Knife": "SWITCH_3", "Falchion Knife": "SWITCH_3", "Bowie Knife": "SWITCH_3",
+    "Butterfly Knife": "SWITCH_3", "Shadow Daggers": "SWITCH_3", "Ursus Knife": "SWITCH_3",
+    "Navaja Knife": "SWITCH_3", "Stiletto Knife": "SWITCH_3", "Talon Knife": "SWITCH_3",
+    "Classic Knife": "SWITCH_3", "Paracord Knife": "SWITCH_3", "Survival Knife": "SWITCH_3",
+    "Nomad Knife": "SWITCH_3", "Skeleton Knife": "SWITCH_3",
+
+    # SWITCH_4: Grenades
+    "High Explosive Grenade": "SWITCH_4", "Flashbang": "SWITCH_4", "Smoke Grenade": "SWITCH_4",
+    "Molotov": "SWITCH_4", "Incendiary Grenade": "SWITCH_4", "Decoy Grenade": "SWITCH_4",
+
+    # SWITCH_5: Other (C4, Defuse Kit, Zeus)
+    "C4 Explosive": "SWITCH_5", "Defuse Kit": "SWITCH_5", "Zeus x27": "SWITCH_3",
+}
+
+def get_weapon_switch_type(weapon_name: str | None) -> str | None:
+    """Returns the SWITCH_X category for a given weapon name."""
+    if not weapon_name:
+        return None
+    return WEAPON_CATEGORIES.get(weapon_name, f"SWITCH_UNDEFINED_{weapon_name}")
+
+
 # ── helper: decode "buttons" bit-field ────────────────────────────────────────
 KEY_MAPPING = {
     "IN_ATTACK":    1 << 0,
@@ -78,15 +123,12 @@ def _export_sqlite(db_path: Path, tick_df: pd.DataFrame) -> None:
     """Write combined *tick_df* info into an SQLite DB at *db_path*."""
     df = tick_df.copy()
 
-    # readable keyboard input
-    df["keyboard_input"] = df["buttons"].apply(lambda b: ",".join(extract_buttons(int(b))))
-
     # stringify inventory lists
     df["inventory"] = df["inventory"].apply(_sanitize_inventory)
 
-    # final shape - added 'active_weapon_name'
+    # final shape - The `keyboard_input` column is now pre-computed in main()
     df.rename(columns={"name": "playername"}, inplace=True)
-    df = df[["tick", "steamid", "playername", "keyboard_input", "inventory", "X", "Y", "Z", "active_weapon_name"]] # ADDED active_weapon_name here
+    df = df[["tick", "steamid", "playername", "keyboard_input", "inventory", "X", "Y", "Z", "active_weapon_name"]]
 
     # write to DB
     con = sqlite3.connect(db_path)
@@ -102,14 +144,14 @@ def _export_sqlite(db_path: Path, tick_df: pd.DataFrame) -> None:
             x REAL,
             y REAL,
             z REAL,
-            active_weapon TEXT, -- ADDED active_weapon column
+            active_weapon TEXT,
             PRIMARY KEY (tick, steamid)
         )
         """
     )
     # Updated column list for INSERT OR REPLACE INTO - now 9 columns
     cur.executemany(
-        "INSERT OR REPLACE INTO inputs VALUES (?,?,?,?,?,?,?,?,?)", # ADDED another '?' for active_weapon
+        "INSERT OR REPLACE INTO inputs VALUES (?,?,?,?,?,?,?,?,?)",
         df.to_records(index=False).tolist(),
     )
     con.commit()
@@ -138,10 +180,8 @@ def main() -> None:
             wanted_props=[
                 "tick", "steamid", "userid", "name",
                 "buttons", "inventory",
-                "X", "Y", "Z", # Added player x, y, z coordinates
-                "active_weapon_name", #"is_defusing", # Retained from original parsedemo.py
-                # Removed: "team_num", "total_rounds_played", "pitch", "yaw",
-                # "usercmd_mouse_dx", "usercmd_mouse_dy", "aim_punch_angle"
+                "X", "Y", "Z",
+                "active_weapon_name", "is_defusing",
             ]
         ).pipe(pd.DataFrame)
     )
@@ -156,17 +196,54 @@ def main() -> None:
         .reset_index()
     )
 
-    # Removed: 3) mouse deltas calculation (d_yaw, d_pitch)
-    # Removed: 4) purchases parsing (get_buys function, raw_buys, buys DFs)
+    # 3) Infer weapon switches from active weapon changes
+    print("[inferring weapon switches...]")
+    # Get the previous tick's weapon for each player
+    tick_df['prev_weapon'] = tick_df.groupby('steamid')['active_weapon_name'].shift(1)
+
+    # Determine if the weapon changed from the previous tick
+    # Also ensure that both current and previous weapons are not None/NaN to avoid false positives
+    weapon_changed_mask = (tick_df['active_weapon_name'] != tick_df['prev_weapon']) & \
+                          (tick_df['active_weapon_name'].notna()) & \
+                          (tick_df['prev_weapon'].notna())
+
+    # Get the SWITCH_X category for the *new* weapon
+    tick_df['switch_type'] = tick_df['active_weapon_name'].apply(get_weapon_switch_type)
+
+    # Create a new column that only contains a value on the tick a switch occurred
+    tick_df['inferred_switch'] = ''
+    tick_df.loc[weapon_changed_mask, 'inferred_switch'] = tick_df.loc[weapon_changed_mask, 'switch_type']
+    tick_df['inferred_switch'].fillna('', inplace=True)
+
+
+    # 4) Create final keyboard_input by combining real and inferred inputs
+    # First, get the list of real keys from the bitfield
+    tick_df['real_keys_list'] = tick_df['buttons'].apply(lambda b: extract_buttons(int(b)))
+
+    # Then, combine the list of real keys with the inferred switch string
+    def combine_inputs(row):
+        keys = row['real_keys_list']
+        switch = row['inferred_switch']
+        if switch: # If an inferred switch exists for this tick...
+            # Ensure we don't add duplicate switch types if somehow both IN_WEAPON1 and a switch were inferred
+            # Although IN_WEAPON1/2 are often specific binds, the inferred switch is more generic.
+            if switch not in keys:
+                keys.append(switch) # ...add it to the list of inputs.
+        return ",".join(keys)
+
+    tick_df['keyboard_input'] = tick_df.apply(combine_inputs, axis=1)
+
+    # Clean up temporary columns
+    tick_df.drop(columns=['prev_weapon', 'switch_type', 'inferred_switch', 'real_keys_list', 'buttons'], inplace=True)
+
 
     # ── SQLite export path ────────────────────────────────────────────────────
     if args.sqlout:
-        # Calls _export_sqlite without the 'buys' DataFrame
         _export_sqlite(args.sqlout, tick_df)
         print(f"✓ wrote {args.sqlout} – done")
         return
 
-    # 5) tiny REPL - Updated for new features and removed old ones
+    # 5) tiny REPL - Now uses the final `keyboard_input` column
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
     while True:
         try:
@@ -203,16 +280,14 @@ def main() -> None:
         sid = players.iloc[int(sel)-1]["steamid"]
 
         r = rows.loc[rows["steamid"] == sid].iloc[-1]
-        keys = extract_buttons(int(r["buttons"]))
+        # We no longer call extract_buttons here; we use the pre-computed column
         print(
             f"\nTick {tgt_tick} – {r['name']}:\n"
-            f"  Keys held : {', '.join(keys) or '(none)'}\n"
-            f"  Position  : x={r['X']:.2f}, y={r['Y']:.2f}, z={r['Z']:.2f}\n" # Added position
-            f"  Inventory : {_sanitize_inventory(r['inventory'])}\n"
+            f"  Inputs      : {r['keyboard_input'] or '(none)'}\n"
+            f"  Position    : x={r['X']:.2f}, y={r['Y']:.2f}, z={r['Z']:.2f}\n"
+            f"  Inventory   : {_sanitize_inventory(r['inventory'])}\n"
             f"  Active Weapon: {r['active_weapon_name']}"
         )
-        # Removed: Mouse Δ display
-        # Removed: Bought display
         print()
 
 if __name__ == "__main__":
