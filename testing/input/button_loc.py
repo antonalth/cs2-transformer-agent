@@ -139,7 +139,7 @@ def main() -> None:
                 "tick", "steamid", "userid", "name",
                 "buttons", "inventory",
                 "X", "Y", "Z", # Added player x, y, z coordinates
-                "active_weapon_name", "is_defusing", # Retained from original parsedemo.py
+                "active_weapon_name", #"is_defusing", # Retained from original parsedemo.py
                 # Removed: "team_num", "total_rounds_played", "pitch", "yaw",
                 # "usercmd_mouse_dx", "usercmd_mouse_dy", "aim_punch_angle"
             ]
