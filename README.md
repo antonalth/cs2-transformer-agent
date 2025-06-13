@@ -25,11 +25,18 @@ folder structure:
                         -internally store as frame:pov -> sizes,jpeg,spectrogram,inputdata,other
                         -there are 5 povs per round. some stop early
                     round_X_ct.lmdb
+TODOs:
+- Parse demo, extract all player inputs/tick; round start - round stop; player recording timeframes (round#, starttick, endtick, isdeath?)
+    - separate tables: playerinput, info for player pov recording (round#, starttick ,endtick, isdeath, (video_path, audio_path), (team)), separate table auxiliary information (money, roundcount)
+- Record based on sql table, put at path,
+- All 5 team: Video -> frames, Audio snippets -> spectrogram, input to 64 bit?, aux? ==> LMDB format per round
+
+
 Required Algorithms:
 - Segment round into player spectate segments (round start - death/round end): round#, team, steamid, playername, starttick, endtick, isdeath
     -> output video__pov_segments.db //leave column is_recorded = false
 - Record Rounds from video_segments.db , set is_recorded=true
-- Extract player information to user_input.db #for entire game,
+- Extract player information to user_input.db #for entire game
     - WASD, Space, Jump, CTRL
     - dX, dY, lClick, rClick
     - usePrimary, useSecondary, useKnife, useFlash, useHE, useMolo, useSmoke
@@ -38,6 +45,8 @@ Required Algorithms:
     = rewrite self: https://github.com/LaihoE/demoparser/tree/main/documentation/python
     -  player attr: player_name, player_steamid, team_num, is_alive, active_weapon, weapon_purchases_this_round?, is_defusing, buttons?, pitch, yaw, balance?
     - usercmd: usercmd_mouse_dx, usercmd_mouse_dy? + m_sensitivity usercmd_weapon_select? usercmd_input_histr
+        -> get ticks with no recoil, and then correlate usercmd_mouse_dx,dy with dAng -> get Sensitivity (average over many ticks!)
+        -> then
 
 TF notes:
  - feed in frame, audio, etc + last keyboard input.

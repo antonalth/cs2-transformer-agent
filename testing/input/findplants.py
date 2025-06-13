@@ -82,7 +82,7 @@ def _export_sqlite(db_path: Path, tick_df: pd.DataFrame, buys: pd.DataFrame) -> 
     df = tick_df.copy()
 
     # readable keyboard input
-    df["keyboard_input"] = df["buttons"].apply(lambda b: ",".join(extract_buttons(int(b))))
+    df["keyboard_input"] = df["buttons"].apply(lambda b: ",".join(extract_buttons(b)))
 
     # mouse delta as "dYaw,dPitch" string
     df["mouse"] = df.apply(lambda r: f"{r['d_yaw']:+.5f},{r['d_pitch']:+.5f}", axis=1)
@@ -103,7 +103,6 @@ def _export_sqlite(db_path: Path, tick_df: pd.DataFrame, buys: pd.DataFrame) -> 
         df = df.merge(buys_agg, on=["tick", "steamid"], how="left")
     else:
         df["buy"] = ""
-
     df["buy"] = df["buy"].fillna("")
 
     # final shape
@@ -134,7 +133,7 @@ def _export_sqlite(db_path: Path, tick_df: pd.DataFrame, buys: pd.DataFrame) -> 
     con.commit()
     con.close()
 
-# ── CLI setup ────────────────────────────────────────────────────────────────
+# ── CLI setup ───────────────────────────────────────────────────────────────
 def cli() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Tiny CS-2 demo inspector / exporter")
     p.add_argument("demofile", type=Path, help="Path to .dem file")
@@ -189,7 +188,6 @@ def main() -> None:
 
     raw_buys = get_buys().pipe(pd.DataFrame)
 
-    # ensure we have a steamid column
     if "steamid" in raw_buys.columns:
         buys = raw_buys
     elif "userid" in raw_buys.columns:
@@ -199,13 +197,12 @@ def main() -> None:
         print("Warning: no steam / user id columns in item_pickup events; purchase list will be empty.")
         buys = raw_buys.assign(steamid=pd.NA)
 
-    # ── SQLite export path ────────────────────────────────────────────────────
+    # 5) output or REPL
     if args.sqlout:
         _export_sqlite(args.sqlout, tick_df, buys)
         print(f"✓ wrote {args.sqlout} – done")
         return
 
-    # 5) tiny REPL
     print("\nCommands:\n  seek <tick>   jump to that tick\n  quit / exit   leave\n")
     while True:
         try:
@@ -242,7 +239,7 @@ def main() -> None:
         sid = players.iloc[int(sel)-1]["steamid"]
 
         r = rows.loc[rows["steamid"] == sid].iloc[-1]
-        keys = extract_buttons(int(r["buttons"]))
+        keys = extract_buttons(r["buttons"])
         print(
             f"\nTick {tgt_tick} – {r['name']}:\n"
             f"  Keys held : {', '.join(keys) or '(none)'}\n"
