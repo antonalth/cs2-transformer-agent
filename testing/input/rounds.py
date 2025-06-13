@@ -32,21 +32,8 @@ from typing import Any
 try:                                # AWPy ≥ 2.0
     from awpy.demo import Demo as _Demo
     _AWPY_VERSION = "2.x"
-except ModuleNotFoundError:         # AWPy 1.x (old layout) or demoparser2 directly
-    try:
-        from awpy.parser import DemoParser as _DemoParser
-        _Demo = None
-        _AWPY_VERSION = "1.x"
-    except ModuleNotFoundError:
-        try:
-            from demoparser2 import DemoParser as _DemoParser
-            _Demo = None
-            _AWPY_VERSION = "demoparser2"
-        except ModuleNotFoundError as exc:
-            sys.exit(
-                "[!] Neither AWPy ≥ 2.0, AWPy 1.x, nor demoparser2 could be imported.\n"
-                "    pip-install one of them and try again."
-            )
+except ModuleNotFoundError: 
+    sys.exit("error")        # AWPy 1.x (old layout) or demoparser2 directly
 
 if _AWPY_VERSION.startswith("2"):
     import polars as pl
