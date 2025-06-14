@@ -88,14 +88,6 @@ def preprocess_crop(crop, scale, min_w, min_h, interp=cv2.INTER_LINEAR):
     return crop
 
 
-def ocr_on_crops(crops, predictor):
-    results = []
-    for crop in crops:
-        out = predictor([crop])
-        results.append(out.export())
-    return results
-
-
 def main():
     args = parse_args()
     min_w, min_h = parse_min_size(args.min_size)
@@ -114,7 +106,67 @@ def main():
     img = load_image(args.screenshot)
     rois = load_rois(args.json_rois)
 
-    # Preprocess all crops (crop + optional scale)
+    # --- PROFILE MODE ---
+    if args.profile:
+        # Pre-generate crops list
+        crops = []
+        for roi in rois:
+            x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+            crop = img[y:y+h, x:x+w]
+            crop = preprocess_crop(crop, args.scale, min_w, min_h)
+            crops.append(crop)
+
+        print("Profiling a single pass with torch.profiler...")
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True
+        ) as prof:
+            with record_function("full_ocr_pass"):
+                _ = predictor(crops)  # pass numpy crops directly
+        print(prof.key_averages().table(
+            sort_by="self_cuda_time_total", row_limit=10
+        ))
+        return
+
+    # --- BENCHMARK MODE ---
+    if args.benchmark:
+        n = args.benchmark
+        total_crop = total_pre = total_infer = total_post = 0.0
+        start_all = time.time()
+
+        for _ in range(n):
+            # 1) Crop + scale all ROIs
+            crops = []
+            t_cs = time.time()
+            for roi in rois:
+                x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+                crop = img[y:y+h, x:x+w]
+                crop = preprocess_crop(crop, args.scale, min_w, min_h)
+                crops.append(crop)
+            total_pre += time.time() - t_cs
+
+            # 2) Inference
+            t_inf = time.time()
+            out_batch = predictor(crops)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            total_infer += time.time() - t_inf
+
+            # 3) Post-processing
+            t_pp = time.time()
+            for out in out_batch:
+                _ = out.export()
+            total_post += time.time() - t_pp
+
+        total_time = time.time() - start_all
+        fps = n / total_time
+        print(f"Average FPS over {n} runs: {fps:.2f}")
+        print(f"  Crop+scale total:  {total_pre:.3f}s")
+        print(f"  Inference total:   {total_infer:.3f}s")
+        print(f"  Post-process total:{total_post:.3f}s")
+        return
+
+    # --- DEFAULT MODE: single OCR pass ---
     crops = []
     for roi in rois:
         x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
@@ -122,64 +174,10 @@ def main():
         crop = preprocess_crop(crop, args.scale, min_w, min_h)
         crops.append(crop)
 
-    # Profiling mode
-    if args.profile:
-        print("Profiling a single pass with torch.profiler...")
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True
-        ) as prof:
-            with record_function("full_ocr_pass"):
-                _ = predictor(crops)
-        print(prof.key_averages().table(
-            sort_by="self_cuda_time_total", row_limit=10
-        ))
-        return
-
-    # Benchmark mode (include crop + resize in timing)
-    if args.benchmark:
-        n = args.benchmark
-        total_crop = total_to_gpu = total_infer = total_post = 0.0
-        start_all = time.time()
-        for _ in range(n):
-            for roi in rois:
-                x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-                # Crop timing
-                t0 = time.time()
-                crop = img[y:y+h, x:x+w]
-                total_crop += time.time() - t0
-                # Scale timing
-                t1 = time.time()
-                crop = preprocess_crop(crop, args.scale, min_w, min_h)
-                total_crop += time.time() - t1
-                # Transfer timing
-                t2 = time.time()
-                batch = [torch.from_numpy(crop).to(device, non_blocking=True)]
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                total_to_gpu += time.time() - t2
-                # Inference timing
-                t3 = time.time()
-                out = predictor(batch)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                total_infer += time.time() - t3
-                # Post-processing timing
-                t4 = time.time()
-                _ = out.export()
-                total_post += time.time() - t4
-
-        total_time = time.time() - start_all
-        fps = n / total_time
-        print(f"Average FPS over {n} runs: {fps:.2f}")
-        print(f"  Crop+resize total: {total_crop:.3f}s")
-        print(f"  Transfer total:    {total_to_gpu:.3f}s")
-        print(f"  Inference total:   {total_infer:.3f}s")
-        print(f"  Post-process total:{total_post:.3f}s")
-        return
-
-    # Default: single pass OCR
-    results = ocr_on_crops(crops, predictor)
+    results = []
+    out_batch = predictor(crops)
+    for out in out_batch:
+        results.append(out.export())
     print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":
