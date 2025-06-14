@@ -164,6 +164,13 @@ def main():
         crop = preprocess_crop(crop, args.scale, min_w, min_h, debug)
         crops.append(crop)
 
+    # Warm-up: run one inference to load CUDA kernels (if GPU)
+    if device.type == "cuda":
+        if debug:
+            print("Warming up model (one inference pass)...")
+        _ = predictor(crops)
+        torch.cuda.synchronize()
+
     # Profile mode
     if args.profile:
         if debug:
