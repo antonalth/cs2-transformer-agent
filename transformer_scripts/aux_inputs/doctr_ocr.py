@@ -11,7 +11,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run OCR on specified bounding boxes using docTR (with GPU accel), with optional scaling."
+        description="Run OCR on specified bounding boxes using docTR, with optional scaling and CPU/GPU selection."
     )
     parser.add_argument("screenshot", help="Path to input image (PNG/JPG/etc.)")
     parser.add_argument(
@@ -50,6 +50,11 @@ def parse_args():
         type=str,
         default="32x32",
         help="Minimum width x height in pixels: if scaled ROI is smaller in any dimension, skip scaling"
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Force use of GPU. If unavailable or CUDA not enabled, the script will error."
     )
     return parser.parse_args()
 
@@ -92,15 +97,24 @@ def main():
     args = parse_args()
     min_w, min_h = parse_min_size(args.min_size)
 
-    # Initialize OCR predictor with GPU accel if available
+    # Determine device: default CPU, or GPU if --gpu
+    if args.gpu:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available or torch not compiled with CUDA enabled. Cannot use --gpu.")
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    # Initialize OCR predictor
     predictor = ocr_predictor(
         det_arch=args.det_arch,
         reco_arch=args.reco_arch,
         pretrained=True
-    )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    predictor = predictor.to(device)
-    torch.backends.cudnn.benchmark = True
+    ).to(device)
+
+    # Enable cuDNN autotuner only if using GPU
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # Load inputs
     img = load_image(args.screenshot)
@@ -108,7 +122,6 @@ def main():
 
     # --- PROFILE MODE ---
     if args.profile:
-        # Pre-generate crops list
         crops = []
         for roi in rois:
             x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
@@ -122,7 +135,7 @@ def main():
             record_shapes=True
         ) as prof:
             with record_function("full_ocr_pass"):
-                _ = predictor(crops)  # pass numpy crops directly
+                _ = predictor(crops)
         print(prof.key_averages().table(
             sort_by="self_cuda_time_total", row_limit=10
         ))
@@ -131,13 +144,13 @@ def main():
     # --- BENCHMARK MODE ---
     if args.benchmark:
         n = args.benchmark
-        total_crop = total_pre = total_infer = total_post = 0.0
+        total_pre = total_infer = total_post = 0.0
         start_all = time.time()
 
         for _ in range(n):
-            # 1) Crop + scale all ROIs
-            crops = []
+            # Crop + scale
             t_cs = time.time()
+            crops = []
             for roi in rois:
                 x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
                 crop = img[y:y+h, x:x+w]
@@ -145,17 +158,17 @@ def main():
                 crops.append(crop)
             total_pre += time.time() - t_cs
 
-            # 2) Inference
+            # Inference
             t_inf = time.time()
-            out_batch = predictor(crops)
+            doc = predictor(crops)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             total_infer += time.time() - t_inf
 
-            # 3) Post-processing
+            # Post-processing
             t_pp = time.time()
-            for out in out_batch:
-                _ = out.export()
+            for page in doc.pages:
+                _ = page.export()
             total_post += time.time() - t_pp
 
         total_time = time.time() - start_all
@@ -174,10 +187,8 @@ def main():
         crop = preprocess_crop(crop, args.scale, min_w, min_h)
         crops.append(crop)
 
-    results = []
-    out_batch = predictor(crops)
-    for out in out_batch:
-        results.append(out.export())
+    doc = predictor(crops)
+    results = [page.export() for page in doc.pages]
     print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":
