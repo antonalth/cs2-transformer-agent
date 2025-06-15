@@ -60,7 +60,7 @@ def _parse_2x(demo_path: Path) -> list[dict[str, Any]]:
     # Iterate round-wise (round_num is the row index after create_round_df)
     for rd in rounds_df.iter_rows(named=True):
         rn = rd["round_num"]
-        s_tick, fz_end, e_tick = rd["start"], rd["freeze_end"], rd["end"]
+        s_tick, fz_end, e_tick = rd["start"], rd["freeze_end"], rd["official_end"]
 
         # helper to collect (side) roster & death ticks in the current round
         def team_list(side: str) -> list[list[Any]]:
@@ -119,7 +119,7 @@ def _parse_1x_or_demoparser2(demo_path: Path) -> list[dict[str, Any]]:
                 "round": rn,
                 "starttick": rnd["startTick"],
                 "freezetime_endtick": rnd["freezeTimeEndTick"],
-                "endtick": rnd["endTick"],
+                "endtick": rnd.get("officialEndTick", rnd["endTick"]),
                 "t_team": [[n, death_map.get(rn, {}).get(n, -1)] for n in t_names],
                 "ct_team": [[n, death_map.get(rn, {}).get(n, -1)] for n in ct_names],
             }

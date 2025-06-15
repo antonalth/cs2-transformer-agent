@@ -112,3 +112,18 @@ Brainstorm first, dont write any code yet but collect all relevant details neede
 //conditional output head
 
 //check rounds.py for freezetime
+
+
+(exercise-cv) antonalthoff@Antons-MacBook-Pro-4 transformer_scripts % python extractstruct.py data_marius-vs-ex-sabre-m2-mirage
+Database: mouse.db
+  Table 'MOUSE': tick (INTEGER), player_name (TEXT), x (REAL), y (REAL)
+
+Database: keyboard_location.db
+  Table 'inputs': tick (INTEGER), steamid (INTEGER), playername (TEXT), keyboard_input (TEXT), inventory (TEXT), x (REAL), y (REAL), z (REAL), active_weapon (TEXT), health (INTEGER), armor (INTEGER), money (INTEGER)
+
+Database: rounds.db
+  Table 'ROUNDS': round (INTEGER), starttick (INTEGER), freezetime_endtick (INTEGER), endtick (INTEGER), t_team (TEXT), ct_team (TEXT)
+
+Database: buy_sell_drop.db
+  Table 'RAREACTIONS': tick (INTEGER), steamid (TEXT), playername (TEXT), action (TEXT), item (TEXT)
+  Table 'BUYZONE': tick (INTEGER), steamid (TEXT), playername (TEXT)
