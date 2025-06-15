@@ -113,17 +113,64 @@ Brainstorm first, dont write any code yet but collect all relevant details neede
 
 //check rounds.py for freezetime
 
-
 (exercise-cv) antonalthoff@Antons-MacBook-Pro-4 transformer_scripts % python extractstruct.py data_marius-vs-ex-sabre-m2-mirage
 Database: mouse.db
   Table 'MOUSE': tick (INTEGER), player_name (TEXT), x (REAL), y (REAL)
+    First row: 2, crickeyyy, 0.0, 0.0
 
 Database: keyboard_location.db
   Table 'inputs': tick (INTEGER), steamid (INTEGER), playername (TEXT), keyboard_input (TEXT), inventory (TEXT), x (REAL), y (REAL), z (REAL), active_weapon (TEXT), health (INTEGER), armor (INTEGER), money (INTEGER)
+    First row: 1, 76561198019527985, homeboyz, IN_FORWARD,SWITCH_2, ["knife_t", "Glock-18", "C4 Explosive", "Smoke Grenade", "Flashbang"], 1135.60205078125, -57.1380615234375, -164.5367431640625, Glock-18, 100, 0, 100
 
 Database: rounds.db
   Table 'ROUNDS': round (INTEGER), starttick (INTEGER), freezetime_endtick (INTEGER), endtick (INTEGER), t_team (TEXT), ct_team (TEXT)
+    First row: 1, 1, None, 2789, [], []
 
 Database: buy_sell_drop.db
   Table 'RAREACTIONS': tick (INTEGER), steamid (TEXT), playername (TEXT), action (TEXT), item (TEXT)
+    First row: 3163, 76561199041006873, hodix, BUY, Kevlar & Helmet
   Table 'BUYZONE': tick (INTEGER), steamid (TEXT), playername (TEXT)
+    First row: 1, 76561198019527985, homeboyz
+
+\\\\ NEW Unified TABLE:
+
+TABLE player 
+    tick int
+    steamid int
+    playername text
+    position = x,y,z (from keyboard_location)
+    inventory
+    active_weapon
+    health 
+    armor 
+    money 
+    keyboard_input (from keyboard_location) + if at tick DROP action from RAREACTIONS, add DROP_itemname to list
+    mouse_input -> x,y from mouse.db
+    is_in_buyzone boolean (if entry in BUYZONE)
+    buy_sell_input (from buyselldrop where action = BUY or SELL) text , if at tick BUY or SELL action from RAREACTIONS, add BUY/SELL_itemname to list
+TABLE rounds
+    /keep as before.
+    
+Note: only keep player_entries if the player is alive, e.g. if health != for player at tick. //write a python script that reads in all of these db files and merges them into the larger merged.db file according to spec. note that these files might be in a dir and we need to specifiy the dirpath to the .db files. also put merged.db in the same dir. Also if for a certain tick there is no entry in keyboard_location inputs table, no entry in the new player table (ignore content from other dbs if they have content for that player at that tick). Finally, also drop any entries in the player table where the tick is not between any starttick and endtick in the ROUNDS table.
+
+
+RECORD.py
+
+//cli type deal open conn with mirv,
+//command record starttick endtick playername path 
+
+# mirv_streams record startMovieWav 1
+# mirv_streams record name "C:\PATH"
+# mirv_streams record screen enabled 1
+# mirv_streams record screen settings afxFfmpegYuv420P
+# mirv_streams record fps 30
+...setup viewmodel settings...
+
+# demo_gototick 1234
+# demo_spectate playername
+
+# mirv_streams record start
+# demo_resume
+...
+# mirv_cmd addAtTick 5678 "mirv_streams record end"
+# mirv_cmd addAtTick 5679 "demo_pause"
