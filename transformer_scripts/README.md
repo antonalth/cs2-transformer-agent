@@ -162,8 +162,12 @@ RECORD.py
 # mirv_streams record startMovieWav 1
 # mirv_streams record name "C:\PATH"
 # mirv_streams record screen enabled 1
-# mirv_streams record screen settings afxFfmpegYuv420P
+# mirv_streams record screen settings afxDefault
+# exec ffmpeg.cfg
+# n1
 # mirv_streams record fps 30
+# cl_drawhud 0; demoui; demoui
+
 ...setup viewmodel settings...
 
 # demo_gototick 1234
@@ -174,3 +178,4 @@ RECORD.py
 ...
 # mirv_cmd addAtTick 5678 "mirv_streams record end"
 # mirv_cmd addAtTick 5679 "demo_pause"
+mirv_cmd clear
