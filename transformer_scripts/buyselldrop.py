@@ -2,11 +2,11 @@ import argparse
 import sqlite3
 import pandas as pd
 from demoparser2 import DemoParser
-from awpy import Demo as AwpyDemo
 from tqdm import tqdm
 from typing import Dict, Any, Set, List, Tuple
 
-# NOTE: This script now requires 'awpy'. Install with: pip install awpy
+# NOTE: This script no longer requires 'awpy'.
+# It now requires an input database from button_loc.py
 ITEM_ID_MAP = {
     1: "deagle", 2: "elite", 3: "fiveseven", 4: "glock", 7: "ak47", 8: "aug", 9: "awp",
     10: "famas", 11: "g3sg1", 13: "galilar", 14: "m249", 16: "m4a1", 17: "mac10", 19: "p90",
@@ -53,31 +53,81 @@ class DatabaseManager:
     def insert_buyzone(self, tick, steamid, playername):
         self.conn.execute("INSERT INTO BUYZONE VALUES (?, ?, ?)", (int(tick), str(steamid), str(playername)))
 
-def get_awpy_grenade_throws(demo_path: str) -> Dict[str, List[int]]:
-    """Uses awpy to parse throws. Returns a dict mapping steamid to a sorted list of throw ticks."""
-    print("Pre-processing with awpy for grenade throw accuracy...")
-    throws_by_player: Dict[str, List[int]] = {}
-    try:
-        awpy_demo = AwpyDemo(demo_path, verbose=False)
-        awpy_demo.parse()
-        if not awpy_demo.grenades.is_empty():
-            throw_events = awpy_demo.grenades.group_by("entity_id").first()
-            for row in throw_events.iter_rows(named=True):
-                steamid = str(row['thrower_steamid'])
-                if steamid not in throws_by_player:
-                    throws_by_player[steamid] = []
-                throws_by_player[steamid].append(row['tick'])
-        # Sort the ticks for each player to allow efficient searching
-        for steamid in throws_by_player:
-            throws_by_player[steamid].sort()
-    except Exception as e:
-        print(f"Warning: Awpy parsing failed: {e}. Grenade drop detection may be less accurate.")
-    print(f"Found {sum(len(v) for v in throws_by_player.values())} total grenade throws via awpy.")
-    return throws_by_player
+class InputVerifier:
+    """Queries the button_loc.py database to verify grenade throws."""
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = None
+        # Mapping from this script's item names to button_loc.py's active_weapon names
+        self.grenade_name_map = {
+            "hegrenade": "High Explosive Grenade",
+            "flashbang": "Flashbang",
+            "smokegrenade": "Smoke Grenade",
+            "molotov": "Molotov",
+            "incgrenade": "Incendiary Grenade",
+            "decoy": "Decoy Grenade"
+        }
 
-def main(demo_path: str, sql_output_path: str):
-    awpy_throws_by_player = get_awpy_grenade_throws(demo_path)
+    def __enter__(self):
+        # Open in read-only mode to prevent accidental modification
+        self.conn = sqlite3.connect(f'file:{self.db_path}?mode=ro', uri=True)
+        return self
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+
+    def is_grenade_throw(self, steamid: str, drop_tick: int, item_name: str) -> bool:
+        """
+        Checks if a grenade disappearing from inventory was a throw.
+        A throw is identified by a recent IN_ATTACK press while holding the grenade.
+        """
+        if item_name not in self.grenade_name_map:
+            return False
+
+        active_weapon_name = self.grenade_name_map[item_name]
+        # Look in a 2-second window (128 ticks @ 64tps) before the drop
+        query_tick_start = drop_tick - 128
+        
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT tick, keyboard_input, active_weapon
+            FROM inputs
+            WHERE steamid = ? AND tick BETWEEN ? AND ?
+            ORDER BY tick DESC
+            """,
+            (int(steamid), query_tick_start, drop_tick)
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            return False # No input data found for this player in this window
+
+        # First, confirm the player was holding the grenade right before it disappeared.
+        # The grenade disappears at 'drop_tick', so at 'drop_tick - 1' it was likely the active weapon.
+        held_grenade_before_drop = False
+        if rows and rows[0][0] < drop_tick: # Check first row if it's before the drop tick
+             if rows[0][2] == active_weapon_name:
+                 held_grenade_before_drop = True
+        
+        if not held_grenade_before_drop:
+            # Sometimes there's a 1-tick delay, check the one before that too
+            if len(rows) > 1 and rows[1][0] < drop_tick and rows[1][2] == active_weapon_name:
+                held_grenade_before_drop = True
+
+        if not held_grenade_before_drop:
+            return False # Player wasn't holding the grenade, so it couldn't be a throw.
+
+        # Now, look for the 'IN_ATTACK' press in the recent history while holding the grenade.
+        for _, keyboard_input, active_weapon in rows:
+            if active_weapon == active_weapon_name and keyboard_input and "IN_ATTACK" in keyboard_input:
+                # Found the pattern: player pressed attack while holding the grenade. This is a throw.
+                return True
+        
+        return False # Did not find the IN_ATTACK pattern, so it's likely a drop.
+
+def main(demo_path: str, sql_output_path: str, sql_input_path: str):
     print(f"Parsing demo with demoparser2: {demo_path}")
     parser = DemoParser(demo_path)
 
@@ -146,20 +196,21 @@ def main(demo_path: str, sql_output_path: str):
 
             last_player_states[steamid] = state._asdict()
         
-        # Post-processing filter for grenade throws
+        # Post-processing filter for grenade throws using the input database
         final_actions = []
         print(f"Post-processing {len(potential_actions)} potential actions...")
-        for action in tqdm(potential_actions, desc="Filtering Grenade Throws"):
-            if action["action"] == "DROP" and action["item"] in GRENADE_NAMES:
-                player_throws = awpy_throws_by_player.get(action["steamid"], [])
-                is_throw = any(
-                    action["tick"] <= throw_tick <= action["tick"] + 640 # 10 second window
-                    for throw_tick in player_throws
-                )
-                if not is_throw:
-                    final_actions.append(action) # It's a real drop
-            else:
-                final_actions.append(action)
+        with InputVerifier(sql_input_path) as input_verifier:
+            for action in tqdm(potential_actions, desc="Filtering Grenade Throws"):
+                if action["action"] == "DROP" and action["item"] in GRENADE_NAMES:
+                    is_throw = input_verifier.is_grenade_throw(
+                        steamid=action["steamid"],
+                        drop_tick=action["tick"],
+                        item_name=action["item"]
+                    )
+                    if not is_throw:
+                        final_actions.append(action) # It's a real drop, not a throw
+                else:
+                    final_actions.append(action)
 
         print(f"Finalizing database with {len(final_actions)} confirmed actions...")
         db.batch_insert_actions(final_actions)
@@ -167,8 +218,9 @@ def main(demo_path: str, sql_output_path: str):
     print(f"\nAnalysis complete. Results saved to '{sql_output_path}'")
 
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser(description="Analyze CS2 demo for BUY, SELL, and DROP actions.")
+    arg_parser = argparse.ArgumentParser(description="Analyze CS2 demo for BUY, SELL, and DROP actions, using detailed player input for accuracy.")
     arg_parser.add_argument("demofile", help="Path to the .dem file")
     arg_parser.add_argument("--sqlout", required=True, help="Path to the output SQLite database file.")
+    arg_parser.add_argument("--sqlin", required=True, help="Path to the input SQLite database file generated by button_loc.py.")
     args = arg_parser.parse_args()
-    main(args.demofile, args.sqlout)
+    main(args.demofile, args.sqlout, args.sqlin)
