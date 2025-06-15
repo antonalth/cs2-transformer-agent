@@ -149,15 +149,6 @@ def main() -> None:
     tick_df['prev_inventory_set'] = tick_df['prev_inventory'].apply(to_set)
     inventory_changed_mask = tick_df['inventory_set'] < tick_df['prev_inventory_set']
 
-    for index, row in tick_df[inventory_changed_mask].iterrows():
-        if (row['tick'], row['steamid']) in death_ticks_set or (row['tick'], row['steamid']) in grenade_throw_ticks:
-            continue
-        dropped_items = list(row['prev_inventory_set'] - row['inventory_set'])
-        if dropped_items:
-            item_name = dropped_items[0]
-            if "Grenade" not in item_name and "Molotov" not in item_name and "Flashbang" not in item_name and "Decoy" not in item_name:
-                tick_df.at[index, 'inferred_drop'] = "DROP"
-
     print("[inferring weapon switches...]")
     tick_df['prev_weapon'] = tick_df.groupby('steamid')['active_weapon_name'].shift(1).fillna('')
     weapon_changed_mask = (tick_df['active_weapon_name'] != tick_df['prev_weapon']) & (tick_df['active_weapon_name'] != '')

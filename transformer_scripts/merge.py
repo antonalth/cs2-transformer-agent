@@ -1,11 +1,13 @@
 import sqlite3
-import sys
 import os
-import json
+import sys
+import argparse
+from tqdm import tqdm
 
-def create_merged_db_structure(cursor):
-    """Creates the new tables in the merged database."""
-    print("Creating 'player' and 'rounds' tables in merged.db...")
+def create_merged_schema(cursor):
+    """Creates the necessary tables in the merged database."""
+    print("Creating schema in merged.db...")
+    
     # Drop tables if they exist to ensure a fresh start
     cursor.execute("DROP TABLE IF EXISTS player")
     cursor.execute("DROP TABLE IF EXISTS rounds")
@@ -16,23 +18,27 @@ def create_merged_db_structure(cursor):
         tick INTEGER,
         steamid INTEGER,
         playername TEXT,
-        position TEXT,
+        position_x REAL,
+        position_y REAL,
+        position_z REAL,
         inventory TEXT,
         active_weapon TEXT,
         health INTEGER,
         armor INTEGER,
         money INTEGER,
         keyboard_input TEXT,
-        mouse_input TEXT,
-        is_in_buyzone INTEGER, -- Using INTEGER for boolean (0 or 1)
-        buy_sell_input TEXT
+        mouse_x REAL,
+        mouse_y REAL,
+        is_in_buyzone INTEGER,
+        buy_sell_input TEXT,
+        PRIMARY KEY (tick, steamid)
     )
     """)
 
-    # Create the rounds table
+    # Create the rounds table (schema will be copied from source)
     cursor.execute("""
     CREATE TABLE rounds (
-        round INTEGER,
+        round INTEGER PRIMARY KEY,
         starttick INTEGER,
         freezetime_endtick INTEGER,
         endtick INTEGER,
@@ -40,220 +46,209 @@ def create_merged_db_structure(cursor):
         ct_team TEXT
     )
     """)
-    print("Table structure created successfully.")
+    print("Schema created successfully.")
 
-def copy_rounds_data(dir_path, merged_cursor):
-    """Copies all data from the original rounds.db into the new merged.db."""
-    print("Copying data from rounds.db...")
-    source_rounds_db_path = os.path.join(dir_path, 'rounds.db')
-    if not os.path.exists(source_rounds_db_path):
-        print(f"Warning: {source_rounds_db_path} not found. 'rounds' table will be empty.")
-        return
-
-    source_conn = sqlite3.connect(source_rounds_db_path)
-    source_cursor = source_conn.cursor()
-
-    source_cursor.execute("SELECT round, starttick, freezetime_endtick, endtick, t_team, ct_team FROM ROUNDS")
-    all_rounds = source_cursor.fetchall()
-
-    if all_rounds:
-        merged_cursor.executemany("INSERT INTO rounds VALUES (?, ?, ?, ?, ?, ?)", all_rounds)
+def load_lookup_data(db_path):
+    """
+    Loads data from secondary databases into memory for efficient lookups.
+    This is much faster than querying the databases inside the main loop.
+    """
+    print("Loading lookup data into memory...")
     
-    source_conn.close()
-    print(f"Copied {len(all_rounds)} rows to 'rounds' table.")
+    # Data structures for quick lookups
+    mouse_positions = {}
+    buy_sell_drop_actions = {}
+    buyzone_presence = set()
+    valid_round_ticks = []
 
-def pre_load_lookup_data(dir_path):
-    """
-    Pre-loads data from smaller tables into dictionaries for fast lookups.
-    This is much more performant than querying the DB for every single row.
-    """
-    print("Pre-loading lookup data from mouse.db and buy_sell_drop.db...")
-    mouse_data = {}
-    actions_data = {}
-    buyzone_data = set() # A set for fast 'in' checks
+    # --- Load Mouse Data ---
+    # Key: (tick, player_name), Value: (x, y)
+    try:
+        with sqlite3.connect(os.path.join(db_path, 'mouse.db')) as conn:
+            cursor = conn.cursor()
+            for tick, player_name, x, y in cursor.execute("SELECT tick, player_name, x, y FROM MOUSE"):
+                mouse_positions[(tick, player_name)] = (x, y)
+    except sqlite3.OperationalError:
+        print("Warning: mouse.db or MOUSE table not found. Mouse data will be empty.")
 
-    # Load Mouse Data: {(tick, player_name): (x, y)}
-    mouse_db_path = os.path.join(dir_path, 'mouse.db')
-    if os.path.exists(mouse_db_path):
-        conn = sqlite3.connect(mouse_db_path)
-        cur = conn.cursor()
-        for row in cur.execute("SELECT tick, player_name, x, y FROM MOUSE"):
-            tick, player_name, x, y = row
-            mouse_data[(tick, player_name)] = (x, y)
-        conn.close()
+    # --- Load Buy/Sell/Drop Data ---
+    # Key: (tick, playername), Value: list of (action, item) tuples
+    try:
+        with sqlite3.connect(os.path.join(db_path, 'buy_sell_drop.db')) as conn:
+            cursor = conn.cursor()
+            for tick, playername, action, item in cursor.execute("SELECT tick, playername, action, item FROM RAREACTIONS"):
+                key = (tick, playername)
+                if key not in buy_sell_drop_actions:
+                    buy_sell_drop_actions[key] = []
+                buy_sell_drop_actions[key].append((action, item))
 
-    # Load Buy/Sell/Drop and Buyzone Data
-    bsd_db_path = os.path.join(dir_path, 'buy_sell_drop.db')
-    if os.path.exists(bsd_db_path):
-        conn = sqlite3.connect(bsd_db_path)
-        cur = conn.cursor()
-        # Load Actions: {(tick, steamid): [(action, item), ...]}
-        for row in cur.execute("SELECT tick, steamid, action, item FROM RAREACTIONS"):
-            tick, steamid, action, item = row
-            key = (tick, int(steamid)) # Ensure steamid is int for matching
-            if key not in actions_data:
-                actions_data[key] = []
-            actions_data[key].append((action, item))
+            # Key: (tick, playername)
+            for tick, _, playername in cursor.execute("SELECT tick, steamid, playername FROM BUYZONE"):
+                buyzone_presence.add((tick, playername))
+    except sqlite3.OperationalError:
+        print("Warning: buy_sell_drop.db or its tables not found. Buy/sell/drop/buyzone data will be empty.")
 
-        # Load Buyzone Entries: {(tick, steamid)}
-        for row in cur.execute("SELECT tick, steamid FROM BUYZONE"):
-            tick, steamid = row
-            buyzone_data.add((tick, int(steamid))) # Ensure steamid is int
-        conn.close()
+    # --- Load Rounds Data ---
+    # A list of (starttick, endtick) tuples
+    try:
+        with sqlite3.connect(os.path.join(db_path, 'rounds.db')) as conn:
+            cursor = conn.cursor()
+            # Filter out rounds that might not have an endtick (e.g., live games)
+            for starttick, endtick in cursor.execute("SELECT starttick, endtick FROM ROUNDS WHERE starttick IS NOT NULL AND endtick IS NOT NULL"):
+                valid_round_ticks.append((starttick, endtick))
+    except sqlite3.OperationalError:
+        print("Error: Could not load rounds.db. Cannot filter ticks by round. Aborting.")
+        sys.exit(1)
+
+    print("Lookup data loaded.")
+    return mouse_positions, buy_sell_drop_actions, buyzone_presence, valid_round_ticks
+
+def is_tick_in_valid_round(tick, round_intervals):
+    """Checks if a tick falls within any of the valid round start/end times."""
+    # This could be optimized further with a binary search if intervals are sorted,
+    # but for a few dozen rounds, a linear scan is perfectly fine.
+    for start, end in round_intervals:
+        if start <= tick <= end:
+            return True
+    return False
+
+def main(db_dir):
+    """Main function to perform the database merge."""
+    if not os.path.isdir(db_dir):
+        print(f"Error: Directory not found at '{db_dir}'")
+        sys.exit(1)
+
+    # --- 1. Load all non-primary data into memory for fast lookups ---
+    mouse_data, action_data, buyzone_data, round_intervals = load_lookup_data(db_dir)
+
+    # --- 2. Set up connections ---
+    # The "driver" database that dictates which rows exist
+    try:
+        keyboard_conn = sqlite3.connect(os.path.join(db_dir, 'keyboard_location.db'))
+    except sqlite3.OperationalError:
+        print(f"Error: Could not open the main driver database keyboard_location.db in '{db_dir}'. Aborting.")
+        sys.exit(1)
     
-    print("Pre-loading complete.")
-    return mouse_data, actions_data, buyzone_data
+    keyboard_cursor = keyboard_conn.cursor()
 
-
-def merge_player_data(dir_path, merged_conn):
-    """
-    The main function to process keyboard_location data and merge other sources.
-    """
+    # The new merged database
+    merged_conn = sqlite3.connect(os.path.join(db_dir, 'merged.db'))
     merged_cursor = merged_conn.cursor()
+
+    # --- 3. Create the schema in the new database ---
+    create_merged_schema(merged_cursor)
+
+    # --- 4. Process the main 'inputs' table and merge data ---
+    print("Processing player data from keyboard_location.db...")
     
-    # Pre-load data for efficiency
-    mouse_data, actions_data, buyzone_data = pre_load_lookup_data(dir_path)
-
-    # The 'keyboard_location.db' is the main driver
-    kl_db_path = os.path.join(dir_path, 'keyboard_location.db')
-    if not os.path.exists(kl_db_path):
-        print(f"ERROR: The main driver file {kl_db_path} was not found. Cannot proceed.")
-        return
-
-    print("Processing main data from keyboard_location.db and merging...")
-    kl_conn = sqlite3.connect(kl_db_path)
-    # Use a dictionary-based row factory for easier access by column name
-    kl_conn.row_factory = sqlite3.Row
-    kl_cursor = kl_conn.cursor()
-
-    # Start a transaction for much faster inserts
-    merged_cursor.execute("BEGIN TRANSACTION")
-
-    # Query all rows from the main 'inputs' table
-    kl_cursor.execute("SELECT * FROM inputs ORDER BY tick")
+    player_rows_to_insert = []
     
-    processed_rows = 0
-    inserted_rows = 0
-    while True:
-        rows = kl_cursor.fetchmany(10000) # Process in chunks to manage memory
-        if not rows:
-            break
+    # Fetch all rows from the driver table
+    keyboard_cursor.execute("""
+        SELECT tick, steamid, playername, keyboard_input, inventory, x, y, z, active_weapon, health, armor, money 
+        FROM inputs
+    """)
+    
+    all_inputs = keyboard_cursor.fetchall()
+    
+    for row in tqdm(all_inputs, desc="Merging Player Data"):
+        tick, steamid, playername, kb_input, inventory, x, y, z, active_w, health, armor, money = row
 
-        player_rows_to_insert = []
-        for row in rows:
-            processed_rows += 1
-            if processed_rows % 50000 == 0:
-                print(f"  ... processed {processed_rows} source rows ...")
+        # FILTER 1: Player must be alive
+        if health is None or health <= 0:
+            continue
 
-            # --- Rule: Skip players with 0 health ---
-            if row['health'] == 0:
-                continue
+        # FILTER 2: Tick must be within a valid round
+        if not is_tick_in_valid_round(tick, round_intervals):
+            continue
 
-            # Extract base data
-            tick = row['tick']
-            steamid = row['steamid']
-            playername = row['playername']
+        # --- Data Aggregation and Transformation ---
 
-            # --- Prepare merged columns ---
-
-            # Position
-            position_str = f"{row['x']},{row['y']},{row['z']}"
-
-            # Actions lookup key
-            action_key = (tick, steamid)
-            player_actions = actions_data.get(action_key, [])
-
-            # Keyboard Input (base + DROP actions)
-            keyboard_inputs = row['keyboard_input'].split(',') if row['keyboard_input'] else []
-            for action, item in player_actions:
-                if action == 'DROP':
-                    # Sanitize item name just in case it contains commas
-                    sanitized_item = item.replace(',', ';')
-                    keyboard_inputs.append(f"DROP_{sanitized_item}")
-            keyboard_input_str = ",".join(filter(None, keyboard_inputs))
-
-            # Buy/Sell Input
-            buy_sell_list = []
-            for action, item in player_actions:
-                if action in ('BUY', 'SELL'):
-                    sanitized_item = item.replace(',', ';')
-                    buy_sell_list.append(f"{action}_{sanitized_item}")
-            buy_sell_input_str = ",".join(buy_sell_list)
-
-            # Mouse Input
-            mouse_pos = mouse_data.get((tick, playername))
-            mouse_input_str = f"{mouse_pos[0]},{mouse_pos[1]}" if mouse_pos else ""
-
-            # Is in Buyzone
-            is_in_buyzone = 1 if action_key in buyzone_data else 0
-
-            # Assemble the final row for insertion
-            final_row = (
-                tick,
-                steamid,
-                playername,
-                position_str,
-                row['inventory'],
-                row['active_weapon'],
-                row['health'],
-                row['armor'],
-                row['money'],
-                keyboard_input_str,
-                mouse_input_str,
-                is_in_buyzone,
-                buy_sell_input_str
-            )
-            player_rows_to_insert.append(final_row)
+        # Get mouse data
+        mouse_x, mouse_y = mouse_data.get((tick, playername), (None, None))
         
-        if player_rows_to_insert:
-            merged_cursor.executemany("""
-                INSERT INTO player (tick, steamid, playername, position, inventory, active_weapon, health, armor, money, keyboard_input, mouse_input, is_in_buyzone, buy_sell_input) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, player_rows_to_insert)
-            inserted_rows += len(player_rows_to_insert)
-    
-    # Commit the transaction
+        # Check if in buyzone
+        is_in_buyzone = 1 if (tick, playername) in buyzone_data else 0
+
+        # Get actions for this tick and player
+        actions = action_data.get((tick, playername), [])
+        
+        # Build keyboard_input field
+        # Start with the base input from the table
+        final_kb_inputs = kb_input.split(',') if kb_input else []
+        # Add any DROP actions
+        for action, item in actions:
+            if action == 'DROP':
+                # Sanitize item name to be a single token
+                safe_item = item.replace(' ', '_').replace('&', 'and')
+                final_kb_inputs.append(f"DROP_{safe_item}")
+
+        # Build buy_sell_input field
+        buy_sell_actions = []
+        for action, item in actions:
+            if action in ('BUY', 'SELL'):
+                # Sanitize item name
+                safe_item = item.replace(' ', '_').replace('&', 'and')
+                buy_sell_actions.append(f"{action}_{safe_item}")
+        
+        # --- Assemble final row for insertion ---
+        player_rows_to_insert.append((
+            tick,
+            steamid,
+            playername,
+            x, y, z,
+            inventory,
+            active_w,
+            health, armor, money,
+            ",".join(final_kb_inputs), # Join lists into a single string
+            mouse_x, mouse_y,
+            is_in_buyzone,
+            ",".join(buy_sell_actions) # Join lists into a single string
+        ))
+
+    # --- 5. Batch insert all processed player rows ---
+    print(f"Inserting {len(player_rows_to_insert)} rows into 'player' table...")
+    if player_rows_to_insert:
+        merged_cursor.executemany("""
+            INSERT INTO player (tick, steamid, playername, position_x, position_y, position_z, 
+                                inventory, active_weapon, health, armor, money, keyboard_input, 
+                                mouse_x, mouse_y, is_in_buyzone, buy_sell_input)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, player_rows_to_insert)
+    print("Player data inserted.")
+
+    # --- 6. Copy the rounds table directly ---
+    print("Copying 'rounds' table...")
+    try:
+        with sqlite3.connect(os.path.join(db_dir, 'rounds.db')) as rounds_conn:
+            rounds_cursor = rounds_conn.cursor()
+            all_rounds = rounds_cursor.execute("SELECT round, starttick, freezetime_endtick, endtick, t_team, ct_team FROM ROUNDS").fetchall()
+            merged_cursor.executemany("INSERT INTO rounds VALUES (?, ?, ?, ?, ?, ?)", all_rounds)
+        print("Rounds data copied.")
+    except sqlite3.OperationalError:
+        print("Warning: Could not copy rounds.db data.")
+
+
+    # --- 7. Commit changes and close all connections ---
+    print("Finalizing and closing databases...")
     merged_conn.commit()
-    kl_conn.close()
+    merged_conn.close()
+    keyboard_conn.close()
 
-    print("Merging complete.")
-    print(f"Total rows processed from source: {processed_rows}")
-    print(f"Total rows inserted into 'player' table: {inserted_rows}")
+    print("\n-----------------------------")
+    print(f"Successfully created merged.db in '{db_dir}'")
+    print("-----------------------------")
 
-
-def main():
-    """Main execution function."""
-    if len(sys.argv) != 2:
-        print("Usage: python extractstruct.py <directory_path_to_db_files>")
-        sys.exit(1)
-
-    dir_path = sys.argv[1]
-    if not os.path.isdir(dir_path):
-        print(f"Error: Directory not found at '{dir_path}'")
-        sys.exit(1)
-
-    print(f"Processing database files in: {dir_path}")
-
-    # Define the path for the new merged database
-    merged_db_path = os.path.join(dir_path, 'merged.db')
-
-    # Connect to the new database (it will be created if it doesn't exist)
-    with sqlite3.connect(merged_db_path) as merged_conn:
-        merged_cursor = merged_conn.cursor()
-
-        # 1. Create the table structure in the new DB
-        create_merged_db_structure(merged_cursor)
-
-        # 2. Copy the rounds data directly
-        copy_rounds_data(dir_path, merged_cursor)
-        
-        # Commit the structure and rounds data
-        merged_conn.commit()
-
-        # 3. Process and merge all player-related data
-        merge_player_data(dir_path, merged_conn)
-
-    print(f"\n✅ Success! All data has been merged into '{merged_db_path}'")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Merges multiple CS:GO data SQLite databases into a single, unified 'merged.db' file."
+    )
+    parser.add_argument(
+        "db_directory",
+        type=str,
+        help="The path to the directory containing the .db files (mouse.db, keyboard_location.db, etc.)"
+    )
+    
+    args = parser.parse_args()
+    main(args.db_directory)
