@@ -91,7 +91,7 @@ For every Round:
         For each 1/20s
 
 task: find item events/tick where a player action = buys/sells/drops an item. Use the demoparser zip to figure out how to extract information required. Add a --sqlout flag and write found info to sqlite db
-sqlite should contain: tick, steamid, playername, action, item
+sqlite table RAREACTIONS should contain: tick, steamid, playername, action, item
 
 things to consider: 
 - Player death DOES NOT count as a drop
@@ -99,12 +99,15 @@ things to consider:
 - Buying a weapon, which results in the drop of the old weapon DOES NOT count as drop (we drop the old weapon but never press the 'g' key)
     -> create BUY, item entry
 - Grenade throw DOES NOT count (but dropping a grenade to a teammate for example is possible and does count)
-    - we need to check for recent related grenade throw events to differentiate, here it makes sense to use awpy, use search to find relevant calls. 
+    - we need to check for recent related grenade throw events to differentiate, here we should use AWPY, not demoparser since they provide a high level way of checking grenade throws. Use search to check for options. 
 - Selling a weapon again DOES NOT count (since the player never actually drops e.g 'g')
     - check if after weapon/item dissapears money has gone up again -> create a SELL, item entry
 - Buying a weapon and instant dropping DOES count e.g player presses control while buying it
     - create BUY entry and DROP entry (at relevant ticks)
-- If the player is in the buy_zone and can still buy/sell (beginning round freeze time), add an entry to a second table BUYZONE an entry with tick, steamid, playername, 
+- If the player is in the buy_zone and can still buy/sell (beginning round freeze time and after round begins until the zone closes), add an entry to a second table BUYZONE an entry with tick, steamid, playername, 
+
+Brainstorm first, dont write any code yet but collect all relevant details needed for later implementation.
+
 //also need buy, sell , is_buy_time?/freeze_time?
 //conditional output head
 
