@@ -3,7 +3,7 @@ import sqlite3
 import pandas as pd
 from demoparser2 import DemoParser
 from tqdm import tqdm
-from typing import Dict, Any, Set, List, Tuple
+from typing import Dict, Any, List, Tuple
 
 # A partial mapping of item definition indices to names.
 ITEM_ID_MAP = {
@@ -22,6 +22,8 @@ ITEM_ID_MAP = {
     509: "knife_m9_bayonet", 515: "knife_karambit", 522: "knife_stiletto", 523: "knife_ursus",
     80: "defuser", 81: "vest", 82: "vesthelm"
 }
+GRENADE_NAMES = {"flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade"}
+
 
 def get_item_name(item_id: int) -> str:
     """Converts an item ID to its string name."""
@@ -103,7 +105,7 @@ def main(demo_path: str, sql_output_path: str):
     tick_props = [
         "tick", "player_steamid", "player_name", "balance",
         "inventory_as_ids", "in_buy_zone", "team_num",
-        "ct_cant_buy", "terrorist_cant_buy", "usercmd_impulse"
+        "ct_cant_buy", "terrorist_cant_buy"
     ]
     with tqdm(total=1, desc="Parsing Ticks") as pbar:
         all_ticks_df = parser.parse_ticks(tick_props)
@@ -123,27 +125,20 @@ def main(demo_path: str, sql_output_path: str):
             if steamid == '0':
                 continue
             
-            # -- BUYZONE LOGIC --
-            # This logic now runs for every tick, not just on state change.
             is_in_usable_buyzone_now = (
                 current_state.in_buy_zone and
                 not (current_state.team_num == 2 and current_state.terrorist_cant_buy) and
                 not (current_state.team_num == 3 and current_state.ct_cant_buy)
             )
             
-            # ---- THE FIX IS HERE ----
             if is_in_usable_buyzone_now:
                  db.insert_buyzone(current_state.tick, steamid, current_state.player_name)
             
-            # -- ACTION LOGIC --
             last_state = last_player_states.get(steamid)
             if last_state:
                 tick_events = events_by_tick.get(current_state.tick, [])
                 
-                for event_name, event_data in tick_events:
-                    if event_name == "item_purchase" and str(event_data.steamid) == steamid:
-                        db.insert_action(current_state.tick, steamid, current_state.player_name, "BUY", event_data.item_name)
-
+                # Exclusion Check 1: Death
                 is_dead_this_tick = any(
                     name == "player_death" and str(data.user_steamid) == steamid for name, data in tick_events
                 )
@@ -151,36 +146,50 @@ def main(demo_path: str, sql_output_path: str):
                     last_player_states[steamid] = current_state._asdict()
                     continue
 
+                # Certainty Action: BUY
+                for event_name, event_data in tick_events:
+                    if event_name == "item_purchase" and str(event_data.steamid) == steamid:
+                        db.insert_action(current_state.tick, steamid, current_state.player_name, "BUY", event_data.item_name)
+
                 last_inv = last_state.get("inventory_as_ids", set())
                 current_inv = current_state.inventory_as_ids
-                
+
+                # State Change: An item was lost
                 if len(current_inv) < len(last_inv):
                     lost_items = last_inv - current_inv
-                    
-                    if current_state.usercmd_impulse == 201 and len(lost_items) == 1:
+                    if not lost_items: continue # Should not happen, but a safe guard
+
+                    # Exclusion 2: Buy-Replacement
+                    is_buy_event = any(name == 'item_purchase' and str(data.steamid) == steamid for name, data in tick_events)
+                    if is_buy_event:
+                        continue # Loss is due to buying a replacement, already logged.
+
+                    # Exclusion 3: Sell
+                    if is_in_usable_buyzone_now and current_state.balance > last_state["balance"]:
                         item_id = lost_items.pop()
-                        item_name = get_item_name(item_id)
-                        
+                        db.insert_action(current_state.tick, steamid, current_state.player_name, "SELL", get_item_name(item_id))
+                        continue # Action is a SELL
+
+                    # Exclusion 4: Grenade Throw
+                    lost_item_name = get_item_name(list(lost_items)[0])
+                    if lost_item_name in GRENADE_NAMES:
                         is_grenade_throw = False
-                        if "grenade" in item_name or "molotov" in item_name or "decoy" in item_name:
-                            for tick_offset in range(-16, 17):
-                                for event_name, event_data in events_by_tick.get(current_state.tick + tick_offset, []):
-                                    if (event_name == "weapon_fire" and 
-                                        str(event_data.user_steamid) == steamid and 
-                                        event_data.weapon == item_name):
-                                        is_grenade_throw = True
-                                        break
-                                if is_grenade_throw:
+                        # Check for a recent 'weapon_fire' event for this grenade
+                        for tick_offset in range(-16, 5): # Check slightly before and after
+                            for event_name, event_data in events_by_tick.get(current_state.tick + tick_offset, []):
+                                if (event_name == "weapon_fire" and 
+                                    str(event_data.user_steamid) == steamid and 
+                                    event_data.weapon == lost_item_name):
+                                    is_grenade_throw = True
                                     break
-                        
-                        if not is_grenade_throw:
-                            db.insert_action(current_state.tick, steamid, current_state.player_name, "DROP", item_name)
+                            if is_grenade_throw:
+                                break
+                        if is_grenade_throw:
+                            continue # Action is a THROW
 
-                    elif is_in_usable_buyzone_now and current_state.balance > last_state["balance"] and len(lost_items) == 1:
-                        item_id = lost_items.pop()
-                        item_name = get_item_name(item_id)
-                        db.insert_action(current_state.tick, steamid, current_state.player_name, "SELL", item_name)
-
+                    # If it passed all exclusions, it must be a DROP
+                    db.insert_action(current_state.tick, steamid, current_state.player_name, "DROP", lost_item_name)
+            
             last_player_states[steamid] = current_state._asdict()
         
         print("Step 4/4: Finalizing database...")
