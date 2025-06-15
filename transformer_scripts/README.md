@@ -89,3 +89,15 @@ Step 2: For each round (each team):
 For every Round:
     For every Player:
         For each 1/20s
+
+
+Find drops:
+
+things to consider: 
+- Player death DOES NOT count as a drop
+- Buying a weapon, which results in the drop of the old weapon DOES NOT count (we drop the old weapon but never press the 'g' key)
+- Grenade throw DOES NOT count (but dropping a grenade to a teammate for example is possible and does count)
+    - we need to check for recent related grenade throw events, perhaps using awpy or demoparser
+- Selling a weapon again DOES NOT count (since the player never actually drops e.g 'g')
+    - check if after weapon/item dissapears money has gone up again
+- Buying a weapon and instant dropping DOES count e.g player presses control while buying it -> needs to be named BUY_DROP
