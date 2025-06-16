@@ -37,7 +37,7 @@ for each entry with starttick, stoptick, roundnumber, playername, team in the in
     #send commands (wait 2s between each one)
         mirv_cmd clear
         demo_gototick starttick #wait 4s after this one
-        demo_spectate playername
+        spec_player playername
         mirv_cmd addAtTick stoptick "mirv_streams record end; demo_pause"
         mirv_streams record start; demo_resume
 
@@ -132,16 +132,28 @@ def setup_environment(demo_file: Path):
 
     # 1. Restart CS2 with HLAE
     LOG.info("Restarting CS2 with HLAE...")
-    # NOTE: Adjust the path to 's1a_restart_all.py' if it's not in '../../cnn_scripts'
-    # The CREATE_NEW_CONSOLE flag is specific to Windows.
+    
+    # Calculate the absolute path to the cnn_scripts directory relative to the current script
+    # Path(__file__).resolve() gives the absolute path to *this* script file.
+    # .parent gets its parent directory.
+    # / "../../cnn_scripts" appends the relative path.
+    # .resolve() again resolves the ".." components to get the final absolute absolute path.
+    cnn_scripts_dir = (Path(__file__).resolve().parent / "../../cnn_scripts").resolve()
+
+    LOG.debug(f"Calculated cnn_scripts_dir: {cnn_scripts_dir}") # Add this for debug output
+
     try:
         subprocess.Popen(
             ["python", "s1a_restart_all.py"],
-            cwd="../../cnn_scripts",
+            cwd=cnn_scripts_dir, # Use the calculated absolute path here
             creationflags=subprocess.CREATE_NEW_CONSOLE
         )
     except FileNotFoundError:
-        LOG.error("Could not find 's1a_restart_all.py'. Please check the path in the script.")
+        LOG.error(f"Could not find 's1a_restart_all.py' or Python executable in the specified path.")
+        LOG.error(f"Expected path for script directory: {cnn_scripts_dir}")
+        sys.exit(1)
+    except Exception as e:
+        LOG.error(f"An error occurred while trying to restart CS2+HLAE: {e}")
         sys.exit(1)
         
     LOG.info("Waiting 15 seconds for CS2 to launch...")
@@ -188,7 +200,7 @@ def setup_environment(demo_file: Path):
     send_command("exec ffmpeg.cfg", wait_after=1) # Assuming this config exists
     send_command("n1", wait_after=1) # A custom bind/alias?
     send_command("mirv_streams record fps 32", wait_after=1)
-    send_command("cl_drawhud 0; demoui; demoui; cl_drawhud_force_radar -1; spec_mode 0", wait_after=1)
+    send_command("demoui; demoui; cl_drawhud_force_radar -1; spec_mode 0", wait_after=1)
     send_command("spec_show_xray 0; sv_cheats 1; cl_hide_avatar_images 1", wait_after=1)
 
     LOG.info("Setup complete. Ready to record clips.")
@@ -257,14 +269,14 @@ def process_recordings(demo_file: Path):
         
         # 1. Send per-clip commands
         send_command("mirv_cmd clear", wait_after=2)
-        send_command(f"demo_gototick {start_tick}", wait_after=4)
-        send_command(f"demo_spectate {player_name}", wait_after=2)
+        send_command(f"demo_gototick {start_tick}", wait_after=10)
+        send_command(f"spec_player {player_name}", wait_after=2)
         
         stop_command = f'mirv_cmd addAtTick {stop_tick} "mirv_streams record end; demo_pause"'
         send_command(stop_command, wait_after=2)
         
         # Start recording and resume
-        send_command("mirv_streams record start; demo_resume", wait_after=0)
+        send_command("mirv_streams record start; demo_resume", wait_after=10)
         
         # 2. Wait for ffmpeg to finish
         wait_for_ffmpeg_to_finish()
@@ -275,18 +287,36 @@ def process_recordings(demo_file: Path):
         new_filename_base = f"{round_num}_{team}_{start_tick}_{stop_tick}_{player_name}"
         
         try:
-            # Find the mp4 and wav files in the temp directory.
-            # This assumes only one of each is created per recording cycle.
-            mp4_files = list(TEMP_RECORD_DIR.glob("*.mp4"))
-            wav_files = list(TEMP_RECORD_DIR.glob("*.wav"))
+            # --- MODIFICATION START ---
+
+            # First, find the 'takeXXXX' subdirectory created by HLAE.
+            # We assume there will be only one since we process one clip at a time.
+            take_dirs = [d for d in TEMP_RECORD_DIR.iterdir() if d.is_dir() and d.name.startswith("take")]
+            
+            if not take_dirs:
+                raise FileNotFoundError("No 'takeXXXX' sub-directory found in temp directory. Recording likely failed.")
+            
+            if len(take_dirs) > 1:
+                LOG.warning(f"Found multiple 'take' directories: {take_dirs}. Using the most recently modified one.")
+                # Sort by modification time to get the latest one, just in case.
+                take_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            take_dir = take_dirs[0]
+            LOG.debug(f"Found recording sub-directory: {take_dir}")
+
+            # Now, find the mp4 and wav files inside that specific take directory.
+            mp4_files = list(take_dir.glob("*.mp4"))
+            wav_files = list(take_dir.glob("*.wav"))
             
             if not mp4_files:
-                raise FileNotFoundError("No .mp4 file found in temp directory.")
+                raise FileNotFoundError(f"No .mp4 file found in '{take_dir}'")
             if not wav_files:
-                raise FileNotFoundError("No .wav file found in temp directory.")
+                raise FileNotFoundError(f"No .wav file found in '{take_dir}'")
                 
             source_mp4 = mp4_files[0]
             source_wav = wav_files[0]
+            
+            # --- MODIFICATION END ---
             
             dest_mp4_path = final_output_dir / f"{new_filename_base}.mp4"
             dest_wav_path = final_output_dir / f"{new_filename_base}.wav"
@@ -294,6 +324,10 @@ def process_recordings(demo_file: Path):
             shutil.move(str(source_mp4), str(dest_mp4_path))
             shutil.move(str(source_wav), str(dest_wav_path))
             LOG.info(f"Moved and renamed clip to: {dest_mp4_path}")
+
+            # Clean up the now-empty take directory
+            LOG.debug(f"Removing processed take directory: {take_dir}")
+            shutil.rmtree(take_dir)
 
             # 4. Update the database
             LOG.info("Updating database entry...")
@@ -337,6 +371,7 @@ def cleanup(signum=None, frame=None):
         DB_CONN.close()
         
     LOG.info("Cleanup complete. Exiting.")
+    sys.exit(0)
     if signum: # If called by signal handler, exit explicitly
         sys.exit(0)
 
