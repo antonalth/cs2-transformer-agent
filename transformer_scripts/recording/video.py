@@ -152,7 +152,7 @@ def setup_environment(demo_file: Path):
     try:
         MIRV_CONN = mirv_connect()
     except:
-        LOG.error(f"Failed to connect to MIRV: {e}")
+        LOG.error(f"Failed to connect to MIRV")
         LOG.error("Is CS2 running with -afxDetour enabled?")
         sys.exit(1)
     
