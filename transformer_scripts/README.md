@@ -154,7 +154,7 @@ TABLE rounds
 Note: only keep player_entries if the player is alive, e.g. if health != for player at tick. //write a python script that reads in all of these db files and merges them into the larger merged.db file according to spec. note that these files might be in a dir and we need to specifiy the dirpath to the .db files. also put merged.db in the same dir. Also if for a certain tick there is no entry in keyboard_location inputs table, no entry in the new player table (ignore content from other dbs if they have content for that player at that tick). Finally, also drop any entries in the player table where the tick is not between any starttick and endtick in the ROUNDS table.
 
 
-RECORD.py
+RECORD.py --demo path/to/game.dem --sql 
 
 //cli type deal open conn with mirv,
 //command record starttick endtick playername path 
