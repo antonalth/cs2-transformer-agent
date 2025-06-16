@@ -169,13 +169,17 @@ RECORD.py
 # cl_drawhud 0; demoui; demoui
 
 ...setup viewmodel settings...
+for each pov we find: 
+    # demo_gototick START_ROUND
+    # demo_spectate playername
 
-# demo_gototick 1234
-# demo_spectate playername
-
-# mirv_streams record start
-# demo_resume
-...
-# mirv_cmd addAtTick 5678 "mirv_streams record end"
-# mirv_cmd addAtTick 5679 "demo_pause"
-mirv_cmd clear
+    # mirv_streams record start
+    # demo_resume
+    ...
+    # mirv_cmd addAtTick 5678 "mirv_streams record end"
+    # mirv_cmd addAtTick 5679 "demo_pause"
+    
+    demo_resume
+    # wait until ffmpeg is closed, delta 5s
+    #
+    mirv_cmd clear
