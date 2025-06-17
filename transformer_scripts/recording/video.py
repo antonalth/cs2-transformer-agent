@@ -78,7 +78,7 @@ database format:
 import argparse
 import logging
 import sqlite3
-import subprocess
+import subprocess, os
 import time
 import sys
 import shutil
@@ -142,19 +142,14 @@ def setup_environment(demo_file: Path):
 
     LOG.debug(f"Calculated cnn_scripts_dir: {cnn_scripts_dir}") # Add this for debug output
 
-    try:
-        subprocess.Popen(
-            ["python", "s1a_restart_all.py"],
-            cwd=cnn_scripts_dir, # Use the calculated absolute path here
-            creationflags=subprocess.CREATE_NEW_CONSOLE| subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    except FileNotFoundError:
-        LOG.error(f"Could not find 's1a_restart_all.py' or Python executable in the specified path.")
-        LOG.error(f"Expected path for script directory: {cnn_scripts_dir}")
-        sys.exit(1)
-    except Exception as e:
-        LOG.error(f"An error occurred while trying to restart CS2+HLAE: {e}")
-        sys.exit(1)
+
+    script = os.path.join(cnn_scripts_dir, "s1a_restart_all.py")
+
+    subprocess.Popen([
+        "powershell", "-NoProfile", "-Command",
+        "Start-Process", "python",
+        "-ArgumentList", f"'{script}'"
+    ], cwd=cnn_scripts_dir)
         
     LOG.info("Waiting 15 seconds for CS2 to launch...")
     time.sleep(15)
@@ -201,7 +196,7 @@ def setup_environment(demo_file: Path):
     send_command("n1", wait_after=1) # A custom bind/alias?
     send_command("mirv_streams record fps 32", wait_after=1)
     send_command("demoui; cl_drawhud_force_radar -1; spec_mode 0", wait_after=1)
-    send_command("volume 0.5; spec_show_xray 0; sv_cheats 1; cl_hide_avatar_images 1", wait_after=1)
+    send_command("volume 0.5; spec_show_xray 0; sv_cheats 1; cl_hide_avatar_images 1; r_show_build_info false", wait_after=1)
 
     LOG.info("Setup complete. Ready to record clips.")
 
