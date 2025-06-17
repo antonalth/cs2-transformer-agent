@@ -157,8 +157,8 @@ def fetch_and_process_rounds(conn, db_path):
 
                 # We only care about players who actually died
                 if death_tick != -1:
-                    if death_tick < (freezetime_endtick + 250):
-                        print(f"Skipping round {round_num}: Player '{player_name}' died too early ({death_tick}), less than 250 ticks after freezetime ended ({freezetime_endtick}).")
+                    if death_tick < (freezetime_endtick + 128):
+                        print(f"Skipping round {round_num}: Player '{player_name}' died too early ({death_tick}), less than 128 ticks after freezetime ended ({freezetime_endtick}).")
                         is_round_valid = False
                         break # An early death invalidates the whole round
 
