@@ -200,8 +200,8 @@ def setup_environment(demo_file: Path):
     send_command("exec ffmpeg.cfg", wait_after=1) # Assuming this config exists
     send_command("n1", wait_after=1) # A custom bind/alias?
     send_command("mirv_streams record fps 32", wait_after=1)
-    send_command("demoui; demoui; cl_drawhud_force_radar -1; spec_mode 0", wait_after=1)
-    send_command("spec_show_xray 0; sv_cheats 1; cl_hide_avatar_images 1", wait_after=1)
+    send_command("demoui; cl_drawhud_force_radar -1; spec_mode 0", wait_after=1)
+    send_command("volume 0.5; spec_show_xray 0; sv_cheats 1; cl_hide_avatar_images 1", wait_after=1)
 
     LOG.info("Setup complete. Ready to record clips.")
 
@@ -284,7 +284,7 @@ def process_recordings(demo_file: Path):
         # 3. Move and rename the recorded files
         LOG.info("Processing recorded files...")
         
-        new_filename_base = f"{round_num}_{team}_{start_tick}_{stop_tick}_{player_name}"
+        new_filename_base = f"{round_num:02d}_{team}_{player_name}_{start_tick}_{stop_tick}"
         
         try:
             # --- MODIFICATION START ---
