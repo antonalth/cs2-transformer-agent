@@ -101,7 +101,16 @@ def fetch_and_process_rounds(conn, db_path):
     all_rounds_data = cursor.fetchall()
     to_be_recorded = []
 
-    for round_num, starttick, endtick, t_team_json, ct_team_json in all_rounds_data:
+    # The loop signature is updated to include freezetime_endtick
+    for round_num, starttick, freezetime_endtick, endtick, t_team_json, ct_team_json in all_rounds_data:
+        # --- Stage 1: Parse and Basic Checks ---
+        
+        # Check for extended freezetime (e.g., from timeouts)
+        if freezetime_endtick is not None and starttick is not None:
+            if (freezetime_endtick - starttick) > 2000:
+                print(f"Skipping round {round_num}: Extended freezetime duration ({freezetime_endtick - starttick} ticks).")
+                continue
+
         # --- Stage 1: Parse and Basic Checks ---
         if starttick is None or endtick is None:
             print(f"Skipping round {round_num}: Missing start or end tick.")
