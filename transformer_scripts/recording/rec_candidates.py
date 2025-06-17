@@ -93,7 +93,8 @@ def fetch_and_process_rounds(conn, db_path):
     print("Processing and validating data from 'ROUNDS' table...")
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT round, starttick, endtick, t_team, ct_team FROM ROUNDS")
+        # Ensure we select freezetime_endtick
+        cursor.execute("SELECT round, starttick, freezetime_endtick, endtick, t_team, ct_team FROM ROUNDS")
     except sqlite3.OperationalError:
         print(f"Error: Table 'ROUNDS' not found in '{db_path}'. Cannot proceed.")
         return None
@@ -101,17 +102,16 @@ def fetch_and_process_rounds(conn, db_path):
     all_rounds_data = cursor.fetchall()
     to_be_recorded = []
 
-    # The loop signature is updated to include freezetime_endtick
+    # Updated loop signature
     for round_num, starttick, freezetime_endtick, endtick, t_team_json, ct_team_json in all_rounds_data:
         # --- Stage 1: Parse and Basic Checks ---
-        
+
         # Check for extended freezetime (e.g., from timeouts)
         if freezetime_endtick is not None and starttick is not None:
             if (freezetime_endtick - starttick) > 2000:
                 print(f"Skipping round {round_num}: Extended freezetime duration ({freezetime_endtick - starttick} ticks).")
                 continue
-
-        # --- Stage 1: Parse and Basic Checks ---
+        
         if starttick is None or endtick is None:
             print(f"Skipping round {round_num}: Missing start or end tick.")
             continue
@@ -144,6 +144,23 @@ def fetch_and_process_rounds(conn, db_path):
             if overlapping_players:
                 print(f"Skipping round {round_num}: Player(s) {list(overlapping_players)} found on both teams.")
                 is_round_valid = False
+
+        # Validation 3: Check for deaths too close to freezetime end
+        if is_round_valid and freezetime_endtick is not None:
+            # Combine players from both teams for this specific check
+            all_round_players_for_check = t_players + ct_players
+            for player_data in all_round_players_for_check:
+                if not isinstance(player_data, list) or len(player_data) < 2:
+                    continue # Skip malformed entries like ["playername"]
+
+                player_name, death_tick = player_data[0], player_data[1]
+
+                # We only care about players who actually died
+                if death_tick != -1:
+                    if death_tick < (freezetime_endtick + 250):
+                        print(f"Skipping round {round_num}: Player '{player_name}' died too early ({death_tick}), less than 250 ticks after freezetime ended ({freezetime_endtick}).")
+                        is_round_valid = False
+                        break # An early death invalidates the whole round
 
         # --- Stage 3: Process the round if it's valid ---
         if is_round_valid:
