@@ -98,34 +98,6 @@ def _parse_2x(demo_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _parse_1x_or_demoparser2(demo_path: Path) -> list[dict[str, Any]]:
-    """Implementation for AWPy 1.x or demoparser2 – retains the original JSON route."""
-    parser = _DemoParser(demofile=str(demo_path), parse_frames=False)
-    match = parser.parse()
-
-    # deaths by round
-    death_map: dict[int, dict[str, int]] = {}
-    for k in match.get("kills", []):
-        death_map.setdefault(k["roundNum"], {})[k["victimName"]] = k["tick"]
-
-    rows: list[dict[str, Any]] = []
-    for rnd in match["gameRounds"]:
-        rn = rnd["roundNum"]
-        t_names = [p["playerName"] for p in rnd["tTeam"]["players"]]
-        ct_names = [p["playerName"] for p in rnd["ctTeam"]["players"]]
-
-        rows.append(
-            {
-                "round": rn,
-                "starttick": rnd["startTick"],
-                "freezetime_endtick": rnd["freezeTimeEndTick"],
-                "endtick": rnd.get("officialEndTick", rnd["endTick"]),
-                "t_team": [[n, death_map.get(rn, {}).get(n, -1)] for n in t_names],
-                "ct_team": [[n, death_map.get(rn, {}).get(n, -1)] for n in ct_names],
-            }
-        )
-    return rows
-
 
 def _to_sql(rows: list[dict[str, Any]], db_file: Path) -> None:
     with sqlite3.connect(db_file) as conn:
@@ -167,7 +139,7 @@ def _cli() -> None:
     if _AWPY_VERSION == "2.x":
         rows = _parse_2x(demo_path)
     else:
-        rows = _parse_1x_or_demoparser2(demo_path)
+       sys.exit("awpy unsupported error.")
 
     if args.sqlout:
         _to_sql(rows, Path(args.sqlout).expanduser())
