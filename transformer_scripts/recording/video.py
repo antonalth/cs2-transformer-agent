@@ -146,7 +146,7 @@ def setup_environment(demo_file: Path):
         subprocess.Popen(
             ["python", "s1a_restart_all.py"],
             cwd=cnn_scripts_dir, # Use the calculated absolute path here
-            creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS
+            creationflags=subprocess.CREATE_NEW_CONSOLE| subprocess.CREATE_NEW_PROCESS_GROUP
         )
     except FileNotFoundError:
         LOG.error(f"Could not find 's1a_restart_all.py' or Python executable in the specified path.")
