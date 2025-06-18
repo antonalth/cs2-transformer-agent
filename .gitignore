@@ -9,3 +9,4 @@ libs/__pycache__/**/ */
 *.jpeg
 .DS_Store
 *.db
+*.mp4
