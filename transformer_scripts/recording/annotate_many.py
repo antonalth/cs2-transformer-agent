@@ -220,6 +220,8 @@ def create_placeholder_frame(width, height, text):
     cv2.putText(frame, text, (text_x, text_y), FONT, 0.8, (150, 150, 150), 2, cv2.LINE_AA)
     return frame
 
+# ... (rest of the script is the same) ...
+
 def create_compiled_video(output_path, player_data, round_start, round_end):
     """
     The main function to composite all videos into a single output file.
@@ -241,7 +243,6 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
             tile_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             tile_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Define the 3x2 grid layout
     output_w, output_h = tile_w * 3, tile_h * 2
     layout = {
         player_names[0]: (0, 0),
@@ -249,13 +250,18 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
         player_names[2]: (tile_w * 2, 0),
         player_names[3]: (0, tile_h),
         player_names[4]: (tile_w, tile_h),
-    } if len(player_names) >= 5 else {} # Handle cases with fewer than 5 players if needed
+    } if len(player_names) >= 5 else {}
 
-    # Setup output video writer
+    # --- FIX #1: Change the video codec to be compatible with Windows ---
+    #fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'mp4v' for better Windows compatibility
     fourcc = cv2.VideoWriter_fourcc(*'avc1')
     out = cv2.VideoWriter(output_path, fourcc, EXPECTED_VIDEO_FPS, (output_w, output_h))
     
-    # Create placeholder frames
+    if not out.isOpened():
+        print(f"Error: Could not open VideoWriter for output file '{output_path}'.", file=sys.stderr)
+        print("This may be due to an unsupported codec ('fourcc') on your system. Try 'avc1' or 'XVID' (with .avi).", file=sys.stderr)
+        sys.exit(1)
+
     placeholder_dead = create_placeholder_frame(tile_w, tile_h, "PLAYER DEAD")
     placeholder_waiting = create_placeholder_frame(tile_w, tile_h, "WAITING TO START")
     placeholder_empty = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
@@ -266,33 +272,24 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
 
     for frame_idx in range(total_round_frames):
         current_start_tick = round_start + (frame_idx * TICKS_PER_FRAME)
-        
-        # Create the large canvas for this frame
         final_frame = np.zeros((output_h, output_w, 3), dtype=np.uint8)
 
-        # Populate the 3x2 grid
         for i, name in enumerate(player_names):
+            # ... (the inner loop logic remains the same) ...
             pov_data = player_data[name]
             tile_frame = None
 
-            # Check if the player is active during this frame's ticks
             if current_start_tick >= pov_data['starttick'] and current_start_tick < pov_data['stoptick']:
                 ret, frame = captures[name].read()
                 if ret:
-                    # Player is alive and recording, get the right tick data and overlay it
                     tick_offset = current_start_tick - pov_data['starttick']
-                    
-                    # Align tick strings to frames
                     string_idx_1 = tick_offset
                     string_idx_2 = tick_offset + 1
-
                     text_to_display = ""
                     if string_idx_1 < len(pov_data['tick_strings']):
                          text_to_display += pov_data['tick_strings'][string_idx_1]
                     if string_idx_2 < len(pov_data['tick_strings']):
                          text_to_display += "\n\n" + pov_data['tick_strings'][string_idx_2]
-
-                    # Overlay the text
                     y = TEXT_POSITION[1]
                     for line in text_to_display.split('\n'):
                         shadow_pos = (TEXT_POSITION[0] + 1, y + 1)
@@ -302,19 +299,16 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
                         y += LINE_HEIGHT
                     tile_frame = frame
                 else:
-                    # Video ended unexpectedly, treat as dead
                     tile_frame = placeholder_dead
             elif current_start_tick >= pov_data['stoptick']:
                 tile_frame = placeholder_dead
             else:
                 tile_frame = placeholder_waiting
 
-            # Paste the tile into the final composite frame
             if name in layout:
                 x, y = layout[name]
                 final_frame[y:y+tile_h, x:x+tile_w] = tile_frame
         
-        # Fill the last empty slot in the grid
         if len(player_names) == 5:
             x, y = tile_w * 2, tile_h
             final_frame[y:y+tile_h, x:x+tile_w] = placeholder_empty
@@ -329,7 +323,8 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
     for cap in captures.values():
         cap.release()
     out.release()
-    cv2.destroyAllWindows()
+    # --- FIX #2: Remove the call to destroyAllWindows() for headless OpenCV ---
+    # cv2.destroyAllWindows()
 
 
 def main():
@@ -340,13 +335,17 @@ def main():
     parser.add_argument("--sql", required=True, help="Path to the input.db SQLite database file.")
     parser.add_argument("--data", required=True, help="Path to the folder containing the POV recordings.")
     parser.add_argument("--round", required=True, type=int, help="The round number to process.")
-    parser.add_argument("--team", required=True, choices=['CT', 'T'], help="The team to process (ct or t).")
+    # --- FIX #3: Update choices to allow uppercase team names ---
+    parser.add_argument("--team", required=True, choices=['ct', 't', 'CT', 'T'], help="The team to process (CT or T).")
     parser.add_argument("--out", required=True, help="Path for the final compiled output video file.")
     args = parser.parse_args()
 
-    # Step 1: Find and validate recordings for the specified round/team
-    recordings = get_round_recordings(args.sql, args.data, args.round, args.team)
+    # Standardize team name to uppercase for database queries
+    team_for_query = args.team.upper()
 
+    # Step 1: Find and validate recordings for the specified round/team
+    recordings = get_round_recordings(args.sql, args.data, args.round, team_for_query)
+    
     # Step 1.5: Get the master timeline for the entire round
     round_start_tick, round_end_tick = get_round_timeline(args.sql, args.round)
     
@@ -357,7 +356,3 @@ def main():
     create_compiled_video(args.out, all_player_data, round_start_tick, round_end_tick)
 
     print(f"\nScript finished successfully! Output saved to: {args.out}")
-
-
-if __name__ == "__main__":
-    main()
