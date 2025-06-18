@@ -49,12 +49,14 @@ import os
 import sys
 
 # --- Configuration for the text overlay ---
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 0.6
-FONT_COLOR = (255, 255, 255)  # White
-LINE_TYPE = 2
-TEXT_POSITION = (15, 30)  # (X, Y) from top-left corner
-LINE_HEIGHT = 25 # Pixel height for each new line of text
+# Switched to a more "serious" font, smaller scale, and compact line height
+FONT = cv2.FONT_HERSHEY_DUPLEX
+FONT_SCALE = 0.45
+FONT_COLOR = (50, 255, 50)  # High-visibility green (in BGR format)
+SHADOW_COLOR = (0, 0, 0)     # Black shadow for readability
+LINE_TYPE = 1
+TEXT_POSITION = (10, 20)  # (X, Y) from top-left corner
+LINE_HEIGHT = 18 # Pixel height for each new line of text
 
 # --- Constants based on the problem description ---
 EXPECTED_VIDEO_FPS = 32
@@ -72,11 +74,9 @@ def parse_filename(filepath):
         filename_no_ext, _ = os.path.splitext(basename)
         parts = filename_no_ext.split('_')
         
-        # Player names can contain underscores, so we parse from the ends.
         stop_tick = int(parts[-1])
         start_tick = int(parts[-2])
         round_num = int(parts[0])
-        # Team is part[1], everything in between is the player name
         player_name = '_'.join(parts[2:-2])
 
         if not player_name:
@@ -104,7 +104,6 @@ def fetch_player_data(db_path, player_name, start_tick, stop_tick):
     print(f"\n-> Connecting to database '{db_path}'...")
     try:
         conn = sqlite3.connect(db_path)
-        # Use Row factory to access columns by name
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
@@ -117,7 +116,6 @@ def fetch_player_data(db_path, player_name, start_tick, stop_tick):
         rows = cursor.fetchall()
         print(f"   - Found {len(rows)} data rows for player '{player_name}' between ticks {start_tick} and {stop_tick}.")
         
-        # Return as a dictionary for fast lookups {tick: row_data}
         return {row['tick']: row for row in rows}
 
     except sqlite3.Error as e:
@@ -130,14 +128,25 @@ def fetch_player_data(db_path, player_name, start_tick, stop_tick):
 
 def format_tick_data(row):
     """
-    Turns a database row into a well-formatted string for display.
+    Turns a database row into a detailed, multi-line string for display.
     """
-    # Example format, can be customized as needed.
-    return (
-        f"Tick: {row['tick']} | "
-        f"HP: {row['health']}/{row['armor']} | "
-        f"Weapon: {row['active_weapon']}"
-    )
+    # Helper to avoid long lines for keyboard input
+    keys = row['keyboard_input'] if row['keyboard_input'] else "None"
+
+    # Helper for buyzone status
+    buyzone_text = "Yes" if row['is_in_buyzone'] else "No"
+
+    # Format all data into separate lines for clarity
+    line1 = f"TICK: {row['tick']}"
+    line2 = f"HP: {row['health']:<3} | ARMOR: {row['armor']:<3} | MONEY: ${row['money']}"
+    line3 = f"POS: ({row['position_x']:.2f}, {row['position_y']:.2f}, {row['position_z']:.2f})"
+    line4 = f"WEAPON: {row['active_weapon']}"
+    # Inventory can be long, so it gets its own line
+    line5 = f"INVENTORY: {row['inventory']}"
+    line6 = f"KEYS: {keys} | MOUSE: ({row['mouse_x']:.4f}, {row['mouse_y']:.4f})"
+    line7 = f"IN BUYZONE: {buyzone_text}"
+
+    return "\n".join([line1, line2, line3, line4, line5, line6, line7])
 
 
 def prepare_tick_strings(db_data, start_tick, stop_tick):
@@ -153,7 +162,8 @@ def prepare_tick_strings(db_data, start_tick, stop_tick):
             formatted_string = format_tick_data(db_data[current_tick])
             all_tick_strings.append(formatted_string)
         else:
-            all_tick_strings.append(f"Tick: {current_tick} | NO_TICK_INFO")
+            # Create a minimal string for missing ticks
+            all_tick_strings.append(f"TICK: {current_tick}\nSTATUS: NO_TICK_INFO")
             missing_ticks += 1
     
     if missing_ticks > 0:
@@ -169,38 +179,26 @@ def process_video(input_path, output_path, ordered_tick_strings):
     Reads the input video, aligns tick data from the end, overlays the text,
     and writes the new video to the output path.
     """
-    # --- 1. Open Video and get properties ---
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         print(f"Error: Could not open video file '{input_path}'", file=sys.stderr)
         sys.exit(1)
 
-    # Get video properties to create the output file correctly
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # --- FIX IS HERE: CHANGING THE VIDEO CODEC ---
-    # The 'mp4v' codec can be unreliable. 'avc1' (H.264) is a much more standard
-    # and compatible codec for .mp4 files, especially on macOS.
+    # Use 'avc1' (H.264) for better .mp4 compatibility, especially on macOS/Linux
     fourcc = cv2.VideoWriter_fourcc(*'avc1')
-    
-    # --- IF 'avc1' FAILS, TRY THESE OTHER OPTIONS: ---
-    # fourcc = cv2.VideoWriter_fourcc(*'h264')  # Alternative for H.264
-    # fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # The original, sometimes works
-    # fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Very compatible, but use .avi for output
-    
     out = cv2.VideoWriter(output_path, fourcc, video_fps, (width, height))
     
     if not out.isOpened():
         print(f"Error: Could not open VideoWriter for output file '{output_path}'.", file=sys.stderr)
-        print("This may be due to an unsupported codec ('fourcc') on your system.", file=sys.stderr)
-        print("Try changing the fourcc code in the script (e.g., to 'h264' or 'XVID').", file=sys.stderr)
+        print("This may be due to an unsupported codec ('fourcc') on your system. Try 'mp4v' or 'XVID' (with .avi).", file=sys.stderr)
         cap.release()
         sys.exit(1)
-
-    
+        
     print("\n-> Processing video...")
     print(f"   - Input video: {total_frames} frames at {video_fps:.2f} FPS.")
     print(f"   - Game data: {len(ordered_tick_strings)} ticks to map ({TICKS_PER_FRAME} ticks/frame).")
@@ -208,32 +206,25 @@ def process_video(input_path, output_path, ordered_tick_strings):
     if abs(video_fps - EXPECTED_VIDEO_FPS) > 1:
         print(f"   - Warning: Video FPS ({video_fps:.2f}) is not the expected {EXPECTED_VIDEO_FPS}. Timing may be slightly off.")
 
-    # --- 2. Align Tick Data to Frames from the END ---
     frame_to_text_map = ["BEFORE_START"] * total_frames
     tick_idx = len(ordered_tick_strings) - 1
 
     for frame_idx in range(total_frames - 1, -1, -1):
         if tick_idx >= (TICKS_PER_FRAME - 1):
-            # We have enough ticks left for this frame
             texts_for_frame = []
             for i in range(TICKS_PER_FRAME):
                 texts_for_frame.append(ordered_tick_strings[tick_idx - i])
             
-            # Combine the two tick strings for this frame, reversing to show older tick first
-            frame_to_text_map[frame_idx] = "\n".join(reversed(texts_for_frame))
+            # Combine the two tick strings, separated by a blank line for readability
+            frame_to_text_map[frame_idx] = "\n\n".join(reversed(texts_for_frame))
             tick_idx -= TICKS_PER_FRAME
         else:
-            # Not enough ticks left, so this frame is before the start of data
-            # The loop will naturally stop and the rest will remain "BEFORE_START"
             break
             
-    # --- 3. Check for leftover ticks ---
     ticks_left_over = tick_idx + 1
     if ticks_left_over > 0:
         print(f"\n   - WARNING: {ticks_left_over} tick(s) from the start of the data range could not be mapped to any video frame.")
-        print(f"     This can happen if the video clip is shorter than the tick data range implies.")
 
-    # --- 4. Read, Annotate, and Write each Frame ---
     print(f"   - Writing annotated video to '{output_path}'...")
     frame_count = 0
     while True:
@@ -241,24 +232,26 @@ def process_video(input_path, output_path, ordered_tick_strings):
         if not ret:
             break
         
-        # Get the pre-calculated text for this frame
         text_to_display = frame_to_text_map[frame_count]
         
-        # Add text to frame. Handles multi-line strings.
+        # Draw text with a shadow for better readability
         y = TEXT_POSITION[1]
         for line in text_to_display.split('\n'):
-            cv2.putText(frame, line, (TEXT_POSITION[0], y), FONT, FONT_SCALE, FONT_COLOR, LINE_TYPE)
+            # Draw shadow (black, offset by 1px)
+            shadow_pos = (TEXT_POSITION[0] + 1, y + 1)
+            cv2.putText(frame, line, shadow_pos, FONT, FONT_SCALE, SHADOW_COLOR, LINE_TYPE, cv2.LINE_AA)
+            # Draw main text (green)
+            text_pos = (TEXT_POSITION[0], y)
+            cv2.putText(frame, line, text_pos, FONT, FONT_SCALE, FONT_COLOR, LINE_TYPE, cv2.LINE_AA)
             y += LINE_HEIGHT
         
         out.write(frame)
         frame_count += 1
-        # Simple progress indicator
         if frame_count % 100 == 0:
             print(f"     Processed {frame_count}/{total_frames} frames...", end='\r')
 
     print(f"\n   - Successfully processed {frame_count} frames.")
 
-    # --- 5. Release resources ---
     cap.release()
     out.release()
     cv2.destroyAllWindows()
@@ -266,7 +259,7 @@ def process_video(input_path, output_path, ordered_tick_strings):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Annotates a CS:GO video with player data from a SQLite database.",
+        description="Annotates a CS:GO video with detailed player data from a SQLite database.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--sql", required=True, help="Path to the merged.db SQLite database file.")
@@ -274,16 +267,9 @@ def main():
     parser.add_argument("--out", required=True, help="Path for the output annotated video file.")
     args = parser.parse_args()
 
-    # Step 1: Extract info from filename
     player_name, start_tick, stop_tick = parse_filename(args.input)
-
-    # Step 2: Query the database
     db_data = fetch_player_data(args.sql, player_name, start_tick, stop_tick)
-    
-    # Step 3: Prepare tick strings, filling in any gaps
     ordered_tick_strings = prepare_tick_strings(db_data, start_tick, stop_tick)
-    
-    # Step 4: Process the video
     process_video(args.input, args.out, ordered_tick_strings)
 
     print("\nScript finished successfully!")
