@@ -253,8 +253,8 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
     } if len(player_names) >= 5 else {}
 
     # --- FIX #1: Change the video codec to be compatible with Windows ---
-    #fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'mp4v' for better Windows compatibility
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'mp4v' for better Windows compatibility
+    #fourcc = cv2.VideoWriter_fourcc(*'avc1')
     out = cv2.VideoWriter(output_path, fourcc, EXPECTED_VIDEO_FPS, (output_w, output_h))
     
     if not out.isOpened():
