@@ -340,7 +340,7 @@ def main():
     parser.add_argument("--sql", required=True, help="Path to the input.db SQLite database file.")
     parser.add_argument("--data", required=True, help="Path to the folder containing the POV recordings.")
     parser.add_argument("--round", required=True, type=int, help="The round number to process.")
-    parser.add_argument("--team", required=True, choices=['ct', 't'], help="The team to process (ct or t).")
+    parser.add_argument("--team", required=True, choices=['CT', 'T'], help="The team to process (ct or t).")
     parser.add_argument("--out", required=True, help="Path for the final compiled output video file.")
     args = parser.parse_args()
 
