@@ -364,7 +364,10 @@ def cleanup(signum=None, frame=None):
     if DB_CONN:
         LOG.info("Closing SQLite database connection.")
         DB_CONN.close()
-        
+    
+    LOG.info("Killing node process..")
+    subprocess.run(r'wsl bash -c "pkill node"', check=False)
+
     LOG.info("Cleanup complete. Exiting.")
     sys.exit(0)
     if signum: # If called by signal handler, exit explicitly
