@@ -151,8 +151,8 @@ def setup_environment(demo_file: Path):
         "-ArgumentList", f"'{script}'"
     ], cwd=cnn_scripts_dir)
         
-    LOG.info("Waiting 15 seconds for CS2 to launch...")
-    time.sleep(15)
+    LOG.info("Waiting 25 seconds for CS2 to launch...")
+    time.sleep(25)
 
     # 2. Start console connection
     LOG.info("Connecting to MIRV console...")
@@ -193,7 +193,7 @@ def setup_environment(demo_file: Path):
     send_command("mirv_streams record screen enabled 1", wait_after=1)
     send_command("mirv_streams record screen settings afxDefault", wait_after=1)
     send_command("exec ffmpeg.cfg", wait_after=1) # Assuming this config exists
-    send_command("n0", wait_after=1) # A custom bind/alias?
+    send_command("n3", wait_after=1) # A custom bind/alias?
     send_command("mirv_streams record fps 32", wait_after=1)
     send_command("demoui; cl_drawhud_force_radar -1; spec_mode 0", wait_after=1)
     send_command("volume 0.5; spec_show_xray 0; sv_cheats 1; cl_hide_avatar_images 1; r_show_build_info false", wait_after=1)
