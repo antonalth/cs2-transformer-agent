@@ -63,8 +63,7 @@ Steps:
 - align the videos based on the calculated ticks from the end. Note: some videos are shorter than others since the players die and the recording stops. 
     So the step at the front where we accurately align each video frame with two ticks from the end of the video is essential to align all frames and povs later.
     Write out compiled video to --out outfile.mp4
-'''
-#!/usr/bin/env python3
+'''#!/usr/bin/env python3
 
 import argparse
 import sqlite3
@@ -72,7 +71,6 @@ import cv2
 import numpy as np
 import os
 import sys
-from collections import defaultdict
 
 # --- Configuration for the text overlay ---
 FONT = cv2.FONT_HERSHEY_DUPLEX
@@ -89,9 +87,7 @@ GAME_TICKS_PER_SEC = 64
 TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
 
 def get_round_recordings(db_path, data_folder, round_num, team):
-    """
-    Queries the RECORDING table and validates that all required video files exist.
-    """
+    """Queries the RECORDING table and validates that all required video files exist."""
     print("-> Step 1: Fetching and validating recording metadata...")
     try:
         conn = sqlite3.connect(db_path)
@@ -121,7 +117,6 @@ def get_round_recordings(db_path, data_folder, round_num, team):
                 print(f"Error: Video file not found at expected path: {filepath}. Exiting.", file=sys.stderr)
                 sys.exit(1)
             
-            # Add the validated filepath to our data
             rec_dict = dict(rec)
             rec_dict['filepath'] = filepath
             valid_recordings.append(rec_dict)
@@ -136,27 +131,24 @@ def get_round_recordings(db_path, data_folder, round_num, team):
         if conn:
             conn.close()
 
-def get_round_timeline(db_path, round_num):
-    """Gets the absolute start and end tick for the entire round."""
+def get_round_start_tick(db_path, round_num):
+    """Gets the absolute start tick for the entire round."""
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT starttick, endtick FROM rounds WHERE round = ?", (round_num,))
+        cursor.execute("SELECT starttick FROM rounds WHERE round = ?", (round_num,))
         round_info = cursor.fetchone()
         if not round_info:
             print(f"Error: Could not find round {round_num} in the 'rounds' table. Exiting.", file=sys.stderr)
             sys.exit(1)
-        return round_info['starttick'], round_info['endtick']
+        return round_info['starttick']
     finally:
         if conn:
             conn.close()
 
 def fetch_and_prepare_all_player_data(db_path, recordings):
-    """
-    For each recording, fetches and prepares all tick data strings.
-    This is the most data-intensive part.
-    """
+    """For each recording, fetches and prepares all tick data strings."""
     print("\n-> Step 2: Fetching and preparing all player tick data...")
     all_player_data = {}
     try:
@@ -165,10 +157,7 @@ def fetch_and_prepare_all_player_data(db_path, recordings):
         cursor = conn.cursor()
 
         for rec in recordings:
-            player_name = rec['playername']
-            start_tick = rec['starttick']
-            stop_tick = rec['stoptick']
-            
+            player_name, start_tick, stop_tick = rec['playername'], rec['starttick'], rec['stoptick']
             print(f"   - Fetching data for '{player_name}' (Ticks: {start_tick}-{stop_tick})...")
             
             query = "SELECT * FROM player WHERE playername = ? AND tick BETWEEN ? AND ? ORDER BY tick"
@@ -176,7 +165,6 @@ def fetch_and_prepare_all_player_data(db_path, recordings):
             rows = cursor.fetchall()
             db_data = {row['tick']: row for row in rows}
 
-            # Prepare all tick strings in advance
             tick_strings = []
             for tick in range(start_tick, stop_tick + 1):
                 if tick in db_data:
@@ -185,10 +173,8 @@ def fetch_and_prepare_all_player_data(db_path, recordings):
                     tick_strings.append(f"TICK: {tick}\nSTATUS: NO_TICK_INFO")
 
             all_player_data[player_name] = {
-                'starttick': start_tick,
-                'stoptick': stop_tick,
-                'filepath': rec['filepath'],
-                'tick_strings': tick_strings
+                'starttick': start_tick, 'stoptick': stop_tick,
+                'filepath': rec['filepath'], 'tick_strings': tick_strings
             }
         
         print("   - All player data has been fetched and prepared.")
@@ -201,15 +187,18 @@ def fetch_and_prepare_all_player_data(db_path, recordings):
         if conn:
             conn.close()
 
-
+# MODIFICATION 1: Restored detailed data formatting
 def format_tick_data(row):
-    """Turns a database row into a detailed, multi-line string."""
-    buyzone_text = "Yes" if row['is_in_buyzone'] else "No"
+    """Turns a database row into a detailed, multi-line string for display."""
+    keys = row['keyboard_input'] if row['keyboard_input'] else "None"
+    
     line1 = f"TICK: {row['tick']}"
     line2 = f"HP: {row['health']:<3} | ARMOR: {row['armor']:<3} | ${row['money']}"
     line3 = f"WEAPON: {row['active_weapon']}"
-    return "\n".join([line1, line2, line3])
+    line4 = f"POS: ({row['position_x']:.0f}, {row['position_y']:.0f}, {row['position_z']:.0f})"
+    line5 = f"KEYS: {keys}"
 
+    return "\n".join([line1, line2, line3, line4, line5])
 
 def create_placeholder_frame(width, height, text):
     """Creates a black frame with centered text (e.g., 'PLAYER DEAD')."""
@@ -220,62 +209,45 @@ def create_placeholder_frame(width, height, text):
     cv2.putText(frame, text, (text_x, text_y), FONT, 0.8, (150, 150, 150), 2, cv2.LINE_AA)
     return frame
 
-# ... (rest of the script is the same) ...
-
-def create_compiled_video(output_path, player_data, round_start, round_end):
-    """
-    The main function to composite all videos into a single output file.
-    """
+# MODIFICATION 2: Function now accepts effective_end_tick
+def create_compiled_video(output_path, player_data, round_start, effective_end_tick):
+    """Composites all videos into a single output file, stopping when all players are dead."""
     print("\n-> Step 3: Compositing videos into final output...")
 
-    # --- 1. Setup Video Captures and Output ---
-    captures = {}
-    tile_w, tile_h = 0, 0
+    captures, (tile_w, tile_h) = {}, (0, 0)
     player_names = sorted(player_data.keys())
 
     for name in player_names:
         cap = cv2.VideoCapture(player_data[name]['filepath'])
-        if not cap.isOpened():
-            print(f"FATAL: Could not open video for {name}", file=sys.stderr)
-            sys.exit(1)
+        if not cap.isOpened(): print(f"FATAL: Could not open video for {name}", file=sys.stderr); sys.exit(1)
         captures[name] = cap
-        if tile_w == 0: # Get dimensions from first video
+        if tile_w == 0:
             tile_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             tile_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     output_w, output_h = tile_w * 3, tile_h * 2
-    layout = {
-        player_names[0]: (0, 0),
-        player_names[1]: (tile_w, 0),
-        player_names[2]: (tile_w * 2, 0),
-        player_names[3]: (0, tile_h),
-        player_names[4]: (tile_w, tile_h),
-    } if len(player_names) >= 5 else {}
+    layout = {p: (c * tile_w, r * tile_h) for i, p in enumerate(player_names) for r, c in [(i // 3, i % 3)]}
 
-    # --- FIX #1: Change the video codec to be compatible with Windows ---
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'mp4v' for better Windows compatibility
-    #fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, EXPECTED_VIDEO_FPS, (output_w, output_h))
     
     if not out.isOpened():
         print(f"Error: Could not open VideoWriter for output file '{output_path}'.", file=sys.stderr)
-        print("This may be due to an unsupported codec ('fourcc') on your system. Try 'avc1' or 'XVID' (with .avi).", file=sys.stderr)
         sys.exit(1)
 
     placeholder_dead = create_placeholder_frame(tile_w, tile_h, "PLAYER DEAD")
     placeholder_waiting = create_placeholder_frame(tile_w, tile_h, "WAITING TO START")
     placeholder_empty = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
 
-    # --- 2. Process Frame by Frame on Global Timeline ---
-    total_round_frames = (round_end - round_start + 1) // TICKS_PER_FRAME
-    print(f"   - Assembling video from global timeline: {round_start} -> {round_end} ({total_round_frames} frames)")
+    # MODIFICATION 2: Use effective_end_tick to determine the number of frames
+    total_round_frames = (effective_end_tick - round_start + 1) // TICKS_PER_FRAME
+    print(f"   - Assembling video from global timeline: {round_start} -> {effective_end_tick} ({total_round_frames} frames)")
 
     for frame_idx in range(total_round_frames):
         current_start_tick = round_start + (frame_idx * TICKS_PER_FRAME)
         final_frame = np.zeros((output_h, output_w, 3), dtype=np.uint8)
 
-        for i, name in enumerate(player_names):
-            # ... (the inner loop logic remains the same) ...
+        for name in player_names:
             pov_data = player_data[name]
             tile_frame = None
 
@@ -286,10 +258,9 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
                     string_idx_1 = tick_offset
                     string_idx_2 = tick_offset + 1
                     text_to_display = ""
-                    if string_idx_1 < len(pov_data['tick_strings']):
-                         text_to_display += pov_data['tick_strings'][string_idx_1]
-                    if string_idx_2 < len(pov_data['tick_strings']):
-                         text_to_display += "\n\n" + pov_data['tick_strings'][string_idx_2]
+                    if string_idx_1 < len(pov_data['tick_strings']): text_to_display += pov_data['tick_strings'][string_idx_1]
+                    if string_idx_2 < len(pov_data['tick_strings']): text_to_display += "\n\n" + pov_data['tick_strings'][string_idx_2]
+                    
                     y = TEXT_POSITION[1]
                     for line in text_to_display.split('\n'):
                         shadow_pos = (TEXT_POSITION[0] + 1, y + 1)
@@ -310,6 +281,7 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
                 final_frame[y:y+tile_h, x:x+tile_w] = tile_frame
         
         if len(player_names) == 5:
+            # Place empty tile in the last grid slot (bottom right)
             x, y = tile_w * 2, tile_h
             final_frame[y:y+tile_h, x:x+tile_w] = placeholder_empty
             
@@ -318,44 +290,39 @@ def create_compiled_video(output_path, player_data, round_start, round_end):
         if (frame_idx + 1) % 100 == 0:
             print(f"     Processed {frame_idx + 1}/{total_round_frames} composite frames...", end='\r')
 
-    # --- 3. Cleanup ---
     print(f"\n   - Successfully processed {total_round_frames} frames.")
-    for cap in captures.values():
-        cap.release()
+    for cap in captures.values(): cap.release()
     out.release()
-    # --- FIX #2: Remove the call to destroyAllWindows() for headless OpenCV ---
-    # cv2.destroyAllWindows()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Compiles multiple player POV videos for a specific round into a single, synchronized grid video.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description="Compiles multiple player POV videos for a specific round into a single, synchronized grid video.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--sql", required=True, help="Path to the input.db SQLite database file.")
     parser.add_argument("--data", required=True, help="Path to the folder containing the POV recordings.")
     parser.add_argument("--round", required=True, type=int, help="The round number to process.")
-    # --- FIX #3: Update choices to allow uppercase team names ---
     parser.add_argument("--team", required=True, choices=['ct', 't', 'CT', 'T'], help="The team to process (CT or T).")
     parser.add_argument("--out", required=True, help="Path for the final compiled output video file.")
     args = parser.parse_args()
 
-    # Standardize team name to uppercase for database queries
     team_for_query = args.team.upper()
 
-    # Step 1: Find and validate recordings for the specified round/team
+    # Step 1: Find and validate recordings
     recordings = get_round_recordings(args.sql, args.data, args.round, team_for_query)
     
-    # Step 1.5: Get the master timeline for the entire round
-    round_start_tick, round_end_tick = get_round_timeline(args.sql, args.round)
+    # Step 1.5: Get master timeline and calculate effective end tick
+    round_start_tick = get_round_start_tick(args.sql, args.round)
+    # MODIFICATION 2: Find the last tick any player is alive
+    effective_end_tick = max(rec['stoptick'] for rec in recordings)
     
-    # Step 2: Pre-fetch and prepare all necessary player data and tick strings
+    # Step 2: Pre-fetch and prepare all player data
     all_player_data = fetch_and_prepare_all_player_data(args.sql, recordings)
 
-    # Step 3: Process all videos and composite them into the final output
-    create_compiled_video(args.out, all_player_data, round_start_tick, round_end_tick)
+    # Step 3: Process videos using the effective timeline
+    # MODIFICATION 2: Pass the new end tick to the function
+    create_compiled_video(args.out, all_player_data, round_start_tick, effective_end_tick)
 
     print(f"\nScript finished successfully! Output saved to: {args.out}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
