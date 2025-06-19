@@ -10,3 +10,4 @@ libs/__pycache__/**/ */
 .DS_Store
 *.db
 *.mp4
+*.wav
