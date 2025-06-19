@@ -187,18 +187,30 @@ def fetch_and_prepare_all_player_data(db_path, recordings):
         if conn:
             conn.close()
 
-# MODIFICATION 1: Restored detailed data formatting
+# MODIFIED FUNCTION WITH ALL REQUESTED CHANGES
 def format_tick_data(row):
-    """Turns a database row into a detailed, multi-line string for display."""
-    keys = row['keyboard_input'] if row['keyboard_input'] else "None"
+    """
+    Turns a database row into a detailed, multi-line string for display.
+    Includes combined keyboard/buy inputs and high-precision position/mouse data.
+    """
+    # Combine keyboard and buy/sell inputs into a single string
+    inputs = []
+    if row['keyboard_input']:
+        inputs.append(row['keyboard_input'])
+    if row['buy_sell_input']:
+        inputs.append(row['buy_sell_input'])
     
+    input_str = ", ".join(inputs) if inputs else "None"
+
+    # Assemble the multi-line display string
     line1 = f"TICK: {row['tick']}"
     line2 = f"HP: {row['health']:<3} | ARMOR: {row['armor']:<3} | ${row['money']}"
     line3 = f"WEAPON: {row['active_weapon']}"
-    line4 = f"POS: ({row['position_x']:.0f}, {row['position_y']:.0f}, {row['position_z']:.0f})"
-    line5 = f"KEYS: {keys}"
+    line4 = f"POS: ({row['position_x']:.3f}, {row['position_y']:.3f}, {row['position_z']:.3f})"
+    line5 = f"INPUT: {input_str} | MOUSE: ({row['mouse_x']:.3f}, {row['mouse_y']:.3f})"
 
     return "\n".join([line1, line2, line3, line4, line5])
+
 
 def create_placeholder_frame(width, height, text):
     """Creates a black frame with centered text (e.g., 'PLAYER DEAD')."""
@@ -209,7 +221,6 @@ def create_placeholder_frame(width, height, text):
     cv2.putText(frame, text, (text_x, text_y), FONT, 0.8, (150, 150, 150), 2, cv2.LINE_AA)
     return frame
 
-# MODIFICATION 2: Function now accepts effective_end_tick
 def create_compiled_video(output_path, player_data, round_start, effective_end_tick):
     """Composites all videos into a single output file, stopping when all players are dead."""
     print("\n-> Step 3: Compositing videos into final output...")
@@ -239,7 +250,6 @@ def create_compiled_video(output_path, player_data, round_start, effective_end_t
     placeholder_waiting = create_placeholder_frame(tile_w, tile_h, "WAITING TO START")
     placeholder_empty = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
 
-    # MODIFICATION 2: Use effective_end_tick to determine the number of frames
     total_round_frames = (effective_end_tick - round_start + 1) // TICKS_PER_FRAME
     print(f"   - Assembling video from global timeline: {round_start} -> {effective_end_tick} ({total_round_frames} frames)")
 
@@ -281,7 +291,6 @@ def create_compiled_video(output_path, player_data, round_start, effective_end_t
                 final_frame[y:y+tile_h, x:x+tile_w] = tile_frame
         
         if len(player_names) == 5:
-            # Place empty tile in the last grid slot (bottom right)
             x, y = tile_w * 2, tile_h
             final_frame[y:y+tile_h, x:x+tile_w] = placeholder_empty
             
@@ -306,19 +315,13 @@ def main():
 
     team_for_query = args.team.upper()
 
-    # Step 1: Find and validate recordings
     recordings = get_round_recordings(args.sql, args.data, args.round, team_for_query)
     
-    # Step 1.5: Get master timeline and calculate effective end tick
     round_start_tick = get_round_start_tick(args.sql, args.round)
-    # MODIFICATION 2: Find the last tick any player is alive
     effective_end_tick = max(rec['stoptick'] for rec in recordings)
     
-    # Step 2: Pre-fetch and prepare all player data
     all_player_data = fetch_and_prepare_all_player_data(args.sql, recordings)
 
-    # Step 3: Process videos using the effective timeline
-    # MODIFICATION 2: Pass the new end tick to the function
     create_compiled_video(args.out, all_player_data, round_start_tick, effective_end_tick)
 
     print(f"\nScript finished successfully! Output saved to: {args.out}")
