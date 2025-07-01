@@ -38,7 +38,7 @@ MODEL_ZOO = {
 
 def benchmark_pytorch(model, dummy_input, precision):
     print(f"--- Benchmarking PyTorch ({precision}) ---")
-    NUM_WARMUP, NUM_TESTS = 20, 100
+    NUM_WARMUP, NUM_TESTS = 100, 300
     with torch.no_grad():
         for _ in range(NUM_WARMUP): _ = model(dummy_input)
     torch.cuda.synchronize()
@@ -50,7 +50,7 @@ def benchmark_pytorch(model, dummy_input, precision):
 
 def benchmark_tensorrt(engine_path, dummy_input, num_labels):
     print("--- Benchmarking TensorRT ---")
-    NUM_WARMUP, NUM_TESTS = 20, 100
+    NUM_WARMUP, NUM_TESTS = 100, 300
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         engine = runtime.deserialize_cuda_engine(f.read())
