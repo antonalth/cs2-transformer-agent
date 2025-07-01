@@ -20,7 +20,7 @@ TENSORRT_PYTHON_WHEEL_PATH = f"C:\\tools\\TensorRT-10.10.0.31\\python\\{TENSORRT
 
 # 5. LIST OF OTHER REQUIRED PACKAGES
 OTHER_PIP_PACKAGES = [
-    "transformers",
+    "transformers==4.41.2",
     "onnx",
     "onnxruntime-gpu",
     "tqdm"  # For progress bars
@@ -115,7 +115,7 @@ def verify_installation():
         command_to_run,
         "Verifying installation and available GPUs"
     )
-
+    
 def cleanup_environment():
     """Removes the conda environment."""
     print(f">>> Starting Environment Cleanup for '{ENV_NAME}' <<<")
