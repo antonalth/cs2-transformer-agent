@@ -58,7 +58,6 @@ def setup_environment():
         sys.exit(1)
 
     # 1. Create Conda environment if it doesn't exist
-    # Check if env exists to make script re-runnable after failure
     env_list_proc = subprocess.run("conda env list", shell=True, capture_output=True, text=True)
     if f"\n{ENV_NAME} " not in env_list_proc.stdout:
         run_command(
@@ -67,7 +66,6 @@ def setup_environment():
         )
     else:
         print(f"\n--- Conda environment '{ENV_NAME}' already exists. Skipping creation. ---")
-
 
     # 2. Install PyTorch with CUDA
     run_in_env(
@@ -85,19 +83,16 @@ def setup_environment():
     )
 
     # 4. Install local TensorRT wheel using a more robust method
-    # This avoids quoting issues by changing the directory first.
     tensorrt_dir = os.path.dirname(TENSORRT_PYTHON_WHEEL_PATH)
     tensorrt_filename = os.path.basename(TENSORRT_PYTHON_WHEEL_PATH)
-    # The command we want to run inside the environment
     pip_command_for_trt = f"pip install {tensorrt_filename}"
-    # The full command for conda to execute
     full_conda_command = f'conda run --cwd "{tensorrt_dir}" -n {ENV_NAME} {pip_command_for_trt}'
     run_command(
         full_conda_command,
         "Installing TensorRT Python bindings for Python 3.11"
     )
 
-    # 5. Verify installation
+    # 5. Basic Verification
     verify_command = "python -c \"import torch; import tensorrt; print('\\n--- Verification ---'); print('PyTorch version:', torch.__version__); print('TensorRT version:', tensorrt.__version__); print('CUDA available for PyTorch:', torch.cuda.is_available()); print('--------------------')\""
     run_in_env(
         ENV_NAME,
@@ -105,9 +100,43 @@ def setup_environment():
         "Verifying installation"
     )
 
+    # 6. Detailed GPU Verification
+    verify_gpu_details()
+
     print("\n\n--- SETUP COMPLETE ---")
     print(f"To activate your new environment, open a new terminal and run:")
     print(f"conda activate {ENV_NAME}")
+
+def verify_gpu_details():
+    """Runs a Python script inside the conda env to print detailed GPU info."""
+    # This Python script will be executed within the environment
+    python_script = """
+import torch
+print('\\n--- Detailed GPU Information ---')
+if not torch.cuda.is_available():
+    print('CUDA is not available. No GPUs were found by PyTorch.')
+else:
+    device_count = torch.cuda.device_count()
+    print(f'Found {device_count} CUDA-enabled GPU(s).')
+    for i in range(device_count):
+        print(f'\\n--- GPU {i} ---')
+        print(f'  Name:          {torch.cuda.get_device_name(i)}')
+        total_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+        print(f'  Total Memory:  {total_mem:.2f} GB')
+        major, minor = torch.cuda.get_device_capability(i)
+        print(f'  Compute Major: {major}')
+        print(f'  Compute Minor: {minor}')
+print('--------------------------------')
+"""
+    # Using 'python -c' to execute the script string
+    # We need to properly quote the script for the command line
+    command_to_run = f"python -c \"{python_script.replace('\"', '\\\"')}\""
+    run_in_env(
+        ENV_NAME,
+        command_to_run,
+        "Verifying available GPUs"
+    )
+
 
 def cleanup_environment():
     """Removes the conda environment."""
