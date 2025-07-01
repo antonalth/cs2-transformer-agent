@@ -22,6 +22,7 @@ TENSORRT_PYTHON_WHEEL_PATH = f"C:\\tools\\TensorRT-10.10.0.31\\python\\{TENSORRT
 OTHER_PIP_PACKAGES = [
     "transformers==4.41.2",
     "onnx",
+    "opencv-python",
     "onnxruntime-gpu",
     "tqdm"  # For progress bars
 ]
