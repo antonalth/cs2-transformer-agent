@@ -184,7 +184,7 @@ def main():
                           onnx_filename,
                           input_names=['input'],
                           output_names=['output'],
-                          opset_version=13, # A commonly supported version
+                          opset_version=17, # A commonly supported version
                           dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
         
         # 2. Build or Load TensorRT Engine
