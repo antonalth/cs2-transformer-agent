@@ -5,8 +5,8 @@ import time
 # --- Configuration ---
 MODEL_NAME = "google/vit-base-patch16-224-in21k"
 BATCH_SIZE = 1  # Simulate one frame at a time
-NUM_WARMUP = 20 # Number of initial runs to discard
-NUM_TESTS = 100 # Number of runs to average for the benchmark
+NUM_WARMUP = 100 # Number of initial runs to discard
+NUM_TESTS = 5000 # Number of runs to average for the benchmark
 
 # --- Setup ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
