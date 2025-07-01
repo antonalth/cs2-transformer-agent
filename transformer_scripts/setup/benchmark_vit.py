@@ -30,28 +30,40 @@ def benchmark_pytorch(model, dummy_input, precision):
     print(f"PyTorch Throughput: {fps:.2f} FPS")
     return fps
 
-def benchmark_tensorrt(engine_path, dummy_input, precision):
-    print(f"\n--- Benchmarking TensorRT ({precision}) ---")
+def benchmark_tensorrt(engine_path, dummy_input):
+    """Benchmarks the optimized TensorRT engine using the modern TensorRT API."""
+    print(f"\n--- Benchmarking TensorRT ---")
     NUM_WARMUP, NUM_TESTS = 20, 100
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         engine = runtime.deserialize_cuda_engine(f.read())
+
     with engine.create_execution_context() as context:
+        # Set the input shape for this specific execution context
         context.set_input_shape("input", dummy_input.shape)
-        output_shape = (dummy_input.shape[0], 1000)
+
+        # Allocate memory for inputs and outputs
+        # The output shape will depend on the model (classification head)
+        output_shape = (dummy_input.shape[0], 1000) # For standard ViT
         output = torch.empty(output_shape, dtype=dummy_input.dtype, device=dummy_input.device)
-        bindings = [None, None]
-        bindings[engine.get_binding_index("input")] = dummy_input.data_ptr()
-        bindings[engine.get_binding_index("output")] = output.data_ptr()
+
+        # --- Modern API for setting bindings ---
+        context.set_tensor_address("input", dummy_input.data_ptr())
+        context.set_tensor_address("output", output.data_ptr())
+        # --- End of modern API section ---
+
         stream = torch.cuda.current_stream().cuda_stream
+
         print(f"Running {NUM_WARMUP} warm-up iterations...")
-        for _ in range(NUM_WARMUP): context.execute_async_v2(bindings=bindings, stream_handle=stream)
+        for _ in range(NUM_WARMUP): context.execute_async_v3(stream_handle=stream)
         torch.cuda.synchronize()
+
         print(f"Running {NUM_TESTS} benchmark iterations...")
         start_time = time.perf_counter()
-        for _ in range(NUM_TESTS): context.execute_async_v2(bindings=bindings, stream_handle=stream)
+        for _ in range(NUM_TESTS): context.execute_async_v3(stream_handle=stream)
         torch.cuda.synchronize()
         end_time = time.perf_counter()
+
     total_time = end_time - start_time
     fps = NUM_TESTS / total_time
     print(f"TensorRT Average Latency: {(total_time / NUM_TESTS) * 1000:.3f} ms")
@@ -59,20 +71,17 @@ def benchmark_tensorrt(engine_path, dummy_input, precision):
     return fps
 
 def build_tensorrt_engine(onnx_path, engine_path, use_fp16, batch_size):
-    """Builds a TensorRT engine with the CORRECT order of operations."""
+    """Builds a TensorRT engine with the correct order of operations."""
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(TRT_LOGGER)
     config = builder.create_builder_config()
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, TRT_LOGGER)
-    
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30) # 1 GB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
     if use_fp16:
         print("Building engine with FP16 precision...")
         config.set_flag(trt.BuilderFlag.FP16)
 
-    # --- CORRECT ORDER ---
-    # 1. First, parse the ONNX file to populate the network.
     print(f"\nLoading ONNX file from: {onnx_path}")
     with open(onnx_path, "rb") as model:
         if not parser.parse(model.read()):
@@ -80,7 +89,6 @@ def build_tensorrt_engine(onnx_path, engine_path, use_fp16, batch_size):
             raise ValueError("Failed to parse the ONNX file.")
     print("ONNX file parsed successfully.")
 
-    # 2. Now that the network is populated, create the optimization profile.
     print("Creating optimization profile...")
     profile = builder.create_optimization_profile()
     input_tensor = network.get_input(0)
@@ -89,17 +97,13 @@ def build_tensorrt_engine(onnx_path, engine_path, use_fp16, batch_size):
     min_shape = (1, input_shape[1], input_shape[2], input_shape[3])
     opt_shape = (batch_size, input_shape[1], input_shape[2], input_shape[3])
     max_shape = (batch_size * 2, input_shape[1], input_shape[2], input_shape[3])
-    
     print(f"Defining profile for input '{input_name}': Min={min_shape}, Opt={opt_shape}, Max={max_shape}")
     profile.set_shape(input_name, min=min_shape, opt=opt_shape, max=max_shape)
     config.add_optimization_profile(profile)
 
-    # 3. Finally, build the engine with the populated network and the profile.
     print(f"\nBuilding TensorRT engine. This may take a few minutes...")
     serialized_engine = builder.build_serialized_network(network, config)
-    if serialized_engine is None:
-        raise RuntimeError("Failed to build the TensorRT engine.")
-        
+    if serialized_engine is None: raise RuntimeError("Failed to build the TensorRT engine.")
     print(f"Saving TensorRT engine to: {engine_path}")
     with open(engine_path, "wb") as f:
         f.write(serialized_engine)
@@ -142,8 +146,10 @@ def main():
         onnx_filename = f"vit-{model_size}-{precision}.onnx"
         engine_filename = f"vit-{model_size}-{precision}.engine"
         
-        print(f"\n--- Exporting to ONNX: {onnx_filename} ---")
-        torch.onnx.export(model, dummy_input, onnx_filename, input_names=['input'], output_names=['output'], opset_version=17, dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
+        # Don't re-export if ONNX file already exists and is fresh
+        if not os.path.exists(onnx_filename):
+            print(f"\n--- Exporting to ONNX: {onnx_filename} ---")
+            torch.onnx.export(model, dummy_input, onnx_filename, input_names=['input'], output_names=['output'], opset_version=17, dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
         
         if not os.path.exists(engine_filename):
             print(f"Engine file not found. Building a new one...")
@@ -151,7 +157,7 @@ def main():
         else:
             print(f"Found existing engine file: {engine_filename}. Loading it.")
         
-        tensorrt_fps = benchmark_tensorrt(engine_filename, dummy_input, precision)
+        tensorrt_fps = benchmark_tensorrt(engine_filename, dummy_input)
 
     print("\n\n--- BENCHMARK SUMMARY ---")
     print(f"Model: {model_name} @ {precision}, Batch Size: {args.batch_size}")
