@@ -12,7 +12,6 @@ ENV_NAME = "cs2_ai_env"
 PYTHON_VERSION = "3.11"
 
 # 3. PYTORCH INSTALLATION COMMAND for CUDA 12.x
-# Using 'pip' is standard inside a specific conda environment.
 PYTORCH_COMMAND = "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
 
 # 4. TENSORRT WHEEL FILE CONFIGURATION
@@ -44,7 +43,6 @@ def run_command(command, description):
 
 def run_in_env(env_name, command, description):
     """Runs a command inside the specified conda environment using 'conda run'."""
-    # This is a more robust method for scripting than 'conda activate'
     full_command = f"conda run -n {env_name} {command}"
     run_command(full_command, description)
 
@@ -59,11 +57,17 @@ def setup_environment():
         print(f"PATH: {TENSORRT_PYTHON_WHEEL_PATH}")
         sys.exit(1)
 
-    # 1. Create Conda environment
-    run_command(
-        f"conda create -n {ENV_NAME} python={PYTHON_VERSION} -y",
-        f"Creating Conda environment '{ENV_NAME}' with Python {PYTHON_VERSION}"
-    )
+    # 1. Create Conda environment if it doesn't exist
+    # Check if env exists to make script re-runnable after failure
+    env_list_proc = subprocess.run("conda env list", shell=True, capture_output=True, text=True)
+    if f"\n{ENV_NAME} " not in env_list_proc.stdout:
+        run_command(
+            f"conda create -n {ENV_NAME} python={PYTHON_VERSION} -y",
+            f"Creating Conda environment '{ENV_NAME}' with Python {PYTHON_VERSION}"
+        )
+    else:
+        print(f"\n--- Conda environment '{ENV_NAME}' already exists. Skipping creation. ---")
+
 
     # 2. Install PyTorch with CUDA
     run_in_env(
@@ -80,12 +84,16 @@ def setup_environment():
         "Installing other required packages (transformers, onnx, etc.)"
     )
 
-    # 4. Install local TensorRT wheel
-    # We need to wrap the path in extra quotes for conda run
-    tensorrt_install_command = f"pip install \\\"{TENSORRT_PYTHON_WHEEL_PATH}\\\""
-    run_in_env(
-        ENV_NAME,
-        tensorrt_install_command,
+    # 4. Install local TensorRT wheel using a more robust method
+    # This avoids quoting issues by changing the directory first.
+    tensorrt_dir = os.path.dirname(TENSORRT_PYTHON_WHEEL_PATH)
+    tensorrt_filename = os.path.basename(TENSORRT_PYTHON_WHEEL_PATH)
+    # The command we want to run inside the environment
+    pip_command_for_trt = f"pip install {tensorrt_filename}"
+    # The full command for conda to execute
+    full_conda_command = f'conda run --cwd "{tensorrt_dir}" -n {ENV_NAME} {pip_command_for_trt}'
+    run_command(
+        full_conda_command,
         "Installing TensorRT Python bindings for Python 3.11"
     )
 
