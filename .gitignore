@@ -11,3 +11,4 @@ libs/__pycache__/**/ */
 *.db
 *.mp4
 *.wav
+gemini.md
