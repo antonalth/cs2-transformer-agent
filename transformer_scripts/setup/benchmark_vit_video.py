@@ -40,17 +40,11 @@ def get_pytorch_prediction(model, image_tensor):
     return model.config.id2label[predicted_class_idx]
 
 def get_tensorrt_prediction(context, input_tensor, output_buffer, model_config):
-    # --- THIS IS THE FIX ---
-    # We must specify the shape for the context on every inference call
-    # when using dynamic shapes.
     context.set_input_shape("input", input_tensor.shape)
-    
     context.set_tensor_address("input", input_tensor.data_ptr())
     context.set_tensor_address("output", output_buffer.data_ptr())
-    
     context.execute_async_v3(stream_handle=torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
-    
     predicted_class_idx = output_buffer.argmax(-1).item()
     return model_config.id2label[predicted_class_idx]
 
@@ -60,15 +54,12 @@ def build_tensorrt_engine(onnx_path, engine_path, use_fp16, batch_size):
     config = builder.create_builder_config()
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, TRT_LOGGER)
-    
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
     if use_fp16: config.set_flag(trt.BuilderFlag.FP16)
-        
     with open(onnx_path, "rb") as model:
         if not parser.parse(model.read()):
             for error in range(parser.num_errors): print(parser.get_error(error))
             raise ValueError("Failed to parse the ONNX file.")
-            
     profile = builder.create_optimization_profile()
     input_tensor = network.get_input(0)
     min_shape = (1, 3, input_tensor.shape[2], input_tensor.shape[3])
@@ -76,10 +67,8 @@ def build_tensorrt_engine(onnx_path, engine_path, use_fp16, batch_size):
     max_shape = (batch_size, 3, input_tensor.shape[2], input_tensor.shape[3])
     profile.set_shape(input_tensor.name, min=min_shape, opt=opt_shape, max=max_shape)
     config.add_optimization_profile(profile)
-    
     serialized_engine = builder.build_serialized_network(network, config)
     if serialized_engine is None: raise RuntimeError("Failed to build the TensorRT engine.")
-        
     with open(engine_path, "wb") as f: f.write(serialized_engine)
 
 
@@ -116,7 +105,7 @@ def main():
             dummy_input = torch.randn(1, 3, input_size, input_size, device=device)
             if use_fp16: dummy_input = dummy_input.half()
             print(f"Exporting to ONNX: {onnx_filename}")
-            torch.onnx.export(model, dummy_input, onnx_filename, input_names=['input'], output_names=['output'], opset_version=17, dynamic_axes={'input': {0: 'batch_size'}})
+            torch.onnx.export(model, dummy_input, onnx_filename, input_names=['input'], output_names=['output'], opset_version=17, dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
             print(f"Building TensorRT engine: {engine_filename}. This may take a while...")
             build_tensorrt_engine(onnx_filename, engine_filename, use_fp16, batch_size=1)
         
@@ -125,7 +114,12 @@ def main():
         with open(engine_filename, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
             tensorrt_engine = runtime.deserialize_cuda_engine(f.read())
         tensorrt_context = tensorrt_engine.create_execution_context()
-        tensorrt_output_buffer = torch.empty((1, 1000), dtype=torch.float16 if use_fp16 else torch.float32, device=device)
+
+        # --- THIS IS THE FIX ---
+        # Get the number of labels dynamically from the model's config
+        num_labels = model.config.num_labels
+        print(f"Model has {num_labels} output classes. Allocating output buffer accordingly.")
+        tensorrt_output_buffer = torch.empty((1, num_labels), dtype=torch.float16 if use_fp16 else torch.float32, device=device)
 
     cap = cv2.VideoCapture(args.input_video)
     if not cap.isOpened(): raise FileNotFoundError(f"Error: Could not open video file {args.input_video}")
