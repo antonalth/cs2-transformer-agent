@@ -1,6 +1,6 @@
 import torch
 import time
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
 def benchmark_recurrent_flashattention():
     # --- Configuration ---
@@ -42,10 +42,8 @@ def benchmark_recurrent_flashattention():
     
     # --- GPU Warmup ---
     print("Warming up GPU with recurrent steps...")
-    # The cache object is now managed by the model itself.
     past_key_values = None
     with torch.no_grad():
-        # The 'use_cache=True' is important to tell the model to return the cache object
         for _ in range(50):
             input_ids = torch.randint(0, config.vocab_size, (1, 1), device=device)
             model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
@@ -71,7 +69,6 @@ def benchmark_recurrent_flashattention():
             
             with torch.no_grad():
                 model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
-                # The crucial update step
                 past_key_values = model_output.past_key_values
                 
             torch.cuda.synchronize()
@@ -81,9 +78,16 @@ def benchmark_recurrent_flashattention():
 
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
         
-        # Safely get the sequence length from the new cache object
-        # The object has a .get_seq_length() method. The 'layer_idx=0' is arbitrary.
-        cache_seq_len = past_key_values.get_seq_length(layer_idx=0)
+        # --- THIS IS THE FIX ---
+        # Get sequence length from the legacy tuple format
+        # `past_key_values` is a tuple of layers
+        # `past_key_values[0]` is the tuple for the first layer (key, value)
+        # `past_key_values[0][0]` is the key tensor for the first layer
+        # Its shape is [batch, heads, seq_len, head_dim], so shape[2] is the length
+        if past_key_values:
+            cache_seq_len = past_key_values[0][0].shape[2]
+        else:
+            cache_seq_len = 0
         
         all_results.append((cache_seq_len, avg_latency))
 
@@ -103,7 +107,7 @@ if __name__ == "__main__":
             
             plt.figure(figsize=(10, 6))
             plt.plot(seq_lens, latencies, marker='o', linestyle='-')
-            plt.ylim(0, max(latencies) * 1.5 if max(latencies) > 0 else 10) 
+            plt.ylim(0, 35) # Set a fixed Y-axis limit to see stability clearly
             plt.axhline(y=33.33, color='r', linestyle='--', label='33.3ms Real-time Budget')
             plt.title('Recurrent FlashAttention-2 Latency vs. KV Cache Size')
             plt.xlabel('KV Cache Sequence Length (tokens)')
