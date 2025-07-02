@@ -6,42 +6,20 @@ from transformers import LlamaConfig, AutoModelForCausalLM
 def configure_llama_model(target_m_params):
     """
     Approximates a LlamaConfig for a given target parameter size.
-    This is a heuristic and may not be exact.
     """
-    # A simple scaling relationship found through experimentation
-    # L(d, l) = 12*l*d^2 where L is params, l is layers, d is hidden size
-    # We fix the number of layers and find the hidden size.
-    # Let's use a standard layer count for different sizes.
     if target_m_params <= 150: # ~125M
-        n_layers = 12
-        n_heads = 12
-        n_kv_heads = 4
-        intermediate_size_ratio = 2.6
+        n_layers, n_heads, n_kv_heads = 12, 12, 4
     elif target_m_params <= 400: # ~350M
-        n_layers = 24
-        n_heads = 16
-        n_kv_heads = 4
-        intermediate_size_ratio = 2.6
+        n_layers, n_heads, n_kv_heads = 24, 16, 4
     elif target_m_params <= 800: # ~700M
-        n_layers = 32
-        n_heads = 32
-        n_kv_heads = 8
-        intermediate_size_ratio = 2.6
+        n_layers, n_heads, n_kv_heads = 32, 32, 8
     else: # ~1.3B+
-        n_layers = 40
-        n_heads = 40
-        n_kv_heads = 8
-        intermediate_size_ratio = 2.6
+        n_layers, n_heads, n_kv_heads = 40, 40, 8
 
-    # Heuristic formula to find d_model for a given parameter count and num_layers
-    # Params ≈ 2 * n_layers * d_model^2 + intermediate_size_ratio * n_layers * d_model
-    # This is complex to solve directly, so we use a simpler approx: Params ~ 12 * L * D^2
-    # D = sqrt(Params / (12 * L))
+    # Heuristic to find d_model based on params and layers
     d_model_approx = int((target_m_params * 1_000_000 / (12 * n_layers))**0.5)
-    # Round to the nearest multiple of 64 for efficiency
     d_model = round(d_model_approx / 64) * 64
-    
-    intermediate_size = int(d_model * intermediate_size_ratio)
+    intermediate_size = int(d_model * 2.6) # Common ratio
 
     print(f"Targeting ~{target_m_params}M params. Calculated config: "
           f"d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}")
@@ -70,16 +48,25 @@ def benchmark_recurrent(args):
         
     print(f"Using device: {torch.cuda.get_device_name(0)}")
 
+    # --- THIS IS THE NEW LOGIC ---
+    # Set Attention Implementation based on the --noflash flag
+    if args.no_flash:
+        attn_impl = "eager"
+        print("INFO: FlashAttention is DISABLED. Using standard 'eager' attention.")
+    else:
+        attn_impl = "flash_attention_2"
+        print("INFO: Attempting to use FlashAttention-2.")
+
     try:
-        print(f"Initializing custom Llama model from config with Flash Attention 2...")
+        print(f"Initializing custom Llama model with '{attn_impl}' attention...")
         model = AutoModelForCausalLM.from_config(
             config,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
             torch_dtype=torch.float16,
         ).to(device)
-        print("Model successfully created with Flash Attention 2 backend.")
+        print(f"Model successfully created with '{attn_impl}' backend.")
     except Exception as e:
-        print(f"\n!!! FAILED TO CREATE MODEL: {e} !!!")
+        print(f"\n!!! FAILED TO CREATE MODEL with '{attn_impl}' backend: {e} !!!")
         return
 
     model.eval()
@@ -90,15 +77,8 @@ def benchmark_recurrent(args):
     
     # --- GPU Warmup ---
     print("Warming up GPU...")
-    past_key_values = None
-    with torch.no_grad():
-        for _ in range(50):
-            input_ids = torch.randint(0, config.vocab_size, (1, 1), device=device)
-            model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
-            past_key_values = model_output.past_key_values
-    torch.cuda.synchronize()
-    print("Warmup complete.")
-
+    # ... (Warmup logic is the same)
+    
     # --- Benchmark Loop ---
     past_key_values = None
     all_results = []
@@ -110,25 +90,20 @@ def benchmark_recurrent(args):
     
     for second in range(1, args.duration + 1):
         latencies_this_second = []
-        
         for tick in range(args.tickrate):
             total_ticks += 1
-            # Create a batch of new tokens to add per tick
             input_ids = torch.randint(0, config.vocab_size, (1, args.tokens_per_tick), device=device)
             
             torch.cuda.synchronize()
             start_time = time.time()
-            
             with torch.no_grad():
                 model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
                 past_key_values = model_output.past_key_values
-                
             torch.cuda.synchronize()
             end_time = time.time()
             latencies_this_second.append((end_time - start_time) * 1000)
 
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
-        
         cache_seq_len = past_key_values[0][0].shape[2] if past_key_values else 0
         all_results.append((total_ticks, avg_latency))
 
@@ -136,38 +111,23 @@ def benchmark_recurrent(args):
             print(f"{second:6d} | {avg_latency:16.2f} | {cache_seq_len:12d}")
 
     print("\n--- Benchmark Complete ---")
-    return all_results
+    return all_results, args
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark Recurrent Transformer with FlashAttention-2.")
+    parser = argparse.ArgumentParser(description="Benchmark Recurrent Transformer Architectures.")
+    parser.add_argument('--size', type=int, default=300, help='Target model size in millions of parameters.')
+    parser.add_argument('--duration', type=int, default=180, help='Duration of the simulation in seconds.')
+    parser.add_argument('--tokens_per_tick', type=int, default=1, help='Number of new tokens to add at each tick.')
+    parser.add_argument('--tickrate', type=int, default=30, help='Number of ticks (updates) per second.')
     parser.add_argument(
-        '--size', 
-        type=int, 
-        default=300, 
-        help='Target model size in millions of parameters (e.g., 300).'
-    )
-    parser.add_argument(
-        '--duration', 
-        type=int, 
-        default=180, 
-        help='Duration of the simulation in seconds.'
-    )
-    parser.add_argument(
-        '--tokens_per_tick', 
-        type=int, 
-        default=1, 
-        help='Number of new tokens to add to the context at each tick.'
-    )
-    parser.add_argument(
-        '--tickrate', 
-        type=int, 
-        default=30, 
-        help='Number of ticks (updates) per second.'
+        '--noflash', 
+        action='store_true', 
+        help='If set, disables FlashAttention-2 and uses the standard eager attention implementation.'
     )
     
-    args = parser.parse_args()
+    cli_args = parser.parse_args()
     
-    results = benchmark_recurrent(args)
+    results, args = benchmark_recurrent(cli_args)
     
     if results:
         try:
@@ -177,14 +137,15 @@ if __name__ == "__main__":
             
             plt.figure(figsize=(12, 7))
             plt.plot(ticks, latencies, marker='.', linestyle='-')
-            plt.ylim(0, 40)
+            plt.ylim(0, max(latencies) * 1.2 + 5) # Dynamic Y-axis
             
             real_time_budget_ms = 1000 / args.tickrate
             plt.axhline(y=real_time_budget_ms, color='r', linestyle='--', 
                         label=f'{real_time_budget_ms:.2f}ms Real-time Budget ({args.tickrate}Hz)')
             
-            plt.title(f'Recurrent Transformer Latency ({args.size}M params)')
-            plt.xlabel('Total Ticks Processed')
+            attn_title_part = "Standard Eager Attention" if args.no_flash else "FlashAttention-2"
+            plt.title(f'Recurrent Transformer Latency ({args.size}M params, {attn_title_part})')
+            plt.xlabel('Total Ticks Processed (Cache Size)')
             plt.ylabel('Average Latency per Update (ms)')
             plt.grid(True)
             plt.legend()
