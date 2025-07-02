@@ -19,7 +19,7 @@ def benchmark_long_context_recurrent():
     
     # Game Simulation Parameters
     TICKS_PER_SECOND = 30
-    MAX_GAME_SECONDS = 300
+    MAX_GAME_SECONDS = 1000
 
     # --- Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
