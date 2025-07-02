@@ -1,26 +1,67 @@
 import torch
-import torch.nn as nn
 import time
+import argparse
 from transformers import LlamaConfig, AutoModelForCausalLM
 
-def benchmark_long_context_recurrent():
-    # --- Configuration ---
-    # Define a custom Llama-style configuration for ~300M params and long context
+def configure_llama_model(target_m_params):
+    """
+    Approximates a LlamaConfig for a given target parameter size.
+    This is a heuristic and may not be exact.
+    """
+    # A simple scaling relationship found through experimentation
+    # L(d, l) = 12*l*d^2 where L is params, l is layers, d is hidden size
+    # We fix the number of layers and find the hidden size.
+    # Let's use a standard layer count for different sizes.
+    if target_m_params <= 150: # ~125M
+        n_layers = 12
+        n_heads = 12
+        n_kv_heads = 4
+        intermediate_size_ratio = 2.6
+    elif target_m_params <= 400: # ~350M
+        n_layers = 24
+        n_heads = 16
+        n_kv_heads = 4
+        intermediate_size_ratio = 2.6
+    elif target_m_params <= 800: # ~700M
+        n_layers = 32
+        n_heads = 32
+        n_kv_heads = 8
+        intermediate_size_ratio = 2.6
+    else: # ~1.3B+
+        n_layers = 40
+        n_heads = 40
+        n_kv_heads = 8
+        intermediate_size_ratio = 2.6
+
+    # Heuristic formula to find d_model for a given parameter count and num_layers
+    # Params ≈ 2 * n_layers * d_model^2 + intermediate_size_ratio * n_layers * d_model
+    # This is complex to solve directly, so we use a simpler approx: Params ~ 12 * L * D^2
+    # D = sqrt(Params / (12 * L))
+    d_model_approx = int((target_m_params * 1_000_000 / (12 * n_layers))**0.5)
+    # Round to the nearest multiple of 64 for efficiency
+    d_model = round(d_model_approx / 64) * 64
+    
+    intermediate_size = int(d_model * intermediate_size_ratio)
+
+    print(f"Targeting ~{target_m_params}M params. Calculated config: "
+          f"d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}")
+
     config = LlamaConfig(
         vocab_size=32000,
-        hidden_size=1024,
-        intermediate_size=2816, 
-        num_hidden_layers=24,   
-        num_attention_heads=16,
-        num_key_value_heads=4,  # Using Grouped-Query Attention (GQA) for efficiency
-        max_position_embeddings=8192, # CRUCIAL: Allows for >5400 token context
+        hidden_size=d_model,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=n_layers,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads,
+        max_position_embeddings=8192,
         rms_norm_eps=1e-5,
     )
-    
-    # Game Simulation Parameters
-    TICKS_PER_SECOND = 30
-    MAX_GAME_SECONDS = 1000
+    return config
 
+def benchmark_recurrent(args):
+    # --- Configuration ---
+    config = configure_llama_model(args.size)
+    
     # --- Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == 'cpu':
@@ -30,21 +71,15 @@ def benchmark_long_context_recurrent():
     print(f"Using device: {torch.cuda.get_device_name(0)}")
 
     try:
-        print("Initializing custom ~300M Llama model from config with Flash Attention 2...")
-        
-        # --- THIS IS THE FIX ---
-        # Use the `.from_config()` factory method to correctly apply attn_implementation
-        # to a randomly initialized model.
+        print(f"Initializing custom Llama model from config with Flash Attention 2...")
         model = AutoModelForCausalLM.from_config(
             config,
             attn_implementation="flash_attention_2",
-            torch_dtype=torch.float16, 
+            torch_dtype=torch.float16,
         ).to(device)
-        
         print("Model successfully created with Flash Attention 2 backend.")
     except Exception as e:
         print(f"\n!!! FAILED TO CREATE MODEL: {e} !!!")
-        print("Ensure your environment supports Flash Attention 2.")
         return
 
     model.eval()
@@ -64,18 +99,22 @@ def benchmark_long_context_recurrent():
     torch.cuda.synchronize()
     print("Warmup complete.")
 
-    # --- Benchmark Loop (Identical to before) ---
+    # --- Benchmark Loop ---
     past_key_values = None
     all_results = []
+    total_ticks = 0
     
-    print("Simulating game up to 5400 token context...")
-    print("Format: Second | Avg Latency (ms) | Cache Length")
+    print(f"Simulating game for {args.duration} seconds at {args.tickrate}Hz...")
+    print(f"Adding {args.tokens_per_tick} token(s) per tick.")
+    print("\nFormat: Second | Avg Latency (ms) | Cache Length")
     
-    for second in range(1, MAX_GAME_SECONDS + 1):
+    for second in range(1, args.duration + 1):
         latencies_this_second = []
         
-        for tick in range(TICKS_PER_SECOND):
-            input_ids = torch.randint(0, config.vocab_size, (1, 1), device=device)
+        for tick in range(args.tickrate):
+            total_ticks += 1
+            # Create a batch of new tokens to add per tick
+            input_ids = torch.randint(0, config.vocab_size, (1, args.tokens_per_tick), device=device)
             
             torch.cuda.synchronize()
             start_time = time.time()
@@ -90,12 +129,8 @@ def benchmark_long_context_recurrent():
 
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
         
-        if past_key_values:
-            cache_seq_len = past_key_values[0][0].shape[2]
-        else:
-            cache_seq_len = 0
-        
-        all_results.append((cache_seq_len, avg_latency))
+        cache_seq_len = past_key_values[0][0].shape[2] if past_key_values else 0
+        all_results.append((total_ticks, avg_latency))
 
         if second % 10 == 0 or second == 1:
             print(f"{second:6d} | {avg_latency:16.2f} | {cache_seq_len:12d}")
@@ -104,20 +139,52 @@ def benchmark_long_context_recurrent():
     return all_results
 
 if __name__ == "__main__":
-    results = benchmark_long_context_recurrent()
+    parser = argparse.ArgumentParser(description="Benchmark Recurrent Transformer with FlashAttention-2.")
+    parser.add_argument(
+        '--size', 
+        type=int, 
+        default=300, 
+        help='Target model size in millions of parameters (e.g., 300).'
+    )
+    parser.add_argument(
+        '--duration', 
+        type=int, 
+        default=180, 
+        help='Duration of the simulation in seconds.'
+    )
+    parser.add_argument(
+        '--tokens_per_tick', 
+        type=int, 
+        default=1, 
+        help='Number of new tokens to add to the context at each tick.'
+    )
+    parser.add_argument(
+        '--tickrate', 
+        type=int, 
+        default=30, 
+        help='Number of ticks (updates) per second.'
+    )
+    
+    args = parser.parse_args()
+    
+    results = benchmark_recurrent(args)
+    
     if results:
-        # Plotting code remains the same...
         try:
             import matplotlib.pyplot as plt
-            seq_lens = [r[0] for r in results]
+            ticks = [r[0] for r in results]
             latencies = [r[1] for r in results]
             
             plt.figure(figsize=(12, 7))
-            plt.plot(seq_lens, latencies, marker='.', linestyle='-')
+            plt.plot(ticks, latencies, marker='.', linestyle='-')
             plt.ylim(0, 40)
-            plt.axhline(y=33.33, color='r', linestyle='--', label='33.3ms Real-time Budget')
-            plt.title('Recurrent FlashAttention-2 Latency on Custom 300M Model')
-            plt.xlabel('KV Cache Sequence Length (tokens)')
+            
+            real_time_budget_ms = 1000 / args.tickrate
+            plt.axhline(y=real_time_budget_ms, color='r', linestyle='--', 
+                        label=f'{real_time_budget_ms:.2f}ms Real-time Budget ({args.tickrate}Hz)')
+            
+            plt.title(f'Recurrent Transformer Latency ({args.size}M params)')
+            plt.xlabel('Total Ticks Processed')
             plt.ylabel('Average Latency per Update (ms)')
             plt.grid(True)
             plt.legend()
