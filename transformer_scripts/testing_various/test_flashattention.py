@@ -50,7 +50,7 @@ def benchmark_recurrent(args):
 
     # --- THIS IS THE NEW LOGIC ---
     # Set Attention Implementation based on the --noflash flag
-    if args.no_flash:
+    if args.noflash:
         attn_impl = "eager"
         print("INFO: FlashAttention is DISABLED. Using standard 'eager' attention.")
     else:
@@ -143,7 +143,7 @@ if __name__ == "__main__":
             plt.axhline(y=real_time_budget_ms, color='r', linestyle='--', 
                         label=f'{real_time_budget_ms:.2f}ms Real-time Budget ({args.tickrate}Hz)')
             
-            attn_title_part = "Standard Eager Attention" if args.no_flash else "FlashAttention-2"
+            attn_title_part = "Standard Eager Attention" if args.noflash else "FlashAttention-2"
             plt.title(f'Recurrent Transformer Latency ({args.size}M params, {attn_title_part})')
             plt.xlabel('Total Ticks Processed (Cache Size)')
             plt.ylabel('Average Latency per Update (ms)')
