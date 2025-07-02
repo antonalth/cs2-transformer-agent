@@ -1,17 +1,16 @@
 import torch
 import torch.nn as nn
 import time
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig, AutoModelForCausalLM
 
 def benchmark_long_context_recurrent():
     # --- Configuration ---
-    # 1. Define a custom Llama-style configuration for ~300M params and long context
-    # We will verify the final parameter count after initialization.
+    # Define a custom Llama-style configuration for ~300M params and long context
     config = LlamaConfig(
         vocab_size=32000,
         hidden_size=1024,
-        intermediate_size=2816, # A common ratio for Llama-style models
-        num_hidden_layers=24,   # gpt2-medium has 24 layers with this hidden size
+        intermediate_size=2816, 
+        num_hidden_layers=24,   
         num_attention_heads=16,
         num_key_value_heads=4,  # Using Grouped-Query Attention (GQA) for efficiency
         max_position_embeddings=8192, # CRUCIAL: Allows for >5400 token context
@@ -20,9 +19,6 @@ def benchmark_long_context_recurrent():
     
     # Game Simulation Parameters
     TICKS_PER_SECOND = 30
-    # We will only run up to the max supported length to save time, 
-    # but could go to 180 seconds.
-    # 5400 tokens / 30 ticks/sec = 180 seconds
     MAX_GAME_SECONDS = 180
 
     # --- Setup ---
@@ -35,10 +31,15 @@ def benchmark_long_context_recurrent():
 
     try:
         print("Initializing custom ~300M Llama model from config with Flash Attention 2...")
-        # Create the model directly from the config object
-        # The weights will be random, which is fine for a latency benchmark.
-        model = LlamaForCausalLM(config, attn_implementation="flash_attention_2")
-        model = model.to(device).to(torch.float16) # Move to GPU and set precision
+        
+        # --- THIS IS THE FIX ---
+        # Use the `.from_config()` factory method to correctly apply attn_implementation
+        # to a randomly initialized model.
+        model = AutoModelForCausalLM.from_config(
+            config,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.float16, 
+        ).to(device)
         
         print("Model successfully created with Flash Attention 2 backend.")
     except Exception as e:
@@ -47,8 +48,8 @@ def benchmark_long_context_recurrent():
         return
 
     model.eval()
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameter count: {num_params / 1_000_000:.2f}M") # Verify the size
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameter count: {num_params / 1_000_000:.2f}M")
 
     print("\n--- Starting Benchmark ---")
     
@@ -63,7 +64,7 @@ def benchmark_long_context_recurrent():
     torch.cuda.synchronize()
     print("Warmup complete.")
 
-    # --- Benchmark Loop ---
+    # --- Benchmark Loop (Identical to before) ---
     past_key_values = None
     all_results = []
     
@@ -105,6 +106,7 @@ def benchmark_long_context_recurrent():
 if __name__ == "__main__":
     results = benchmark_long_context_recurrent()
     if results:
+        # Plotting code remains the same...
         try:
             import matplotlib.pyplot as plt
             seq_lens = [r[0] for r in results]
@@ -112,7 +114,7 @@ if __name__ == "__main__":
             
             plt.figure(figsize=(12, 7))
             plt.plot(seq_lens, latencies, marker='.', linestyle='-')
-            plt.ylim(0, 40) # Keep Y-axis fixed to see stability
+            plt.ylim(0, 40)
             plt.axhline(y=33.33, color='r', linestyle='--', label='33.3ms Real-time Budget')
             plt.title('Recurrent FlashAttention-2 Latency on Custom 300M Model')
             plt.xlabel('KV Cache Sequence Length (tokens)')
