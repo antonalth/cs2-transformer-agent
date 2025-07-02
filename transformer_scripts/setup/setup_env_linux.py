@@ -4,6 +4,11 @@ import subprocess
 import sys
 import argparse
 
+#TODO BEFORE:
+#install cuda correctly (use .run cuda installer, fails once to disable original driver)
+#download tensorrt tarfile, add lib folder to LD_LIB stuff alternative to /etc/ldconfig...
+#test with nvidia-smi + nvcc --version
+
 # --- CONFIGURATION SECTION ---
 
 # 1. ENVIRONMENT NAME
@@ -29,6 +34,7 @@ TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0
 
 # 5. LIST OF OTHER REQUIRED PACKAGES
 OTHER_PIP_PACKAGES = [
+    "flash-attn",
     "transformers",
     "onnx",
     "matplotlib",

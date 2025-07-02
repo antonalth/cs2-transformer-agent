@@ -4,7 +4,6 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 def benchmark_recurrent_flashattention():
     # --- Configuration ---
-    # We'll use a standard, well-supported model. gpt2-medium is ~355M params.
     MODEL_NAME = "gpt2-medium" 
     
     # Game Simulation Parameters
@@ -21,8 +20,6 @@ def benchmark_recurrent_flashattention():
 
     try:
         print(f"Attempting to load '{MODEL_NAME}' with Flash Attention 2...")
-        # This is the key step. If Flash Attention 2 is not available in the
-        # environment, this line will raise an error.
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.float16,
@@ -32,8 +29,6 @@ def benchmark_recurrent_flashattention():
     except Exception as e:
         print("\n-------------------------------------------------------------")
         print("!!! FAILED TO LOAD MODEL WITH FLASH ATTENTION 2 !!!")
-        print("Your environment may not be set up correctly.")
-        print("Please ensure you have a compatible GPU, PyTorch version, and CUDA version.")
         print(f"Error: {e}")
         print("-------------------------------------------------------------")
         return
@@ -47,16 +42,19 @@ def benchmark_recurrent_flashattention():
     
     # --- GPU Warmup ---
     print("Warming up GPU with recurrent steps...")
-    kv_cache = None
+    # The cache object is now managed by the model itself.
+    past_key_values = None
     with torch.no_grad():
+        # The 'use_cache=True' is important to tell the model to return the cache object
         for _ in range(50):
             input_ids = torch.randint(0, config.vocab_size, (1, 1), device=device)
-            _, kv_cache = model(input_ids, past_key_values=kv_cache)
+            model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = model_output.past_key_values
     torch.cuda.synchronize()
     print("Warmup complete.")
 
     # --- Benchmark Loop ---
-    kv_cache = None
+    past_key_values = None
     all_results = []
     
     print("Simulating game...")
@@ -65,28 +63,28 @@ def benchmark_recurrent_flashattention():
     for second in range(1, MAX_GAME_SECONDS + 1):
         latencies_this_second = []
         
-        # This inner loop simulates the 30Hz updates
         for tick in range(TICKS_PER_SECOND):
-            # The input is always just ONE new token
             input_ids = torch.randint(0, config.vocab_size, (1, 1), device=device)
             
-            # --- Time the SINGLE recurrent step ---
             torch.cuda.synchronize()
             start_time = time.time()
             
             with torch.no_grad():
-                # The model processes one token and uses/updates the KV cache
-                _, kv_cache = model(input_ids, past_key_values=kv_cache)
+                model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
+                # The crucial update step
+                past_key_values = model_output.past_key_values
                 
             torch.cuda.synchronize()
             end_time = time.time()
-            # --- End timing ---
 
             latencies_this_second.append((end_time - start_time) * 1000)
 
-        # Calculate stats for the second
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
-        cache_seq_len = kv_cache[0][0].shape[2] # Get sequence length from the cache tensor
+        
+        # Safely get the sequence length from the new cache object
+        # The object has a .get_seq_length() method. The 'layer_idx=0' is arbitrary.
+        cache_seq_len = past_key_values.get_seq_length(layer_idx=0)
+        
         all_results.append((cache_seq_len, avg_latency))
 
         if second % 10 == 0 or second == 1:
@@ -105,8 +103,7 @@ if __name__ == "__main__":
             
             plt.figure(figsize=(10, 6))
             plt.plot(seq_lens, latencies, marker='o', linestyle='-')
-            # Set a more appropriate Y-axis limit to see the stability
-            plt.ylim(0, max(latencies) * 1.5) 
+            plt.ylim(0, max(latencies) * 1.5 if max(latencies) > 0 else 10) 
             plt.axhline(y=33.33, color='r', linestyle='--', label='33.3ms Real-time Budget')
             plt.title('Recurrent FlashAttention-2 Latency vs. KV Cache Size')
             plt.xlabel('KV Cache Sequence Length (tokens)')
