@@ -6,7 +6,7 @@ import argparse
 
 #TODO BEFORE:
 #install cuda correctly (use .run cuda installer, fails once to disable original driver)
-#download tensorrt tarfile, add lib folder to LD_LIB stuff alternative to /etc/ldconfig...
+#download tensorrt tarfile, add lib folder to LD_LIB local variable
 #test with nvidia-smi + nvcc --version
 
 # --- CONFIGURATION SECTION ---
