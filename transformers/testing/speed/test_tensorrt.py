@@ -207,13 +207,13 @@ def benchmark_tensorrt(args, config, model):
             )
             past_len = max(1, cache_len)
 
-            # Set dynamic shapes for each binding by index
-            # input_ids is binding 0
-            context.set_binding_shape(0, input_ids.shape)
+                        # Set dynamic shapes for each input
+            context.set_input_shape("input_ids", input_ids.shape)
             for i in range(len(past_buffers)):
-                bind_idx = engine.get_binding_index(f"past_key_values.{i}")
-                context.set_binding_shape(bind_idx, (1, config.num_key_value_heads, past_len, config.hidden_size // config.num_attention_heads))
-            assert context.all_binding_shapes_specified, "Some dynamic shapes are unset!"
+                context.set_input_shape(
+                    f"past_key_values.{i}",
+                    (1, config.num_key_value_heads, past_len, config.hidden_size // config.num_attention_heads)
+                )
 
             context.set_tensor_address("input_ids", input_ids.data_ptr())
 
