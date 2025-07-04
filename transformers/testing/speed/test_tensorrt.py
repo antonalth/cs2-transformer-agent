@@ -2,9 +2,9 @@
 #
 #  Production-Grade Autoregressive Transformer Benchmarking Tool
 #
-#  Final, fully verified version with all API updates and bug fixes for modern
-#  `transformers` and `tensorrt` libraries, including support for
-#  variable-sized input token chunks.
+#  This version builds a highly specialized TensorRT engine for a *fixed*
+#  number of input tokens (`tokens_per_tick`), ensuring maximum optimization
+#  for a specific workload by removing dynamic shape overhead.
 #
 # ==============================================================================
 
@@ -68,23 +68,38 @@ class LlamaOnnxWrapper(torch.nn.Module):
         present_key_values = tuple(item for sublist in present_cache_obj.to_legacy_cache() for item in sublist)
         return (logits,) + present_key_values
 
-def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
-    """Builds a TensorRT engine using the modern, robust API."""
-    print("Building TensorRT engine. This may take a few minutes..."); onnx_model = LlamaOnnxWrapper(model)
+def build_tensorrt_engine(model, llama_config, onnx_path, engine_path, tokens_per_tick):
+    """Builds a TensorRT engine for a *fixed* input size."""
+    # Force delete existing engine file to ensure a fresh build for the specific settings
+    try:
+        os.remove(engine_path)
+        print(f"Removed existing engine file: {engine_path}")
+    except FileNotFoundError:
+        pass # No file to remove, which is fine
+
+    print(f"Building TensorRT engine for fixed tokens_per_tick={tokens_per_tick}...")
+    onnx_model = LlamaOnnxWrapper(model)
     print(f"Exporting model to ONNX at {onnx_path}...")
-    batch_size, sequence_length, past_sequence_length = 1, 1, 1
-    input_ids = torch.ones((batch_size, sequence_length), dtype=torch.int64).cuda()
+    batch_size, past_sequence_length = 1, 1
+    
+    # Use the exact tokens_per_tick for the dummy input shape
+    input_ids = torch.ones((batch_size, tokens_per_tick), dtype=torch.int64).cuda()
+
     past_key_values_dummy = []
     for _ in range(llama_config.num_hidden_layers):
         shape = (batch_size, llama_config.num_key_value_heads, past_sequence_length, llama_config.hidden_size // llama_config.num_attention_heads)
         past_key_values_dummy.extend([torch.zeros(shape, dtype=torch.float16).cuda()] * 2)
+    
     onnx_args = (input_ids, *past_key_values_dummy)
     input_names = ["input_ids"] + [f"past_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
     output_names = ["logits"] + [f"present_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
-    dynamic_axes = {'input_ids': {0: 'batch_size', 1: 'sequence_length'}}
+    
+    # Define dynamic axes only for the parts that still change: batch and cache length
+    dynamic_axes = {'input_ids': {0: 'batch_size'}, 'logits': {0: 'batch_size'}}
     for i in range(llama_config.num_hidden_layers * 2):
         dynamic_axes[f"past_key_values.{i}"] = {0: 'batch_size', 2: 'past_sequence_length'}
         dynamic_axes[f"present_key_values.{i}"] = {0: 'batch_size', 2: 'total_sequence_length'}
+        
     with torch.no_grad():
         torch.onnx.export(onnx_model, onnx_args, onnx_path, input_names=input_names, output_names=output_names,
                           dynamic_axes=dynamic_axes, opset_version=17, export_params=True)
@@ -95,21 +110,26 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
     builder_config = builder.create_builder_config()
     builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024) # 2GB
     builder_config.set_flag(trt.BuilderFlag.FP16)
+    
     print(f"Parsing ONNX model from {onnx_path}...")
     with open(onnx_path, 'rb') as model_file:
         if not parser.parse(model_file.read()):
             print("ERROR: Failed to parse the ONNX file."); [print(parser.get_error(i)) for i in range(parser.num_errors)]; return None
     print("ONNX parsing complete.")
+    
     profile = builder.create_optimization_profile()
     max_context = llama_config.max_position_embeddings
     
-    profile.set_shape("input_ids", min=(1, 1), opt=(1, 1), max=(1, 64))
+    # FIX: Set a static, fixed shape for the input_ids based on the argument
+    profile.set_shape("input_ids", min=(1, tokens_per_tick), opt=(1, tokens_per_tick), max=(1, tokens_per_tick))
     
+    # The KV cache remains dynamic in length
     kv_shape = (batch_size, llama_config.num_key_value_heads, 1, llama_config.hidden_size // llama_config.num_attention_heads)
     for i in range(llama_config.num_hidden_layers * 2):
         profile.set_shape(f"past_key_values.{i}", min=(kv_shape[0], kv_shape[1], 1, kv_shape[3]),
                           opt=(kv_shape[0], kv_shape[1], 512, kv_shape[3]),
                           max=(kv_shape[0], kv_shape[1], max_context - 1, kv_shape[3]))
+                          
     builder_config.add_optimization_profile(profile)
     print("Building serialized TensorRT engine...");
     serialized_engine = builder.build_serialized_network(network, builder_config)
@@ -118,21 +138,21 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
     print(f"TensorRT engine saved to {engine_path}"); return engine_path
 
 def benchmark_tensorrt(args, config, model):
-    """Runs the benchmark using a compiled TensorRT engine and the modern name-based API."""
-    engine_path = f"model_{args.size}M.engine"; onnx_path = f"model_{args.size}M.onnx"
-    # Rebuild engine if it doesn't exist. Crucially, if you change args like tokens_per_tick,
-    # you must manually delete the old .engine file to trigger a rebuild.
-    if not os.path.exists(engine_path):
-        build_tensorrt_engine(model, config, onnx_path, engine_path)
+    """Runs the benchmark using a compiled TensorRT engine."""
+    # Create a filename specific to the input token count
+    engine_path = f"model_{args.size}M_t{args.tokens_per_tick}.engine"
+    onnx_path = f"model_{args.size}M_t{args.tokens_per_tick}.onnx"
     
-    print("\n--- Loading and Benchmarking TensorRT Engine ---")
+    # Always rebuild the engine for the specific `tokens_per_tick` to ensure max optimization
+    build_tensorrt_engine(model, config, onnx_path, engine_path, args.tokens_per_tick)
+    
+    print(f"\n--- Loading and Benchmarking TensorRT Engine for t={args.tokens_per_tick} ---")
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         engine = runtime.deserialize_cuda_engine(f.read())
 
     context = engine.create_execution_context()
     device = torch.device("cuda")
-    # Using a non-default stream is a best practice for performance, as noted by the TRT warning
     stream = torch.cuda.Stream()
 
     max_context, batch_size = config.max_position_embeddings, 1
@@ -140,6 +160,8 @@ def benchmark_tensorrt(args, config, model):
     for i in range(config.num_hidden_layers * 2):
         shape = (batch_size, config.num_key_value_heads, max_context, config.hidden_size // config.num_attention_heads)
         kv_cache_buffers.append(torch.zeros(shape, dtype=torch.float16, device=device))
+    
+    # The logits buffer size is now fixed based on the arg
     logits_buffer = torch.empty((batch_size, args.tokens_per_tick, config.vocab_size), dtype=torch.float16, device=device)
 
     for i in range(len(kv_cache_buffers)):
