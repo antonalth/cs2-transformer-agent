@@ -171,7 +171,7 @@ def benchmark_tensorrt(args, config, model):
             start_event.record(stream)
             context.execute_async_v3(stream_handle=stream.cuda_stream)
             end_event.record(stream)
-            stream.synchronize()
+            stream.synchronize() # This prevents the race condition
             
             latencies_this_second.append(start_event.elapsed_time(end_event))
             current_cache_len += args.tokens_per_tick
