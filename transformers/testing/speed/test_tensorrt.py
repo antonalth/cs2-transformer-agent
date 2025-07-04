@@ -2,11 +2,9 @@
 #
 #  Production-Grade Autoregressive Transformer Benchmarking Tool
 #
-#  This script provides a comprehensive framework for benchmarking the latency
-#  of modern transformer architectures in a real-time, recurrent setting.
-#
 #  Final, fully verified version with all API updates and bug fixes for modern
-#  `transformers` and `tensorrt` libraries.
+#  `transformers` and `tensorrt` libraries, including support for
+#  variable-sized input token chunks.
 #
 # ==============================================================================
 
@@ -83,10 +81,10 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
     onnx_args = (input_ids, *past_key_values_dummy)
     input_names = ["input_ids"] + [f"past_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
     output_names = ["logits"] + [f"present_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
-    dynamic_axes = {'input_ids': {1: 'sequence_length'}}
+    dynamic_axes = {'input_ids': {0: 'batch_size', 1: 'sequence_length'}}
     for i in range(llama_config.num_hidden_layers * 2):
-        dynamic_axes[f"past_key_values.{i}"] = {2: 'past_sequence_length'}
-        dynamic_axes[f"present_key_values.{i}"] = {2: 'total_sequence_length'}
+        dynamic_axes[f"past_key_values.{i}"] = {0: 'batch_size', 2: 'past_sequence_length'}
+        dynamic_axes[f"present_key_values.{i}"] = {0: 'batch_size', 2: 'total_sequence_length'}
     with torch.no_grad():
         torch.onnx.export(onnx_model, onnx_args, onnx_path, input_names=input_names, output_names=output_names,
                           dynamic_axes=dynamic_axes, opset_version=17, export_params=True)
@@ -104,7 +102,10 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
     print("ONNX parsing complete.")
     profile = builder.create_optimization_profile()
     max_context = llama_config.max_position_embeddings
-    profile.set_shape("input_ids", (1, 1), (1, 1), (1, 1))
+    
+    # *** FIX: Allow the input sequence length to be dynamic to support tokens_per_tick > 1 ***
+    profile.set_shape("input_ids", min=(1, 1), opt=(1, 8), max=(1, 64))
+    
     kv_shape = (batch_size, llama_config.num_key_value_heads, 1, llama_config.hidden_size // llama_config.num_attention_heads)
     for i in range(llama_config.num_hidden_layers * 2):
         profile.set_shape(f"past_key_values.{i}", min=(kv_shape[0], kv_shape[1], 1, kv_shape[3]),
@@ -120,7 +121,10 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
 def benchmark_tensorrt(args, config, model):
     """Runs the benchmark using a compiled TensorRT engine and the modern name-based API."""
     engine_path = f"model_{args.size}M.engine"; onnx_path = f"model_{args.size}M.onnx"
-    if not os.path.exists(engine_path): build_tensorrt_engine(model, config, onnx_path, engine_path)
+    # Rebuild engine if it doesn't exist. Crucially, if you change args like tokens_per_tick,
+    # you must manually delete the old .engine file to trigger a rebuild.
+    if not os.path.exists(engine_path):
+        build_tensorrt_engine(model, config, onnx_path, engine_path)
     
     print("\n--- Loading and Benchmarking TensorRT Engine ---")
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
@@ -129,14 +133,15 @@ def benchmark_tensorrt(args, config, model):
 
     context = engine.create_execution_context()
     device = torch.device("cuda")
-    stream = torch.cuda.current_stream().cuda_stream
+    # Using a non-default stream is a best practice for performance, as noted by the TRT warning
+    stream = torch.cuda.Stream()
 
     max_context, batch_size = config.max_position_embeddings, 1
     kv_cache_buffers = []
     for i in range(config.num_hidden_layers * 2):
         shape = (batch_size, config.num_key_value_heads, max_context, config.hidden_size // config.num_attention_heads)
         kv_cache_buffers.append(torch.zeros(shape, dtype=torch.float16, device=device))
-    logits_buffer = torch.empty((batch_size, 1, config.vocab_size), dtype=torch.float16, device=device)
+    logits_buffer = torch.empty((batch_size, args.tokens_per_tick, config.vocab_size), dtype=torch.float16, device=device)
 
     for i in range(len(kv_cache_buffers)):
         context.set_tensor_address(f"past_key_values.{i}", kv_cache_buffers[i].data_ptr())
@@ -160,9 +165,11 @@ def benchmark_tensorrt(args, config, model):
             
             context.set_tensor_address("input_ids", input_ids.data_ptr())
 
-            torch.cuda.synchronize(); start_time = time.time()
-            context.execute_async_v3(stream_handle=stream)
-            torch.cuda.synchronize(); end_time = time.time()
+            with torch.cuda.stream(stream):
+                start_time = time.time()
+                context.execute_async_v3(stream_handle=stream.cuda_stream)
+                end_time = time.time()
+            stream.synchronize()
             
             latencies_this_second.append((end_time - start_time) * 1000)
             current_cache_len += args.tokens_per_tick
