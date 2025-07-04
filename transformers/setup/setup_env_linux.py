@@ -30,7 +30,9 @@ PYTORCH_COMMAND = "pip3 install torch==2.7.1 torchvision torchaudio --index-url 
 #       Its name will be similar to 'tensorrt-10.x.y.z-cp311-none-linux_x86_64.whl'.
 #    d. UPDATE THE PATH BELOW to the full, absolute path of that .whl file.
 
-TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0.31-cp311-none-linux_x86_64.whl"
+# https://nvidia.github.io/TensorRT-LLM/installation/linux.html
+
+TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0.31-cp312-none-linux_x86_64.whl"
 
 # 5. LIST OF OTHER REQUIRED PACKAGES
 OTHER_PIP_PACKAGES = [
