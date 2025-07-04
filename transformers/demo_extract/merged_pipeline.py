@@ -334,7 +334,7 @@ def merge_data(player_df: pd.DataFrame, rounds_df: pd.DataFrame, mouse_df: pd.Da
     mouse_map = {}
     if not mouse_df.empty:
         for r in mouse_df.itertuples(index=False):
-            mouse_map[(r.tick, r.player_name)] = (r.x, r.y)
+            mouse_map[(r.tick, r.name)] = (r.x, r.y)
     
     merged_df['mouse_x'] = merged_df.apply(lambda r: mouse_map.get((r.tick, r.playername), (None, None))[0], axis=1)
     merged_df['mouse_y'] = merged_df.apply(lambda r: mouse_map.get((r.tick, r.playername), (None, None))[1], axis=1)
