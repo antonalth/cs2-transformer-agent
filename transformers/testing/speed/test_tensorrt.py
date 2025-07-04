@@ -2,9 +2,8 @@
 #
 #  Production-Grade Autoregressive Transformer Benchmarking Tool
 #
-#  This version builds a highly specialized TensorRT engine for a *fixed*
-#  number of input tokens (`tokens_per_tick`), ensuring maximum optimization
-#  for a specific workload by removing dynamic shape overhead.
+#  Final, fully verified version with all API updates and bug fixes, including
+#  robust, race-condition-free CUDA synchronization and timing.
 #
 # ==============================================================================
 
@@ -70,36 +69,27 @@ class LlamaOnnxWrapper(torch.nn.Module):
 
 def build_tensorrt_engine(model, llama_config, onnx_path, engine_path, tokens_per_tick):
     """Builds a TensorRT engine for a *fixed* input size."""
-    # Force delete existing engine file to ensure a fresh build for the specific settings
     try:
         os.remove(engine_path)
         print(f"Removed existing engine file: {engine_path}")
     except FileNotFoundError:
-        pass # No file to remove, which is fine
-
+        pass
     print(f"Building TensorRT engine for fixed tokens_per_tick={tokens_per_tick}...")
     onnx_model = LlamaOnnxWrapper(model)
     print(f"Exporting model to ONNX at {onnx_path}...")
     batch_size, past_sequence_length = 1, 1
-    
-    # Use the exact tokens_per_tick for the dummy input shape
     input_ids = torch.ones((batch_size, tokens_per_tick), dtype=torch.int64).cuda()
-
     past_key_values_dummy = []
     for _ in range(llama_config.num_hidden_layers):
         shape = (batch_size, llama_config.num_key_value_heads, past_sequence_length, llama_config.hidden_size // llama_config.num_attention_heads)
         past_key_values_dummy.extend([torch.zeros(shape, dtype=torch.float16).cuda()] * 2)
-    
     onnx_args = (input_ids, *past_key_values_dummy)
     input_names = ["input_ids"] + [f"past_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
     output_names = ["logits"] + [f"present_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
-    
-    # Define dynamic axes only for the parts that still change: batch and cache length
     dynamic_axes = {'input_ids': {0: 'batch_size'}, 'logits': {0: 'batch_size'}}
     for i in range(llama_config.num_hidden_layers * 2):
         dynamic_axes[f"past_key_values.{i}"] = {0: 'batch_size', 2: 'past_sequence_length'}
         dynamic_axes[f"present_key_values.{i}"] = {0: 'batch_size', 2: 'total_sequence_length'}
-        
     with torch.no_grad():
         torch.onnx.export(onnx_model, onnx_args, onnx_path, input_names=input_names, output_names=output_names,
                           dynamic_axes=dynamic_axes, opset_version=17, export_params=True)
@@ -108,28 +98,21 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path, tokens_pe
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, TRT_LOGGER)
     builder_config = builder.create_builder_config()
-    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024) # 2GB
+    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024)
     builder_config.set_flag(trt.BuilderFlag.FP16)
-    
     print(f"Parsing ONNX model from {onnx_path}...")
     with open(onnx_path, 'rb') as model_file:
         if not parser.parse(model_file.read()):
             print("ERROR: Failed to parse the ONNX file."); [print(parser.get_error(i)) for i in range(parser.num_errors)]; return None
     print("ONNX parsing complete.")
-    
     profile = builder.create_optimization_profile()
     max_context = llama_config.max_position_embeddings
-    
-    # FIX: Set a static, fixed shape for the input_ids based on the argument
     profile.set_shape("input_ids", min=(1, tokens_per_tick), opt=(1, tokens_per_tick), max=(1, tokens_per_tick))
-    
-    # The KV cache remains dynamic in length
     kv_shape = (batch_size, llama_config.num_key_value_heads, 1, llama_config.hidden_size // llama_config.num_attention_heads)
     for i in range(llama_config.num_hidden_layers * 2):
         profile.set_shape(f"past_key_values.{i}", min=(kv_shape[0], kv_shape[1], 1, kv_shape[3]),
                           opt=(kv_shape[0], kv_shape[1], 512, kv_shape[3]),
                           max=(kv_shape[0], kv_shape[1], max_context - 1, kv_shape[3]))
-                          
     builder_config.add_optimization_profile(profile)
     print("Building serialized TensorRT engine...");
     serialized_engine = builder.build_serialized_network(network, builder_config)
@@ -138,12 +121,9 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path, tokens_pe
     print(f"TensorRT engine saved to {engine_path}"); return engine_path
 
 def benchmark_tensorrt(args, config, model):
-    """Runs the benchmark using a compiled TensorRT engine."""
-    # Create a filename specific to the input token count
+    """Runs the benchmark using a compiled TensorRT engine with robust synchronization."""
     engine_path = f"model_{args.size}M_t{args.tokens_per_tick}.engine"
     onnx_path = f"model_{args.size}M_t{args.tokens_per_tick}.onnx"
-    
-    # Always rebuild the engine for the specific `tokens_per_tick` to ensure max optimization
     build_tensorrt_engine(model, config, onnx_path, engine_path, args.tokens_per_tick)
     
     print(f"\n--- Loading and Benchmarking TensorRT Engine for t={args.tokens_per_tick} ---")
@@ -160,8 +140,6 @@ def benchmark_tensorrt(args, config, model):
     for i in range(config.num_hidden_layers * 2):
         shape = (batch_size, config.num_key_value_heads, max_context, config.hidden_size // config.num_attention_heads)
         kv_cache_buffers.append(torch.zeros(shape, dtype=torch.float16, device=device))
-    
-    # The logits buffer size is now fixed based on the arg
     logits_buffer = torch.empty((batch_size, args.tokens_per_tick, config.vocab_size), dtype=torch.float16, device=device)
 
     for i in range(len(kv_cache_buffers)):
@@ -170,6 +148,9 @@ def benchmark_tensorrt(args, config, model):
     context.set_tensor_address("logits", logits_buffer.data_ptr())
 
     all_results, total_ticks, current_cache_len = [], 0, 0
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
     print(f"Simulating for {args.duration} seconds at {args.tickrate}Hz...\nFormat: Second | Avg Latency (ms) | Cache Length")
 
     for second in range(1, args.duration + 1):
@@ -186,13 +167,13 @@ def benchmark_tensorrt(args, config, model):
             
             context.set_tensor_address("input_ids", input_ids.data_ptr())
 
-            with torch.cuda.stream(stream):
-                start_time = time.time()
-                context.execute_async_v3(stream_handle=stream.cuda_stream)
-                end_time = time.time()
+            # FIX: Use CUDA events for accurate and safe asynchronous timing
+            start_event.record(stream)
+            context.execute_async_v3(stream_handle=stream.cuda_stream)
+            end_event.record(stream)
             stream.synchronize()
             
-            latencies_this_second.append((end_time - start_time) * 1000)
+            latencies_this_second.append(start_event.elapsed_time(end_event))
             current_cache_len += args.tokens_per_tick
             
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
@@ -214,17 +195,21 @@ def benchmark_pytorch(args, config, model):
     torch.cuda.synchronize(); print("Warmup complete.")
     past_key_values = None; all_results, total_ticks = [], 0
     print(f"Simulating for {args.duration} seconds at {args.tickrate}Hz...\nFormat: Second | Avg Latency (ms) | Cache Length")
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     for second in range(1, args.duration + 1):
         latencies_this_second = []
         for tick in range(args.tickrate):
             total_ticks += 1
             input_ids = torch.randint(0, config.vocab_size, (1, args.tokens_per_tick), device=device)
-            torch.cuda.synchronize(); start_time = time.time()
+            
+            start_event.record()
             with torch.no_grad():
                 model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
                 past_key_values = model_output.past_key_values
-            torch.cuda.synchronize(); end_time = time.time()
-            latencies_this_second.append((end_time - start_time) * 1000)
+            end_event.record()
+            torch.cuda.synchronize()
+            latencies_this_second.append(start_event.elapsed_time(end_event))
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
         cache_seq_len = past_key_values.get_seq_length() if past_key_values else 0
         all_results.append((total_ticks, avg_latency))
