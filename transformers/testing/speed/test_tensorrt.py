@@ -103,8 +103,7 @@ def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
     profile = builder.create_optimization_profile()
     max_context = llama_config.max_position_embeddings
     
-    # *** FIX: Allow the input sequence length to be dynamic to support tokens_per_tick > 1 ***
-    profile.set_shape("input_ids", min=(1, 1), opt=(1, 8), max=(1, 64))
+    profile.set_shape("input_ids", min=(1, 1), opt=(1, 1), max=(1, 64))
     
     kv_shape = (batch_size, llama_config.num_key_value_heads, 1, llama_config.hidden_size // llama_config.num_attention_heads)
     for i in range(llama_config.num_hidden_layers * 2):
