@@ -7,12 +7,15 @@
 #  1. PyTorch Eager/SDPA/FlashAttention-2: Native PyTorch implementations.
 #  2. TensorRT: A fully compiled and optimized inference engine.
 #
+#  This version includes the necessary wrapper to correctly export modern
+#  transformers models with KV-caching to ONNX for TensorRT compilation.
+#
 #  Usage:
 #  # Benchmark FlashAttention-2
-#  python benchmark_poc.py --size 300 --attn flash
+#  python benchmark_final.py --size 300 --attn flash
 #
 #  # Build and benchmark a TensorRT engine for the same model
-#  python benchmark_poc.py --size 300 --attn tensorrt
+#  python benchmark_final.py --size 300 --attn tensorrt
 #
 # ==============================================================================
 
@@ -29,8 +32,7 @@ try:
 except ImportError:
     trt = None
 
-# --- Original Helper Functions (configure_llama_model, plot_results) ---
-# These are unchanged from your original script.
+# --- Helper Functions and Classes ---
 
 def configure_llama_model(target_m_params):
     """
@@ -99,12 +101,42 @@ def plot_results(results, args):
     plt.tight_layout()
     plt.show()
 
+class LlamaOnnxWrapper(torch.nn.Module):
+    """
+    A wrapper to prepare the Llama model for ONNX export.
+    It flattens the past_key_values input and output, and calls the
+    original model with keyword arguments to avoid positional argument confusion
+    that occurs during ONNX tracing.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
 
-# --- New TensorRT-specific Functions ---
+    def forward(self, input_ids, *past_key_values):
+        # Re-assemble the past_key_values tuple from the flat input list.
+        # The model expects a tuple of tuples: ((k1, v1), (k2, v2), ...)
+        pkv_tuples = tuple(past_key_values[i:i+2] for i in range(0, len(past_key_values), 2))
+
+        # Call the original model with explicit keyword arguments. This is the key fix.
+        model_outputs = self.model(
+            input_ids=input_ids,
+            past_key_values=pkv_tuples,
+            use_cache=True
+        )
+
+        # Flatten the output present_key_values for the ONNX graph.
+        logits = model_outputs.logits
+        present_key_values = tuple(item for sublist in model_outputs.past_key_values for item in sublist)
+        
+        # The final ONNX graph output must be a tuple containing logits and all present_kv tensors.
+        return (logits,) + present_key_values
 
 def build_tensorrt_engine(model, config, onnx_path, engine_path):
     """Builds and saves a TensorRT engine from a PyTorch model."""
     print("Building TensorRT engine. This may take a few minutes...")
+
+    # Use the ONNX wrapper to create a clear interface for the exporter
+    onnx_model = LlamaOnnxWrapper(model)
     
     # 1. Export to ONNX
     print(f"Exporting model to ONNX at {onnx_path}...")
@@ -112,34 +144,31 @@ def build_tensorrt_engine(model, config, onnx_path, engine_path):
     sequence_length = 1 # For single-token decoding
     past_sequence_length = 1 # Initial past length
 
-    # Dummy inputs for ONNX export
     input_ids = torch.ones((batch_size, sequence_length), dtype=torch.int64).cuda()
     
-    # Create dummy past_key_values matching the model's structure
-    past_key_values = []
+    # Create dummy past_key_values and flatten them for the wrapper's input
+    past_key_values_dummy = []
     for _ in range(config.num_hidden_layers):
         key = torch.zeros((batch_size, config.num_key_value_heads, past_sequence_length, config.hidden_size // config.num_attention_heads), dtype=torch.float16).cuda()
         value = torch.zeros((batch_size, config.num_key_value_heads, past_sequence_length, config.hidden_size // config.num_attention_heads), dtype=torch.float16).cuda()
-        past_key_values.append((key, value))
+        past_key_values_dummy.append(key)
+        past_key_values_dummy.append(value)
     
-    # Define input and output names for clarity
+    # The arguments tuple for the wrapper's forward method: input_ids followed by all K and V tensors
+    onnx_args = (input_ids, *past_key_values_dummy)
+
     input_names = ["input_ids"] + [f"past_key_values.{i}" for i in range(config.num_hidden_layers * 2)]
     output_names = ["logits"] + [f"present_key_values.{i}" for i in range(config.num_hidden_layers * 2)]
     
-    # Flatten the past_key_values for ONNX export
-    flat_past_key_values = [item for sublist in past_key_values for item in sublist]
-    
-    # Define dynamic axes for variable sequence lengths (CRITICAL for KV Cache)
     dynamic_axes = {'input_ids': {1: 'sequence_length'}}
     for i in range(config.num_hidden_layers * 2):
-        # The third dimension (index 2) is the sequence length of the cache
         dynamic_axes[f"past_key_values.{i}"] = {2: 'past_sequence_length'}
         dynamic_axes[f"present_key_values.{i}"] = {2: 'total_sequence_length'}
 
     with torch.no_grad():
         torch.onnx.export(
-            model,
-            (input_ids, tuple(past_key_values)),
+            onnx_model, # Use the wrapper model
+            onnx_args,  # Use the arguments tailored for the wrapper
             onnx_path,
             input_names=input_names,
             output_names=output_names,
@@ -166,26 +195,21 @@ def build_tensorrt_engine(model, config, onnx_path, engine_path):
 
     # 3. Configure the builder and create optimization profile
     builder_config = builder.create_builder_config()
-    builder_config.set_flag(trt.BuilderFlag.FP16) # Enable FP16 precision
-    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 * 1024 * 1024) # 4GB workspace
+    builder_config.set_flag(trt.BuilderFlag.FP16)
+    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 * 1024 * 1024)
 
     profile = builder.create_optimization_profile()
-    
-    # Define min, opt, and max shapes for dynamic inputs
-    # This tells TensorRT how to optimize for different KV cache sizes
     max_context = config.max_position_embeddings
     
-    profile.set_shape("input_ids", (1, 1), (1, 1), (1, 1)) # We always feed one new token
+    profile.set_shape("input_ids", (1, 1), (1, 1), (1, 1))
     
-    # Shape of one K or V tensor in the cache
     kv_shape = (batch_size, config.num_key_value_heads, 1, config.hidden_size // config.num_attention_heads)
-
     for i in range(config.num_hidden_layers * 2):
         profile.set_shape(
             f"past_key_values.{i}",
-            min=(kv_shape[0], kv_shape[1], 1, kv_shape[3]),             # Min: cache has 1 token
-            opt=(kv_shape[0], kv_shape[1], 512, kv_shape[3]),           # Opt: cache has 512 tokens
-            max=(kv_shape[0], kv_shape[1], max_context - 1, kv_shape[3])# Max: cache is full
+            min=(kv_shape[0], kv_shape[1], 1, kv_shape[3]),
+            opt=(kv_shape[0], kv_shape[1], 512, kv_shape[3]),
+            max=(kv_shape[0], kv_shape[1], max_context - 1, kv_shape[3])
         )
     builder_config.add_optimization_profile(profile)
 
@@ -218,53 +242,40 @@ def benchmark_tensorrt(args, config, model):
         engine = runtime.deserialize_cuda_engine(f.read())
 
     context = engine.create_execution_context()
-
-    # Allocate GPU buffers for inputs and outputs
     bindings = [None] * engine.num_bindings
     device = torch.device("cuda")
 
-    # We need to allocate buffers large enough for the MAXIMUM possible size
     max_context = config.max_position_embeddings
     batch_size = 1
     
-    # Prepare past_key_values buffers (these will be updated in the loop)
     past_key_values_trt = []
     for i in range(config.num_hidden_layers):
-        # Shape: [batch, num_kv_heads, max_seq_len, head_dim]
         key_shape = (batch_size, config.num_key_value_heads, max_context, config.hidden_size // config.num_attention_heads)
-        value_shape = key_shape
         past_key_values_trt.append(torch.zeros(key_shape, dtype=torch.float16, device=device))
-        past_key_values_trt.append(torch.zeros(value_shape, dtype=torch.float16, device=device))
+        past_key_values_trt.append(torch.zeros(key_shape, dtype=torch.float16, device=device))
 
-    # Output logits buffer
     logits_buffer = torch.empty((batch_size, 1, config.vocab_size), dtype=torch.float16, device=device)
 
-    # Set up bindings
-    # Order must match the ONNX export order: input_ids, past_kvs..., logits, present_kvs...
+    # Set up bindings (order must match ONNX export)
     binding_idx = 0
-    # Input bindings
-    context.set_binding_shape(binding_idx, (batch_size, 1)) # input_ids
-    bindings[binding_idx] = 0 # Placeholder, will be set in loop
+    context.set_binding_shape(binding_idx, (batch_size, 1))
+    bindings[binding_idx] = 0 # Placeholder for input_ids
     binding_idx += 1
     for i in range(len(past_key_values_trt)):
-        context.set_binding_shape(binding_idx, past_key_values_trt[i].shape) # Initially shape is max
+        context.set_binding_shape(binding_idx, past_key_values_trt[i].shape)
         bindings[binding_idx] = past_key_values_trt[i].data_ptr()
         binding_idx += 1
-    # Output bindings
     bindings[binding_idx] = logits_buffer.data_ptr()
     binding_idx += 1
-    # For outputs, the 'present' KV cache tensors will write back into our 'past' buffers
     for i in range(len(past_key_values_trt)):
         bindings[binding_idx] = past_key_values_trt[i].data_ptr()
         binding_idx += 1
     
     # --- Benchmark Loop ---
     all_results = []
-    total_ticks = 0
-    current_cache_len = 0
+    total_ticks, current_cache_len = 0, 0
     
-    print(f"Simulating game for {args.duration} seconds at {args.tickrate}Hz...")
-    print(f"Adding {args.tokens_per_tick} token(s) per tick.")
+    print(f"Simulating for {args.duration} seconds at {args.tickrate}Hz...")
     print("\nFormat: Second | Avg Latency (ms) | Cache Length")
 
     for second in range(1, args.duration + 1):
@@ -273,30 +284,21 @@ def benchmark_tensorrt(args, config, model):
             total_ticks += 1
             input_ids = torch.randint(0, config.vocab_size, (1, args.tokens_per_tick), device=device, dtype=torch.int64)
 
-            # Update context shapes for the current iteration
-            context.set_binding_shape(0, input_ids.shape) # input_ids
             bindings[0] = input_ids.data_ptr()
-            
-            # For the first token, past cache is size 0, but TRT needs a min size of 1.
-            # We handle this by setting the past shape to 1 and growing from there.
             past_len = max(1, current_cache_len)
 
-            for i in range(len(past_key_values_trt)):
-                # The shape of the PAST cache for this iteration
+            for i in range(config.num_hidden_layers * 2):
                 shape = list(past_key_values_trt[i].shape)
                 shape[2] = past_len
                 context.set_binding_shape(1 + i, tuple(shape))
 
-            # Precise timing
             torch.cuda.synchronize()
             start_time = time.time()
-            
-            context.execute_v2(bindings=bindings) # Run inference
-            
+            context.execute_v2(bindings=bindings)
             torch.cuda.synchronize()
             end_time = time.time()
-            latencies_this_second.append((end_time - start_time) * 1000)
             
+            latencies_this_second.append((end_time - start_time) * 1000)
             current_cache_len += args.tokens_per_tick
             
         avg_latency = sum(latencies_this_second) / len(latencies_this_second)
@@ -309,12 +311,11 @@ def benchmark_tensorrt(args, config, model):
     return all_results, args
 
 def benchmark_pytorch(args, config, model):
-    """Main function to run the benchmark for PyTorch backends."""
+    """Runs the benchmark for PyTorch backends."""
     model.eval()
     device = model.device
 
     print("\n--- Starting PyTorch Benchmark ---")
-    # --- GPU Warmup ---
     print("Warming up GPU...")
     past_key_values = None
     with torch.no_grad():
@@ -325,13 +326,10 @@ def benchmark_pytorch(args, config, model):
     torch.cuda.synchronize()
     print("Warmup complete.")
 
-    # --- Benchmark Loop ---
     past_key_values = None
-    all_results = []
-    total_ticks = 0
+    all_results, total_ticks = [], 0
     
-    print(f"Simulating game for {args.duration} seconds at {args.tickrate}Hz...")
-    print(f"Adding {args.tokens_per_tick} token(s) per tick.")
+    print(f"Simulating for {args.duration} seconds at {args.tickrate}Hz...")
     print("\nFormat: Second | Avg Latency (ms) | Cache Length")
     
     for second in range(1, args.duration + 1):
@@ -342,11 +340,9 @@ def benchmark_pytorch(args, config, model):
             
             torch.cuda.synchronize()
             start_time = time.time()
-            
             with torch.no_grad():
                 model_output = model(input_ids, past_key_values=past_key_values, use_cache=True)
                 past_key_values = model_output.past_key_values
-                
             torch.cuda.synchronize()
             end_time = time.time()
             latencies_this_second.append((end_time - start_time) * 1000)
@@ -362,31 +358,20 @@ def benchmark_pytorch(args, config, model):
     return all_results, args
 
 # --- Main Execution Logic ---
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark Recurrent Transformer Architectures.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--size', type=int, default=300, 
-                        help='Target model size in millions of parameters.')
-    parser.add_argument('--duration', type=int, default=180, 
-                        help='Duration of the simulation in seconds.')
-    parser.add_argument('--tokens_per_tick', type=int, default=1, 
-                        help='Number of new tokens to add at each tick.')
-    parser.add_argument('--tickrate', type=int, default=30, 
-                        help='Number of ticks (updates) per second.')
-    parser.add_argument(
-        '--attn', 
-        type=str, 
-        default='sdpa',
-        choices=['flash', 'sdpa', 'eager', 'tensorrt'],
-        help="The attention implementation to use: 'flash', 'sdpa', 'eager', or 'tensorrt'."
-    )
+    parser.add_argument('--size', type=int, default=300, help='Target model size in millions of parameters.')
+    parser.add_argument('--duration', type=int, default=180, help='Duration of the simulation in seconds.')
+    parser.add_argument('--tokens_per_tick', type=int, default=1, help='Number of new tokens to add at each tick.')
+    parser.add_argument('--tickrate', type=int, default=30, help='Number of ticks (updates) per second.')
+    parser.add_argument('--attn', type=str, default='sdpa', choices=['flash', 'sdpa', 'eager', 'tensorrt'],
+                        help="The implementation to use: 'flash', 'sdpa', 'eager', or 'tensorrt'.")
     
     cli_args = parser.parse_args()
 
-    # --- Common setup for all modes ---
     config = configure_llama_model(cli_args.size)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == 'cpu':
@@ -394,9 +379,9 @@ if __name__ == "__main__":
         exit()
     print(f"Using device: {torch.cuda.get_device_name(0)}")
 
-    # --- Create PyTorch model (needed for all backends, even TRT for the initial export) ---
+    # Use SDPA as the base model for TRT export, as it's a standard and reliable implementation.
     attn_impl_map = {'flash': 'flash_attention_2', 'sdpa': 'sdpa', 'eager': 'eager', 'tensorrt': 'sdpa'}
-    attn_impl = attn_impl_map[cli_args.attn] # Use SDPA as base for TRT export
+    attn_impl = attn_impl_map[cli_args.attn]
     print(f"INFO: Using '{attn_impl}' as the base PyTorch model implementation.")
 
     try:
@@ -415,21 +400,17 @@ if __name__ == "__main__":
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameter count: {num_params / 1_000_000:.2f}M")
 
-    # --- Route to the correct benchmark function ---
     results = None
     if cli_args.attn == 'tensorrt':
         if trt is None:
             print("\nERROR: TensorRT library not found. Cannot run --attn tensorrt.")
-            print("Please install it from NVIDIA's website or PyPI.")
             exit()
         results, args = benchmark_tensorrt(cli_args, config, model)
     else:
         results, args = benchmark_pytorch(cli_args, config, model)
 
-    # --- Plot results if successful ---
     if results:
         try:
-            import matplotlib.pyplot as plt
             plot_results(results, args)
         except ImportError:
             print("\nMatplotlib not found, skipping plot. To install: pip install matplotlib")
