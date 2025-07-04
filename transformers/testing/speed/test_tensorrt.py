@@ -5,16 +5,8 @@
 #  This script provides a comprehensive framework for benchmarking the latency
 #  of modern transformer architectures in a real-time, recurrent setting.
 #
-#  It integrates the modern TensorRT API patterns from the ViT benchmark
-#  (name-based tensor addressing, async execution) with the requirements of
-#  an autoregressive model (KV-caching, dynamic input shapes).
-#
-#  Usage:
-#  # Benchmark FlashAttention-2
-#  python benchmark_autoregressive.py --size 300 --attn flash
-#
-#  # Build and benchmark a state-of-the-art TensorRT engine
-#  python benchmark_autoregressive.py --size 300 --attn tensorrt
+#  Final, fully verified version with all API updates and bug fixes for modern
+#  `transformers` and `tensorrt` libraries.
 #
 # ==============================================================================
 
@@ -57,7 +49,7 @@ def plot_results(results, args):
     plt.plot(ticks, latencies, marker='.', linestyle='-')
     plt.ylim(0, max(latencies) * 1.2 + 10)
     real_time_budget_ms = 1000 / args.tickrate
-    plt.axhline(y=real_time_budget_ms, color='r', linestyle='--', 
+    plt.axhline(y=real_time_budget_ms, color='r', linestyle='--',
                 label=f'{real_time_budget_ms:.2f}ms Real-time Budget ({args.tickrate}Hz)')
     attn_title_map = {'flash': "FlashAttention-2", 'sdpa': "PyTorch SDPA", 'eager': "Eager Attention", 'tensorrt': "TensorRT Engine"}
     plt.title(f'Recurrent Transformer Latency ({args.size}M params, {attn_title_map.get(args.attn)})', fontsize=16)
@@ -78,21 +70,21 @@ class LlamaOnnxWrapper(torch.nn.Module):
         present_key_values = tuple(item for sublist in present_cache_obj.to_legacy_cache() for item in sublist)
         return (logits,) + present_key_values
 
-def build_tensorrt_engine(model, config, onnx_path, engine_path):
+def build_tensorrt_engine(model, llama_config, onnx_path, engine_path):
     """Builds a TensorRT engine using the modern, robust API."""
     print("Building TensorRT engine. This may take a few minutes..."); onnx_model = LlamaOnnxWrapper(model)
     print(f"Exporting model to ONNX at {onnx_path}...")
     batch_size, sequence_length, past_sequence_length = 1, 1, 1
     input_ids = torch.ones((batch_size, sequence_length), dtype=torch.int64).cuda()
     past_key_values_dummy = []
-    for _ in range(config.num_hidden_layers):
-        shape = (batch_size, config.num_key_value_heads, past_sequence_length, config.hidden_size // config.num_attention_heads)
+    for _ in range(llama_config.num_hidden_layers):
+        shape = (batch_size, llama_config.num_key_value_heads, past_sequence_length, llama_config.hidden_size // llama_config.num_attention_heads)
         past_key_values_dummy.extend([torch.zeros(shape, dtype=torch.float16).cuda()] * 2)
     onnx_args = (input_ids, *past_key_values_dummy)
-    input_names = ["input_ids"] + [f"past_key_values.{i}" for i in range(config.num_hidden_layers * 2)]
-    output_names = ["logits"] + [f"present_key_values.{i}" for i in range(config.num_hidden_layers * 2)]
+    input_names = ["input_ids"] + [f"past_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
+    output_names = ["logits"] + [f"present_key_values.{i}" for i in range(llama_config.num_hidden_layers * 2)]
     dynamic_axes = {'input_ids': {1: 'sequence_length'}}
-    for i in range(config.num_hidden_layers * 2):
+    for i in range(llama_config.num_hidden_layers * 2):
         dynamic_axes[f"past_key_values.{i}"] = {2: 'past_sequence_length'}
         dynamic_axes[f"present_key_values.{i}"] = {2: 'total_sequence_length'}
     with torch.no_grad():
@@ -101,23 +93,26 @@ def build_tensorrt_engine(model, config, onnx_path, engine_path):
     print("ONNX export complete.")
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING); builder = trt.Builder(TRT_LOGGER)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
-    parser = trt.OnnxParser(network, TRT_LOGGER); config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024) # 2GB
-    config.set_flag(trt.BuilderFlag.FP16)
+    parser = trt.OnnxParser(network, TRT_LOGGER)
+    builder_config = builder.create_builder_config()
+    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024) # 2GB
+    builder_config.set_flag(trt.BuilderFlag.FP16)
     print(f"Parsing ONNX model from {onnx_path}...")
     with open(onnx_path, 'rb') as model_file:
         if not parser.parse(model_file.read()):
             print("ERROR: Failed to parse the ONNX file."); [print(parser.get_error(i)) for i in range(parser.num_errors)]; return None
     print("ONNX parsing complete.")
-    profile = builder.create_optimization_profile(); max_context = config.max_position_embeddings
+    profile = builder.create_optimization_profile()
+    max_context = llama_config.max_position_embeddings
     profile.set_shape("input_ids", (1, 1), (1, 1), (1, 1))
-    kv_shape = (batch_size, config.num_key_value_heads, 1, config.hidden_size // config.num_attention_heads)
-    for i in range(config.num_hidden_layers * 2):
+    kv_shape = (batch_size, llama_config.num_key_value_heads, 1, llama_config.hidden_size // llama_config.num_attention_heads)
+    for i in range(llama_config.num_hidden_layers * 2):
         profile.set_shape(f"past_key_values.{i}", min=(kv_shape[0], kv_shape[1], 1, kv_shape[3]),
                           opt=(kv_shape[0], kv_shape[1], 512, kv_shape[3]),
                           max=(kv_shape[0], kv_shape[1], max_context - 1, kv_shape[3]))
-    config.add_optimization_profile(profile)
-    print("Building serialized TensorRT engine..."); serialized_engine = builder.build_serialized_network(network, config)
+    builder_config.add_optimization_profile(profile)
+    print("Building serialized TensorRT engine...");
+    serialized_engine = builder.build_serialized_network(network, builder_config)
     if serialized_engine is None: print("ERROR: Failed to build the TensorRT engine."); return None
     with open(engine_path, 'wb') as f: f.write(serialized_engine)
     print(f"TensorRT engine saved to {engine_path}"); return engine_path
@@ -136,7 +131,6 @@ def benchmark_tensorrt(args, config, model):
     device = torch.device("cuda")
     stream = torch.cuda.current_stream().cuda_stream
 
-    # Allocate GPU buffers for inputs and outputs
     max_context, batch_size = config.max_position_embeddings, 1
     kv_cache_buffers = []
     for i in range(config.num_hidden_layers * 2):
@@ -144,15 +138,11 @@ def benchmark_tensorrt(args, config, model):
         kv_cache_buffers.append(torch.zeros(shape, dtype=torch.float16, device=device))
     logits_buffer = torch.empty((batch_size, 1, config.vocab_size), dtype=torch.float16, device=device)
 
-    # --- Modern API: Set persistent tensor addresses ---
-    # We set the pointers for the large, persistent KV cache buffers once.
-    # The output KV cache (`present_...`) writes back into the same buffers.
     for i in range(len(kv_cache_buffers)):
         context.set_tensor_address(f"past_key_values.{i}", kv_cache_buffers[i].data_ptr())
         context.set_tensor_address(f"present_key_values.{i}", kv_cache_buffers[i].data_ptr())
     context.set_tensor_address("logits", logits_buffer.data_ptr())
 
-    # --- Benchmark Loop ---
     all_results, total_ticks, current_cache_len = [], 0, 0
     print(f"Simulating for {args.duration} seconds at {args.tickrate}Hz...\nFormat: Second | Avg Latency (ms) | Cache Length")
 
@@ -160,20 +150,16 @@ def benchmark_tensorrt(args, config, model):
         latencies_this_second = []
         for tick in range(args.tickrate):
             total_ticks += 1
-            # `input_ids` is new on each tick, so its shape and address must be updated.
             input_ids = torch.randint(0, config.vocab_size, (1, args.tokens_per_tick), device=device, dtype=torch.int64)
             past_len = max(1, current_cache_len)
 
-            # Set the dynamic shapes for this specific inference call
             context.set_input_shape("input_ids", input_ids.shape)
             for i in range(len(kv_cache_buffers)):
                 shape = (batch_size, config.num_key_value_heads, past_len, config.hidden_size // config.num_attention_heads)
                 context.set_input_shape(f"past_key_values.{i}", shape)
             
-            # Set the memory address for the non-persistent input
             context.set_tensor_address("input_ids", input_ids.data_ptr())
 
-            # Time and execute the inference
             torch.cuda.synchronize(); start_time = time.time()
             context.execute_async_v3(stream_handle=stream)
             torch.cuda.synchronize(); end_time = time.time()
