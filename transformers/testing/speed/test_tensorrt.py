@@ -2,12 +2,8 @@
 #
 #  Production-Grade Transformer Benchmarking Tool (Extended for TensorRT)
 #
-#  This script provides a framework for benchmarking latency, comparing:
-#
-#  1. PyTorch Eager/SDPA/FlashAttention-2: Native PyTorch implementations.
-#  2. TensorRT: A fully compiled and optimized inference engine.
-#
-#  Final version with fixes for modern transformers and TensorRT APIs.
+#  Final, corrected version compatible with modern `transformers` and `tensorrt`
+#  Python APIs.
 #
 # ==============================================================================
 
@@ -126,7 +122,6 @@ def benchmark_tensorrt(args, config, model):
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING); runtime = trt.Runtime(TRT_LOGGER)
     with open(engine_path, 'rb') as f: engine = runtime.deserialize_cuda_engine(f.read())
     
-    # *** FIX: Use `engine.num_io_tensors` instead of the outdated `engine.num_bindings` ***
     context, bindings, device = engine.create_execution_context(), [None] * engine.num_io_tensors, torch.device("cuda")
 
     max_context, batch_size = config.max_position_embeddings, 1
@@ -136,12 +131,21 @@ def benchmark_tensorrt(args, config, model):
         past_key_values_trt.extend([torch.zeros(shape, dtype=torch.float16, device=device)] * 2)
     logits_buffer = torch.empty((batch_size, 1, config.vocab_size), dtype=torch.float16, device=device)
     
-    binding_idx = 0; context.set_binding_shape(binding_idx, (batch_size, 1)); bindings[binding_idx] = 0; binding_idx += 1
-    for i in range(len(past_key_values_trt)):
-        context.set_binding_shape(binding_idx, past_key_values_trt[i].shape); bindings[binding_idx] = past_key_values_trt[i].data_ptr(); binding_idx += 1
-    bindings[binding_idx] = logits_buffer.data_ptr(); binding_idx += 1
-    for i in range(len(past_key_values_trt)):
-        bindings[binding_idx] = past_key_values_trt[i].data_ptr(); binding_idx += 1
+    # --- Setup bindings using tensor names ---
+    # The order of bindings must match the engine's expected order (inputs then outputs)
+    input_names = [f"past_key_values.{i}" for i in range(len(past_key_values_trt))]
+    all_bindings = {"input_ids": 0} # Placeholder for pointer
+    for i, name in enumerate(input_names):
+        all_bindings[name] = past_key_values_trt[i].data_ptr()
+    all_bindings["logits"] = logits_buffer.data_ptr()
+    # The output KV cache will write back into the same buffers
+    for i, name in enumerate(input_names):
+        all_bindings[f"present_{name}"] = past_key_values_trt[i].data_ptr()
+
+    # Populate the bindings list in the correct order
+    for i in range(engine.num_io_tensors):
+        tensor_name = engine.get_tensor_name(i)
+        bindings[i] = all_bindings[tensor_name]
     
     all_results, total_ticks, current_cache_len = [], 0, 0
     print(f"Simulating for {args.duration} seconds at {args.tickrate}Hz...\nFormat: Second | Avg Latency (ms) | Cache Length")
@@ -150,10 +154,18 @@ def benchmark_tensorrt(args, config, model):
         for tick in range(args.tickrate):
             total_ticks += 1
             input_ids = torch.randint(0, config.vocab_size, (1, args.tokens_per_tick), device=device, dtype=torch.int64)
-            bindings[0] = input_ids.data_ptr(); past_len = max(1, current_cache_len)
-            for i in range(config.num_hidden_layers * 2):
+            past_len = max(1, current_cache_len)
+
+            # *** FIX: Use `set_input_shape` with tensor names ***
+            context.set_input_shape("input_ids", input_ids.shape)
+            for i in range(len(past_key_values_trt)):
+                name = f"past_key_values.{i}"
                 shape = list(past_key_values_trt[i].shape); shape[2] = past_len
-                context.set_binding_shape(1 + i, tuple(shape))
+                context.set_input_shape(name, tuple(shape))
+
+            # Update the input_ids pointer in the bindings list
+            bindings[engine.get_binding_index("input_ids")] = input_ids.data_ptr()
+
             torch.cuda.synchronize(); start_time = time.time()
             context.execute_v2(bindings=bindings)
             torch.cuda.synchronize(); end_time = time.time()
