@@ -39,7 +39,7 @@ def main():
         (['python', os.path.join(script_dir, 'keyboard_location.py'), '--sqlout', os.path.join(out_dir, 'keyboard_location.db'), demo_path, '--optimize'], None),
         (['python', os.path.join(script_dir, 'buy_sell_drop.py'), '--sqlin', os.path.join(out_dir, 'keyboard_location.db'), '--sqlout', os.path.join(out_dir, 'buy_sell_drop.db'), demo_path], None),
         (['python', os.path.join(script_dir,'merge.py'),out_dir],None),
-        (['python', os.path.join(script_dir,'recording/rec_candidates.py'),os.path.join(out_dir,"merged.db")],None)
+        #(['python', os.path.join(script_dir,'recording/rec_candidates.py'),os.path.join(out_dir,"merged.db")],None)
     ]
 
     for cmd, cwd in commands:
