@@ -15,11 +15,11 @@ import argparse
 ENV_NAME = "cs2_ai_env"
 
 # 2. PYTHON VERSION - Using 3.11 for performance and broad support.
-PYTHON_VERSION = "3.11"
+PYTHON_VERSION = "3.12"
 
 # 3. PYTORCH INSTALLATION COMMAND for CUDA 12.x
 # This command is cross-platform and works for Linux with CUDA 12.1
-PYTORCH_COMMAND = "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
+PYTORCH_COMMAND = "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128"
 
 # --- ACTION REQUIRED for TENSORRT ---
 # 4. TENSORRT WHEEL FILE CONFIGURATION FOR LINUX
@@ -35,6 +35,7 @@ TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0
 # 5. LIST OF OTHER REQUIRED PACKAGES
 OTHER_PIP_PACKAGES = [
     "flash-attn",
+   #"tensorrt_llm"
     "transformers",
     "onnx",
     "matplotlib",
