@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aggregate.py - A unified and optimized script to process CS2 demo files.
+extract.py - A unified and optimized script to process CS2 demo files.
 
 This script merges the functionality of five separate processing scripts into a
 single, efficient pipeline that operates primarily in-memory. It avoids creating
