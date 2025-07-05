@@ -9,4 +9,7 @@
     data/packaged/info.db
     data/packaged/200_GB.lmdb
 
+# write efficient python to unpack
 
+...
+# train model
