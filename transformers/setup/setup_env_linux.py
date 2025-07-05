@@ -38,7 +38,6 @@ TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0
 # 5. LIST OF OTHER REQUIRED PACKAGES
 OTHER_PIP_PACKAGES = [
     "flash-attn",
-   #"tensorrt_llm"
     "transformers",
     "onnx",
     "matplotlib",
