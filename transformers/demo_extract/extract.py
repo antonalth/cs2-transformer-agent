@@ -160,7 +160,7 @@ def _rounds_parse_2x(demo_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
 
     for rd in tqdm(rounds_df.iter_rows(named=True), total=len(rounds_df), desc="    Extracting round info", leave=False):
-        rn, s_tick, fz_end, e_tick = rd["round_num"], rd["start"], rd["freeze_end"], rd["official_end"]
+        rn, s_tick, fz_end, e_tick, win_tick, win_team = rd["round_num"], rd["start"], rd["freeze_end"], rd["official_end"], rd["end"], rd["winner"]
         # Find bomb plant tick for the current round
         plant_in_round = bomb_plants.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= e_tick))
         bomb_plant_tick = -1
@@ -171,13 +171,13 @@ def _rounds_parse_2x(demo_path: Path) -> list[dict[str, Any]]:
             died = deaths.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= e_tick)).select("victim_name", "tick")
             death_map = dict(zip(died["victim_name"], died["tick"]))
             return [[p, death_map.get(p, -1)] for p in roster]
-        rows.append({"round": rn, "starttick": s_tick, "freezetime_endtick": fz_end, "endtick": e_tick, "bomb_planted_tick": bomb_plant_tick, "t_team": team_list(_C.T_SIDE), "ct_team": team_list(_C.CT_SIDE)})
+        rows.append({"round": rn, "starttick": s_tick, "freezetime_endtick": fz_end, "endtick": e_tick, "win_tick": win_tick, "win_team": win_team, "bomb_planted_tick": bomb_plant_tick, "t_team": team_list(_C.T_SIDE), "ct_team": team_list(_C.CT_SIDE)})
     return rows
 
 def _rounds_to_sql(rows: list[dict[str, Any]], conn: sqlite3.Connection) -> None:
-    conn.execute("""CREATE TABLE IF NOT EXISTS ROUNDS (round INTEGER PRIMARY KEY, starttick INTEGER, freezetime_endtick INTEGER, endtick INTEGER, bomb_planted_tick INTEGER, t_team TEXT, ct_team TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS ROUNDS (round INTEGER PRIMARY KEY, starttick INTEGER, freezetime_endtick INTEGER, endtick INTEGER, win_tick INTEGER, win_team TEXT, bomb_planted_tick INTEGER, t_team TEXT, ct_team TEXT)""")
     if not rows: return
-    conn.executemany("""INSERT OR REPLACE INTO ROUNDS VALUES (:round, :starttick, :freezetime_endtick, :endtick, :bomb_planted_tick, :t_team, :ct_team)""", ({**r, "t_team": json.dumps(r["t_team"]), "ct_team": json.dumps(r["ct_team"])} for r in rows))
+    conn.executemany("""INSERT OR REPLACE INTO ROUNDS VALUES (:round, :starttick, :freezetime_endtick, :endtick, :win_tick, :win_team, :bomb_planted_tick, :t_team, :ct_team)""", ({**r, "t_team": json.dumps(r["t_team"]), "ct_team": json.dumps(r["ct_team"])} for r in rows))
     conn.commit()
 
 def run_rounds_processing(demo_path: str, conn: sqlite3.Connection):
@@ -375,7 +375,7 @@ def _merge_create_merged_schema(cursor):
         tick INTEGER, steamid INTEGER, playername TEXT, position_x REAL, position_y REAL, position_z REAL, inventory TEXT,
         active_weapon TEXT, health INTEGER, armor INTEGER, money INTEGER, keyboard_input TEXT, mouse_x REAL, mouse_y REAL,
         is_in_buyzone INTEGER, buy_sell_input TEXT, PRIMARY KEY (tick, steamid))""")
-    cursor.execute("CREATE TABLE rounds (round INTEGER PRIMARY KEY, starttick INTEGER, freezetime_endtick INTEGER, endtick INTEGER, bomb_planted_tick INTEGER, t_team TEXT, ct_team TEXT)")
+    cursor.execute("CREATE TABLE rounds (round INTEGER PRIMARY KEY, starttick INTEGER, freezetime_endtick INTEGER, endtick INTEGER, win_tick INTEGER, win_team TEXT, bomb_planted_tick INTEGER, t_team TEXT, ct_team TEXT)")
 
 def _merge_load_lookup_data(mouse_conn, bsd_conn, rounds_conn):
     mouse_positions, buy_sell_drop_actions, buyzone_presence, valid_round_ticks = {}, {}, set(), []
@@ -422,7 +422,7 @@ def run_merge_processing(mouse_conn, rounds_conn, kl_conn, bsd_conn, merged_conn
 
     print("    Copying 'rounds' table...")
     all_rounds = rounds_conn.cursor().execute("SELECT * FROM ROUNDS").fetchall()
-    merged_cursor.executemany("INSERT INTO rounds VALUES (?, ?, ?, ?, ?, ?, ?)", all_rounds)
+    merged_cursor.executemany("INSERT INTO rounds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", all_rounds)
 
     merged_conn.commit()
     print("    ✓ Final database merged and written to disk.")
