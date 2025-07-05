@@ -2,15 +2,17 @@
 """
 extract.py - A unified and optimized script to process CS2 demo files.
 
-This script merges the functionality of five separate processing scripts into a
+This script merges the functionality of multiple separate processing scripts into a
 single, efficient pipeline that operates primarily in-memory. It avoids creating
 intermediate disk files, writing only the final, unified database.
 
+The pipeline includes the following steps:
 1. Extracts sensitivity-independent mouse movement data.
 2. Extracts per-round metadata and player death information.
 3. Extracts detailed per-tick player state (inputs, position, etc.).
 4. Infers buy, sell, and drop actions.
 5. Combines all generated data into a final, unified database on disk.
+6. Generates a list of recording candidates based on strict round validation.
 
 The --optimize feature from the original keyboard_location.py is enabled by default.
 
@@ -27,7 +29,7 @@ import sqlite3
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from demoparser2 import DemoParser
@@ -57,7 +59,7 @@ if _AWPY_VERSION.startswith("2"):
 # --- From keyboard_location.py ---
 WEAPON_CATEGORIES = {
     "AK-47": "SWITCH_1", "M4A4": "SWITCH_1", "M4A1-S": "SWITCH_1", "Galil AR": "SWITCH_1", "FAMAS": "SWITCH_1", "AUG": "SWITCH_1", "SG 553": "SWITCH_1", "AWP": "SWITCH_1", "SSG 08": "SWITCH_1", "G3SG1": "SWITCH_1", "SCAR-20": "SWITCH_1", "MP9": "SWITCH_1", "MAC-10": "SWITCH_1", "MP7": "SWITCH_1", "MP5-SD": "SWITCH_1", "UMP-45": "SWITCH_1", "P90": "SWITCH_1", "PP-Bizon": "SWITCH_1", "Nova": "SWITCH_1", "XM1014": "SWITCH_1", "MAG-7": "SWITCH_1", "Sawed-Off": "SWITCH_1", "M249": "SWITCH_1", "Negev": "SWITCH_1",
-    "Glock-18": "SWITCH_2", "USP-S": "SWITCH_2", "P250": "SWITCH_2", "P2000": "SWITCH_2", "Dual Berettas": "SWITCH_2", "Five-SeveN": "SWITCH_2", "Tec-9": "SWITCH_2", "CZ75-Auto": "SWITCH_2", "Desert Eagle": "SWITCH_2", "R8 Revolver": "SWITCH_2",
+    "Glock-18": "SWITCH_2", "USP-S": "SWITCH_2", "P250": "SWITCH_2", "P2000": "SWITCH_2", "Dual Berettas": "SWITCH_2", "Five-SeveN": "SWITCH_2", "Tec-9": "SWITCH_2", "CZ75-Auto": "SWITCH_2", "R8 Revolver": "SWITCH_2",
     "knife":"SWITCH_3","knife_ct": "SWITCH_3", "knife_t": "SWITCH_3", "Bayonet": "SWITCH_3", "Flip Knife": "SWITCH_3", "Gut Knife": "SWITCH_3", "Karambit": "SWITCH_3", "M9 Bayonet": "SWITCH_3", "Huntsman Knife": "SWITCH_3", "Falchion Knife": "SWITCH_3", "Bowie Knife": "SWITCH_3", "Butterfly Knife": "SWITCH_3", "Shadow Daggers": "SWITCH_3", "Ursus Knife": "SWITCH_3", "Navaja Knife": "SWITCH_3", "Stiletto Knife": "SWITCH_3", "Talon Knife": "SWITCH_3", "Classic Knife": "SWITCH_3", "Paracord Knife": "SWITCH_3", "Survival Knife": "SWITCH_3", "Nomad Knife": "SWITCH_3", "Skeleton Knife": "SWITCH_3",
     "High Explosive Grenade": "SWITCH_4", "Flashbang": "SWITCH_4", "Smoke Grenade": "SWITCH_4", "Molotov": "SWITCH_4", "Incendiary Grenade": "SWITCH_4", "Decoy Grenade": "SWITCH_4",
     "C4 Explosive": "SWITCH_5", "Defuse Kit": "SWITCH_5", "Zeus x27": "SWITCH_3",
@@ -137,7 +139,7 @@ def _mouse_process_demo(parser: DemoParser, conn: sqlite3.Connection, table_name
     result_df.to_sql(table_name, conn, if_exists='append', index=False)
 
 def run_mouse_processing(demo_path: str, conn: sqlite3.Connection):
-    print("\n[1/5] Processing mouse data...")
+    print("\n[1/6] Processing mouse data...")
     table_name = "MOUSE"
     parser = DemoParser(demo_path)
     _mouse_setup_database(conn, table_name)
@@ -173,7 +175,7 @@ def _rounds_to_sql(rows: list[dict[str, Any]], conn: sqlite3.Connection) -> None
     conn.commit()
 
 def run_rounds_processing(demo_path: str, conn: sqlite3.Connection):
-    print("\n[2/5] Processing rounds data...")
+    print("\n[2/6] Processing rounds data...")
     if not _AWPY_VERSION.startswith("2"):
         print("    Warning: AWPy version 2.x is required for round processing. Skipping.")
         _rounds_to_sql([], conn) # Create empty table
@@ -214,7 +216,7 @@ def _kl_export_sqlite_inputs(conn: sqlite3.Connection, tick_df: pd.DataFrame) ->
     conn.commit()
 
 def run_keyboard_location_processing(demo_path: str, conn: sqlite3.Connection):
-    print("\n[3/5] Processing keyboard and location data...")
+    print("\n[3/6] Processing keyboard and location data...")
     print("    Parsing detailed player states (this can be slow)...")
     dp = DemoParser(demo_path)
 
@@ -300,7 +302,7 @@ class _bsd_InputVerifier:
         return False
 
 def run_buy_sell_drop_processing(demo_path: str, input_conn: sqlite3.Connection, output_conn: sqlite3.Connection):
-    print("\n[4/5] Processing buy, sell, and drop data...")
+    print("\n[4/6] Processing buy, sell, and drop data...")
     parser = DemoParser(demo_path)
     
     events = parser.parse_events(["item_purchase", "player_death"])
@@ -384,7 +386,7 @@ def _merge_is_tick_in_valid_round(tick, round_intervals):
     return False
 
 def run_merge_processing(mouse_conn, rounds_conn, kl_conn, bsd_conn, merged_conn):
-    print("\n[5/5] Merging all in-memory data...")
+    print("\n[5/6] Merging all in-memory data...")
     mouse_data, action_data, buyzone_data, round_intervals = _merge_load_lookup_data(mouse_conn, bsd_conn, rounds_conn)
 
     merged_cursor = merged_conn.cursor()
@@ -421,7 +423,137 @@ def run_merge_processing(mouse_conn, rounds_conn, kl_conn, bsd_conn, merged_conn
 
 
 # =============================================================================
-# 8. MAIN DRIVER
+# 8. PROCESSING STEP 6: RECORDING CANDIDATES (NEWLY INTEGRATED)
+# =============================================================================
+def _rc_prepare_and_create_table(conn: sqlite3.Connection):
+    """Prepares the database by dropping and recreating the RECORDING table."""
+    cursor = conn.cursor()
+    print("    Preparing 'RECORDING' table...")
+    cursor.execute("DROP TABLE IF EXISTS RECORDING;")
+    cursor.execute("""
+        CREATE TABLE RECORDING (
+            roundnumber        INTEGER,
+            starttick          INTEGER,
+            stoptick           INTEGER,
+            team               TEXT,
+            playername         TEXT,
+            is_recorded        BOOLEAN,
+            recording_filepath TEXT,
+            PRIMARY KEY (starttick, stoptick, playername)
+        );
+    """)
+    conn.commit()
+
+def _rc_fetch_and_process_rounds(conn: sqlite3.Connection) -> List[Tuple]:
+    """Fetches, validates, and processes rounds to generate recording candidates."""
+    print("    Processing and validating data from 'ROUNDS' table...")
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT round, starttick, freezetime_endtick, endtick, t_team, ct_team FROM ROUNDS")
+    except sqlite3.OperationalError:
+        print(f"    Error: Table 'ROUNDS' not found. Cannot generate candidates.")
+        return []
+
+    all_rounds_data = cursor.fetchall()
+    to_be_recorded = []
+
+    for round_num, starttick, freezetime_endtick, endtick, t_team_json, ct_team_json in all_rounds_data:
+        # Stage 1: Parse and Basic Checks
+        if freezetime_endtick is not None and starttick is not None:
+            if (freezetime_endtick - starttick) > 2000:
+                print(f"    Skipping round {round_num}: Extended freezetime duration ({freezetime_endtick - starttick} ticks).")
+                continue
+        
+        if starttick is None or endtick is None:
+            print(f"    Skipping round {round_num}: Missing start or end tick.")
+            continue
+            
+        try:
+            t_players = json.loads(t_team_json) if t_team_json else []
+            ct_players = json.loads(ct_team_json) if ct_team_json else []
+            if not isinstance(t_players, list) or not isinstance(ct_players, list):
+                print(f"    Skipping round {round_num}: Team data is not a valid JSON list.")
+                continue
+        except json.JSONDecodeError:
+            print(f"    Skipping round {round_num}: Failed to parse JSON data.")
+            continue
+
+        # Stage 2: Strict Validation
+        is_round_valid = True
+        if len(t_players) != 5 or len(ct_players) != 5:
+            print(f"    Skipping round {round_num}: Invalid team sizes. T: {len(t_players)}, CT: {len(ct_players)}. Expected 5v5.")
+            is_round_valid = False
+        
+        if is_round_valid:
+            t_player_names = {p[0] for p in t_players if isinstance(p, list) and len(p) > 0}
+            ct_player_names = {p[0] for p in ct_players if isinstance(p, list) and len(p) > 0}
+            if t_player_names.intersection(ct_player_names):
+                print(f"    Skipping round {round_num}: Player(s) found on both teams.")
+                is_round_valid = False
+
+        if is_round_valid and freezetime_endtick is not None:
+            all_round_players_for_check = t_players + ct_players
+            for player_data in all_round_players_for_check:
+                if not isinstance(player_data, list) or len(player_data) < 2: continue
+                _, death_tick = player_data[0], player_data[1]
+                if death_tick != -1 and death_tick < (freezetime_endtick + 128):
+                    print(f"    Skipping round {round_num}: Player died too early ({death_tick}).")
+                    is_round_valid = False
+                    break
+
+        # Stage 3: Process the valid round
+        if is_round_valid:
+            all_round_players = [(*p, 'T') for p in t_players] + [(*p, 'CT') for p in ct_players]
+            for player_data in all_round_players:
+                if len(player_data) != 3: continue
+                player_name, death_tick, team_name = player_data
+                stop_tick = death_tick if death_tick != -1 else endtick
+                record = (round_num, starttick, stop_tick, team_name, player_name)
+                to_be_recorded.append(record)
+    return to_be_recorded
+
+def _rc_insert_records(conn: sqlite3.Connection, records: List[Tuple]):
+    """Inserts the generated records into the 'RECORDING' table."""
+    if not records:
+        print("    No valid rounds found to generate recording candidates.")
+        return
+
+    records_to_insert = [(*rec, False, None) for rec in records]
+    cursor = conn.cursor()
+    sql = """
+        INSERT INTO RECORDING (roundnumber, starttick, stoptick, team, playername, is_recorded, recording_filepath)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+    """
+    try:
+        cursor.executemany(sql, records_to_insert)
+        conn.commit()
+        print(f"    ✓ Successfully inserted {cursor.rowcount} records into 'RECORDING' table.")
+    except sqlite3.IntegrityError as e:
+        print(f"    Error during insertion: {e}. This should not happen with pre-validated data.")
+        conn.rollback()
+
+def run_recording_candidates_processing(db_path: str):
+    """
+    Main function for the recording candidate generation step.
+    Connects to the final DB and populates the RECORDING table.
+    """
+    print(f"\n[6/6] Generating recording candidates...")
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        _rc_prepare_and_create_table(conn)
+        records_to_add = _rc_fetch_and_process_rounds(conn)
+        _rc_insert_records(conn, records_to_add)
+    except sqlite3.Error as e:
+        print(f"    A database error occurred during candidate generation: {e}")
+        if conn: conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
+# =============================================================================
+# 9. MAIN DRIVER
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(description="Run full, optimized demo processing pipeline.")
@@ -442,28 +574,37 @@ def main():
         print(f"Removing existing output file: {merged_db_path}")
         os.remove(merged_db_path)
     
-    # Setup all database connections
+    # Setup in-memory database connections
     mouse_conn, rounds_conn, kl_conn, bsd_conn = (sqlite3.connect(':memory:') for _ in range(4))
-    merged_conn = sqlite3.connect(merged_db_path)
-
+    
     try:
+        # Steps 1-4: Process into memory
         run_mouse_processing(demo_path, mouse_conn)
         run_rounds_processing(demo_path, rounds_conn)
         run_keyboard_location_processing(demo_path, kl_conn)
         run_buy_sell_drop_processing(demo_path, kl_conn, bsd_conn)
-        run_merge_processing(mouse_conn, rounds_conn, kl_conn, bsd_conn, merged_conn)
+
+        # Step 5: Merge from memory to disk
+        merged_conn = sqlite3.connect(merged_db_path)
+        try:
+            run_merge_processing(mouse_conn, rounds_conn, kl_conn, bsd_conn, merged_conn)
+        finally:
+            merged_conn.close()
+
+        # Step 6: Post-process the on-disk file to add recording candidates
+        run_recording_candidates_processing(merged_db_path)
+
     except Exception as e:
         print(f"\nAn unhandled error occurred during processing: {e}", file=sys.stderr)
         traceback.print_exc()
         print("Pipeline aborted.", file=sys.stderr)
         sys.exit(1)
     finally:
-        # Close all connections
+        # Close all in-memory connections
         mouse_conn.close()
         rounds_conn.close()
         kl_conn.close()
         bsd_conn.close()
-        merged_conn.close()
 
     print("\n-------------------------------------------")
     print("All processing steps completed successfully.")
