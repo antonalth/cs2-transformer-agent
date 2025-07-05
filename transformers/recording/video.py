@@ -138,7 +138,7 @@ def setup_environment(demo_file: Path):
     # .parent gets its parent directory.
     # / "../../cnn_scripts" appends the relative path.
     # .resolve() again resolves the ".." components to get the final absolute absolute path.
-    cnn_scripts_dir = (Path(__file__).resolve().parent / "../../cnn_scripts").resolve()
+    cnn_scripts_dir = (Path(__file__).resolve().parent / "../../scripts").resolve()
 
     LOG.debug(f"Calculated cnn_scripts_dir: {cnn_scripts_dir}") # Add this for debug output
 
