@@ -5,11 +5,12 @@ import signal
 import platform
 
 # --- Configuration ---
-# This script focuses solely on running the TypeScript server.
-# It assumes Node.js, npm, and required packages are already installed.
+# This script runs the TypeScript server, assuming all prerequisites are met.
+# It uses the `wsl --cd` command on Windows to ensure the correct working directory.
 
-# The path to the TypeScript server file, relative to this script's location.
-SERVER_SCRIPT_PATH = os.path.join('src', 'server.ts')
+# The path to the TypeScript server file, relative to the project root.
+# Using forward slashes is safer for cross-platform compatibility.
+SERVER_SCRIPT_FILENAME = 'src/server.ts'
 
 # --- Global variable to hold the server process ---
 server_process = None
@@ -17,56 +18,57 @@ server_process = None
 def run_server():
     """
     Runs the TypeScript server, automatically using WSL on Windows.
-    This function now streams the server's output in real-time.
+    This version explicitly sets the working directory inside WSL.
     """
     global server_process
 
-    # Determine the script's directory and set it as the CWD
+    # Determine the script's directory and set it as the CWD for this Python script.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
     print(f"--- Working directory set to: {script_dir} ---")
 
-    if not os.path.exists(SERVER_SCRIPT_PATH):
-        print(f"\nERROR: Server script not found at '{SERVER_SCRIPT_PATH}'")
+    if not os.path.exists(SERVER_SCRIPT_FILENAME):
+        print(f"\nERROR: Server script not found at '{SERVER_SCRIPT_FILENAME}'")
         sys.exit(1)
 
     command = []
     
     # --- Command Construction ---
-    # Construct the appropriate command based on the operating system.
     if platform.system() == "Windows":
         print("\n--- Detected Windows. Preparing to launch server via WSL. ---")
-        print("    NOTE: Node.js, npm, and tsx must be installed in your WSL distribution.")
         
-        # This is the key change. By not using '-e', we invoke the user's default
-        # WSL shell (e.g., bash), which correctly loads the PATH environment
-        # variable from .bashrc or .zshrc, allowing it to find 'npx'.
-        # The command arguments are passed directly to WSL.
-        command = ['wsl', 'npx', 'tsx', SERVER_SCRIPT_PATH]
+        # KEY FIX: Use `wsl --cd <dir>` to explicitly set the working directory inside WSL.
+        # This is the most reliable way to solve pathing issues.
+        # `os.getcwd()` gets the current directory (e.g., C:\Users\...\project),
+        # and `--cd` correctly translates it to /mnt/c/Users/.../project within WSL.
+        # The command to run is now relative to that new CWD.
+        command = [
+            'wsl',
+            '--cd', os.getcwd(),
+            'npx', 'tsx', SERVER_SCRIPT_FILENAME
+        ]
     else:
         print("\n--- Detected Linux/macOS. Launching server directly. ---")
-        command = ['npx', 'tsx', SERVER_SCRIPT_PATH]
+        # For non-Windows systems, the CWD is already set by os.chdir(), so we can
+        # execute the command directly.
+        command = ['npx', 'tsx', SERVER_SCRIPT_FILENAME]
 
     print(f"Executing command: {' '.join(command)}\n")
 
     try:
-        # Launch the subprocess with stdout/stderr piped so we can stream it.
-        # bufsize=1 enables line-buffered output.
-        # universal_newlines=True decodes output as text.
+        # Launch the subprocess and stream its output in real-time.
         server_process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, # Redirect stderr to stdout for combined output
+            stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             universal_newlines=True
         )
 
-        # Stream the server's output to the console in real-time
         for line in iter(server_process.stdout.readline, ''):
             sys.stdout.write(line)
         
-        # Wait for the process to finish and get the exit code
         server_process.wait()
         return_code = server_process.returncode
         
@@ -87,22 +89,18 @@ def signal_handler(sig, frame):
     global server_process
     print("\n--- Ctrl+C detected. Shutting down server... ---")
     if server_process and server_process.poll() is None:
-        # The process is still running, terminate it
         server_process.terminate()
         try:
-            # Give it a moment to terminate gracefully
             server_process.wait(timeout=5)
             print("✅ Server shut down.")
         except subprocess.TimeoutExpired:
-            # If it doesn't respond, force kill it
-            print("Server did not respond to terminate, forcing kill.")
+            print("Server did not respond, forcing kill.")
             server_process.kill()
             print("✅ Server killed.")
     sys.exit(0)
 
 def main():
     """Main execution function."""
-    # Register the signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     run_server()
 
