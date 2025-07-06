@@ -138,7 +138,7 @@ async def main():
         game_client_handler,
         WS_HOST,
         WS_PORT,
-        ping_interval=20,  # Send a ping every 20 seconds
+        ping_interval=5,  # Send a ping every 20 seconds
         ping_timeout=20,   # Wait max 20 seconds for the pong response
     ):
         print(f"[WS] Listening for game clients on ws://{WS_HOST}:{WS_PORT}")
