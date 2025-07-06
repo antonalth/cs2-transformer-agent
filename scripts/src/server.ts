@@ -2,7 +2,6 @@
 
 import http from 'http';
 import { URL } from 'url';
-// CORRECTED IMPORTS: SimpleWebSocketServer is in a separate sub-module.
 import { SimpleWebSocket } from 'simple-websockets';
 import { SimpleWebSocketServer } from 'simple-websockets/server';
 
@@ -12,8 +11,6 @@ const HTTP_PORT = 8080;
 const HOST = '0.0.0.0'; // Listen on all network interfaces
 
 // --- Shared State ---
-// We will store all connected game clients in this Map.
-// The key is the client's unique ID, and the value is the socket object.
 const gameClients = new Map<string, SimpleWebSocket<any>>();
 
 /**
@@ -26,12 +23,9 @@ function startWebSocketServer() {
         server: wsHttpServer,
     });
 
-    // This event fires for every new WebSocket connection.
     wss.onConnection((socket, req) => {
-        // The client ID is determined by the URL path (e.g., /instance-1 -> "instance-1").
         const clientId = (req.url || '/').slice(1);
 
-        // --- Validation ---
         if (!clientId) {
             console.log('[WS] Rejecting connection: No client ID provided in path.');
             socket._socket.close(1008, 'A unique client ID is required in the URL path.');
@@ -44,11 +38,9 @@ function startWebSocketServer() {
             return;
         }
 
-        // --- Registration ---
         console.log(`[WS] ✅ Game client connected: '${clientId}'`);
         gameClients.set(clientId, socket);
 
-        // --- Event Handling for this specific socket ---
         socket.on('disconnect', () => {
             console.log(`[WS] ❌ Game client disconnected: '${clientId}'`);
             gameClients.delete(clientId);
@@ -58,10 +50,6 @@ function startWebSocketServer() {
             console.error(`[WS] Error on client '${clientId}':`, err.message);
         });
 
-        // *** CRUCIAL STABILITY FIX ***
-        // We must add listeners for events coming FROM the game client.
-        // This proves to the client that we are a valid broker and prevents
-        // the connection from being terminated, which causes the WeakContextWrapper crash.
         const eventsToKeepAlive = ['onGameEvent', 'onCViewRenderSetupView', 'onAddEntity', 'onRemoveEntity'];
         for (const eventName of eventsToKeepAlive) {
             socket.on(eventName, () => { /* Listening is all that matters. */ });
@@ -102,13 +90,14 @@ function startHttpCommandServer() {
 
             const targetSocket = gameClients.get(targetId);
 
-            if (!targetSocket || !targetSocket.isConnected()) {
+            // *** THE FIX IS HERE ***
+            // Change from targetSocket.isConnected() to the correct property: targetSocket.connected
+            if (!targetSocket || !targetSocket.connected) {
                 res.writeHead(404, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: `Not Found: Client with id '${targetId}' is not connected.` }));
                 return;
             }
 
-            // The 'simple-websockets' library handles the JSON formatting for us.
             targetSocket.send('exec', command);
             
             console.log(`[HTTP] -> Relaying command to '${targetId}': ${command}`);
@@ -117,7 +106,6 @@ function startHttpCommandServer() {
             return;
         }
 
-        // --- Fallback for unknown paths ---
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not Found: Use /listavailable or /sendcommand' }));
     });
