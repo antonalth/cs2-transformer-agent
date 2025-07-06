@@ -1,135 +1,126 @@
-// src/server.ts
+// This script acts as a bridge between multiple game clients and external applications.
+// Game clients connect via WebSocket. Applications can interact with them via an HTTP API.
+//
+// Functionality:
+// 1. WebSocket Server (Port 31337):
+//    - Listens for incoming connections from game clients.
+//    - Assigns a unique, incrementing ID to each client upon connection.
+//    - Manages a list of active clients.
+//
+// 2. HTTP API Server (Port 8080):
+//    - Provides a '/list' endpoint to get the IDs of all connected clients.
+//    - Provides a '/run' endpoint to send a console command to a specific client by its ID.
+//
+// We use the 'simple-websockets' library for convenience.
+// It sends events in the following format: { eventName: string, values: unknown[] }
+// To execute a command, we send an 'exec' event.
 
 import http from 'http';
-import { URL } from 'url';
-import { SimpleWebSocket } from 'simple-websockets';
 import { SimpleWebSocketServer } from 'simple-websockets/server';
+import { URL } from 'url';
+
+// Define the event map for our simple API. We only need to send 'exec' commands.
+const API_EVENT_MAP = {
+	exec: (command) => {},
+};
 
 // --- Configuration ---
-const WS_PORT = 31337;
-const HTTP_PORT = 8080;
-const HOST = '0.0.0.0'; // Listen on all network interfaces
+const WEBSOCKET_HOST = 'localhost';
+const WEBSOCKET_PORT = 31337;
+const HTTP_API_PORT = 8080;
 
-// --- Shared State ---
-const gameClients = new Map<string, SimpleWebSocket<any>>();
+// --- State Management ---
+// A map to store connected game clients, with our assigned ID as the key.
+const gameClients = new Map();
+let nextClientId = 1; // Used to generate unique IDs for clients.
 
-/**
- * Sets up and starts the WebSocket server to listen for game clients.
- */
-function startWebSocketServer() {
-    const wsHttpServer = http.createServer();
+// --- WebSocket Server for Game Clients ---
+function createWebSocketServer() {
+	const wsServer = http.createServer();
+	const wss = new SimpleWebSocketServer({
+		server: wsServer,
+	});
 
-    const wss = new SimpleWebSocketServer({
-        server: wsHttpServer,
-    });
+	wss.onConnection((socket, req) => {
+		// Assign a unique ID to the new client.
+		const clientId = (nextClientId++).toString();
+		gameClients.set(clientId, socket);
+		console.log(`[WebSocket] Game client connected. Assigned ID: ${clientId}`);
 
-    wss.onConnection((socket, req) => {
-        // *** THE FIX IS HERE: We now properly parse the URL to assign a clean ID ***
-        const connectionUrl = new URL(req.url || '/', `ws://${req.headers.host}`);
-        let clientId: string | null = null;
+		// Handle client disconnection.
+		socket.on('disconnect', () => {
+			gameClients.delete(clientId);
+			console.log(`[WebSocket] Game client ${clientId} has disconnected.`);
+		});
 
-        // Case 1: Handle the original HLAE connection style
-        if (connectionUrl.pathname === '/mirv' && connectionUrl.searchParams.has('hlae')) {
-            clientId = 'hlae-main'; // Assign a clean, predictable, canonical ID
-        } 
-        // Case 2: Handle the new multi-client style where the ID is the path
-        else if (connectionUrl.pathname !== '/') {
-            clientId = connectionUrl.pathname.slice(1); // e.g., /instance-1 -> "instance-1"
-        }
+        // We don't need to listen for any events from the client in this setup.
+	});
 
-        // --- Validation (now uses the clean clientId) ---
-        if (!clientId) {
-            console.log('[WS] Rejecting connection: Could not determine a valid client ID from URL.');
-            socket._socket.close(1008, 'A unique client ID is required in the URL path.');
-            return;
-        }
-
-        if (gameClients.has(clientId)) {
-            console.log(`[WS] Rejecting connection: Client ID '${clientId}' is already in use.`);
-            socket._socket.close(1013, `Client ID '${clientId}' is already connected.`);
-            return;
-        }
-
-        // --- Registration (uses the clean clientId) ---
-        console.log(`[WS] ✅ Game client connected with clean ID: '${clientId}'`);
-        gameClients.set(clientId, socket);
-
-        // --- Event Handling for this specific socket ---
-        socket.on('disconnect', () => {
-            console.log(`[WS] ❌ Game client disconnected: '${clientId}'`);
-            gameClients.delete(clientId);
-        });
-
-        socket.on('error', (err) => {
-            console.error(`[WS] Error on client '${clientId}':`, err.message);
-        });
-
-        const eventsToKeepAlive = ['onGameEvent', 'onCViewRenderSetupView', 'onAddEntity', 'onRemoveEntity'];
-        for (const eventName of eventsToKeepAlive) {
-            socket.on(eventName, () => { /* Listening is all that matters. */ });
-        }
-    });
-
-    wsHttpServer.listen(WS_PORT, HOST, () => {
-        console.log(`[WS] Listening for game clients on ws://${HOST}:${WS_PORT}`);
-    });
+	wsServer.listen(WEBSOCKET_PORT, WEBSOCKET_HOST, () => {
+		console.log(`[WebSocket] Server listening for game clients on ws://${WEBSOCKET_HOST}:${WEBSOCKET_PORT}`);
+	});
 }
 
-/**
- * Sets up and starts the HTTP server to listen for external commands.
- * This function is already correct and needs no changes.
- */
-function startHttpCommandServer() {
-    const commandServer = http.createServer((req, res) => {
-        const requestUrl = new URL(req.url || '/', `http://${req.headers.host}`);
-        const { pathname, searchParams } = requestUrl;
+// --- HTTP API Server for Applications ---
+function createHttpApiServer() {
+	const apiServer = http.createServer((req, res) => {
+        // Use the URL constructor for robust parsing of path and query parameters.
+		const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+		
+		// Endpoint: /list
+		// Returns a JSON array of connected client IDs.
+		if (requestUrl.pathname === '/list') {
+			const clientIds = Array.from(gameClients.keys());
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify(clientIds));
+			return;
+		}
 
-        if (pathname === '/listavailable') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            const clientIds = Array.from(gameClients.keys());
-            res.end(JSON.stringify(clientIds));
-            return;
-        }
+		// Endpoint: /run?id=...&cmd=...
+		// Sends a command to a specific client.
+		if (requestUrl.pathname === '/run') {
+			const clientId = requestUrl.searchParams.get('id');
+			const commandToRun = requestUrl.searchParams.get('cmd');
 
-        if (pathname === '/sendcommand') {
-            const targetId = searchParams.get('id');
-            const command = searchParams.get('command');
+			if (!clientId || !commandToRun) {
+				res.writeHead(400, { 'Content-Type': 'text/plain' });
+				res.end('Bad Request: Missing "id" or "cmd" query parameter.');
+				return;
+			}
 
-            if (!targetId || !command) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: "Bad Request: 'id' and 'command' parameters are required." }));
-                return;
-            }
+			const clientSocket = gameClients.get(clientId);
 
-            const targetSocket = gameClients.get(targetId);
+			if (!clientSocket) {
+				res.writeHead(404, { 'Content-Type': 'text/plain' });
+				res.end(`Not Found: No client with ID "${clientId}" is connected.`);
+				return;
+			}
 
-            if (!targetSocket || !targetSocket.connected) {
-                res.writeHead(404, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: `Not Found: Client with id '${targetId}' is not connected.` }));
-                return;
-            }
+			// Send the command to the game client using the 'exec' event.
+			clientSocket.send('exec', commandToRun);
 
-            targetSocket.send('exec', command);
-            
-            console.log(`[HTTP] -> Relaying command to '${targetId}': ${command}`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'success', message: `Command sent to '${targetId}'.` }));
-            return;
-        }
+			res.writeHead(200, { 'Content-Type': 'text/plain' });
+			res.end(`Command sent to client ${clientId}.`);
+			console.log(`[HTTP API] Sent command to client ${clientId}: ${commandToRun}`);
+			return;
+		}
 
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Not Found: Use /listavailable or /sendcommand' }));
-    });
+		// Handle unknown paths
+		res.writeHead(404, { 'Content-Type': 'text/plain' });
+		res.end('Not Found');
+	});
 
-    commandServer.listen(HTTP_PORT, HOST, () => {
-        console.log(`[HTTP] Listening for commands on http://${HOST}:${HTTP_PORT}`);
-    });
+	apiServer.listen(HTTP_API_PORT, () => {
+		console.log(`[HTTP API] Server listening on http://localhost:${HTTP_API_PORT}`);
+		console.log(`  > Usage: /list`);
+		console.log(`  > Usage: /run?id=<CLIENT_ID>&cmd=<URL_ENCODED_COMMAND>`);
+	});
 }
 
+// --- Main Execution ---
 function main() {
-    console.log('--- TypeScript Command Server Starting ---');
-    startWebSocketServer();
-    startHttpCommandServer();
+	createWebSocketServer();
+	createHttpApiServer();
 }
 
 main();
