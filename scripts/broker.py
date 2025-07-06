@@ -13,10 +13,7 @@ HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8080
 
 # --- Shared State ---
-# This dictionary stores active game client connections.
-# Key: client_id, Value: websocket connection object.
 GAME_CLIENTS = {}
-# A lock is crucial for thread-safe access to the shared GAME_CLIENTS dict.
 clients_lock = threading.Lock()
 
 # --- WebSocket Server Logic (asyncio) ---
@@ -24,27 +21,33 @@ clients_lock = threading.Lock()
 async def game_client_handler(websocket, path):
     """
     Handles connections from game clients.
-    It determines the client ID from the connection URL, supporting both the
-    original "?hlae=1" format and a future path-based ID.
+    This version is cross-platform compatible and works reliably on Windows.
     """
     client_id = None
-    parsed_uri = urllib.parse.urlparse(websocket.request_headers['uri'])
+    
+    # *** FIX FOR WINDOWS COMPATIBILITY ***
+    # Instead of parsing request_headers['uri'], we use the official
+    # `websocket.path` and `websocket.query_params` attributes.
+    # This is the robust, recommended way.
+    
+    # The `path` variable is automatically passed to the handler by websockets.
+    # `websocket.query_params` is a dictionary of the parsed query string.
     
     # Check for the original "?hlae=1" format
-    if parsed_uri.path == '/mirv':
-        query_params = urllib.parse.parse_qs(parsed_uri.query)
-        if query_params.get('hlae'):
-            client_id = "hlae-main" # Assign a default ID for the main HLAE instance
-    else:
-        # Support for future path-based IDs (e.g., /my-game-id)
-        client_id = parsed_uri.path.strip('/')
+    if path == '/mirv' and 'hlae' in websocket.query_params:
+        # Assign a default ID, as the original script doesn't provide one.
+        client_id = "hlae-main" 
+    # Check for a future path-based ID (e.g., ws://.../my-game-id)
+    elif path != '/':
+        client_id = path.strip('/')
+    
+    # --- The rest of the function is the same ---
 
     if not client_id:
-        print(f"[WS] Connection rejected from {websocket.remote_address}: Could not determine client ID from URI.")
-        await websocket.close(1008, "Could not determine client ID.")
+        print(f"[WS] Connection rejected from {websocket.remote_address}: Could not determine client ID from path '{path}'.")
+        await websocket.close(1008, "Could not determine client ID from connection URL.")
         return
 
-    # Safely register the new client
     with clients_lock:
         if client_id in GAME_CLIENTS:
             print(f"[WS] Connection rejected: ID '{client_id}' is already connected.")
@@ -55,11 +58,8 @@ async def game_client_handler(websocket, path):
         print(f"[WS]    Total clients: {len(GAME_CLIENTS)}")
 
     try:
-        # We don't expect messages from the game client in this simple setup.
-        # Just wait for it to disconnect.
         await websocket.wait_closed()
     finally:
-        # Safely unregister the client
         with clients_lock:
             if client_id in GAME_CLIENTS:
                 del GAME_CLIENTS[client_id]
@@ -67,6 +67,7 @@ async def game_client_handler(websocket, path):
             print(f"[WS]    Total clients: {len(GAME_CLIENTS)}")
 
 # --- HTTP Server Logic (threading) ---
+# This part does not need any changes.
 
 class CommandHTTPHandler(BaseHTTPRequestHandler):
     """Handles incoming HTTP GET requests to control the game clients."""
@@ -74,7 +75,6 @@ class CommandHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         
-        # --- Endpoint: /listavailable ---
         if parsed_path.path == '/listavailable':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -84,7 +84,6 @@ class CommandHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(client_ids).encode('utf-8'))
             return
 
-        # --- Endpoint: /sendcommand ---
         if parsed_path.path == '/sendcommand':
             params = urllib.parse.parse_qs(parsed_path.query)
             target_id = params.get('id', [None])[0]
@@ -94,20 +93,13 @@ class CommandHTTPHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Bad Request: 'id' and 'command' parameters are required.")
                 return
             
-            # Find the target socket connection
             with clients_lock:
                 target_socket = GAME_CLIENTS.get(target_id)
             
             if target_socket:
-                # *** CRUCIAL CHANGE FOR COMPATIBILITY ***
-                # We must wrap the command in the JSON format expected by simple-websockets.
-                payload = {
-                    "eventName": "exec",
-                    "values": [command]
-                }
+                payload = { "eventName": "exec", "values": [command] }
                 message_to_send = json.dumps(payload)
                 
-                # Schedule the async send operation on the main event loop
                 asyncio.run_coroutine_threadsafe(
                     target_socket.send(message_to_send),
                     self.server.loop
@@ -125,23 +117,17 @@ class CommandHTTPHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found: Use /listavailable or /sendcommand?id=...&command=...")
 
 def start_http_server(loop):
-    """Sets up and runs the HTTP server in its own thread."""
     server_address = (HTTP_HOST, HTTP_PORT)
     httpd = HTTPServer(server_address, CommandHTTPHandler)
-    httpd.loop = loop # Give it a reference to the main asyncio loop
+    httpd.loop = loop
     print(f"[HTTP] Listening for commands on http://{HTTP_HOST}:{HTTP_PORT}")
     httpd.serve_forever()
 
 async def main():
-    """Starts both the WebSocket and HTTP servers."""
     print("--- Compatible Command Server ---")
     main_loop = asyncio.get_running_loop()
-
-    # Start the HTTP server in a separate daemon thread
     http_thread = threading.Thread(target=start_http_server, args=(main_loop,), daemon=True)
     http_thread.start()
-
-    # Start the WebSocket server
     async with serve(game_client_handler, WS_HOST, WS_PORT):
         print(f"[WS] Listening for game clients on ws://{WS_HOST}:{WS_PORT}")
         await asyncio.Future()
