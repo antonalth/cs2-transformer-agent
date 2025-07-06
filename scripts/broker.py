@@ -124,11 +124,23 @@ def start_http_server(loop):
     httpd.serve_forever()
 
 async def main():
-    print("--- Compatible Command Server ---")
+    """Starts both the WebSocket and HTTP servers."""
+    print("--- Compatible Command Server (with Keep-Alive) ---")
     main_loop = asyncio.get_running_loop()
+
+    # Start the HTTP server in a separate daemon thread
     http_thread = threading.Thread(target=start_http_server, args=(main_loop,), daemon=True)
     http_thread.start()
-    async with serve(game_client_handler, WS_HOST, WS_PORT):
+
+    # Start the WebSocket server with a keep-alive ping interval
+    # This will send a ping every 20 seconds to keep the connection open.
+    async with serve(
+        game_client_handler,
+        WS_HOST,
+        WS_PORT,
+        ping_interval=20,  # Send a ping every 20 seconds
+        ping_timeout=20,   # Wait max 20 seconds for the pong response
+    ):
         print(f"[WS] Listening for game clients on ws://{WS_HOST}:{WS_PORT}")
         await asyncio.Future()
 
