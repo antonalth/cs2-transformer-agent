@@ -24,10 +24,22 @@ function startWebSocketServer() {
     });
 
     wss.onConnection((socket, req) => {
-        const clientId = (req.url || '/').slice(1);
+        // *** THE FIX IS HERE: We now properly parse the URL to assign a clean ID ***
+        const connectionUrl = new URL(req.url || '/', `ws://${req.headers.host}`);
+        let clientId: string | null = null;
 
+        // Case 1: Handle the original HLAE connection style
+        if (connectionUrl.pathname === '/mirv' && connectionUrl.searchParams.has('hlae')) {
+            clientId = 'hlae-main'; // Assign a clean, predictable, canonical ID
+        } 
+        // Case 2: Handle the new multi-client style where the ID is the path
+        else if (connectionUrl.pathname !== '/') {
+            clientId = connectionUrl.pathname.slice(1); // e.g., /instance-1 -> "instance-1"
+        }
+
+        // --- Validation (now uses the clean clientId) ---
         if (!clientId) {
-            console.log('[WS] Rejecting connection: No client ID provided in path.');
+            console.log('[WS] Rejecting connection: Could not determine a valid client ID from URL.');
             socket._socket.close(1008, 'A unique client ID is required in the URL path.');
             return;
         }
@@ -38,9 +50,11 @@ function startWebSocketServer() {
             return;
         }
 
-        console.log(`[WS] ✅ Game client connected: '${clientId}'`);
+        // --- Registration (uses the clean clientId) ---
+        console.log(`[WS] ✅ Game client connected with clean ID: '${clientId}'`);
         gameClients.set(clientId, socket);
 
+        // --- Event Handling for this specific socket ---
         socket.on('disconnect', () => {
             console.log(`[WS] ❌ Game client disconnected: '${clientId}'`);
             gameClients.delete(clientId);
@@ -63,13 +77,13 @@ function startWebSocketServer() {
 
 /**
  * Sets up and starts the HTTP server to listen for external commands.
+ * This function is already correct and needs no changes.
  */
 function startHttpCommandServer() {
     const commandServer = http.createServer((req, res) => {
         const requestUrl = new URL(req.url || '/', `http://${req.headers.host}`);
         const { pathname, searchParams } = requestUrl;
 
-        // --- Endpoint: /listavailable ---
         if (pathname === '/listavailable') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             const clientIds = Array.from(gameClients.keys());
@@ -77,7 +91,6 @@ function startHttpCommandServer() {
             return;
         }
 
-        // --- Endpoint: /sendcommand ---
         if (pathname === '/sendcommand') {
             const targetId = searchParams.get('id');
             const command = searchParams.get('command');
@@ -90,8 +103,6 @@ function startHttpCommandServer() {
 
             const targetSocket = gameClients.get(targetId);
 
-            // *** THE FIX IS HERE ***
-            // Change from targetSocket.isConnected() to the correct property: targetSocket.connected
             if (!targetSocket || !targetSocket.connected) {
                 res.writeHead(404, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: `Not Found: Client with id '${targetId}' is not connected.` }));
@@ -115,9 +126,6 @@ function startHttpCommandServer() {
     });
 }
 
-/**
- * Main entry point to start all services.
- */
 function main() {
     console.log('--- TypeScript Command Server Starting ---');
     startWebSocketServer();
