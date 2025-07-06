@@ -14,3 +14,4 @@ libs/__pycache__/**/ */
 gemini.md
 *.jpg
 *.png
+/scripts/node_modules
