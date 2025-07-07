@@ -16,7 +16,8 @@
 // It sends events in the following format: { eventName: string, values: unknown[] }
 // To execute a command, we send an 'exec' event.
 
-import { spawn } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import http from 'http';
 import { SimpleWebSocketServer } from 'simple-websockets/server';
 import { URL } from 'url';
@@ -30,42 +31,8 @@ const API_EVENT_MAP: ApiEventMap = {
 	exec: (command: string) => {},
 };
 
-// --- Helper function to run commands via spawn, avoiding shell quoting issues ---
-/**
- * Executes a command using spawn for robustness, especially for WSL -> Windows calls.
- * @param command The executable to run (e.g., 'cmd.exe').
- * @param args An array of arguments to pass to the command.
- * @returns A promise that resolves with the stdout or rejects with an error.
- */
-function execSpawn(command: string, args: string[]): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const child = spawn(command, args);
-        let stdout = '';
-        let stderr = '';
-
-        child.stdout.on('data', (data) => {
-            stdout += data.toString();
-        });
-
-        child.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-
-        child.on('error', (err) => {
-            reject(err);
-        });
-
-        child.on('close', (code) => {
-            if (code !== 0) {
-                // Reject with the stderr output for better debugging
-                reject(new Error(`Command failed with code ${code}: ${stderr.trim()}`));
-            } else {
-                resolve(stdout);
-            }
-        });
-    });
-}
-
+// Promisify exec for async/await usage in the HTTP server.
+const execPromise = promisify(exec);
 
 // --- Configuration ---
 const WEBSOCKET_HOST = 'localhost';
@@ -161,22 +128,23 @@ function createHttpApiServer() {
 			}
 
 			const sandboxName = `game${clientId}`;
-            // FIX: Use `spawn` to avoid shell quoting issues.
-            // The command for cmd.exe is passed as a single argument.
-            const listPidsArgs = ['/c', `""C:\\Program Files\\Sandboxie-Plus\\Start.exe" /box:${sandboxName} /listpids"`];
+			// FIX: Correctly quote the command for `cmd.exe /c` to handle the space in "Program Files".
+			// The entire command passed to `/c` is quoted, and the inner path is also quoted.
+			const listPidsCmd = `cmd.exe /c "\\"C:\\Program Files\\Sandboxie-Plus\\Start.exe\\" /box:${sandboxName} /listpids"`;
 
 			try {
 				// Get the list of PIDs from the sandbox.
-				const pidsOutput = await execSpawn('cmd.exe', listPidsArgs);
+				const { stdout: pidsOutput } = await execPromise(listPidsCmd);
 				// Extract all sequences of digits from the output to get clean PIDs.
 				const pids = pidsOutput.match(/\d+/g) || [];
 
 				let isRunning = false;
 				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
-                    // FIX: Use `spawn` for the tasklist command as well.
-                    const checkPidArgs = ['/c', `tasklist /nh /fi "PID eq ${pid}"`];
-					const tasklistOutput = await execSpawn('cmd.exe', checkPidArgs);
+					// Run tasklist (a Windows exe) via `cmd.exe /c` for WSL compatibility.
+					// The filter value must be quoted, so we escape those quotes.
+					const checkPidCmd = `cmd.exe /c "tasklist /nh /fi \\"PID eq ${pid}\\""`;
+					const { stdout: tasklistOutput } = await execPromise(checkPidCmd);
 
 					// tasklist output starts with the image name. We do a case-insensitive check.
 					if (tasklistOutput.trim().toLowerCase().startsWith(processName.toLowerCase())) {
@@ -190,10 +158,11 @@ function createHttpApiServer() {
 			} catch (error) {
 				// If the command fails (e.g., sandbox doesn't exist), we can assume the process isn't running.
 				// We log the error for debugging but return 'false' to the caller.
-				console.error(
-					`[HTTP API /running] Error checking process for client ${clientId}:`,
-					error instanceof Error ? error.message : String(error)
-				);
+				if (error instanceof Error) {
+					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error.message);
+				} else {
+					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
+				}
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end('false');
 			}
