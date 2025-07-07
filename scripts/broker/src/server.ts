@@ -16,7 +16,6 @@
 // It sends events in the following format: { eventName: string, values: unknown[] }
 // To execute a command, we send an 'exec' event.
 
-// FIX: Import execFile instead of exec to avoid shell quoting issues.
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import http from 'http';
@@ -32,7 +31,7 @@ const API_EVENT_MAP: ApiEventMap = {
 	exec: (command: string) => {},
 };
 
-// FIX: Promisify execFile. It is more secure and handles arguments better than exec.
+// Promisify execFile. It is more secure and handles arguments better than exec.
 const execFilePromise = promisify(execFile);
 
 // --- Configuration ---
@@ -130,14 +129,17 @@ function createHttpApiServer() {
 
 			const sandboxName = `game${clientId}`;
 			
-			// FIX: Construct the command and arguments for execFile to run on Windows.
-			// This avoids all shell quoting issues by passing arguments directly.
-			// The command to run, including the quoted path and its own arguments.
-			const listPidsCmdString = `"${"C:\\Program Files\\Sandboxie-Plus\\Start.exe"}" /box:${sandboxName} /listpids`;
+			// FIX: Set the Current Working Directory (cwd) to avoid path quoting issues.
+			// The path must be in the WSL format (`/mnt/c/...`) because Node is running in WSL.
+			const sandboxieDirWsl = '/mnt/c/Program Files/Sandboxie-Plus/';
+			const execOptions = { cwd: sandboxieDirWsl };
+
+			// Now the command is simple, as we're already in the right directory.
+			const listPidsCmdString = `Start.exe /box:${sandboxName} /listpids`;
 
 			try {
-				// Execute `cmd.exe /c "..."` without an intermediate shell.
-				const { stdout: pidsOutput } = await execFilePromise('cmd.exe', ['/c', listPidsCmdString]);
+				// Execute `cmd.exe /c "..."` with the specified working directory.
+				const { stdout: pidsOutput } = await execFilePromise('cmd.exe', ['/c', listPidsCmdString], execOptions);
 				
 				// Extract all sequences of digits from the output to get clean PIDs.
 				const pids = pidsOutput.match(/\d+/g) || [];
@@ -145,6 +147,7 @@ function createHttpApiServer() {
 				let isRunning = false;
 				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
+					// tasklist.exe is in the Windows System PATH, so it doesn't need a special cwd.
 					const checkPidCmdString = `tasklist /nh /fi "PID eq ${pid}"`;
 					const { stdout: tasklistOutput } = await execFilePromise('cmd.exe', ['/c', checkPidCmdString]);
 
