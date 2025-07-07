@@ -98,7 +98,8 @@ def main():
 
     # 1. Initial Cleanup
     terminate_all_sandboxes()
-    
+    time.sleep(10)
+
     # 2. Start Steam in each sandbox
     print(f"\n--- Starting {args.num} Steam client(s) in sandboxes [game1...game{args.num}] ---")
     for i in range(1, args.num + 1):
