@@ -104,7 +104,7 @@ def main():
     print(f"\n--- Starting {args.num} Steam client(s) in sandboxes [game1...game{args.num}] ---")
     for i in range(1, args.num + 1):
         box_name = f"game{i}"
-        command = [SANDBOXIE_EXE_PATH, '/hide_window', f'/box:{box_name}', 'steamwebhelper_min.bat']
+        command = [SANDBOXIE_EXE_PATH, '/hide_window', f'/box:{box_name}', 'steam_min.bat']
         run_command(command)
     
     # 3. Wait for Steam to initialize
