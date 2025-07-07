@@ -10,11 +10,14 @@
 // 2. HTTP API Server (Port 8080):
 //    - Provides a '/list' endpoint to get the IDs of all connected clients.
 //    - Provides a '/run' endpoint to send a console command to a specific client by its ID.
+//    - Provides a '/running' endpoint to check if a specific process is running in a client's sandbox.
 //
 // We use the 'simple-websockets' library for convenience.
 // It sends events in the following format: { eventName: string, values: unknown[] }
 // To execute a command, we send an 'exec' event.
 
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import http from 'http';
 import { SimpleWebSocketServer } from 'simple-websockets/server';
 import { URL } from 'url';
@@ -27,6 +30,9 @@ interface ApiEventMap {
 const API_EVENT_MAP: ApiEventMap = {
 	exec: (command: string) => {},
 };
+
+// Promisify exec for async/await usage in the HTTP server.
+const execPromise = promisify(exec);
 
 // --- Configuration ---
 const WEBSOCKET_HOST = 'localhost';
@@ -67,7 +73,7 @@ function createWebSocketServer() {
 
 // --- HTTP API Server for Applications ---
 function createHttpApiServer() {
-	const apiServer = http.createServer((req, res) => {
+	const apiServer = http.createServer(async (req, res) => {
         // Use the URL constructor for robust parsing of path and query parameters.
 		const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host}`);
 		
@@ -109,6 +115,56 @@ function createHttpApiServer() {
 			return;
 		}
 
+		// Endpoint: /running?id=X&name=processname.exe
+		// Checks if a given process name is running inside the specified client's sandbox.
+		if (requestUrl.pathname === '/running') {
+			const clientId = requestUrl.searchParams.get('id');
+			const processName = requestUrl.searchParams.get('name');
+
+			if (!clientId || !processName) {
+				res.writeHead(400, { 'Content-Type': 'text/plain' });
+				res.end('Bad Request: Missing "id" or "name" query parameter.');
+				return;
+			}
+
+			const sandboxName = `game${clientId}`;
+			// Command to list all Process IDs (PIDs) running in the specified sandbox.
+			// We enclose the path in quotes to handle spaces.
+			const listPidsCmd = `"C:\\Program Files\\Sandboxie-Plus\\Start.exe" /box:${sandboxName} /listpids`;
+
+			try {
+				// Get the list of PIDs from the sandbox.
+				const { stdout: pidsOutput } = await execPromise(listPidsCmd);
+				// Extract all sequences of digits from the output to get clean PIDs.
+				const pids = pidsOutput.match(/\d+/g) || [];
+
+				let isRunning = false;
+				// Check each PID to see if it matches the requested process name.
+				for (const pid of pids) {
+					// Use tasklist to get the executable name for the given PID.
+					// /nh = No Header, /fi = Filter
+					const checkPidCmd = `tasklist /nh /fi "PID eq ${pid}"`;
+					const { stdout: tasklistOutput } = await execPromise(checkPidCmd);
+
+					// tasklist output starts with the image name. We do a case-insensitive check.
+					if (tasklistOutput.trim().toLowerCase().startsWith(processName.toLowerCase())) {
+						isRunning = true;
+						break; // Process found, no need to check other PIDs.
+					}
+				}
+
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(isRunning));
+			} catch (error) {
+				// If the command fails (e.g., sandbox doesn't exist), we can assume the process isn't running.
+				// We log the error for debugging but return 'false' to the caller.
+				console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error.message);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end('false');
+			}
+			return;
+		}
+
 		// Handle unknown paths
 		res.writeHead(404, { 'Content-Type': 'text/plain' });
 		res.end('Not Found');
@@ -118,6 +174,7 @@ function createHttpApiServer() {
 		console.log(`[HTTP API] Server listening on http://localhost:${HTTP_API_PORT}`);
 		console.log(`  > Usage: /list`);
 		console.log(`  > Usage: /run?id=<CLIENT_ID>&cmd=<URL_ENCODED_COMMAND>`);
+		console.log(`  > Usage: /running?id=<CLIENT_ID>&name=<PROCESS_NAME.EXE>`);
 	});
 }
 
