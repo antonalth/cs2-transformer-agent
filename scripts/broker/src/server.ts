@@ -128,9 +128,9 @@ function createHttpApiServer() {
 			}
 
 			const sandboxName = `game${clientId}`;
-			// Command to list all Process IDs (PIDs) running in the specified sandbox.
-			// We enclose the path in quotes to handle spaces.
-			const listPidsCmd = `"C:\\Program Files\\Sandboxie-Plus\\Start.exe" /box:${sandboxName} /listpids`;
+			// FIX: Run the Windows command via `cmd.exe /c` for WSL compatibility.
+			// The inner command is wrapped in quotes to be passed as a single argument to /c.
+			const listPidsCmd = `cmd.exe /c ""C:\\Program Files\\Sandboxie-Plus\\Start.exe" /box:${sandboxName} /listpids"`;
 
 			try {
 				// Get the list of PIDs from the sandbox.
@@ -141,9 +141,9 @@ function createHttpApiServer() {
 				let isRunning = false;
 				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
-					// Use tasklist to get the executable name for the given PID.
-					// /nh = No Header, /fi = Filter
-					const checkPidCmd = `tasklist /nh /fi "PID eq ${pid}"`;
+					// FIX: Run tasklist (a Windows exe) via `cmd.exe /c` for WSL compatibility.
+					// Note the escaped quotes \" for the filter argument.
+					const checkPidCmd = `cmd.exe /c "tasklist /nh /fi \\"PID eq ${pid}\\""`;
 					const { stdout: tasklistOutput } = await execPromise(checkPidCmd);
 
 					// tasklist output starts with the image name. We do a case-insensitive check.
@@ -158,7 +158,11 @@ function createHttpApiServer() {
 			} catch (error) {
 				// If the command fails (e.g., sandbox doesn't exist), we can assume the process isn't running.
 				// We log the error for debugging but return 'false' to the caller.
-				console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error.message);
+				if (error instanceof Error) {
+					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error.message);
+				} else {
+					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
+				}
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end('false');
 			}
