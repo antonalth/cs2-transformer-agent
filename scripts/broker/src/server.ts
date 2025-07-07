@@ -129,7 +129,7 @@ function createHttpApiServer() {
 
 			const sandboxName = `game${clientId}`;
 			
-			// FIX: Set the Current Working Directory (cwd) to avoid path quoting issues.
+			// Set the Current Working Directory (cwd) to avoid path quoting issues.
 			// The path must be in the WSL format (`/mnt/c/...`) because Node is running in WSL.
 			const sandboxieDirWsl = '/mnt/c/Program Files/Sandboxie-Plus/';
 			const execOptions = { cwd: sandboxieDirWsl };
@@ -147,8 +147,8 @@ function createHttpApiServer() {
 				let isRunning = false;
 				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
-					// tasklist.exe is in the Windows System PATH, so it doesn't need a special cwd.
-					const checkPidCmdString = `tasklist /nh /fi "PID eq ${pid}"`;
+					// FIX: Prepend with 'call' to ensure cmd.exe correctly parses the quoted filter argument.
+					const checkPidCmdString = `call tasklist /nh /fi "PID eq ${pid}"`;
 					const { stdout: tasklistOutput } = await execFilePromise('cmd.exe', ['/c', checkPidCmdString]);
 
 					// tasklist output starts with the image name. We do a case-insensitive check.
