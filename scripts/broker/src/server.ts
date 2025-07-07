@@ -128,9 +128,9 @@ function createHttpApiServer() {
 			}
 
 			const sandboxName = `game${clientId}`;
-			// FIX: Run the Windows command via `cmd.exe /c` for WSL compatibility.
-			// The inner command is wrapped in quotes to be passed as a single argument to /c.
-			const listPidsCmd = `cmd.exe /c ""C:\\Program Files\\Sandboxie-Plus\\Start.exe" /box:${sandboxName} /listpids"`;
+			// FIX: Use single quotes to wrap the command for the WSL shell,
+			// ensuring the inner double quotes for the Windows path are preserved.
+			const listPidsCmd = `cmd.exe /c '"C:\\Program Files\\Sandboxie-Plus\\Start.exe" /box:${sandboxName} /listpids'`;
 
 			try {
 				// Get the list of PIDs from the sandbox.
@@ -141,9 +141,8 @@ function createHttpApiServer() {
 				let isRunning = false;
 				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
-					// FIX: Run tasklist (a Windows exe) via `cmd.exe /c` for WSL compatibility.
-					// Note the escaped quotes \" for the filter argument.
-					const checkPidCmd = `cmd.exe /c "tasklist /nh /fi \\"PID eq ${pid}\\""`;
+					// FIX: Apply the same single-quote wrapping strategy for the tasklist command.
+					const checkPidCmd = `cmd.exe /c 'tasklist /nh /fi "PID eq ${pid}"'`;
 					const { stdout: tasklistOutput } = await execPromise(checkPidCmd);
 
 					// tasklist output starts with the image name. We do a case-insensitive check.
