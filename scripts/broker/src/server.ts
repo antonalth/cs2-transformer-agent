@@ -16,7 +16,8 @@
 // It sends events in the following format: { eventName: string, values: unknown[] }
 // To execute a command, we send an 'exec' event.
 
-import { exec } from 'child_process';
+// FIX: Import execFile instead of exec to avoid shell quoting issues.
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import http from 'http';
 import { SimpleWebSocketServer } from 'simple-websockets/server';
@@ -31,8 +32,8 @@ const API_EVENT_MAP: ApiEventMap = {
 	exec: (command: string) => {},
 };
 
-// Promisify exec for async/await usage in the HTTP server.
-const execPromise = promisify(exec);
+// FIX: Promisify execFile. It is more secure and handles arguments better than exec.
+const execFilePromise = promisify(execFile);
 
 // --- Configuration ---
 const WEBSOCKET_HOST = 'localhost';
@@ -128,23 +129,24 @@ function createHttpApiServer() {
 			}
 
 			const sandboxName = `game${clientId}`;
-			// FIX: Correctly quote the command for `cmd.exe /c` to handle the space in "Program Files".
-			// The entire command passed to `/c` is quoted, and the inner path is also quoted.
-			const listPidsCmd = `cmd.exe /c "\\"C:\\Program Files\\Sandboxie-Plus\\Start.exe\\" /box:${sandboxName} /listpids"`;
+			
+			// FIX: Construct the command and arguments for execFile to run on Windows.
+			// This avoids all shell quoting issues by passing arguments directly.
+			// The command to run, including the quoted path and its own arguments.
+			const listPidsCmdString = `"${"C:\\Program Files\\Sandboxie-Plus\\Start.exe"}" /box:${sandboxName} /listpids`;
 
 			try {
-				// Get the list of PIDs from the sandbox.
-				const { stdout: pidsOutput } = await execPromise(listPidsCmd);
+				// Execute `cmd.exe /c "..."` without an intermediate shell.
+				const { stdout: pidsOutput } = await execFilePromise('cmd.exe', ['/c', listPidsCmdString]);
+				
 				// Extract all sequences of digits from the output to get clean PIDs.
 				const pids = pidsOutput.match(/\d+/g) || [];
 
 				let isRunning = false;
 				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
-					// Run tasklist (a Windows exe) via `cmd.exe /c` for WSL compatibility.
-					// The filter value must be quoted, so we escape those quotes.
-					const checkPidCmd = `cmd.exe /c "tasklist /nh /fi \\"PID eq ${pid}\\""`;
-					const { stdout: tasklistOutput } = await execPromise(checkPidCmd);
+					const checkPidCmdString = `tasklist /nh /fi "PID eq ${pid}"`;
+					const { stdout: tasklistOutput } = await execFilePromise('cmd.exe', ['/c', checkPidCmdString]);
 
 					// tasklist output starts with the image name. We do a case-insensitive check.
 					if (tasklistOutput.trim().toLowerCase().startsWith(processName.toLowerCase())) {
@@ -158,11 +160,7 @@ function createHttpApiServer() {
 			} catch (error) {
 				// If the command fails (e.g., sandbox doesn't exist), we can assume the process isn't running.
 				// We log the error for debugging but return 'false' to the caller.
-				if (error instanceof Error) {
-					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error.message);
-				} else {
-					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
-				}
+				console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end('false');
 			}
