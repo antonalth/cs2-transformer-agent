@@ -20,8 +20,12 @@ import { SimpleWebSocketServer } from 'simple-websockets/server';
 import { URL } from 'url';
 
 // Define the event map for our simple API. We only need to send 'exec' commands.
-const API_EVENT_MAP = {
-	exec: (command) => {},
+interface ApiEventMap {
+	exec: (command: string) => void;
+}
+
+const API_EVENT_MAP: ApiEventMap = {
+	exec: (command: string) => {},
 };
 
 // --- Configuration ---
@@ -65,7 +69,7 @@ function createWebSocketServer() {
 function createHttpApiServer() {
 	const apiServer = http.createServer((req, res) => {
         // Use the URL constructor for robust parsing of path and query parameters.
-		const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+		const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host}`);
 		
 		// Endpoint: /list
 		// Returns a JSON array of connected client IDs.
