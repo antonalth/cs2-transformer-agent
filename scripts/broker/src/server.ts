@@ -28,7 +28,7 @@ interface ApiEventMap {
 }
 
 const API_EVENT_MAP: ApiEventMap = {
-	exec: (command: string) => {},
+	exec: (command:string) => {},
 };
 
 // Promisify execFile. It is more secure and handles arguments better than exec.
@@ -130,7 +130,6 @@ function createHttpApiServer() {
 			const sandboxName = `game${clientId}`;
 			
 			// Set the Current Working Directory (cwd) to avoid path quoting issues.
-			// The path must be in the WSL format (`/mnt/c/...`) because Node is running in WSL.
 			const sandboxieDirWsl = '/mnt/c/Program Files/Sandboxie-Plus/';
 			const execOptions = { cwd: sandboxieDirWsl };
 
@@ -138,32 +137,41 @@ function createHttpApiServer() {
 			const listPidsCmdString = `Start.exe /box:${sandboxName} /listpids`;
 
 			try {
-				// Execute `cmd.exe /c "..."` with the specified working directory.
+				// Execute the first command to get the PIDs.
 				const { stdout: pidsOutput } = await execFilePromise('cmd.exe', ['/c', listPidsCmdString], execOptions);
 				
-				// Extract all sequences of digits from the output to get clean PIDs.
 				const pids = pidsOutput.match(/\d+/g) || [];
 
 				let isRunning = false;
-				// Check each PID to see if it matches the requested process name.
 				for (const pid of pids) {
-					// FIX: Prepend with 'call' to ensure cmd.exe correctly parses the quoted filter argument.
-					const checkPidCmdString = `call tasklist /nh /fi "PID eq ${pid}"`;
-					const { stdout: tasklistOutput } = await execFilePromise('cmd.exe', ['/c', checkPidCmdString]);
+					// FIX: Use PowerShell for a reliable way to get the process name from a PID.
+					// This avoids all the quoting issues with cmd.exe and tasklist.
+					const checkPidCmd = 'powershell.exe';
+					const checkPidArgs = ['-Command', `(Get-Process -Id ${pid}).MainModule.ModuleName`];
+					const { stdout: processNameOutput } = await execFilePromise(checkPidCmd, checkPidArgs);
 
-					// tasklist output starts with the image name. We do a case-insensitive check.
-					if (tasklistOutput.trim().toLowerCase().startsWith(processName.toLowerCase())) {
+					// The output is now clean (e.g., "cs2.exe"). We can do a direct, case-insensitive comparison.
+					if (processNameOutput.trim().toLowerCase() === processName.toLowerCase()) {
 						isRunning = true;
-						break; // Process found, no need to check other PIDs.
+						break; 
 					}
 				}
 
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify(isRunning));
 			} catch (error) {
-				// If the command fails (e.g., sandbox doesn't exist), we can assume the process isn't running.
-				// We log the error for debugging but return 'false' to the caller.
-				console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
+				// We still expect errors if a PID disappears between listing and checking.
+				// We can log it for debugging but it's not a critical failure.
+				// Critical failures (like sandbox not found) will also be caught here.
+				if (
+					typeof error === 'object' &&
+					error !== null &&
+					'stderr' in error &&
+					typeof (error as { stderr?: string }).stderr === 'string' &&
+					!(error as { stderr: string }).stderr.includes('No process with process ID')
+				) {
+					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
+				}
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end('false');
 			}
