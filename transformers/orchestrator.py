@@ -17,7 +17,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from multiprocessing import Pool, Manager, Event
+# *** FIX 1: Import Process directly ***
+from multiprocessing import Pool, Manager, Event, Process
 
 # --- Third-party libraries that need to be installed: ---
 # pip install requests
@@ -80,11 +81,9 @@ def run_subprocess(command_list, worker_prefix):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            # The encoding here is for the *reading* side in this orchestrator.
-            # The 'env' setting below handles the *writing* side in the child.
             encoding='utf-8',
             errors='replace',
-            env=child_env  # Pass the modified environment to the child
+            env=child_env
         )
 
         while True:
@@ -118,7 +117,7 @@ def extract_worker(task_queue, datadir, extract_script_path):
     while not SHUTDOWN_EVENT.is_set():
         try:
             demo_path = task_queue.get(timeout=1)
-            if demo_path is None:  # Sentinel value
+            if demo_path is None:
                 break
             
             db_filename = demo_path.stem + '.db'
@@ -133,7 +132,7 @@ def extract_worker(task_queue, datadir, extract_script_path):
             run_subprocess(command, prefix)
             
         except queue.Empty:
-            break # No more work
+            break
         except Exception as e:
             print(f"{prefix} Worker error: {e}", flush=True)
             break
@@ -146,8 +145,8 @@ def record_worker(task_queue, datadir, recdir, override_level, client_id, record
     while not SHUTDOWN_EVENT.is_set():
         try:
             demo_path = task_queue.get_nowait()
-            if demo_path is None: # Sentinel value
-                task_queue.put(None) # Put it back for other workers
+            if demo_path is None:
+                task_queue.put(None)
                 break
             
             db_filename = demo_path.stem + '.db'
@@ -166,8 +165,7 @@ def record_worker(task_queue, datadir, recdir, override_level, client_id, record
             ]
             run_subprocess(command, prefix)
 
-        except Exception: # Includes queue.Empty
-            # No more tasks in the queue
+        except Exception:
             break
 
 
@@ -307,7 +305,8 @@ def main():
 
         processes = []
         for client_id in available_clients:
-            proc = Manager().Process(
+            # *** FIX 2: Use Process(...) directly, not Manager().Process(...) ***
+            proc = Process(
                 target=record_worker,
                 args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH)
             )
