@@ -35,7 +35,6 @@ def setup_logging(debug=False):
     handler.setFormatter(formatter)
     LOG.addHandler(handler)
     LOG.setLevel(level)
-    # Give a unique name to the logger for this instance
     LOG.name = f"CS2 Recorder (ID: {CLIENT_ID})"
 
 def send_command(command, wait_after=0.5):
@@ -44,14 +43,13 @@ def send_command(command, wait_after=0.5):
         LOG.error("Cannot send command, client ID is not set.")
         return
 
-    # URL-encode the command to handle special characters safely.
     encoded_command = quote_plus(command)
     url = f"{HTTP_SERVER_URL}/run?id={CLIENT_ID}&cmd={encoded_command}"
     
     LOG.debug(f"Sending command: {command}")
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status()  # Raises an exception for 4xx or 5xx status codes
+        response.raise_for_status()
         LOG.debug(f"Server responded: {response.text}")
         time.sleep(wait_after)
     except requests.exceptions.RequestException as e:
@@ -60,17 +58,26 @@ def send_command(command, wait_after=0.5):
         cleanup()
 
 def wait_for_ffmpeg_to_finish():
-    """Polls the HTTP API until ffmpeg.exe is no longer reported as running."""
+    """
+    Polls the HTTP API until ffmpeg.exe is no longer reported as running.
+    Includes a retry mechanism to handle server timeouts under heavy load.
+    """
     LOG.info("Recording in progress... waiting for ffmpeg.exe to complete.")
     url = f"{HTTP_SERVER_URL}/running?id={CLIENT_ID}&name=ffmpeg.exe"
     
     is_recording = True
+    max_retries = 5  # Maximum number of consecutive timeouts before giving up
+    retry_count = 0
+
     while is_recording:
         try:
-            response = requests.get(url, timeout=5)
+            # Increased timeout for more resilience on a loaded system
+            response = requests.get(url, timeout=10)
             response.raise_for_status()
             
-            # The server returns JSON `true` or `false`
+            # Reset retry counter on a successful connection
+            retry_count = 0
+            
             is_running = response.json()
             
             if is_running:
@@ -80,20 +87,21 @@ def wait_for_ffmpeg_to_finish():
                 is_recording = False
                 
         except (requests.exceptions.RequestException, ValueError) as e:
-            LOG.error(f"Error polling for ffmpeg status: {e}")
-            LOG.warning("Could not confirm ffmpeg status. Assuming it has finished to avoid getting stuck.")
-            is_recording = False # Break loop on error
+            retry_count += 1
+            LOG.warning(f"Error polling for ffmpeg status: {e}")
+            if retry_count >= max_retries:
+                LOG.error(f"Could not confirm ffmpeg status after {max_retries} retries. Assuming it has finished to avoid getting stuck.")
+                is_recording = False  # Break loop on repeated errors
+            else:
+                LOG.warning(f"Retrying poll... ({retry_count}/{max_retries})")
+                time.sleep(5) # Wait longer before retrying if server is struggling
 
-    LOG.info("ffmpeg.exe process has finished.")
-    LOG.info("Waiting an additional 3 seconds for file handles to be released.")
-    time.sleep(3)
+    LOG.info("ffmpeg.exe process has finished or is assumed to have finished.")
+    LOG.info("Waiting an additional 10 seconds for file handles to be released (conservative wait).")
+    time.sleep(10) # Increased this wait time as a final safety measure
 
 def setup_environment(demo_file: Path):
     """Performs all initial setup steps using the HTTP API."""
-    # This script assumes the corresponding CS2 instance is already running
-    # and connected to the WebSocket server.
-
-    # Load demo
     full_path = str(demo_file.resolve())
     LOG.info(f"Loading demo: {full_path}")
     send_command(f'playdemo "{full_path}"')
@@ -103,14 +111,12 @@ def setup_environment(demo_file: Path):
     
     send_command("demo_pause")
 
-    # Prepare this instance's temporary recording directory
     LOG.info(f"Setting up temporary directory: {TEMP_RECORD_DIR}")
     if TEMP_RECORD_DIR.exists():
         LOG.warning("Temp directory already exists. Deleting contents.")
         shutil.rmtree(TEMP_RECORD_DIR)
     TEMP_RECORD_DIR.mkdir(parents=True)
 
-    # Send initial recording commands
     LOG.info("Sending initial recording setup commands...")
     temp_record_path_str = str(TEMP_RECORD_DIR.resolve())
     
@@ -141,7 +147,6 @@ def process_recordings(demo_file: Path, output_dir: Path):
     cursor.execute("SELECT * FROM RECORDING")
     all_db_entries = cursor.fetchall()
     
-    # Filter entries based on the --override flag
     entries_to_process = []
     if ARGS.override == 2:
         LOG.info("Override level 2: All entries will be re-recorded.")
@@ -164,7 +169,6 @@ def process_recordings(demo_file: Path, output_dir: Path):
 
     LOG.info(f"Found {len(all_db_entries)} total entries in DB. Selected {len(entries_to_process)} for processing with --override {ARGS.override}.")
 
-    # Prepare final output directory for this specific demo
     demo_name = demo_file.stem
     final_output_dir = output_dir / demo_name
     final_output_dir.mkdir(parents=True, exist_ok=True)
@@ -179,25 +183,21 @@ def process_recordings(demo_file: Path, output_dir: Path):
         
         LOG.info(f"--- Starting recording for Round {round_num}, Player: {player_name} ---")
         
-        # 1. Send per-clip commands
         send_command("mirv_cmd clear", wait_after=2)
         send_command(f"demo_gototick {start_tick}", wait_after=10)
-        send_command(f"spec_player {player_name}", wait_after=2) # Use safer command
+        send_command(f"spec_player {player_name}", wait_after=2)
         
         stop_command = f'mirv_cmd addAtTick {stop_tick} "mirv_streams record end; demo_pause"'
         send_command(stop_command, wait_after=2)
         
         send_command("mirv_streams record start; demo_resume", wait_after=10)
         
-        # 2. Wait for ffmpeg to finish using the HTTP API
         wait_for_ffmpeg_to_finish()
         
-        # 3. Move and rename the recorded files
         LOG.info("Processing recorded files...")
         new_filename_base = f"{round_num:02d}_{team}_{player_name}_{start_tick}_{stop_tick}"
         
         try:
-            # Find the 'takeXXXX' subdirectory created by HLAE inside our unique temp folder.
             take_dirs = [d for d in TEMP_RECORD_DIR.iterdir() if d.is_dir() and d.name.startswith("take")]
             if not take_dirs:
                 raise FileNotFoundError("No 'takeXXXX' sub-directory found. Recording likely failed.")
@@ -218,7 +218,6 @@ def process_recordings(demo_file: Path, output_dir: Path):
             dest_mp4_path = final_output_dir / f"{new_filename_base}.mp4"
             dest_wav_path = final_output_dir / f"{new_filename_base}.wav"
 
-            # **NEW**: Safely handle overwriting by deleting existing files first
             if dest_mp4_path.exists():
                 LOG.warning(f"Destination file exists, will be overwritten: {dest_mp4_path}")
                 dest_mp4_path.unlink()
@@ -233,7 +232,6 @@ def process_recordings(demo_file: Path, output_dir: Path):
             LOG.debug(f"Removing processed take directory: {take_dir}")
             shutil.rmtree(take_dir)
 
-            # 4. Update the database
             LOG.info("Updating database entry...")
             DB_CONN.execute(
                 "UPDATE RECORDING SET is_recorded = ?, recording_filepath = ? WHERE starttick = ? AND stoptick = ? AND playername = ?",
@@ -245,7 +243,7 @@ def process_recordings(demo_file: Path, output_dir: Path):
         except FileNotFoundError as e:
             LOG.error(f"File handling failed: {e}. Skipping database update.")
         except Exception as e:
-            LOG.error(f"An unexpected error occurred during file processing: {e}")
+            LOG.error(f"An unexpected error occurred during file processing: {e}", exc_info=ARGS.debug)
 
         LOG.info(f"--- Finished recording for Round {round_num}, Player: {player_name} ---")
 
@@ -253,7 +251,6 @@ def cleanup(signum=None, frame=None):
     """Cleans up resources. Can be called by 'finally' or signal handler."""
     LOG.info("\n--- Cleaning up resources ---")
     
-    # Send a final command to stop any active recording, just in case.
     send_command("demo_pause; mirv_streams record end;", wait_after=1)
 
     if TEMP_RECORD_DIR and TEMP_RECORD_DIR.exists():
@@ -264,9 +261,6 @@ def cleanup(signum=None, frame=None):
         LOG.info("Closing SQLite database connection.")
         DB_CONN.close()
     
-    # IMPORTANT: Do NOT kill the node server here. It's a shared resource
-    # for all parallel recording scripts and should be managed separately.
-
     LOG.info("Cleanup complete. Exiting.")
     if signum:
         sys.exit(0)
@@ -277,7 +271,7 @@ def main():
     
     parser = argparse.ArgumentParser(
         description="Automate CS2 video recording using an HTTP API. Controls a single game instance.",
-        formatter_class=argparse.RawTextHelpFormatter # For better help text formatting
+        formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--id", required=True, help="The client ID to control via the HTTP API.")
     parser.add_argument("--sql", required=True, help="Path to the input.db SQLite database file.")
@@ -297,7 +291,6 @@ def main():
     
     ARGS = parser.parse_args()
     
-    # Set instance-specific globals from arguments
     CLIENT_ID = ARGS.id
     TEMP_RECORD_DIR = Path(f"temp/temp_recording_id{CLIENT_ID}")
     
@@ -313,18 +306,12 @@ def main():
     output_dir = Path(ARGS.out)
 
     try:
-        # Step 1: Setup
         setup_environment(demo_file)
-        
-        # Step 2: Process all recordings
         process_recordings(demo_file, output_dir)
-        
         LOG.info("All recording tasks have been processed.")
-        
     except Exception as e:
         LOG.error(f"An unhandled error occurred during execution: {e}", exc_info=ARGS.debug)
     finally:
-        # Step 3: Cleanup (this will always run)
         cleanup()
 
 if __name__ == "__main__":
