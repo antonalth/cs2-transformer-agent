@@ -13,7 +13,6 @@ import time
 import threading
 from pathlib import Path
 from multiprocessing import Pool, Manager, Event, Process
-import requests
 
 # --- Globals ---
 HTTP_SERVER_URL = "http://localhost:8080"
