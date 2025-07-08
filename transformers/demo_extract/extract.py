@@ -17,7 +17,7 @@ The pipeline includes the following steps:
 The --optimize feature from the original keyboard_location.py is enabled by default.
 
 Usage:
-    python aggregate.py --demo /path/to/match.dem --out /path/to/final.db
+    python extract.py --demo /path/to/match.dem --out /path/to/final.db
 """
 
 from __future__ import annotations
