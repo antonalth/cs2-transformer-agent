@@ -126,7 +126,7 @@ def setup_environment(demo_file: Path):
     LOG.info("Setup complete. Ready to record clips.")
 
 def process_recordings(demo_file: Path, output_dir: Path):
-    """Iterates through DB entries and records each clip."""
+    """Iterates through DB entries and records each clip based on override settings."""
     global DB_CONN
     
     sql_file = Path(ARGS.sql)
@@ -138,14 +138,31 @@ def process_recordings(demo_file: Path, output_dir: Path):
     DB_CONN.row_factory = sqlite3.Row
     cursor = DB_CONN.cursor()
     
-    cursor.execute("SELECT * FROM RECORDING WHERE is_recorded IS NOT TRUE")
-    record_entries = cursor.fetchall()
+    cursor.execute("SELECT * FROM RECORDING")
+    all_db_entries = cursor.fetchall()
     
-    if not record_entries:
-        LOG.info("No unrecorded entries found in the database.")
+    # Filter entries based on the --override flag
+    entries_to_process = []
+    if ARGS.override == 2:
+        LOG.info("Override level 2: All entries will be re-recorded.")
+        entries_to_process = all_db_entries
+    else:
+        for entry in all_db_entries:
+            is_recorded = entry['is_recorded']
+            filepath = entry['recording_filepath']
+            
+            if not is_recorded:
+                entries_to_process.append(entry)
+            elif ARGS.override == 1 and is_recorded:
+                if not filepath or not Path(filepath).resolve().exists():
+                    LOG.info(f"Entry for round {entry['roundnumber']} marked as recorded but file is missing. Queuing for re-recording.")
+                    entries_to_process.append(entry)
+
+    if not entries_to_process:
+        LOG.info("No entries to record based on current criteria. Check --override options if you want to re-record.")
         return
 
-    LOG.info(f"Found {len(record_entries)} clips to record.")
+    LOG.info(f"Found {len(all_db_entries)} total entries in DB. Selected {len(entries_to_process)} for processing with --override {ARGS.override}.")
 
     # Prepare final output directory for this specific demo
     demo_name = demo_file.stem
@@ -153,7 +170,7 @@ def process_recordings(demo_file: Path, output_dir: Path):
     final_output_dir.mkdir(parents=True, exist_ok=True)
     LOG.info(f"Final recordings will be saved to: {final_output_dir}")
 
-    for entry in record_entries:
+    for entry in entries_to_process:
         round_num = entry['roundnumber']
         start_tick = entry['starttick']
         stop_tick = entry['stoptick']
@@ -185,7 +202,6 @@ def process_recordings(demo_file: Path, output_dir: Path):
             if not take_dirs:
                 raise FileNotFoundError("No 'takeXXXX' sub-directory found. Recording likely failed.")
             
-            # Sort by modification time to get the latest one, just in case.
             take_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
             take_dir = take_dirs[0]
             LOG.debug(f"Found recording sub-directory: {take_dir}")
@@ -201,6 +217,14 @@ def process_recordings(demo_file: Path, output_dir: Path):
             
             dest_mp4_path = final_output_dir / f"{new_filename_base}.mp4"
             dest_wav_path = final_output_dir / f"{new_filename_base}.wav"
+
+            # **NEW**: Safely handle overwriting by deleting existing files first
+            if dest_mp4_path.exists():
+                LOG.warning(f"Destination file exists, will be overwritten: {dest_mp4_path}")
+                dest_mp4_path.unlink()
+            if dest_wav_path.exists():
+                LOG.warning(f"Destination file exists, will be overwritten: {dest_wav_path}")
+                dest_wav_path.unlink()
             
             shutil.move(str(source_mp4), str(dest_mp4_path))
             shutil.move(str(source_wav), str(dest_wav_path))
@@ -251,12 +275,25 @@ def main():
     """Main execution function."""
     global ARGS, CLIENT_ID, TEMP_RECORD_DIR
     
-    parser = argparse.ArgumentParser(description="Automate CS2 video recording using an HTTP API.")
+    parser = argparse.ArgumentParser(
+        description="Automate CS2 video recording using an HTTP API. Controls a single game instance.",
+        formatter_class=argparse.RawTextHelpFormatter # For better help text formatting
+    )
     parser.add_argument("--id", required=True, help="The client ID to control via the HTTP API.")
     parser.add_argument("--sql", required=True, help="Path to the input.db SQLite database file.")
     parser.add_argument("--demofile", required=True, help="Path to the .dem demo file.")
     parser.add_argument("--out", required=True, help="Base path for the final output folder.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging.")
+    parser.add_argument(
+        "--override",
+        type=int,
+        choices=[0, 1, 2],
+        default=0,
+        help="Set the re-recording behavior:\n"
+             "0: (Default) Record only entries not marked as recorded in the DB.\n"
+             "1: Record entries from (0) AND entries marked as recorded but where the video file is missing.\n"
+             "2: Re-record all entries in the DB, overwriting any existing files."
+    )
     
     ARGS = parser.parse_args()
     
