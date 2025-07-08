@@ -165,7 +165,7 @@ def process_recordings(demo_file: Path, output_dir: Path):
         # 1. Send per-clip commands
         send_command("mirv_cmd clear", wait_after=2)
         send_command(f"demo_gototick {start_tick}", wait_after=10)
-        send_command(f"spec_player_by_name {player_name}", wait_after=2) # Use safer command
+        send_command(f"spec_player {player_name}", wait_after=2) # Use safer command
         
         stop_command = f'mirv_cmd addAtTick {stop_tick} "mirv_streams record end; demo_pause"'
         send_command(stop_command, wait_after=2)
