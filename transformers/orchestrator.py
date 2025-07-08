@@ -67,16 +67,24 @@ def signal_handler(signum, frame):
 def run_subprocess(command_list, worker_prefix):
     """
     Runs a command in a subprocess and streams its output with a prefix.
+    This version forces the child process to use UTF-8 encoding for its I/O.
     """
     print(f"{worker_prefix} Starting command: {' '.join(map(str, command_list))}", flush=True)
     try:
+        # Create a copy of the current environment and force UTF-8
+        child_env = os.environ.copy()
+        child_env['PYTHONUTF8'] = '1'
+
         process = subprocess.Popen(
             command_list,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # The encoding here is for the *reading* side in this orchestrator.
+            # The 'env' setting below handles the *writing* side in the child.
             encoding='utf-8',
-            errors='replace'
+            errors='replace',
+            env=child_env  # Pass the modified environment to the child
         )
 
         while True:
