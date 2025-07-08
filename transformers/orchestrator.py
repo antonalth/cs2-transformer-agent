@@ -39,9 +39,8 @@ EXTRACT_SCRIPT_PATH = SCRIPT_DIR / "demo_extract" / "extract.py"
 RECORD_SCRIPT_PATH = SCRIPT_DIR / "recording" / "record2.py"
 
 
-# *** FIX 1: Worker Initializer Function ***
-def initialize_worker():
-    """Initializer for worker processes to make them ignore SIGINT (Ctrl+C)."""
+def initialize_worker_pool():
+    """Initializer for processes within a Pool to make them ignore SIGINT."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
@@ -75,7 +74,6 @@ def run_subprocess(command_list, worker_prefix):
     responsive to a shutdown event in the main thread.
     """
     def stream_output(pipe, prefix):
-        """Reads from a pipe and prints lines with a prefix."""
         try:
             for line in iter(pipe.readline, ''):
                 print(f"{prefix} {line.strip()}", flush=True)
@@ -95,26 +93,19 @@ def run_subprocess(command_list, worker_prefix):
         encoding='utf-8',
         errors='replace',
         env=child_env,
-        # On Windows, this helps contain the process tree for easier cleanup
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     )
 
-    output_thread = threading.Thread(
-        target=stream_output, 
-        args=(process.stdout, worker_prefix)
-    )
+    output_thread = threading.Thread(target=stream_output, args=(process.stdout, worker_prefix))
     output_thread.daemon = True
     output_thread.start()
 
-    # The main thread of the worker now ONLY polls for shutdown or completion
     while process.poll() is None:
         if SHUTDOWN_EVENT.is_set():
-            print(f"{worker_prefix} Shutdown detected. Sending SIGINT to child process {process.pid}...", flush=True)
+            print(f"{worker_prefix} Shutdown detected. Sending signal to child process {process.pid}...", flush=True)
             if sys.platform == "win32":
-                # Send Ctrl+C equivalent on Windows
                 process.send_signal(signal.CTRL_C_EVENT)
             else:
-                # Send SIGINT on Unix-like systems
                 process.send_signal(signal.SIGINT)
             break
         time.sleep(0.1)
@@ -157,7 +148,11 @@ def extract_worker(task_queue, datadir, extract_script_path):
 
 
 def record_worker(task_queue, datadir, recdir, override_level, client_id, record_script_path):
-    """Worker function for the recording phase."""
+    """Worker function for the recording phase (for single Process instances)."""
+    # ** THE FIX IS HERE: **
+    # A single Process doesn't use an initializer, so we set the signal handler here.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     prefix = f"[RECORD-WORKER-ID-{client_id}]"
 
     while not SHUTDOWN_EVENT.is_set():
@@ -201,7 +196,6 @@ def get_available_clients():
         return clients
     except requests.exceptions.RequestException as e:
         print(f"! ERROR: Could not connect to the recording server at {HTTP_SERVER_URL}.", file=sys.stderr)
-        print(f"! Make sure the 'server.ts' script is running and accessible.", file=sys.stderr)
         print(f"! Details: {e}", file=sys.stderr)
         return []
 
@@ -256,8 +250,7 @@ def main():
                 for demo in demos_to_extract: task_queue.put(demo)
                 for _ in range(args.workers): task_queue.put(None)
                 
-                # *** FIX 2: Add initializer to the Pool ***
-                pool = Pool(processes=args.workers, initializer=initialize_worker)
+                pool = Pool(processes=args.workers, initializer=initialize_worker_pool)
                 ACTIVE_PROCESSES.append(pool)
                 tasks = [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH) for _ in range(args.workers)]
                 pool.starmap(extract_worker, tasks)
@@ -285,11 +278,11 @@ def main():
 
             processes = []
             for client_id in available_clients:
-                # *** FIX 3: Add initializer to the Process ***
+                # ** THE FIX IS HERE: **
+                # The 'initializer' argument is removed.
                 proc = Process(
                     target=record_worker,
-                    args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH),
-                    initializer=initialize_worker
+                    args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH)
                 )
                 processes.append(proc); ACTIVE_PROCESSES.append(proc)
                 proc.start()
