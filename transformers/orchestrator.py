@@ -16,8 +16,8 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
-# *** FIX 1: Import Process directly ***
 from multiprocessing import Pool, Manager, Event, Process
 
 # --- Third-party libraries that need to be installed: ---
@@ -31,82 +31,103 @@ except ImportError:
 # --- Globals ---
 HTTP_SERVER_URL = "http://localhost:8080"
 SHUTDOWN_EVENT = Event()
-# Keep track of active pools/processes for graceful shutdown
 ACTIVE_PROCESSES = []
 
 # --- Script Path Resolution ---
-# Assumes orchestrator.py is in the root project directory.
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXTRACT_SCRIPT_PATH = SCRIPT_DIR / "demo_extract" / "extract.py"
 RECORD_SCRIPT_PATH = SCRIPT_DIR / "recording" / "record2.py"
 
 
 def signal_handler(signum, frame):
-    """Gracefully handle Ctrl+C."""
+    """Gracefully handle Ctrl+C by setting an event and terminating processes."""
+    # Import type inside handler to avoid scope issues in some contexts
+    from multiprocessing.pool import Pool
+
     print("\n\n! CTRL+C DETECTED! INITIATING GRACEFUL SHUTDOWN...\n", flush=True)
     SHUTDOWN_EVENT.set()
     
-    # Give workers a moment to see the event, then terminate forcefully
-    time.sleep(2)
+    time.sleep(1) # Give workers a moment to see the event
     
-    for p in ACTIVE_PROCESSES:
+    # Use a copy for safe iteration while modifying the list
+    for p in list(ACTIVE_PROCESSES):
         if isinstance(p, Pool):
             print(f"! Terminating Pool {p}...", flush=True)
             p.terminate()
-        else:
+        elif isinstance(p, Process):
             print(f"! Terminating Process {p.name}...", flush=True)
             p.terminate()
     
-    # Wait for them to die
-    for p in ACTIVE_PROCESSES:
-        p.join()
+    for p in list(ACTIVE_PROCESSES):
+        p.join(timeout=5)
         
     print("\n! All workers terminated. Exiting now.", flush=True)
-    sys.exit(1)
+    # Use os._exit for a more forceful exit from a signal handler
+    os._exit(1)
 
 
 def run_subprocess(command_list, worker_prefix):
     """
-    Runs a command in a subprocess and streams its output with a prefix.
-    This version forces the child process to use UTF-8 encoding for its I/O.
+    Runs a command, streaming its output in a separate thread, while remaining
+    responsive to a shutdown event in the main thread. This ensures graceful
+    shutdown propagation.
     """
+    def stream_output(pipe, prefix):
+        """Reads from a pipe and prints lines with a prefix."""
+        try:
+            for line in iter(pipe.readline, ''):
+                print(f"{prefix} {line.strip()}", flush=True)
+        finally:
+            pipe.close()
+
     print(f"{worker_prefix} Starting command: {' '.join(map(str, command_list))}", flush=True)
+    
+    child_env = os.environ.copy()
+    child_env['PYTHONUTF8'] = '1'
+
+    process = subprocess.Popen(
+        command_list,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        env=child_env
+    )
+
+    output_thread = threading.Thread(
+        target=stream_output, 
+        args=(process.stdout, worker_prefix)
+    )
+    output_thread.daemon = True
+    output_thread.start()
+
     try:
-        # Create a copy of the current environment and force UTF-8
-        child_env = os.environ.copy()
-        child_env['PYTHONUTF8'] = '1'
-
-        process = subprocess.Popen(
-            command_list,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            env=child_env
-        )
-
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
+        # Loop to check for shutdown signal or process completion
+        while process.poll() is None:
+            if SHUTDOWN_EVENT.is_set():
+                print(f"{worker_prefix} Shutdown detected. Sending SIGINT to child process {process.pid}...", flush=True)
+                # Send Ctrl+C to the child, which triggers its own cleanup function
+                process.send_signal(signal.SIGINT)
                 break
-            if output:
-                print(f"{worker_prefix} {output.strip()}", flush=True)
+            time.sleep(0.1)
+    except (KeyboardInterrupt, SystemExit):
+        # This worker process itself was interrupted
+        print(f"{worker_prefix} Worker interrupted. Terminating child {process.pid}...", flush=True)
+        process.terminate()
 
-        return_code = process.poll()
-        if return_code == 0:
-            print(f"{worker_prefix} Command finished successfully.", flush=True)
-        else:
+    return_code = process.wait()
+    output_thread.join()
+
+    if return_code == 0:
+        print(f"{worker_prefix} Command finished successfully.", flush=True)
+    else:
+        # On Windows, a SIGINT termination often results in code 1.
+        # Check if shutdown was requested to avoid printing a scary error.
+        if not SHUTDOWN_EVENT.is_set():
             print(f"{worker_prefix} ERROR: Command failed with exit code {return_code}.", flush=True)
-        
-        return return_code
 
-    except FileNotFoundError:
-        print(f"{worker_prefix} ERROR: Could not find executable '{command_list[1]}'. Path seems incorrect.", flush=True)
-        return -1
-    except Exception as e:
-        print(f"{worker_prefix} An unexpected error occurred: {e}", flush=True)
-        return -1
+    return return_code
 
 
 def extract_worker(task_queue, datadir, extract_script_path):
@@ -124,10 +145,8 @@ def extract_worker(task_queue, datadir, extract_script_path):
             db_path = datadir / db_filename
             
             command = [
-                sys.executable,
-                str(extract_script_path),
-                "--demo", str(demo_path),
-                "--out", str(db_path)
+                sys.executable, str(extract_script_path),
+                "--demo", str(demo_path), "--out", str(db_path)
             ]
             run_subprocess(command, prefix)
             
@@ -155,12 +174,9 @@ def record_worker(task_queue, datadir, recdir, override_level, client_id, record
             print(f"{prefix} Processing demo: {demo_path.name}", flush=True)
 
             command = [
-                sys.executable,
-                str(record_script_path),
-                "--id", str(client_id),
-                "--demofile", str(demo_path),
-                "--sql", str(db_path),
-                "--out", str(recdir),
+                sys.executable, str(record_script_path),
+                "--id", str(client_id), "--demofile", str(demo_path),
+                "--sql", str(db_path), "--out", str(recdir),
                 "--override", str(override_level)
             ]
             run_subprocess(command, prefix)
@@ -190,7 +206,6 @@ def get_available_clients():
 
 
 def main():
-    # --- Initial Sanity Checks ---
     if not EXTRACT_SCRIPT_PATH.is_file():
         print(f"FATAL ERROR: `extract.py` not found at expected path: {EXTRACT_SCRIPT_PATH}", file=sys.stderr)
         sys.exit(1)
@@ -210,7 +225,7 @@ def main():
     parser.add_argument("--no_data_gen", action="store_true", help="Skip data generation and only run recording for demos with existing .db files.")
     args = parser.parse_args()
 
-    # --- Setup ---
+    original_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, signal_handler)
     
     args.demodir.mkdir(exist_ok=True)
@@ -225,113 +240,114 @@ def main():
     if not all_demo_files:
         print(f"No .dem files found in {args.demodir}. Exiting.")
         return
+        
+    try:
+        # ========================================================================
+        # PHASE 1: DATA GENERATION (extract.py)
+        # ========================================================================
+        print("\n" + "="*50)
+        print("### PHASE 1: DATA GENERATION ###")
+        print("="*50)
 
-    # ========================================================================
-    # PHASE 1: DATA GENERATION (extract.py)
-    # ========================================================================
-    print("\n" + "="*50)
-    print("### PHASE 1: DATA GENERATION ###")
-    print("="*50)
+        demos_to_extract = []
+        if args.no_data_gen:
+            print("> --no_data_gen is set. Skipping data generation.")
+        else:
+            print(f"> Checking {len(all_demo_files)} demos for existing database files...")
+            for demo_path in all_demo_files:
+                expected_db_path = args.datadir / (demo_path.stem + '.db')
+                if not expected_db_path.exists():
+                    demos_to_extract.append(demo_path)
+            
+            if not demos_to_extract:
+                print("> All demo files already have a corresponding .db file.")
+            else:
+                print(f"> Queuing {len(demos_to_extract)} demos for data extraction.")
+                
+                manager = Manager()
+                task_queue = manager.Queue()
+                for demo in demos_to_extract:
+                    task_queue.put(demo)
+                
+                for _ in range(args.workers):
+                    task_queue.put(None)
+                
+                pool = Pool(processes=args.workers)
+                ACTIVE_PROCESSES.append(pool)
 
-    demos_to_extract = []
-    if args.no_data_gen:
-        print("> --no_data_gen is set. Skipping data generation.")
-    else:
-        print(f"> Checking {len(all_demo_files)} demos for existing database files...")
+                tasks = [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH) for _ in range(args.workers)]
+                pool.starmap(extract_worker, tasks)
+                
+                pool.close()
+                pool.join()
+                ACTIVE_PROCESSES.remove(pool)
+
+        if SHUTDOWN_EVENT.is_set(): return
+        print("\n### PHASE 1 COMPLETE ###")
+
+        # ========================================================================
+        # PHASE 2: VIDEO RECORDING (record2.py)
+        # ========================================================================
+        print("\n" + "="*50)
+        print("### PHASE 2: VIDEO RECORDING ###")
+        print("="*50)
+
+        available_clients = get_available_clients()
+        if not available_clients:
+            print("! Cannot proceed with recording phase. Exiting.", file=sys.stderr)
+            return
+
+        demos_to_record = []
+        print("> Determining which demos to process for recording...")
         for demo_path in all_demo_files:
             expected_db_path = args.datadir / (demo_path.stem + '.db')
-            if not expected_db_path.exists():
-                demos_to_extract.append(demo_path)
-        
-        if not demos_to_extract:
-            print("> All demo files already have a corresponding .db file.")
+            if expected_db_path.exists():
+                demos_to_record.append(demo_path)
+            elif not args.no_data_gen:
+                print(f"! WARNING: DB file for {demo_path.name} was not generated. It will be skipped.", file=sys.stderr)
+
+        if not demos_to_record:
+            print("> No demos with corresponding .db files found. Nothing to record.")
         else:
-            print(f"> Queuing {len(demos_to_extract)} demos for data extraction.")
+            print(f"> Queuing {len(demos_to_record)} demos for video recording across {len(available_clients)} workers.")
             
             manager = Manager()
             task_queue = manager.Queue()
-            for demo in demos_to_extract:
+            for demo in demos_to_record:
                 task_queue.put(demo)
+
+            processes = []
+            for client_id in available_clients:
+                proc = Process(
+                    target=record_worker,
+                    args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH)
+                )
+                processes.append(proc)
+                ACTIVE_PROCESSES.append(proc)
+                proc.start()
+
+            for proc in processes:
+                proc.join()
             
-            for _ in range(args.workers):
-                task_queue.put(None)
-            
-            pool = Pool(processes=args.workers)
-            ACTIVE_PROCESSES.append(pool)
-
-            tasks = [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH) for _ in range(args.workers)]
-            pool.starmap(extract_worker, tasks)
-            
-            pool.close()
-            pool.join()
-            ACTIVE_PROCESSES.remove(pool)
-
-    if SHUTDOWN_EVENT.is_set():
-        print("\n> Phase 1 interrupted. Aborting pipeline.", file=sys.stderr)
-        return
-
-    print("\n### PHASE 1 COMPLETE ###")
-    
-    # ========================================================================
-    # PHASE 2: VIDEO RECORDING (record2.py)
-    # ========================================================================
-    print("\n" + "="*50)
-    print("### PHASE 2: VIDEO RECORDING ###")
-    print("="*50)
-
-    available_clients = get_available_clients()
-    if not available_clients:
-        print("! Cannot proceed with recording phase. Exiting.", file=sys.stderr)
-        return
-
-    demos_to_record = []
-    print("> Determining which demos to process for recording...")
-    for demo_path in all_demo_files:
-        expected_db_path = args.datadir / (demo_path.stem + '.db')
-        if expected_db_path.exists():
-            demos_to_record.append(demo_path)
-        elif not args.no_data_gen:
-            print(f"! WARNING: DB file for {demo_path.name} was not generated. It will be skipped.", file=sys.stderr)
-
-    if not demos_to_record:
-        print("> No demos with corresponding .db files found. Nothing to record.")
-    else:
-        print(f"> Queuing {len(demos_to_record)} demos for video recording across {len(available_clients)} workers.")
+            for proc in processes:
+                if proc in ACTIVE_PROCESSES:
+                    ACTIVE_PROCESSES.remove(proc)
         
-        manager = Manager()
-        task_queue = manager.Queue()
-        for demo in demos_to_record:
-            task_queue.put(demo)
+        if SHUTDOWN_EVENT.is_set(): return
+        print("\n### PHASE 2 COMPLETE ###")
 
-        processes = []
-        for client_id in available_clients:
-            # *** FIX 2: Use Process(...) directly, not Manager().Process(...) ***
-            proc = Process(
-                target=record_worker,
-                args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH)
-            )
-            processes.append(proc)
-            ACTIVE_PROCESSES.append(proc)
-            proc.start()
+    except (KeyboardInterrupt, SystemExit):
+        print("\n> Main process interrupted. Pipeline shutting down.", file=sys.stderr)
+    finally:
+        signal.signal(signal.SIGINT, original_sigint_handler)
+        if SHUTDOWN_EVENT.is_set():
+            sys.exit(1)
 
-        for proc in processes:
-            proc.join()
-        
-        for proc in processes:
-            ACTIVE_PROCESSES.remove(proc)
-
-    if SHUTDOWN_EVENT.is_set():
-        print("\n> Phase 2 interrupted. Aborting pipeline.", file=sys.stderr)
-        return
-
-    print("\n### PHASE 2 COMPLETE ###")
     print("\n" + "="*50)
     print(">>> Orchestration finished successfully. <<<")
     print("="*50)
 
-
 if __name__ == '__main__':
-    # Necessary for multiprocessing on some platforms
     import queue
     from multiprocessing import set_start_method
     try:
