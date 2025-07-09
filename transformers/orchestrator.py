@@ -6,7 +6,23 @@ This script manages a two-phase process:
 1. Data Generation: Runs `demo_extract/extract.py` on demo files to produce SQLite databases.
 2. Video Recording: Runs `recording/record2.py` using the generated databases to record video clips.
 
-It supports parallel execution and features a robust, graceful shutdown mechanism.
+It supports parallel execution for both phases and features a robust, graceful shutdown
+mechanism that works reliably on both Windows and POSIX-based systems.
+This script should be located in the project's root directory.
+
+GRACEFUL SHUTDOWN (Ctrl+C) LOGIC:
+1. The main process catches SIGINT via a signal handler. The main thread is kept
+   responsive by using non-blocking waits (e.g., `async_result.wait(timeout=...)`).
+2. The handler's ONLY job is to set a global `SHUTDOWN_EVENT`.
+3. Worker processes (spawned by Pool or Process) are configured to IGNORE SIGINT.
+   This prevents them from dying immediately and allows them to obey the SHUTDOWN_EVENT.
+4. The child scripts (`extract.py`, `record2.py`) are spawned in a new process
+   group/session, shielding them from the initial Ctrl+C broadcast.
+5. The `run_subprocess` function in each worker periodically checks SHUTDOWN_EVENT.
+   If set, it sends a SIGINT/Ctrl+C to its specific child process.
+6. The worker waits for its child to exit, then the worker itself exits cleanly.
+7. The main process, which is waiting in its non-blocking loop, sees that all
+   workers have finished and exits cleanly.
 """
 
 import argparse
@@ -20,6 +36,8 @@ from pathlib import Path
 from multiprocessing import Pool, Manager, Event, Process
 import queue
 
+# --- Third-party libraries that need to be installed: ---
+# pip install requests
 try:
     import requests
 except ImportError:
@@ -27,8 +45,6 @@ except ImportError:
     sys.exit(1)
 
 # --- Globals ---
-# This global is for the main process's signal handler. Workers will get this
-# object passed to them as an argument.
 HTTP_SERVER_URL = "http://localhost:8080"
 SHUTDOWN_EVENT = Event()
 
@@ -44,15 +60,19 @@ def initialize_worker_pool():
 
 
 def signal_handler(signum, frame):
-    """Gracefully handle Ctrl+C by setting the global shutdown event."""
+    """
+    Gracefully handle Ctrl+C by setting a global shutdown event.
+    This function's ONLY job is to set the event. The main loop will handle cleanup.
+    """
     print("\n\n! CTRL+C DETECTED! INITIATING GRACEFUL SHUTDOWN...\n"
           "! Workers will finish their current task and then exit. Please wait.\n", flush=True)
     SHUTDOWN_EVENT.set()
 
 
-def run_subprocess(command_list, worker_prefix, shutdown_event): # MODIFIED: Accepts event
+def run_subprocess(command_list, worker_prefix):
     """
-    Runs a command, streaming its output, while remaining responsive to a shutdown event.
+    Runs a command in a new process group, streaming its output in a separate thread,
+    while remaining responsive to a shutdown event.
     """
     def stream_output(pipe, prefix):
         try:
@@ -65,10 +85,17 @@ def run_subprocess(command_list, worker_prefix, shutdown_event): # MODIFIED: Acc
 
     child_env = os.environ.copy()
     child_env['PYTHONUTF8'] = '1'
-    
+
+    # This is critical for correct signal handling. It puts the child process
+    # in a new group, shielding it from the initial Ctrl+C from the terminal.
+    # This gives our orchestrator full control over when to send the shutdown signal.
     popen_kwargs = {
-        'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT, 'text': True,
-        'encoding': 'utf-8', 'errors': 'replace', 'env': child_env,
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.STDOUT,
+        'text': True,
+        'encoding': 'utf-8',
+        'errors': 'replace',
+        'env': child_env,
     }
     if sys.platform == "win32":
         popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -82,8 +109,7 @@ def run_subprocess(command_list, worker_prefix, shutdown_event): # MODIFIED: Acc
     output_thread.start()
 
     while process.poll() is None:
-        # MODIFIED: Checks the passed-in event object, not a global one.
-        if shutdown_event.is_set():
+        if SHUTDOWN_EVENT.is_set():
             print(f"{worker_prefix} Shutdown detected. Sending signal to child process {process.pid}...", flush=True)
             if sys.platform == "win32":
                 process.send_signal(signal.CTRL_C_EVENT)
@@ -95,8 +121,7 @@ def run_subprocess(command_list, worker_prefix, shutdown_event): # MODIFIED: Acc
     return_code = process.wait()
     output_thread.join()
 
-    # MODIFIED: Checks the passed-in event object.
-    if shutdown_event.is_set():
+    if SHUTDOWN_EVENT.is_set():
         print(f"{worker_prefix} Child process terminated due to shutdown request.", flush=True)
     elif return_code == 0:
         print(f"{worker_prefix} Command finished successfully.", flush=True)
@@ -106,17 +131,16 @@ def run_subprocess(command_list, worker_prefix, shutdown_event): # MODIFIED: Acc
     return return_code
 
 
-# MODIFIED: Accepts shutdown_event as an argument
-def extract_worker(task_queue, datadir, extract_script_path, shutdown_event):
-    """Worker function for the extraction phase."""
+def extract_worker(task_queue, datadir, extract_script_path):
+    """Worker function for the extraction phase (runs inside a Pool)."""
     worker_id = os.getpid()
     prefix = f"[EXTRACT-WORKER-{worker_id}]"
 
-    # MODIFIED: Checks the passed-in event object.
-    while not shutdown_event.is_set():
+    while not SHUTDOWN_EVENT.is_set():
         try:
             demo_path = task_queue.get(timeout=1)
-            if demo_path is None: break
+            if demo_path is None:  # Sentinel value means no more tasks.
+                break
 
             db_filename = demo_path.stem + '.db'
             db_path = datadir / db_filename
@@ -124,23 +148,25 @@ def extract_worker(task_queue, datadir, extract_script_path, shutdown_event):
                 sys.executable, str(extract_script_path),
                 "--demo", str(demo_path), "--out", str(db_path)
             ]
-            # MODIFIED: Passes the event down to the subprocess runner.
-            run_subprocess(command, prefix, shutdown_event)
+            run_subprocess(command, prefix)
+
         except queue.Empty:
-            continue
+            continue # Timeout, loop again to check SHUTDOWN_EVENT
         except Exception as e:
             print(f"{prefix} Worker error: {e}", flush=True)
             break
 
 
-# MODIFIED: Accepts shutdown_event as an argument
-def record_worker(task_queue, datadir, recdir, override_level, client_id, record_script_path, shutdown_event):
-    """Worker function for the recording phase."""
+def record_worker(task_queue, datadir, recdir, override_level, client_id, record_script_path):
+    """Worker function for the recording phase (for single Process instances)."""
+    # CRITICAL: Manually tell this worker process to ignore SIGINT so that
+    # it doesn't die instantly upon Ctrl+C. This is done by the Pool initializer
+    # for Pool workers, but must be done here for Process workers.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     prefix = f"[RECORD-WORKER-ID-{client_id}]"
 
-    # MODIFIED: Checks the passed-in event object.
-    while not shutdown_event.is_set():
+    while not SHUTDOWN_EVENT.is_set():
         try:
             demo_path = task_queue.get(timeout=1)
             db_filename = demo_path.stem + '.db'
@@ -152,13 +178,13 @@ def record_worker(task_queue, datadir, recdir, override_level, client_id, record
                 "--sql", str(db_path), "--out", str(recdir),
                 "--override", str(override_level)
             ]
-            # MODIFIED: Passes the event down to the subprocess runner.
-            run_subprocess(command, prefix, shutdown_event)
+            run_subprocess(command, prefix)
         except queue.Empty:
-            break
+            break # No more tasks.
         except Exception as e:
             print(f"{prefix} Unhandled worker error: {e}", flush=True)
             break
+
 
 def get_available_clients():
     """Queries the HTTP server to get a list of available recording client IDs."""
@@ -178,11 +204,19 @@ def get_available_clients():
         print(f"! Details: {e}", file=sys.stderr)
         return []
 
+
 def main():
-    # ... (Path checking and argument parsing is unchanged) ...
-    if not EXTRACT_SCRIPT_PATH.is_file(): sys.exit(f"FATAL ERROR: `extract.py` not found at expected path: {EXTRACT_SCRIPT_PATH}")
-    if not RECORD_SCRIPT_PATH.is_file(): sys.exit(f"FATAL ERROR: `record2.py` not found at expected path: {RECORD_SCRIPT_PATH}")
-    parser = argparse.ArgumentParser(description="Orchestrator for the CS2 data collection pipeline.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    if not EXTRACT_SCRIPT_PATH.is_file():
+        print(f"FATAL ERROR: `extract.py` not found at expected path: {EXTRACT_SCRIPT_PATH}", file=sys.stderr)
+        sys.exit(1)
+    if not RECORD_SCRIPT_PATH.is_file():
+        print(f"FATAL ERROR: `record2.py` not found at expected path: {RECORD_SCRIPT_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(
+        description="Orchestrator for the CS2 data collection pipeline.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--demodir", required=True, type=Path, help="Directory containing .dem files.")
     parser.add_argument("--datadir", required=True, type=Path, help="Directory to store generated .db files.")
     parser.add_argument("--recdir", required=True, type=Path, help="Directory to store final video folders.")
@@ -190,7 +224,6 @@ def main():
     parser.add_argument("--override", type=int, choices=[0, 1, 2], default=0, help="Override level for re-recording (passed to record2.py).")
     parser.add_argument("--no_data_gen", action="store_true", help="Skip data generation and only run recording for demos with existing .db files.")
     args = parser.parse_args()
-
 
     original_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, signal_handler)
@@ -223,9 +256,7 @@ def main():
                     for _ in range(args.workers): task_queue.put(None)
 
                     with Pool(processes=args.workers, initializer=initialize_worker_pool) as pool:
-                        # MODIFIED: Pass the SHUTDOWN_EVENT to each worker.
-                        tasks = [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH, SHUTDOWN_EVENT) for _ in range(args.workers)]
-                        async_result = pool.starmap_async(extract_worker, tasks)
+                        async_result = pool.starmap_async(extract_worker, [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH) for _ in range(args.workers)])
                         while not async_result.ready():
                             async_result.wait(timeout=1)
         else:
@@ -250,9 +281,10 @@ def main():
 
                 processes = []
                 for client_id in available_clients:
-                    # MODIFIED: Pass the SHUTDOWN_EVENT to each worker process.
-                    proc_args = (task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH, SHUTDOWN_EVENT)
-                    proc = Process(target=record_worker, args=proc_args)
+                    proc = Process(
+                        target=record_worker,
+                        args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH)
+                    )
                     processes.append(proc)
                     proc.start()
 
