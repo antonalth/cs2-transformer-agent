@@ -6,19 +6,23 @@ This script manages a two-phase process:
 1. Data Generation: Runs `demo_extract/extract.py` on demo files to produce SQLite databases.
 2. Video Recording: Runs `recording/record2.py` using the generated databases to record video clips.
 
-It supports parallel execution for both phases to improve performance.
+It supports parallel execution for both phases and features a robust, graceful shutdown
+mechanism that works reliably on both Windows and POSIX-based systems.
 This script should be located in the project's root directory.
 
 GRACEFUL SHUTDOWN (Ctrl+C) LOGIC:
-1. The main process catches SIGINT and calls `signal_handler`.
-2. `signal_handler` ONLY sets a global `SHUTDOWN_EVENT`. It does not terminate processes.
-3. Worker processes are configured to IGNORE SIGINT. This prevents them from dying immediately.
-4. The `run_subprocess` function in each worker periodically checks `SHUTDOWN_EVENT`.
-5. If the event is set, `run_subprocess` sends SIGINT to its specific child process
-   (e.g., `extract.py`), allowing it to perform its own cleanup.
-6. The worker waits for its child to exit, then the worker itself exits.
-7. The `main()` function, which is waiting on `pool.join()` or `proc.join()`, unblocks
-   and the script exits cleanly.
+1. The main process catches SIGINT via a signal handler. The main thread is kept
+   responsive by using non-blocking waits (e.g., `async_result.wait(timeout=...)`).
+2. The handler's ONLY job is to set a global `SHUTDOWN_EVENT`.
+3. Worker processes (spawned by Pool or Process) are configured to IGNORE SIGINT.
+   This prevents them from dying immediately and allows them to obey the SHUTDOWN_EVENT.
+4. The child scripts (`extract.py`, `record2.py`) are spawned in a new process
+   group/session, shielding them from the initial Ctrl+C broadcast.
+5. The `run_subprocess` function in each worker periodically checks SHUTDOWN_EVENT.
+   If set, it sends a SIGINT/Ctrl+C to its specific child process.
+6. The worker waits for its child to exit, then the worker itself exits cleanly.
+7. The main process, which is waiting in its non-blocking loop, sees that all
+   workers have finished and exits cleanly.
 """
 
 import argparse
@@ -30,7 +34,7 @@ import time
 import threading
 from pathlib import Path
 from multiprocessing import Pool, Manager, Event, Process
-import queue # Added for queue.Empty exception
+import queue
 
 # --- Third-party libraries that need to be installed: ---
 # pip install requests
@@ -43,7 +47,6 @@ except ImportError:
 # --- Globals ---
 HTTP_SERVER_URL = "http://localhost:8080"
 SHUTDOWN_EVENT = Event()
-ACTIVE_PROCESSES = [] # Kept for tracking/debugging purposes
 
 # --- Script Path Resolution ---
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -83,10 +86,8 @@ def run_subprocess(command_list, worker_prefix):
     child_env = os.environ.copy()
     child_env['PYTHONUTF8'] = '1'
 
-    # This is critical for correct signal handling.
-    # On Windows, CREATE_NEW_PROCESS_GROUP detaches the child from the parent's
-    # console, preventing it from receiving the initial Ctrl+C event.
-    # On POSIX, preexec_fn=os.setsid does the same by putting the child in a new session.
+    # This is critical for correct signal handling. It puts the child process
+    # in a new group, shielding it from the initial Ctrl+C from the terminal.
     # This gives our orchestrator full control over when to send the shutdown signal.
     popen_kwargs = {
         'stdout': subprocess.PIPE,
@@ -111,10 +112,8 @@ def run_subprocess(command_list, worker_prefix):
         if SHUTDOWN_EVENT.is_set():
             print(f"{worker_prefix} Shutdown detected. Sending signal to child process {process.pid}...", flush=True)
             if sys.platform == "win32":
-                # Send Ctrl+C event on Windows
                 process.send_signal(signal.CTRL_C_EVENT)
             else:
-                # Send SIGINT to the entire process group on POSIX
                 os.killpg(os.getpgid(process.pid), signal.SIGINT)
             break
         time.sleep(0.1)
@@ -133,18 +132,18 @@ def run_subprocess(command_list, worker_prefix):
 
 
 def extract_worker(task_queue, datadir, extract_script_path):
-    """Worker function for the extraction phase. (Runs inside a Pool)."""
+    """Worker function for the extraction phase (runs inside a Pool)."""
     worker_id = os.getpid()
     prefix = f"[EXTRACT-WORKER-{worker_id}]"
 
     while not SHUTDOWN_EVENT.is_set():
         try:
-            demo_path = task_queue.get(timeout=0.5) # Use a timeout to remain responsive
-            if demo_path is None: break
+            demo_path = task_queue.get(timeout=1)
+            if demo_path is None:  # Sentinel value means no more tasks.
+                break
 
             db_filename = demo_path.stem + '.db'
             db_path = datadir / db_filename
-
             command = [
                 sys.executable, str(extract_script_path),
                 "--demo", str(demo_path), "--out", str(db_path)
@@ -152,8 +151,7 @@ def extract_worker(task_queue, datadir, extract_script_path):
             run_subprocess(command, prefix)
 
         except queue.Empty:
-            # Queue is empty, but we might be shutting down. Loop again to check event.
-            continue
+            continue # Timeout, loop again to check SHUTDOWN_EVENT
         except Exception as e:
             print(f"{prefix} Worker error: {e}", flush=True)
             break
@@ -161,24 +159,19 @@ def extract_worker(task_queue, datadir, extract_script_path):
 
 def record_worker(task_queue, datadir, recdir, override_level, client_id, record_script_path):
     """Worker function for the recording phase (for single Process instances)."""
-    # CRITICAL: A worker process created via `multiprocessing.Process` does not
-    # use the Pool's initializer. We must manually tell this worker process
-    # to ignore SIGINT so that it doesn't die instantly upon Ctrl+C.
-    # This allows it to check the SHUTDOWN_EVENT and perform a graceful exit.
+    # CRITICAL: Manually tell this worker process to ignore SIGINT so that
+    # it doesn't die instantly upon Ctrl+C. This is done by the Pool initializer
+    # for Pool workers, but must be done here for Process workers.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     prefix = f"[RECORD-WORKER-ID-{client_id}]"
 
     while not SHUTDOWN_EVENT.is_set():
         try:
-            # Use a timeout to remain responsive to the shutdown event
-            demo_path = task_queue.get(timeout=0.5)
-
+            demo_path = task_queue.get(timeout=1)
             db_filename = demo_path.stem + '.db'
             db_path = datadir / db_filename
-
             print(f"{prefix} Processing demo: {demo_path.name}", flush=True)
-
             command = [
                 sys.executable, str(record_script_path),
                 "--id", str(client_id), "--demofile", str(demo_path),
@@ -187,8 +180,7 @@ def record_worker(task_queue, datadir, recdir, override_level, client_id, record
             ]
             run_subprocess(command, prefix)
         except queue.Empty:
-            # Queue is empty, our job is done.
-            break
+            break # No more tasks.
         except Exception as e:
             print(f"{prefix} Unhandled worker error: {e}", flush=True)
             break
@@ -233,7 +225,6 @@ def main():
     parser.add_argument("--no_data_gen", action="store_true", help="Skip data generation and only run recording for demos with existing .db files.")
     args = parser.parse_args()
 
-    # Set up signal handling
     original_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -262,15 +253,12 @@ def main():
                 with Manager() as manager:
                     task_queue = manager.Queue()
                     for demo in demos_to_extract: task_queue.put(demo)
-                    # Add sentinels for workers to know when to stop
                     for _ in range(args.workers): task_queue.put(None)
 
                     with Pool(processes=args.workers, initializer=initialize_worker_pool) as pool:
-                        ACTIVE_PROCESSES.append(pool)
-                        tasks = [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH) for _ in range(args.workers)]
-                        pool.starmap(extract_worker, tasks)
-                        # The 'with' statement handles pool.close() and pool.join()
-                if pool in ACTIVE_PROCESSES: ACTIVE_PROCESSES.remove(pool)
+                        async_result = pool.starmap_async(extract_worker, [(task_queue, args.datadir, EXTRACT_SCRIPT_PATH) for _ in range(args.workers)])
+                        while not async_result.ready():
+                            async_result.wait(timeout=1)
         else:
             print("> --no_data_gen is set. Skipping data generation.")
 
@@ -293,31 +281,24 @@ def main():
 
                 processes = []
                 for client_id in available_clients:
-                    # Note: `Process` does NOT take an `initializer` argument.
-                    # The signal handling is done inside the target function `record_worker`.
                     proc = Process(
                         target=record_worker,
                         args=(task_queue, args.datadir, args.recdir, args.override, client_id, RECORD_SCRIPT_PATH)
                     )
                     processes.append(proc)
-                    ACTIVE_PROCESSES.append(proc)
                     proc.start()
 
-                for proc in processes:
-                    proc.join() # Wait for each process to complete
-                for proc in processes:
-                    if proc in ACTIVE_PROCESSES: ACTIVE_PROCESSES.remove(proc)
+                active_procs = list(processes)
+                while any(p.is_alive() for p in active_procs):
+                    for p in active_procs:
+                        p.join(timeout=0.2)
 
         if SHUTDOWN_EVENT.is_set(): return
         print("\n### PHASE 2 COMPLETE ###")
 
     except KeyboardInterrupt:
-        # This block will run after the signal_handler sets the event.
-        # The main loop's .join() calls will be interrupted, or the workers
-        # will terminate gracefully, causing the joins to complete.
-        print("\n> Main process interrupted. Waiting for running tasks to gracefully shutdown...", file=sys.stderr)
+        print("\n> Main process caught KeyboardInterrupt. Pipeline is shutting down.", file=sys.stderr)
     finally:
-        # Restore the original signal handler before exiting.
         signal.signal(signal.SIGINT, original_sigint_handler)
         if SHUTDOWN_EVENT.is_set():
             print("\n! Pipeline shutdown was triggered by user.", file=sys.stderr)
@@ -326,11 +307,9 @@ def main():
     print("\n" + "="*50 + "\n>>> Orchestration finished successfully. <<<\n" + "="*50)
 
 if __name__ == '__main__':
-    # 'spawn' is a safer start method, especially for cross-platform apps.
-    # It's the default on Windows and macOS.
     from multiprocessing import set_start_method
     try:
         set_start_method('spawn')
     except RuntimeError:
-        pass # Already set
+        pass
     main()
