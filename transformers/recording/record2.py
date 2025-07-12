@@ -97,8 +97,8 @@ def wait_for_ffmpeg_to_finish():
                 time.sleep(5) # Wait longer before retrying if server is struggling
 
     LOG.info("ffmpeg.exe process has finished or is assumed to have finished.")
-    LOG.info("Waiting an additional 10 seconds for file handles to be released (conservative wait).")
-    time.sleep(10) # Increased this wait time as a final safety measure
+    LOG.info("Waiting an additional 5 seconds for file handles to be released.")
+    time.sleep(5) # Increased this wait time as a final safety measure
 
 def setup_environment(demo_file: Path):
     """Performs all initial setup steps using the HTTP API."""
