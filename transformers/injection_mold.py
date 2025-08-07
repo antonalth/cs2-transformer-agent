@@ -136,18 +136,18 @@ def define_numpy_dtypes():
         ('money', np.int32),
         # Bitmask for keyboard/movement/weapon handling
         ('keyboard_bitmask', np.uint32),
-        # NEW: Larger bitmask for buy/sell/drop/zone actions (2 * 64 = 128 bits)
+        # Larger bitmask for buy/sell/drop/zone actions (2 * 64 = 128 bits)
         ('eco_bitmask', np.uint64, (2,)),
-        # Bitmask for player's full inventory
-        ('inventory_bitmask', np.uint64),
-         # Bitmask for player's active weapon
-        ('active_weapon_bitmask', np.uint64),
+        # --- FIX: Expanded bitmasks for inventory and active weapon (128 bits) ---
+        ('inventory_bitmask', np.uint64, (2,)),
+        ('active_weapon_bitmask', np.uint64, (2,)),
     ])
-    
+
     # Assert that our bitmasks are large enough
     assert len(KEYBOARD_TO_BIT) <= 32, "Too many keyboard actions for uint32 bitmask"
     assert len(ECO_TO_BIT) <= 128, "Too many economic actions for 128-bit bitmask (2x uint64)"
-    assert len(ITEM_TO_INDEX) <= 64, "Too many items for inventory/weapon bitmasks (uint64)"
+    # --- FIX: Adjusted assertion for 128 bits ---
+    assert len(ITEM_TO_INDEX) <= 128, "Too many items for inventory/weapon bitmasks (2x uint64)"
 
     return game_state_dtype, player_input_dtype
 
@@ -251,21 +251,33 @@ def get_bitmask_array(actions, mapping):
     return mask
 
 def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
-    inventory_mask, active_weapon_mask = np.uint64(0), np.uint64(0)
+    """Creates 128-bit bitmasks for the player's inventory and active weapon."""
+    inventory_mask = np.zeros(2, dtype=np.uint64)
+    active_weapon_mask = np.zeros(2, dtype=np.uint64)
 
-    if active_weapon and active_weapon in mapping:
-        active_weapon_mask = (np.uint64(1) << np.uint64(mapping[active_weapon]))
-    elif active_weapon and ("knife" in active_weapon.lower() or "bayonet" in active_weapon.lower()):
-        if "Knife" in mapping: active_weapon_mask = (np.uint64(1) << np.uint64(mapping["Knife"]))
+    def set_bit(mask, item_name):
+        bit_pos = mapping.get(item_name)
+        # Handle knife variations as a fallback
+        if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()):
+            bit_pos = mapping.get("Knife")
 
+        if bit_pos is not None:
+            idx = bit_pos // 64
+            pos_in_idx = bit_pos % 64
+            if idx < 2:  # Ensure we don't write out of bounds
+                mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
+
+    # Active Weapon
+    if active_weapon:
+        set_bit(active_weapon_mask, active_weapon)
+
+    # Full Inventory
     try:
         inventory_list = json.loads(inventory_json) if inventory_json else []
         for item in inventory_list:
-            if item in mapping:
-                inventory_mask |= (np.uint64(1) << np.uint64(mapping[item]))
-            elif "knife" in item.lower() or "bayonet" in item.lower():
-                if "Knife" in mapping: inventory_mask |= (np.uint64(1) << np.uint64(mapping["Knife"]))
-    except (json.JSONDecodeError, TypeError): pass
+            set_bit(inventory_mask, item)
+    except (json.JSONDecodeError, TypeError):
+        pass  # Ignore malformed inventory strings
 
     return inventory_mask, active_weapon_mask
 
