@@ -37,6 +37,8 @@ TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0
 
 # 5. LIST OF OTHER REQUIRED PACKAGES
 OTHER_PIP_PACKAGES = [
+    "lmdb",
+    "msgpack",
     "flash-attn",
     "transformers",
     "onnx",
@@ -94,7 +96,7 @@ def run_in_env(env_name, command, description):
 
 def setup_environment():
     """Creates the conda environment and installs all packages."""
-    print(">>> Starting Environment Setup for Python 3.11 on Linux <<<")
+    print(">>> Starting Environment Setup for Python 3.12 on Linux <<<")
 
     # Verify the user has updated the TensorRT path
     if "/path/to/your/" in TENSORRT_WHEEL_PATH:

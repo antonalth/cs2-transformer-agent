@@ -1,377 +1,491 @@
 #!/usr/bin/env python3
 """
-injection_mold.py - ML Data Preprocessing and Packaging Script
+injection_mold.py - Compile CS2 recordings and database into a unified LMDB
+for model training.
 
-This script serves as the final stage of the data preparation pipeline. It consumes
-the structured game data from an SQLite database and the corresponding raw video/audio
-recordings, then "molds" them into a single, highly-optimized, and training-ready
-LMDB (Lightning Memory-Mapped Database).
-
-The script iterates through the `rounds` table and, for each complete round, verifies
-that all 10 player recordings exist. It then processes the full round timeframe,
-packaging the global game state and individual player data into the LMDB.
+This script performs the following actions:
+1. Validates the existence of all required video/audio recordings against a
+   SQLite database.
+2. For each tick in a valid round, it fetches:
+   - The overall game state (round status, player liveness, enemy positions).
+   - The POV video frame and audio chunk for each of the 5 players on a team.
+   - The detailed inputs (keyboard, mouse, etc.) for each of the 5 players.
+3. Aligns and encodes this data into a structured format using NumPy and msgpack.
+4. Writes the final packaged data into an LMDB database, keyed by demo, round,
+   team, and tick.
+5. Includes robust error handling and a cleanup mechanism to prevent corrupt
+   database states on interruption.
 """
 
-# =============================================================================
-# 1. IMPORTS
-# =============================================================================
-
-# --- Standard Library Imports ---
 import argparse
 import json
 import logging
 import os
 import signal
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
-import sqlite3
-from collections import defaultdict
 
-# --- Third-Party Imports ---
-# These must be installed via pip:
-# pip install lmdb numpy msgpack-python opencv-python soundfile tqdm
-try:
-    import lmdb
-    import numpy as np
-    import msgpack
-    import cv2
-    import soundfile as sf
-    from tqdm import tqdm
-except ImportError as e:
-    print(f"Error: A required library is missing. {e}", file=sys.stderr)
-    print("Please run: pip install lmdb numpy msgpack-python opencv-python soundfile tqdm", file=sys.stderr)
-    sys.exit(1)
+import cv2
+import lmdb
+import msgpack
+import msgpack_numpy as m
+import numpy as np
+from tqdm import tqdm
 
+# --- Configuration Constants ---
+GAME_TICKS_PER_SEC = 64
+EXPECTED_VIDEO_FPS = 32
+TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_CHANNELS = 2
+AUDIO_BIT_DEPTH = 2  # 16-bit
+AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNELS * AUDIO_BIT_DEPTH
 
-# =============================================================================
-# 2. GLOBAL CONSTANTS & CONFIGURATION
-# =============================================================================
+# LMDB Configuration
+INITIAL_MAP_SIZE = 20 * 1024 * 1024 * 1024  # 20 GB
+MAP_RESIZE_INCREMENT = 5 * 1024 * 1024 * 1024  # 5 GB
+MAP_RESIZE_THRESHOLD = 200 * 1024 * 1024  # 200 MB
 
-# --- LMDB Configuration ---
-LMDB_INITIAL_MAP_SIZE = 20 * (1024**3)  # 20 GB
-LMDB_RESIZE_INCREMENT = 5 * (1024**3)   # 5 GB
-LMDB_REMAINING_THRESHOLD = 200 * (1024**2) # 200 MB
-INFO_KEY_SUFFIX = "_INFO"
-
-# --- Game & Video Data Configuration ---
-GAME_TICKRATE = 64
-VIDEO_FPS = 32
-TICKS_PER_FRAME = GAME_TICKRATE // VIDEO_FPS
-
-# --- NumPy Data Structure Definitions (DTypes) ---
-game_state_dtype = np.dtype([
-    ('tick', np.int32),
-    ('round_state_flags', np.uint8),
-    ('team_alive_mask', np.uint8),
-    ('enemy_alive_mask', np.uint8),
-    ('enemy_positions', np.float32, (5, 3))
-])
-
-player_input_dtype = np.dtype([
-    ('position', np.float32, 3),
-    ('mouse_delta', np.float32, 2),
-    ('health', np.uint8),
-    ('armor', np.uint8),
-    ('money', np.int32),
-    ('input_flags', np.uint64),
-    ('active_weapon_id', np.uint8),
-    ('inventory_flags', np.uint32),
-    ('is_in_buyzone', bool)
-])
-
-# --- Data Mapping Constants ---
-KEY_INPUT_MAP = {
-    'IN_FORWARD': 1 << 0, 'IN_BACK': 1 << 1, 'IN_MOVELEFT': 1 << 2, 'IN_MOVERIGHT': 1 << 3,
-    'IN_JUMP': 1 << 4, 'IN_DUCK': 1 << 5, 'IN_WALK': 1 << 6, 'IN_RELOAD': 1 << 7,
-    'IN_ATTACK': 1 << 8, 'IN_ATTACK2': 1 << 9, 'IN_USE': 1 << 10,
-    'DROP_': 1 << 11, 'BUY_': 1 << 12, 'SELL_': 1 << 13
-}
-# TODO: Define these mappings based on final data from extract.py
-WEAPON_CATEGORY_MAP = {'Rifle': 1, 'Pistol': 2, 'SMG': 3, 'Heavy': 4, 'Knife': 5, 'Grenade': 6}
-INVENTORY_MAP = {'defuser': 1 << 0, 'c4': 1 << 1}
-
-# =============================================================================
-# 3. GLOBAL STATE
-# =============================================================================
-
+# --- Globals ---
 LOG = logging.getLogger("InjectionMold")
-CLEANUP_REQUIRED = True
+# This global is needed for the signal handler to find the directory to clean up
+LMDB_PATH_FOR_CLEANUP = None
 
 
 # =============================================================================
-# 4. CORE LOGIC FUNCTIONS
+# 1. DATA ENCODING MAPPINGS
+# =============================================================================
+# These maps are derived from the schema documentation provided.
+
+# Maps every possible discrete input action to a bit position for a bitmask.
+KEYBOARD_ACTIONS = [
+    # Direct Inputs
+    "IN_ATTACK", "IN_JUMP", "IN_DUCK", "IN_FORWARD", "IN_BACK", "IN_USE", "IN_CANCEL",
+    "IN_TURNLEFT", "IN_TURNRIGHT", "IN_MOVELEFT", "IN_MOVERIGHT", "IN_ATTACK2",
+    "IN_RELOAD", "IN_ALT1", "IN_ALT2", "IN_SPEED", "IN_WALK", "IN_ZOOM",
+    "IN_WEAPON1", "IN_WEAPON2", "IN_BULLRUSH", "IN_GRENADE1", "IN_GRENADE2",
+    "IN_ATTACK3", "IN_SCORE", "IN_INSPECT",
+    # Inferred Weapon Switches
+    "SWITCH_1", "SWITCH_2", "SWITCH_3", "SWITCH_4", "SWITCH_5",
+    # Inferred Drop Actions (common items)
+    "DROP_deagle", "DROP_elite", "DROP_fiveseven", "DROP_glock", "DROP_ak47", "DROP_aug",
+    "DROP_awp", "DROP_famas", "DROP_g3sg1", "DROP_galilar", "DROP_m249", "DROP_m4a1",
+    "DROP_mac10", "DROP_p90", "DROP_mp5sd", "DROP_ump45", "DROP_xm1014", "DROP_bizon",
+    "DROP_mag7", "DROP_negev", "DROP_sawedoff", "DROP_tec9", "DROP_p2000", "DROP_mp7",
+    "DROP_mp9", "DROP_nova", "DROP_p250", "DROP_scar20", "DROP_sg556", "DROP_ssg08",
+    "DROP_knife", "DROP_flashbang", "DROP_hegrenade", "DROP_smokegrenade", "DROP_molotov",
+    "DROP_decoy", "DROP_incgrenade", "DROP_c4", "DROP_m4a1_silencer", "DROP_usp_silencer",
+    "DROP_cz75a", "DROP_revolver", "DROP_defuser",
+    # Buy/Sell Actions
+    "BUY_deagle", "BUY_elite", "BUY_fiveseven", "BUY_glock", "BUY_ak47", "BUY_aug",
+    "BUY_awp", "BUY_famas", "BUY_g3sg1", "BUY_galilar", "BUY_m249", "BUY_m4a1",
+    "BUY_mac10", "BUY_p90", "BUY_mp5sd", "BUY_ump45", "BUY_xm1014", "BUY_bizon",
+    "BUY_mag7", "BUY_negev", "BUY_sawedoff", "BUY_tec9", "BUY_p2000", "BUY_mp7",
+    "BUY_mp9", "BUY_nova", "BUY_p250", "BUY_scar20", "BUY_sg556", "BUY_ssg08",
+    "BUY_knife", "BUY_flashbang", "BUY_hegrenade", "BUY_smokegrenade", "BUY_molotov",
+    "BUY_decoy", "BUY_incgrenade", "BUY_c4", "BUY_m4a1_silencer", "BUY_usp_silencer",
+    "BUY_cz75a", "BUY_revolver", "BUY_defuser", "BUY_vest", "BUY_vesthelm",
+    "SELL_deagle", "SELL_fiveseven", "SELL_glock", "SELL_ak47", "SELL_aug", "SELL_awp",
+    "SELL_famas", "SELL_galilar", "SELL_m4a1", "SELL_mac10", "SELL_p90", "SELL_ump45",
+    "SELL_xm1014", "SELL_bizon", "SELL_mag7", "SELL_sawedoff", "SELL_tec9", "SELL_p2000",
+    "SELL_mp7", "SELL_mp9", "SELL_nova", "SELL_p250", "SELL_ssg08", "SELL_flashbang",
+    "SELL_hegrenade", "SELL_smokegrenade", "SELL_molotov", "SELL_decoy", "SELL_incgrenade",
+    # Special value for being in buy zone
+    "IN_BUYZONE"
+]
+KEYBOARD_TO_BIT = {action: i for i, action in enumerate(KEYBOARD_ACTIONS)}
+# We need enough bits to store all keyboard actions. A uint32 should be sufficient.
+assert len(KEYBOARD_TO_BIT) < 256, "Too many actions for uint8 bitmask. Increase size."
+
+# Maps every possible item/weapon to a unique index for one-hot encoding.
+ITEM_NAMES = [
+    # Rifles
+    "AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553", "AWP", "SSG 08", "G3SG1", "SCAR-20",
+    # Pistols
+    "Glock-18", "USP-S", "P250", "P2000", "Dual Berettas", "Five-SeveN", "Tec-9", "CZ75-Auto", "R8 Revolver", "Desert Eagle",
+    # SMGs
+    "MP9", "MAC-10", "MP7", "MP5-SD", "UMP-45", "P90", "PP-Bizon",
+    # Heavy
+    "Nova", "XM1014", "MAG-7", "Sawed-Off", "M249", "Negev",
+    # Knives (consolidated)
+    "Knife", "Bayonet", "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife", "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers", "Ursus Knife", "Navaja Knife", "Stiletto Knife", "Talon Knife", "Classic Knife", "Paracord Knife", "Survival Knife", "Nomad Knife", "Skeleton Knife",
+    # Grenades
+    "High Explosive Grenade", "Flashbang", "Smoke Grenade", "Molotov", "Incendiary Grenade", "Decoy Grenade",
+    # Gear & Other
+    "C4 Explosive", "Defuse Kit", "Zeus x27", "Kevlar Vest", "Helmet"
+]
+# Add knife variations from schema
+ITEM_NAMES.extend(["knife_ct", "knife_t"])
+ITEM_TO_INDEX = {item: i for i, item in enumerate(sorted(list(set(ITEM_NAMES))))}
+assert len(ITEM_TO_INDEX) < 256, "Too many items for uint8 bitmask. Increase size."
+
+# Make msgpack aware of numpy
+m.patch()
+
+# =============================================================================
+# 2. NUMPY DTYPE DEFINITIONS
 # =============================================================================
 
-def fetch_and_validate_round_manifest(db_conn, recordings_dir, overridesql_flag):
-    LOG.info("Connecting to database and building round manifest...")
-    cursor = db_conn.cursor()
+def define_numpy_dtypes():
+    """Defines the structured NumPy dtypes for game state and player input."""
+    game_state_dtype = np.dtype([
+        ('tick', np.int32),
+        # 5 bools packed into a uint8: freezetime, inround, bomb_planted, won, lost
+        ('round_state', np.uint8),
+        # 5 bools for team player liveness
+        ('team_alive', np.uint8),
+        # 5 bools for enemy player liveness
+        ('enemy_alive', np.uint8),
+        # 5 enemies, each with x, y, z coordinates
+        ('enemy_pos', np.float32, (5, 3))
+    ])
 
-    cursor.execute("SELECT round, starttick, endtick, freezetime_endtick, bomb_planted_tick, t_team, ct_team FROM rounds ORDER BY round")
-    all_rounds = cursor.fetchall()
-    if not all_rounds:
-        LOG.error("No entries found in the 'rounds' table. Cannot proceed.")
+    player_input_dtype = np.dtype([
+        ('pos', np.float32, (3,)),
+        ('mouse', np.float32, (2,)),
+        ('health', np.uint8),
+        ('armor', np.uint8),
+        ('money', np.int32),
+        # A bitmask for all keyboard/buy/sell/drop actions
+        ('keyboard_bitmask', np.uint32),
+        # A one-hot encoded bitmask for player's full inventory
+        ('inventory_bitmask', np.uint64),
+         # A one-hot encoded bitmask for player's active weapon
+        ('active_weapon_bitmask', np.uint64),
+    ])
+    
+    # Ensure our bitmasks are large enough
+    assert len(KEYBOARD_TO_BIT) <= 32, "Too many actions for keyboard_bitmask (uint32)"
+    assert len(ITEM_TO_INDEX) <= 64, "Too many items for inventory/weapon bitmasks (uint64)"
+
+    return game_state_dtype, player_input_dtype
+
+# =============================================================================
+# 3. HELPER FUNCTIONS AND SETUP
+# =============================================================================
+
+def setup_logging(debug=False):
+    """Configures the logging for the script."""
+    level = logging.DEBUG if debug else logging.INFO
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    LOG.addHandler(handler)
+    LOG.setLevel(level)
+
+def signal_handler(sig, frame):
+    """Handles Ctrl+C interruption to clean up a partially written LMDB."""
+    LOG.warning("Interruption detected. Cleaning up partial LMDB database...")
+    if LMDB_PATH_FOR_CLEANUP and os.path.exists(LMDB_PATH_FOR_CLEANUP):
+        try:
+            shutil.rmtree(LMDB_PATH_FOR_CLEANUP)
+            LOG.info(f"Successfully removed incomplete LMDB at: {LMDB_PATH_FOR_CLEANUP}")
+        except OSError as e:
+            LOG.error(f"Error removing LMDB directory: {e}")
+    sys.exit(0)
+
+def load_and_validate_data(db_path, rec_dir, override_sql):
+    """
+    Loads all required data from the SQLite DB, validates that all media
+    files exist, and organizes it for processing.
+    """
+    LOG.info("-> Phase 1: Validating database and recording files...")
+    if not db_path.exists():
+        LOG.critical(f"Database file not found at: {db_path}")
         sys.exit(1)
 
-    round_manifest = {}
-    for r in all_rounds:
-        round_num = r['round']
-        round_manifest[round_num] = {'round_data': dict(r), 'recordings': {}}
-        
-        try:
-            t_players = [p[0] for p in json.loads(r['t_team'])]
-            ct_players = [p[0] for p in json.loads(r['ct_team'])]
-        except (json.JSONDecodeError, TypeError, IndexError):
-            LOG.warning(f"Skipping Round {round_num}: Invalid team data format in 'rounds' table.")
-            continue
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
 
-        all_players_in_round = t_players + ct_players
-        cursor.execute(f"SELECT * FROM RECORDING WHERE roundnumber = ? AND playername IN ({','.join(['?']*len(all_players_in_round))})",
-                       (round_num, *all_players_in_round))
-        
-        recordings = cursor.fetchall()
-        for rec in recordings:
-            if not rec['is_recorded'] and not overridesql_flag:
-                LOG.warning(f"Skipping Round {round_num}: Player '{rec['playername']}' is marked 'is_recorded=False'. Use --overridesql to ignore.")
-                round_manifest.pop(round_num)
-                break
+    # 1. Fetch all rounds
+    rounds_info = {r['round']: dict(r) for r in conn.execute("SELECT * FROM rounds").fetchall()}
+    LOG.info(f"   - Loaded info for {len(rounds_info)} rounds.")
 
-            base_filename = f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
-            mp4_path = recordings_dir / f"{base_filename}.mp4"
-            wav_path = recordings_dir / f"{base_filename}.wav"
+    # 2. Fetch and validate all recordings
+    recordings_map = {}
+    db_recordings = conn.execute("SELECT * FROM RECORDING ORDER BY roundnumber, team, playername").fetchall()
 
-            if not mp4_path.exists() or not wav_path.exists():
-                LOG.warning(f"Skipping Round {round_num}: Missing recording file for player '{rec['playername']}'.")
-                if round_num in round_manifest: round_manifest.pop(round_num)
-                break
-            
-            rec_dict = dict(rec)
-            rec_dict['mp4_path'] = mp4_path
-            rec_dict['wav_path'] = wav_path
-            round_manifest[round_num]['recordings'][rec['playername']] = rec_dict
-        
-        # Final check if all players for the round were found and validated
-        if round_num in round_manifest and len(round_manifest[round_num]['recordings']) != len(all_players_in_round):
-            LOG.warning(f"Skipping Round {round_num}: Mismatch between players in 'rounds' table and validated recordings in 'RECORDING' table.")
-            round_manifest.pop(round_num)
+    for rec in db_recordings:
+        rec = dict(rec)
+        round_num, team = rec['roundnumber'], rec['team']
 
-    return round_manifest
-
-def construct_game_state(current_tick, round_data, team_players_data, enemy_players_data):
-    gs_array = np.zeros(1, dtype=game_state_dtype)
-    gs_array['tick'] = current_tick
-    
-    round_state_flags = 0
-    if round_data and current_tick < round_data['freezetime_endtick']: round_state_flags |= 1 << 0
-    if round_data and current_tick >= round_data['freezetime_endtick']: round_state_flags |= 1 << 1
-    if round_data and round_data['bomb_planted_tick'] != -1 and current_tick >= round_data['bomb_planted_tick']: round_state_flags |= 1 << 2
-    gs_array['round_state_flags'] = round_state_flags
-
-    team_alive_mask, enemy_alive_mask = 0, 0
-    enemy_pos_array = np.zeros((5, 3), dtype=np.float32)
-
-    for i, player_data in enumerate(team_players_data):
-        if player_data and player_data['health'] > 0: team_alive_mask |= (1 << i)
-    
-    for i, player_data in enumerate(enemy_players_data):
-        if player_data and player_data['health'] > 0:
-            enemy_alive_mask |= (1 << i)
-            enemy_pos_array[i] = [player_data['position_x'], player_data['position_y'], player_data['position_z']]
-
-    gs_array['team_alive_mask'] = team_alive_mask
-    gs_array['enemy_alive_mask'] = enemy_alive_mask
-    gs_array['enemy_positions'] = enemy_pos_array
-    return gs_array
-
-def construct_player_input(player_data):
-    pi_array = np.zeros(1, dtype=player_input_dtype)
-    pi_array['position'] = (player_data['position_x'], player_data['position_y'], player_data['position_z'])
-    pi_array['mouse_delta'] = (player_data['mouse_x'] or 0.0, player_data['mouse_y'] or 0.0)
-    pi_array['health'] = player_data['health']
-    pi_array['armor'] = player_data['armor']
-    pi_array['money'] = player_data['money']
-    pi_array['is_in_buyzone'] = bool(player_data['is_in_buyzone'])
-
-    input_flags = 0
-    inputs = (player_data['keyboard_input'] or "").split(',') + (player_data['buy_sell_input'] or "").split(',')
-    for key, mask in KEY_INPUT_MAP.items():
-        if any(inp.strip().startswith(key) for inp in inputs if inp): input_flags |= mask
-    pi_array['input_flags'] = input_flags
-    
-    pi_array['active_weapon_id'] = 0
-    pi_array['inventory_flags'] = 0
-    return pi_array
-
-def process_round_perspective(round_num, team_name, players_meta, enemies_meta, round_data, data_by_tick, lmdb_txn, demo_name):
-    LOG.info(f"Processing Round {round_num}, Team '{team_name}'...")
-    round_start_tick = round_data['starttick']
-    round_end_tick = round_data['endtick']
-
-    caps = {p['playername']: cv2.VideoCapture(str(p['mp4_path'])) for p in players_meta}
-    auds = {p['playername']: sf.SoundFile(str(p['wav_path'])) for p in players_meta}
-    total_frames = (round_end_tick - round_start_tick) // TICKS_PER_FRAME
-
-    for frame_idx in tqdm(range(total_frames), desc=f"  R{round_num}-{team_name}", leave=False):
-        current_tick = round_start_tick + (frame_idx * TICKS_PER_FRAME)
-        if current_tick > round_end_tick: break
-
-        tick_data_for_all = data_by_tick.get(current_tick, {})
-        team_data_at_tick = [tick_data_for_all.get(p['playername']) for p in players_meta]
-        enemy_data_at_tick = [tick_data_for_all.get(p['playername']) for p in enemies_meta]
-
-        game_state_np = construct_game_state(current_tick, round_data, team_data_at_tick, enemy_data_at_tick)
-        packaged_data = [game_state_np]
-        team_alive_mask = game_state_np['team_alive_mask'][0]
-
-        for i, player_meta in enumerate(players_meta):
-            if (team_alive_mask >> i) & 1:
-                player_name = player_meta['playername']
-                player_data_at_tick = team_data_at_tick[i]
-                if not player_data_at_tick: continue
-
-                ret, frame = caps[player_name].read()
-                if not ret: continue
-                
-                audio_frames_to_read = int(auds[player_name].samplerate / VIDEO_FPS)
-                audio_data = auds[player_name].read(audio_frames_to_read)
-                
-                _, jpeg_bytes = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                player_input_np = construct_player_input(player_data_at_tick)
-                packaged_data.append((player_input_np, jpeg_bytes.tobytes(), audio_data.tobytes()))
-        
-        key = f"{demo_name}_round_{round_num:02d}_team_{team_name}_tick_{current_tick}".encode('utf-8')
-        value = msgpack.packb(packaged_data, use_bin_type=True, default=lambda obj: obj.tolist() if isinstance(obj, np.ndarray) else obj)
-        lmdb_txn.put(key, value)
-
-    for cap in caps.values(): cap.release()
-    for aud in auds.values(): aud.close()
-
-def write_metadata_info(lmdb_txn, processed_rounds, demoname):
-    metadata = {
-        "demoname": demoname,
-        "rounds": sorted(processed_rounds)
-    }
-    key = f"{demoname}{INFO_KEY_SUFFIX}".encode('utf-8')
-    value = json.dumps(metadata, indent=4).encode('utf-8')
-    lmdb_txn.put(key, value)
-
-# =============================================================================
-# 5. HELPER & UTILITY FUNCTIONS
-# =============================================================================
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Mold CS2 recordings and data into a unified LMDB.", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--recdir", required=True, help="Path to the directory containing .mp4 and .wav recordings.")
-    parser.add_argument("--dbfile", required=True, help="Path to the SQLite database file from extract.py.")
-    parser.add_argument("--outlmdb", required=True, help="Path where the output LMDB will be created.")
-    parser.add_argument("--overwrite", action="store_true", help="If specified, delete and recreate the LMDB if it exists.")
-    parser.add_argument("--overridesql", action="store_true", help="Ignore 'is_recorded=False' flags in the DB.")
-    parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging.")
-    return parser.parse_args()
-
-def setup_logging(is_debug):
-    level = logging.DEBUG if is_debug else logging.INFO
-    logging.basicConfig(level=level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
-
-def prepare_output_lmdb(output_path, overwrite_flag):
-    if os.path.exists(output_path):
-        if overwrite_flag:
-            LOG.warning(f"Output path '{output_path}' exists. Overwriting as requested.")
-            shutil.rmtree(output_path)
-        else:
-            LOG.error(f"Output path '{output_path}' already exists. Use --overwrite to replace it. Exiting.")
+        if not rec['is_recorded'] and not override_sql:
+            LOG.critical(f"Recording for player '{rec['playername']}' in round {round_num} is marked `is_recorded=False`.")
+            LOG.critical("Use --overridesql to ignore this. Exiting.")
             sys.exit(1)
 
-def interrupt_handler(signum, frame):
-    global CLEANUP_REQUIRED
-    LOG.warning("\nCTRL+C detected. Shutting down gracefully...")
-    CLEANUP_REQUIRED = True
-    raise KeyboardInterrupt
+        filename_base = f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
+        mp4_path = rec_dir / f"{filename_base}.mp4"
+        wav_path = rec_dir / f"{filename_base}.wav"
+
+        if not mp4_path.exists():
+            LOG.critical(f"Required video file not found: {mp4_path}")
+            sys.exit(1)
+        if not wav_path.exists():
+            LOG.critical(f"Required audio file not found: {wav_path}")
+            sys.exit(1)
+
+        rec['mp4_path'] = mp4_path
+        rec['wav_path'] = wav_path
+        
+        key = (round_num, team)
+        if key not in recordings_map:
+            recordings_map[key] = []
+        recordings_map[key].append(rec)
+    
+    LOG.info(f"   - Validated {len(db_recordings)} recording entries and their corresponding media files.")
+    
+    # 3. Cache all player data for performance
+    LOG.info("   - Caching all 'player' table data into memory (this may take a moment)...")
+    player_data_cache = {}
+    all_player_rows = conn.execute("SELECT * FROM player").fetchall()
+    for row in tqdm(all_player_rows, desc="   Caching player ticks", leave=False):
+        key = (row['playername'], row['tick'])
+        player_data_cache[key] = dict(row)
+    LOG.info(f"   - Cached {len(player_data_cache)} player-tick entries.")
+
+    conn.close()
+    
+    demoname = rec_dir.name
+    LOG.info(f"   - Validation complete. Demo name identified as '{demoname}'.")
+    return demoname, rounds_info, recordings_map, player_data_cache
+
+
+def get_bitmask(actions_str, mapping):
+    """Converts a comma-separated string of actions into a bitmask."""
+    mask = 0
+    if not actions_str:
+        return mask
+    for action in actions_str.split(','):
+        if action in mapping:
+            mask |= (1 << mapping[action])
+    return mask
+
+def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
+    """Creates bitmasks for the player's inventory and active weapon."""
+    inventory_mask = 0
+    active_weapon_mask = 0
+
+    # Active Weapon
+    if active_weapon and active_weapon in mapping:
+        active_weapon_mask = (1 << mapping[active_weapon])
+    elif active_weapon:
+        # Handle knife name variations
+        if "knife" in active_weapon.lower() or "bayonet" in active_weapon.lower():
+             if "Knife" in mapping: active_weapon_mask = (1 << mapping["Knife"])
+
+    # Full Inventory
+    try:
+        inventory_list = json.loads(inventory_json) if inventory_json else []
+        for item in inventory_list:
+            if item in mapping:
+                inventory_mask |= (1 << mapping[item])
+            elif "knife" in item.lower() or "bayonet" in item.lower():
+                if "Knife" in mapping: inventory_mask |= (1 << mapping["Knife"])
+    except (json.JSONDecodeError, TypeError):
+        pass # Ignore malformed inventory strings
+
+    return np.uint64(inventory_mask), np.uint64(active_weapon_mask)
+
 
 # =============================================================================
-# 6. MAIN EXECUTION
+# 4. MAIN PROCESSING LOGIC
 # =============================================================================
 
 def main():
-    global CLEANUP_REQUIRED
-    args = parse_arguments()
+    """Main execution function."""
+    global LMDB_PATH_FOR_CLEANUP
+
+    parser = argparse.ArgumentParser(
+        description="Compile CS2 recordings and database into a unified LMDB for model training.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("--recdir", required=True, type=Path, help="Path to the directory containing .mp4 and .wav files.")
+    parser.add_argument("--dbfile", required=True, type=Path, help="Path to the SQLite .db file.")
+    parser.add_argument("--outlmdb", required=True, type=Path, help="Path for the output LMDB directory.")
+    parser.add_argument("--overwrite", action='store_true', help="Allow overwriting an existing LMDB database.")
+    parser.add_argument("--overridesql", action='store_true', help="Ignore 'is_recorded=False' flags in the database and proceed.")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging.")
+    args = parser.parse_args()
+
     setup_logging(args.debug)
-    signal.signal(signal.SIGINT, interrupt_handler)
+    
+    # --- Setup ---
+    LMDB_PATH_FOR_CLEANUP = args.outlmdb
+    signal.signal(signal.SIGINT, signal_handler)
 
-    lmdb_env = None
-    demo_name = Path(args.dbfile).stem
-    recordings_dir = Path(args.recdir)
-    outlmdb_path = Path(args.outlmdb)
+    if args.outlmdb.exists():
+        if args.overwrite:
+            LOG.warning(f"Output LMDB path exists. Removing: {args.outlmdb}")
+            shutil.rmtree(args.outlmdb)
+        else:
+            LOG.critical(f"Output path {args.outlmdb} already exists. Use --overwrite to replace it. Exiting.")
+            sys.exit(1)
+    
+    demoname, rounds_info, recordings_map, player_data_cache = load_and_validate_data(
+        args.dbfile, args.recdir, args.overridesql
+    )
+    
+    gs_dtype, pi_dtype = define_numpy_dtypes()
+    
+    env = lmdb.open(str(args.outlmdb), map_size=INITIAL_MAP_SIZE, writemap=True)
+    
+    # --- Processing Loop ---
+    LOG.info("-> Phase 2: Processing rounds and writing to LMDB...")
+    
+    # Iterate through sorted rounds to ensure chronological processing
+    sorted_rounds = sorted(recordings_map.keys())
 
-    try:
-        LOG.info("Step 1: Preparing output and validating data manifest...")
-        prepare_output_lmdb(outlmdb_path, args.overwrite)
+    for round_num, team in tqdm(sorted_rounds, desc="Total Progress"):
         
-        db_conn = sqlite3.connect(args.dbfile)
-        db_conn.row_factory = sqlite3.Row
+        # --- Per-Round/Team Setup ---
+        round_data = rounds_info[round_num]
+        team_recordings = recordings_map[(round_num, team)]
+        if len(team_recordings) != 5:
+            LOG.warning(f"Skipping Round {round_num} Team {team}: Expected 5 player recordings, found {len(team_recordings)}. The demo might be from a non-5v5 match.")
+            continue
         
-        round_manifest = fetch_and_validate_round_manifest(db_conn, recordings_dir, args.overridesql)
-        valid_round_nums = sorted(round_manifest.keys())
-        LOG.info(f"Manifest validated. Found {len(valid_round_nums)} complete rounds to process: {valid_round_nums}")
+        t_team_roster = [p[0] for p in json.loads(round_data['t_team'])]
+        ct_team_roster = [p[0] for p in json.loads(round_data['ct_team'])]
+        
+        current_team_roster = t_team_roster if team == 'T' else ct_team_roster
+        enemy_team_roster = ct_team_roster if team == 'T' else t_team_roster
 
-        if not valid_round_nums:
-            LOG.warning("No complete rounds found to process. Exiting.")
-            sys.exit(0)
+        # Open all media files for this team
+        caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in team_recordings}
+        auds = {rec['playername']: open(rec['wav_path'], 'rb') for rec in team_recordings}
+        # Skip WAV header
+        for aud_file in auds.values(): aud_file.seek(44)
 
-        LOG.info("Step 2: Caching all player data for performance...")
-        cursor = db_conn.cursor()
-        cursor.execute("SELECT * FROM player")
-        all_player_data = cursor.fetchall()
-        data_by_tick = defaultdict(dict)
-        for row in all_player_data:
-            data_by_tick[row['tick']][row['playername']] = row
-        db_conn.close()
+        round_start_tick = round_data['starttick']
+        # The effective end is when the last player on the team dies or the round ends
+        round_end_tick = max(rec['stoptick'] for rec in team_recordings)
 
-        LOG.info("Step 3: Initializing LMDB environment...")
-        lmdb_env = lmdb.open(str(outlmdb_path), map_size=LMDB_INITIAL_MAP_SIZE, writemap=True)
+        # --- Tick/Frame Loop ---
+        for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
+            
+            # 1. Assemble game_state
+            game_state = np.zeros(1, dtype=gs_dtype)[0]
+            game_state['tick'] = current_tick
+            
+            # round_state bitmask
+            round_state_mask = 0
+            if round_data['freezetime_endtick'] and current_tick < round_data['freezetime_endtick']: round_state_mask |= (1 << 0) # freezetime
+            if current_tick >= round_data['starttick'] and current_tick <= round_data['endtick']: round_state_mask |= (1 << 1) # inround
+            if round_data['bomb_planted_tick'] != -1 and current_tick >= round_data['bomb_planted_tick']: round_state_mask |= (1 << 2) # bomb_planted
+            # win/loss is determined by looking at the whole round, not per tick
+            game_state['round_state'] = round_state_mask
+            
+            # liveness bitmasks
+            team_death_ticks = {p[0]: p[1] for p in json.loads(round_data[f"{team.lower()}_team"])}
+            enemy_death_ticks = {p[0]: p[1] for p in json.loads(round_data[f"{'ct' if team == 'T' else 't'}_team"])}
 
-        LOG.info("Step 4: Starting data processing loop...")
-        processed_rounds_info = []
-        with lmdb_env.begin(write=True) as lmdb_txn:
-            for round_num in valid_round_nums:
-                manifest_entry = round_manifest[round_num]
-                round_data = manifest_entry['round_data']
+            team_alive_mask = 0
+            for i, name in enumerate(current_team_roster):
+                if team_death_ticks[name] == -1 or current_tick < team_death_ticks[name]:
+                    team_alive_mask |= (1 << i)
+            game_state['team_alive'] = team_alive_mask
+
+            enemy_alive_mask = 0
+            for i, name in enumerate(enemy_team_roster):
+                if enemy_death_ticks[name] == -1 or current_tick < enemy_death_ticks[name]:
+                    enemy_alive_mask |= (1 << i)
+            game_state['enemy_alive'] = enemy_alive_mask
+            
+            # enemy positions
+            for i, name in enumerate(enemy_team_roster):
+                if (enemy_alive_mask >> i) & 1: # if enemy is alive
+                    enemy_tick_data = player_data_cache.get((name, current_tick))
+                    if enemy_tick_data:
+                        game_state['enemy_pos'][i] = [enemy_tick_data['position_x'], enemy_tick_data['position_y'], enemy_tick_data['position_z']]
+
+            # 2. Assemble list of player_input and media
+            player_data_list = []
+            for i, rec in enumerate(team_recordings):
+                playername = rec['playername']
                 
-                # Split players by team for processing
-                all_recordings = manifest_entry['recordings'].values()
-                t_players_meta = sorted([r for r in all_recordings if r['team'] == 'T'], key=lambda x: x['playername'])
-                ct_players_meta = sorted([r for r in all_recordings if r['team'] == 'CT'], key=lambda x: x['playername'])
+                # Only process players who are alive and their recording is still running
+                if not ((team_alive_mask >> i) & 1) or current_tick >= rec['stoptick']:
+                    continue
+
+                # Read media
+                ret, frame = caps[playername].read()
+                audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
+                if not ret or len(audio_chunk) == 0:
+                    LOG.warning(f"Media stream for {playername} ended prematurely at tick {current_tick}. Skipping frame.")
+                    continue
                 
-                # Process T-side perspective
-                process_round_perspective(round_num, 'T', t_players_meta, ct_players_meta, round_data, data_by_tick, lmdb_txn, demo_name)
-                # Process CT-side perspective
-                process_round_perspective(round_num, 'CT', ct_players_meta, t_players_meta, round_data, data_by_tick, lmdb_txn, demo_name)
+                jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
+
+                # Get player input data from cache
+                tick_data = player_data_cache.get((playername, current_tick))
+                player_input = np.zeros(1, dtype=pi_dtype)[0]
                 
-                processed_rounds_info.append([round_num, round_data['starttick'], round_data['endtick']])
+                if tick_data:
+                    player_input['pos'] = [tick_data['position_x'], tick_data['position_y'], tick_data['position_z']]
+                    player_input['mouse'] = [tick_data['mouse_x'], tick_data['mouse_y']]
+                    player_input['health'] = tick_data['health']
+                    player_input['armor'] = tick_data['armor']
+                    player_input['money'] = tick_data['money']
 
-            LOG.info("Step 5: Writing final metadata key...")
-            write_metadata_info(lmdb_txn, processed_rounds_info, demo_name)
+                    kb_string = tick_data['keyboard_input'] or ''
+                    buy_string = tick_data['buy_sell_input'] or ''
+                    combined_actions = ','.join(filter(None, [kb_string, buy_string]))
+                    if tick_data.get('is_in_buyzone') == 1:
+                        combined_actions += ',IN_BUYZONE'
+                    
+                    player_input['keyboard_bitmask'] = get_bitmask(combined_actions, KEYBOARD_TO_BIT)
+                    inv_mask, wep_mask = get_inventory_bitmasks(tick_data['inventory'], tick_data['active_weapon'], ITEM_TO_INDEX)
+                    player_input['inventory_bitmask'] = inv_mask
+                    player_input['active_weapon_bitmask'] = wep_mask
+                
+                player_data_list.append((player_input, jpeg_bytes, audio_chunk))
+            
+            # 3. Pack and write to LMDB
+            if not player_data_list: # Skip ticks where no one on the team is alive
+                continue
+                
+            tick_payload = msgpack.packb({
+                "game_state": game_state,
+                "player_data": player_data_list
+            }, use_bin_type=True)
 
-        LOG.info("All data successfully processed and written to LMDB.")
-        CLEANUP_REQUIRED = False
+            # Check if DB needs resizing
+            stats = env.stat()
+            if env.info()['map_size'] - stats['psize'] * stats['last_pgno'] < MAP_RESIZE_THRESHOLD:
+                new_size = env.info()['map_size'] + MAP_RESIZE_INCREMENT
+                LOG.info(f"LMDB is nearing capacity. Resizing to {new_size / (1024**3):.2f} GB.")
+                env.set_mapsize(new_size)
 
-    except KeyboardInterrupt:
-        LOG.warning("Process interrupted by user.")
-    except Exception as e:
-        LOG.error(f"An unhandled exception occurred: {e}", exc_info=args.debug)
-    finally:
-        LOG.info("Step 6: Finalizing script execution...")
-        if lmdb_env:
-            lmdb_env.close()
-        if CLEANUP_REQUIRED and outlmdb_path.exists():
-            LOG.error(f"Process did not complete successfully. Deleting incomplete LMDB at: {outlmdb_path}")
-            try:
-                shutil.rmtree(outlmdb_path)
-                LOG.info("Incomplete LMDB deleted.")
-            except OSError as e:
-                LOG.error(f"Failed to delete incomplete LMDB: {e}")
-        LOG.info("Shutdown complete.")
+            with env.begin(write=True) as txn:
+                key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
+                txn.put(key, tick_payload)
 
+        # Cleanup for the round/team
+        for cap in caps.values(): cap.release()
+        for aud in auds.values(): aud.close()
 
-if __name__ == "__main__":
+    # --- Finalization ---
+    LOG.info("-> Phase 3: Writing final metadata...")
+    metadata = {
+        "demoname": demoname,
+        "rounds": [
+            [r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())
+        ]
+    }
+    with env.begin(write=True) as txn:
+        key = f"{demoname}_INFO".encode('utf-8')
+        txn.put(key, json.dumps(metadata).encode('utf-8'))
+
+    env.close()
+    signal.signal(signal.SIGINT, signal.SIG_DFL)  # Deregister handler
+    
+    LOG.info("-------------------------------------------------")
+    LOG.info("All processing steps completed successfully.")
+    LOG.info(f"Final LMDB database is at: {args.outlmdb}")
+    LOG.info("-------------------------------------------------")
+
+if __name__ == '__main__':
     main()
