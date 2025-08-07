@@ -333,7 +333,7 @@ def main():
         round_start_tick, round_end_tick = round_data['starttick'], max(rec['stoptick'] for rec in team_recordings)
 
         for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
-            game_state = np.zeros(1, dtype=gs_dtype)[0]
+            game_state = np.zeros(1, dtype=gs_dtype)
             game_state['tick'] = current_tick
             
             # round_state bitmask
@@ -369,7 +369,7 @@ def main():
                 
                 jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
                 tick_data = player_data_cache.get((playername, current_tick))
-                player_input = np.zeros(1, dtype=pi_dtype)[0]
+                player_input = np.zeros(1, dtype=pi_dtype)
                 
                 if tick_data:
                     # Separate inputs for different bitmasks
