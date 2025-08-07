@@ -331,26 +331,35 @@ def main():
     tasks = sorted(recordings_map.keys())
     
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        # Submit all tasks to the executor
         futures = {executor.submit(process_round_perspective, r, t, demoname, gs_dtype, pi_dtype, rounds_info, recordings_map, player_data_cache): (r,t) for r, t in tasks}
         
-        # Process results as they complete
         for future in tqdm(as_completed(futures), total=len(tasks), desc="Processing Round/Team Perspectives"):
             try:
-                # Get the list of (key, data) tuples from the worker
                 round_results = future.result()
                 
                 if not round_results: continue
 
-                # Check for LMDB resize before committing a batch
-                info, stats = env.info(), env.stat()
-                current_map_size, used_space = info['map_size'], info['last_pgno'] * stats['psize']
-                if current_map_size - used_space < MAP_RESIZE_THRESHOLD:
-                    new_size = current_map_size + MAP_RESIZE_INCREMENT
-                    LOG.info(f"LMDB resizing to {new_size / (1024**3):.2f} GB.")
-                    env.set_mapsize(new_size)
+                # --- FIX: Proactive resizing logic ---
+                # 1. Calculate the size of the incoming batch of data
+                batch_size = sum(len(payload) for key, payload in round_results)
 
-                # Write the batch of results in a single transaction
+                # 2. Check if there is enough space, and resize in a loop if not.
+                info = env.info()
+                stats = env.stat()
+                available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
+
+                while available_space < batch_size:
+                    LOG.warning(
+                        f"Resizing LMDB: Need {batch_size / (1024*1024):.2f} MB, "
+                        f"only {available_space / (1024*1024):.2f} MB available."
+                    )
+                    new_size = info['map_size'] + MAP_RESIZE_INCREMENT
+                    env.set_mapsize(new_size)
+                    # Update the info for the next loop check
+                    info = env.info()
+                    available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
+
+                # 3. Now it is safe to write the entire batch.
                 with env.begin(write=True) as txn:
                     for key, payload in round_results:
                         txn.put(key, payload)
@@ -358,7 +367,8 @@ def main():
             except Exception as exc:
                 task_id = futures[future]
                 LOG.error(f"Task {task_id} generated an exception: {exc}")
-                # Optionally re-raise or handle more gracefully
+                # Ensure the program stops on worker failure
+                executor.shutdown(wait=False, cancel_futures=True)
                 raise exc
 
     LOG.info("-> Phase 3: Writing final metadata...")
