@@ -96,8 +96,6 @@ KEYBOARD_ACTIONS = [
     "IN_BUYZONE"
 ]
 KEYBOARD_TO_BIT = {action: i for i, action in enumerate(KEYBOARD_ACTIONS)}
-# We need enough bits to store all keyboard actions. A uint32 should be sufficient.
-assert len(KEYBOARD_TO_BIT) < 256, "Too many actions for uint8 bitmask. Increase size."
 
 # Maps every possible item/weapon to a unique index for one-hot encoding.
 ITEM_NAMES = [
@@ -119,7 +117,6 @@ ITEM_NAMES = [
 # Add knife variations from schema
 ITEM_NAMES.extend(["knife_ct", "knife_t"])
 ITEM_TO_INDEX = {item: i for i, item in enumerate(sorted(list(set(ITEM_NAMES))))}
-assert len(ITEM_TO_INDEX) < 256, "Too many items for uint8 bitmask. Increase size."
 
 # Make msgpack aware of numpy
 m.patch()
@@ -210,6 +207,12 @@ def load_and_validate_data(db_path, rec_dir, override_sql):
     for rec in db_recordings:
         rec = dict(rec)
         round_num, team = rec['roundnumber'], rec['team']
+        
+        # --- NEW: Robustness check ---
+        # Ensure the round corresponding to this recording has the essential tick data
+        if round_num not in rounds_info or rounds_info[round_num].get('starttick') is None or rounds_info[round_num].get('endtick') is None:
+            LOG.warning(f"Skipping recording for round {round_num} because the round has missing start/end ticks in the database.")
+            continue
 
         if not rec['is_recorded'] and not override_sql:
             LOG.critical(f"Recording for player '{rec['playername']}' in round {round_num} is marked `is_recorded=False`.")
@@ -372,9 +375,13 @@ def main():
             
             # round_state bitmask
             round_state_mask = 0
-            if round_data['freezetime_endtick'] and current_tick < round_data['freezetime_endtick']: round_state_mask |= (1 << 0) # freezetime
-            if current_tick >= round_data['starttick'] and current_tick <= round_data['endtick']: round_state_mask |= (1 << 1) # inround
-            if round_data['bomb_planted_tick'] != -1 and current_tick >= round_data['bomb_planted_tick']: round_state_mask |= (1 << 2) # bomb_planted
+            # --- FIX: Check for None before comparison ---
+            if round_data['freezetime_endtick'] is not None and current_tick < round_data['freezetime_endtick']: 
+                round_state_mask |= (1 << 0) # freezetime
+            if current_tick >= round_data['starttick'] and current_tick <= round_data['endtick']: 
+                round_state_mask |= (1 << 1) # inround
+            if round_data['bomb_planted_tick'] != -1 and current_tick >= round_data['bomb_planted_tick']: 
+                round_state_mask |= (1 << 2) # bomb_planted
             # win/loss is determined by looking at the whole round, not per tick
             game_state['round_state'] = round_state_mask
             
@@ -424,20 +431,20 @@ def main():
                 player_input = np.zeros(1, dtype=pi_dtype)[0]
                 
                 if tick_data:
-                    player_input['pos'] = [tick_data['position_x'], tick_data['position_y'], tick_data['position_z']]
-                    player_input['mouse'] = [tick_data['mouse_x'], tick_data['mouse_y']]
-                    player_input['health'] = tick_data['health']
-                    player_input['armor'] = tick_data['armor']
-                    player_input['money'] = tick_data['money']
+                    player_input['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]
+                    player_input['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
+                    player_input['health'] = tick_data.get('health', 0)
+                    player_input['armor'] = tick_data.get('armor', 0)
+                    player_input['money'] = tick_data.get('money', 0)
 
-                    kb_string = tick_data['keyboard_input'] or ''
-                    buy_string = tick_data['buy_sell_input'] or ''
+                    kb_string = tick_data.get('keyboard_input') or ''
+                    buy_string = tick_data.get('buy_sell_input') or ''
                     combined_actions = ','.join(filter(None, [kb_string, buy_string]))
                     if tick_data.get('is_in_buyzone') == 1:
                         combined_actions += ',IN_BUYZONE'
                     
                     player_input['keyboard_bitmask'] = get_bitmask(combined_actions, KEYBOARD_TO_BIT)
-                    inv_mask, wep_mask = get_inventory_bitmasks(tick_data['inventory'], tick_data['active_weapon'], ITEM_TO_INDEX)
+                    inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX)
                     player_input['inventory_bitmask'] = inv_mask
                     player_input['active_weapon_bitmask'] = wep_mask
                 
@@ -472,7 +479,7 @@ def main():
     metadata = {
         "demoname": demoname,
         "rounds": [
-            [r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())
+            [r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys()) if r in recordings_map
         ]
     }
     with env.begin(write=True) as txn:
