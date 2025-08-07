@@ -397,10 +397,16 @@ def main():
             if not player_data_list: continue
             tick_payload = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True)
 
+            # --- FIX: Correctly check if DB needs resizing ---
+            info = env.info()
             stats = env.stat()
-            if env.info()['map_size'] - stats['psize'] * stats['last_pgno'] < MAP_RESIZE_THRESHOLD:
-                new_size = env.info()['map_size'] + MAP_RESIZE_INCREMENT
-                LOG.info(f"LMDB resizing to {new_size / (1024**3):.2f} GB.")
+            current_map_size = info['map_size']
+            # Calculate used space based on the last used page number
+            used_space = info['last_pgno'] * stats['psize']
+
+            if current_map_size - used_space < MAP_RESIZE_THRESHOLD:
+                new_size = current_map_size + MAP_RESIZE_INCREMENT
+                LOG.info(f"LMDB is nearing capacity. Resizing to {new_size / (1024**3):.2f} GB.")
                 env.set_mapsize(new_size)
 
             with env.begin(write=True) as txn:
