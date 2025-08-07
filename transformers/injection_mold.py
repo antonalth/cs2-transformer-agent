@@ -90,13 +90,41 @@ def define_numpy_dtypes():
 # 3. HELPER FUNCTIONS AND SETUP (No changes here)
 # =============================================================================
 
+class TqdmLoggingHandler(logging.Handler):
+    """
+    A custom logging handler that redirects all logging output
+    to `tqdm.write()`, ensuring that it does not interfere with
+    the progress bar.
+    """
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=sys.stderr)
+            self.flush()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self.handleError(record)
+
 def setup_logging(debug=False):
+    """
+    Configures the logging for the script, using the custom
+    TqdmLoggingHandler to prevent conflicts with the progress bar.
+    """
     level = logging.DEBUG if debug else logging.INFO
-    handler = logging.StreamHandler(sys.stdout)
+    # Get the root logger
+    log = logging.getLogger()
+    log.setLevel(level)
+    
+    # Remove any existing handlers to avoid duplicate messages
+    if log.hasHandlers():
+        log.handlers.clear()
+        
+    # Add our custom tqdm-aware handler
+    handler = TqdmLoggingHandler()
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
-    LOG.addHandler(handler)
-    LOG.setLevel(level)
+    log.addHandler(handler)
 
 def signal_handler(sig, frame):
     LOG.warning("Interruption detected. Cleaning up partial LMDB database...")
@@ -217,7 +245,26 @@ def process_round_perspective(round_num, team, demoname, gs_dtype, pi_dtype, rou
             playername = rec['playername']
             ret, frame = caps[playername].read()
             audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
-            if not ret or not audio_chunk: continue
+            
+            # --- NEW: Enhanced warning logic ---
+            if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME:
+                player_start_tick = rec['starttick']
+                player_stop_tick = rec['stoptick']
+
+                # Calculate expected vs actual frames processed for this player's POV
+                expected_total_frames = (player_stop_tick - player_start_tick) // TICKS_PER_FRAME
+                # The current frame index within this player's own video timeline
+                current_frame_index = (current_tick - player_start_tick) // TICKS_PER_FRAME
+                
+                # To avoid negative numbers if the stream is longer than expected
+                frames_missing = max(0, expected_total_frames - current_frame_index)
+
+                LOG.warning(
+                    f"Media stream for {playername} ended unexpectedly at tick {current_tick}. "
+                    f"({current_frame_index}/{expected_total_frames} frames processed, "
+                    f"approx. {frames_missing} frames missing from recording)."
+                )
+                continue # Skip processing this player for this tick
             
             jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
             tick_data = player_data_cache.get((playername, current_tick))
