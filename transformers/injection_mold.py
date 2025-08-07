@@ -138,7 +138,7 @@ def define_numpy_dtypes():
         ('keyboard_bitmask', np.uint32),
         # Larger bitmask for buy/sell/drop/zone actions (2 * 64 = 128 bits)
         ('eco_bitmask', np.uint64, (2,)),
-        # --- FIX: Expanded bitmasks for inventory and active weapon (128 bits) ---
+        # Expanded bitmasks for inventory and active weapon (128 bits)
         ('inventory_bitmask', np.uint64, (2,)),
         ('active_weapon_bitmask', np.uint64, (2,)),
     ])
@@ -146,7 +146,6 @@ def define_numpy_dtypes():
     # Assert that our bitmasks are large enough
     assert len(KEYBOARD_TO_BIT) <= 32, "Too many keyboard actions for uint32 bitmask"
     assert len(ECO_TO_BIT) <= 128, "Too many economic actions for 128-bit bitmask (2x uint64)"
-    # --- FIX: Adjusted assertion for 128 bits ---
     assert len(ITEM_TO_INDEX) <= 128, "Too many items for inventory/weapon bitmasks (2x uint64)"
 
     return game_state_dtype, player_input_dtype
@@ -334,28 +333,29 @@ def main():
 
         for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
             game_state = np.zeros(1, dtype=gs_dtype)
-            game_state['tick'] = current_tick
+            # --- PATCH: Index the record with [0] before accessing fields ---
+            game_state[0]['tick'] = current_tick
             
             # round_state bitmask
             rs_mask = 0
             if round_data.get('freezetime_endtick') is not None and current_tick < round_data['freezetime_endtick']: rs_mask |= (1 << 0)
             if round_data.get('starttick') is not None and round_data.get('endtick') is not None and current_tick >= round_data['starttick'] and current_tick <= round_data['endtick']: rs_mask |= (1 << 1)
             if round_data.get('bomb_planted_tick', -1) != -1 and current_tick >= round_data['bomb_planted_tick']: rs_mask |= (1 << 2)
-            game_state['round_state'] = rs_mask
+            game_state[0]['round_state'] = rs_mask
             
             # liveness bitmasks
             team_deaths = {p[0]: p[1] for p in json.loads(round_data[f"{team.lower()}_team"])}
             enemy_deaths = {p[0]: p[1] for p in json.loads(round_data[f"{'ct' if team == 'T' else 't'}_team"])}
             team_alive_mask = sum(1 << i for i, n in enumerate(current_roster) if team_deaths.get(n, 0) == -1 or current_tick < team_deaths.get(n, 0))
             enemy_alive_mask = sum(1 << i for i, n in enumerate(enemy_roster) if enemy_deaths.get(n, 0) == -1 or current_tick < enemy_deaths.get(n, 0))
-            game_state['team_alive'], game_state['enemy_alive'] = team_alive_mask, enemy_alive_mask
+            game_state[0]['team_alive'], game_state[0]['enemy_alive'] = team_alive_mask, enemy_alive_mask
             
             # enemy positions
             for i, name in enumerate(enemy_roster):
                 if (enemy_alive_mask >> i) & 1:
                     if (name, current_tick) in player_data_cache:
                         e_data = player_data_cache[(name, current_tick)]
-                        game_state['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
+                        game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
 
             player_data_list = []
             for i, rec in enumerate(team_recordings):
@@ -372,28 +372,25 @@ def main():
                 player_input = np.zeros(1, dtype=pi_dtype)
                 
                 if tick_data:
-                    # Separate inputs for different bitmasks
+                    # --- PATCH: Index player_input with [0] for all assignments ---
                     kb_input_str = tick_data.get('keyboard_input', '') or ''
                     buy_sell_input_str = tick_data.get('buy_sell_input', '') or ''
-                    
                     all_kb_actions = kb_input_str.split(',')
                     
-                    # Keyboard/Switch actions
                     keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
-                    player_input['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT)
+                    player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT)
 
-                    # Eco actions
                     drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]
                     eco_actions_list = drop_actions + buy_sell_input_str.split(',')
                     if tick_data.get('is_in_buyzone') == 1:
                         eco_actions_list.append('IN_BUYZONE')
-                    player_input['eco_bitmask'] = get_bitmask_array(filter(None, eco_actions_list), ECO_TO_BIT)
+                    player_input[0]['eco_bitmask'] = get_bitmask_array(filter(None, eco_actions_list), ECO_TO_BIT)
                     
-                    player_input['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]
-                    player_input['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
-                    player_input['health'], player_input['armor'], player_input['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
+                    player_input[0]['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]
+                    player_input[0]['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
+                    player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
                     inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX)
-                    player_input['inventory_bitmask'], player_input['active_weapon_bitmask'] = inv_mask, wep_mask
+                    player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
                 
                 player_data_list.append((player_input, jpeg_bytes, audio_chunk))
             
