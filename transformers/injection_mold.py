@@ -207,7 +207,7 @@ if __name__ == '__main__':
     except RuntimeError:
         pass # Can only be set once
 
-    # --- HELPER FUNCTIONS (remain the same) ---
+    # --- HELPER FUNCTIONS (must be defined or imported here for spawn) ---
     class TqdmLoggingHandler(logging.Handler):
         def emit(self, record):
             try: msg = self.format(record); tqdm.write(msg, file=sys.stderr); self.flush()
@@ -222,6 +222,16 @@ if __name__ == '__main__':
             try: shutil.rmtree(LMDB_PATH_FOR_CLEANUP); LOG.info(f"Successfully removed incomplete LMDB at: {LMDB_PATH_FOR_CLEANUP}")
             except OSError as e: LOG.error(f"Error removing LMDB directory: {e}")
         os._exit(1)
+        
+    # --- NEW: Re-introducing the missing function ---
+    def define_numpy_dtypes():
+        game_state_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
+        player_input_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (2,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
+        assert len(KEYBOARD_TO_BIT) <= 32, "Too many keyboard actions for uint32 bitmask"
+        assert len(ECO_TO_BIT) <= 128, "Too many economic actions for 128-bit bitmask (2x uint64)"
+        assert len(ITEM_TO_INDEX) <= 128, "Too many items for inventory/weapon bitmasks (2x uint64)"
+        return game_state_dtype, player_input_dtype
+
     def get_bitmask(actions, mapping):
         mask = 0;
         if actions:
@@ -311,7 +321,6 @@ if __name__ == '__main__':
     initargs = (shm_cache_name, len(packed_cache), gs_dtype, pi_dtype, rounds_info, recordings_map)
     with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
         
-        # Use imap_unordered for better memory management and progress tracking
         pbar = tqdm(pool.imap_unordered(process_round_perspective, tasks), total=len(tasks), desc="Processing Round/Team Perspectives")
         
         for result in pbar:
@@ -319,14 +328,12 @@ if __name__ == '__main__':
             
             result_shm_name, result_size = result
             try:
-                # Connect to the result block, read data, then unlink
                 result_shm = SharedMemory(name=result_shm_name)
                 packed_results = result_shm.buf[:result_size]
                 round_results = msgpack.unpackb(packed_results, raw=False)
                 result_shm.close()
-                result_shm.unlink() # Crucial cleanup
+                result_shm.unlink()
 
-                # Proactive LMDB resizing
                 batch_size = sum(len(payload) for key, payload in round_results)
                 info, stats = env.info(), env.stat()
                 available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
@@ -344,7 +351,6 @@ if __name__ == '__main__':
             except Exception as exc:
                 pbar.close()
                 LOG.error(f"FATAL ERROR in main process while handling result: {exc}")
-                # Clean up potentially orphaned shared memory block
                 try: SharedMemory(name=result_shm_name).unlink()
                 except FileNotFoundError: pass
                 raise exc
@@ -356,7 +362,6 @@ if __name__ == '__main__':
         txn.put(key, json.dumps(metadata).encode('utf-8'))
 
     env.close()
-    # Clean up the main shared memory cache
     shm_cache.close()
     shm_cache.unlink()
     LOG.info("Shared memory cache unlinked.")
@@ -364,4 +369,4 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     
     LOG.info("All processing steps completed successfully.")
-    LOG.i(f"Final LMDB database is at: {args.outlmdb}")
+    LOG.info(f"Final LMDB database is at: {args.outlmdb}")
