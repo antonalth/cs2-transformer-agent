@@ -5,7 +5,8 @@ of a CS2 data LMDB.
 
 This script allows you to navigate through the dataset frame-by-frame,
 switch player perspectives, play audio, and view detailed metadata overlays
-to ensure the data was processed correctly.
+in multiple modes (off, bitmasks, strings) to ensure the data was
+processed correctly.
 """
 
 import argparse
@@ -28,8 +29,8 @@ TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
 AUDIO_SAMPLE_RATE = 44100
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.4
-FONT_COLOR = (0, 255, 0)  # Green
-SHADOW_COLOR = (0, 0, 0) # Black
+FONT_COLOR = (0, 255, 0)
+SHADOW_COLOR = (0, 0, 0)
 LINE_TYPE = 1
 TEXT_START_POS = (10, 20)
 LINE_HEIGHT = 16
@@ -37,18 +38,52 @@ LINE_HEIGHT = 16
 # Make msgpack aware of numpy for deserialization
 m.patch()
 
+# =============================================================================
+# DATA ENCODING MAPPINGS (Copied from injection_mold.py for decoding)
+# =============================================================================
+KEYBOARD_ONLY_ACTIONS = [
+    "IN_ATTACK", "IN_JUMP", "IN_DUCK", "IN_FORWARD", "IN_BACK", "IN_USE", "IN_CANCEL", "IN_TURNLEFT", "IN_TURNRIGHT", "IN_MOVELEFT", "IN_MOVERIGHT", "IN_ATTACK2", "IN_RELOAD", "IN_ALT1", "IN_ALT2", "IN_SPEED", "IN_WALK", "IN_ZOOM", "IN_WEAPON1", "IN_WEAPON2", "IN_BULLRUSH", "IN_GRENADE1", "IN_GRENADE2", "IN_ATTACK3", "IN_SCORE", "IN_INSPECT", "SWITCH_1", "SWITCH_2", "SWITCH_3", "SWITCH_4", "SWITCH_5",
+]
+ECO_ACTIONS = [
+    "IN_BUYZONE", "DROP_deagle", "DROP_elite", "DROP_fiveseven", "DROP_glock", "DROP_ak47", "DROP_aug", "DROP_awp", "DROP_famas", "DROP_g3sg1", "DROP_galilar", "DROP_m249", "DROP_m4a1", "DROP_mac10", "DROP_p90", "DROP_mp5sd", "DROP_ump45", "DROP_xm1014", "DROP_bizon", "DROP_mag7", "DROP_negev", "DROP_sawedoff", "DROP_tec9", "DROP_p2000", "DROP_mp7", "DROP_mp9", "DROP_nova", "DROP_p250", "DROP_scar20", "DROP_sg556", "DROP_ssg08", "DROP_knife", "DROP_flashbang", "DROP_hegrenade", "DROP_smokegrenade", "DROP_molotov", "DROP_decoy", "DROP_incgrenade", "DROP_c4", "DROP_m4a1_silencer", "DROP_usp_silencer", "DROP_cz75a", "DROP_revolver", "DROP_defuser", "BUY_deagle", "BUY_elite", "BUY_fiveseven", "BUY_glock", "BUY_ak47", "BUY_aug", "BUY_awp", "BUY_famas", "BUY_g3sg1", "BUY_galilar", "BUY_m249", "BUY_m4a1", "BUY_mac10", "BUY_p90", "BUY_mp5sd", "BUY_ump45", "BUY_xm1014", "BUY_bizon", "BUY_mag7", "BUY_negev", "BUY_sawedoff", "BUY_tec9", "BUY_p2000", "BUY_mp7", "BUY_mp9", "BUY_nova", "BUY_p250", "BUY_scar20", "BUY_sg556", "BUY_ssg08", "BUY_knife", "BUY_flashbang", "BUY_hegrenade", "BUY_smokegrenade", "BUY_molotov", "BUY_decoy", "BUY_incgrenade", "BUY_c4", "BUY_m4a1_silencer", "BUY_usp_silencer", "BUY_cz75a", "BUY_revolver", "BUY_defuser", "BUY_vest", "BUY_vesthelm", "SELL_deagle", "SELL_fiveseven", "SELL_glock", "SELL_ak47", "SELL_aug", "SELL_awp", "SELL_famas", "SELL_galilar", "SELL_m4a1", "SELL_mac10", "SELL_p90", "SELL_ump45", "SELL_xm1014", "SELL_bizon", "SELL_mag7", "SELL_sawedoff", "SELL_tec9", "SELL_p2000", "SELL_mp7", "SELL_mp9", "SELL_nova", "SELL_p250", "SELL_ssg08", "SELL_flashbang", "SELL_hegrenade", "SELL_smokegrenade", "SELL_molotov", "SELL_decoy", "SELL_incgrenade",
+]
+ITEM_NAMES = sorted(list(set([
+    "AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553", "AWP", "SSG 08", "G3SG1", "SCAR-20", "Glock-18", "USP-S", "P250", "P2000", "Dual Berettas", "Five-SeveN", "Tec-9", "CZ75-Auto", "R8 Revolver", "Desert Eagle", "MP9", "MAC-10", "MP7", "MP5-SD", "UMP-45", "P90", "PP-Bizon", "Nova", "XM1014", "MAG-7", "Sawed-Off", "M249", "Negev", "Knife", "Bayonet", "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife", "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers", "Ursus Knife", "Navaja Knife", "Stiletto Knife", "Talon Knife", "Classic Knife", "Paracord Knife", "Survival Knife", "Nomad Knife", "Skeleton Knife", "High Explosive Grenade", "Flashbang", "Smoke Grenade", "Molotov", "Incendiary Grenade", "Decoy Grenade", "C4 Explosive", "Defuse Kit", "Zeus x27", "Kevlar Vest", "Helmet", "knife_ct", "knife_t",
+])))
+
+# --- NEW: Reverse mappings for decoding ---
+BIT_TO_KEYBOARD = {i: action for i, action in enumerate(KEYBOARD_ONLY_ACTIONS)}
+BIT_TO_ECO = {i: action for i, action in enumerate(ECO_ACTIONS)}
+BIT_TO_ITEM = {i: item for i, item in enumerate(ITEM_NAMES)}
+
+# =============================================================================
+# HELPER AND DECODER FUNCTIONS
+# =============================================================================
+
+def decode_bitmask(mask, reverse_map):
+    """Decodes a single integer bitmask into a list of strings."""
+    actions = [reverse_map[i] for i in range(32) if (mask >> i) & 1 and i in reverse_map]
+    return ", ".join(actions) if actions else "None"
+
+def decode_bitmask_array(mask_array, reverse_map):
+    """Decodes a multi-integer bitmask array into a list of strings."""
+    actions = []
+    for i, sub_mask in enumerate(mask_array):
+        for j in range(64):
+            if (sub_mask >> j) & 1:
+                global_bit_pos = i * 64 + j
+                if global_bit_pos in reverse_map:
+                    actions.append(reverse_map[global_bit_pos])
+    return ", ".join(actions) if actions else "None"
+
 def play_audio(audio_chunk, blocking=False):
-    """
-    Plays a raw PCM audio chunk using sounddevice.
-    Can be blocking or non-blocking.
-    """
+    """Plays a raw PCM audio chunk using sounddevice."""
     if not audio_chunk:
         print("No audio chunk to play for this frame.")
         return
     try:
         audio_array = np.frombuffer(audio_chunk, dtype=np.int16).reshape(-1, 2)
         sd.play(audio_array, samplerate=AUDIO_SAMPLE_RATE)
-        # --- FIX: Re-introduced blocking logic ---
         if blocking:
             sd.wait()
     except Exception as e:
@@ -71,20 +106,17 @@ def draw_text(frame, text, pos, color=FONT_COLOR, shadow=SHADOW_COLOR):
     return (pos[0], pos[1] + LINE_HEIGHT)
 
 def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
-    """
-    Finds the correct player's data from the list based on their liveness.
-    The list only contains data for living players, so we must map the
-    player_idx (0-4) to the correct index in the shortened list.
-    """
+    """Finds the correct player's data from the list based on their liveness."""
     if not (team_alive_mask >> player_idx) & 1:
-        return None, None, None # Player is dead
+        return None  # Player is dead
 
-    # Count how many living players come before our target player_idx
     living_players_before = bin(team_alive_mask & ((1 << player_idx) - 1)).count('1')
     
     if living_players_before < len(player_data_list):
-        player_input, jpeg, audio = player_data_list[living_players_before]
-        return player_input, jpeg, audio
+        return player_data_list[living_players_before]
+    
+    return None # Data inconsistent or player just died this tick
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.",
                                      formatter_class=argparse.RawTextHelpFormatter)
@@ -120,8 +152,10 @@ def main():
         round_info = {r[0]: {'start': r[1], 'end': r[2]} for r in metadata['rounds']}
 
     current_round, current_team, current_player_idx = args.round, args.team, args.player_idx
-    overlay_on = True
     run_mode_on = False
+    # --- NEW: Three-state overlay ---
+    # 0 = OFF, 1 = Bitmasks, 2 = Strings
+    overlay_state = 1 
 
     if args.tick == -1:
         if current_round not in round_info:
@@ -143,13 +177,10 @@ def main():
             game_state_record = data['game_state'][0]
             player_data_list = data['player_data']
             
-            # --- FIX: Defensive call and unpacking ---
             pov_data = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
             
-            # Initialize variables
-            player_input_array, jpeg, audio = None, None, None
+            player_input_array, jpeg, audio = (None, None, None)
             if pov_data:
-                # Only unpack if the player is alive and data exists
                 player_input_array, jpeg, audio = pov_data
 
             if not run_mode_on and args.autoplay and audio:
@@ -159,21 +190,31 @@ def main():
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
                 player_input_record = player_input_array[0]
-                if overlay_on:
-                    pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
+
+                # --- NEW: Three-state overlay drawing logic ---
+                if overlay_state > 0:
+                    overlay_mode_str = "MASKS" if overlay_state == 1 else "STRINGS"
                     run_status = "ON" if run_mode_on else "OFF"
-                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN MODE: {run_status}", pos)
-                    pos = draw_text(frame, "-"*40, pos)
+                    pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
+                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN: {run_status} | OVERLAY: {overlay_mode_str}", pos)
+                    pos = draw_text(frame, "-"*60, pos)
                     pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
-                    pos = draw_text(frame, f"Team Alive Mask: {game_state_record['team_alive']:05b} | Enemy Alive Mask: {game_state_record['enemy_alive']:05b}", pos)
-                    pos = draw_text(frame, "-"*40, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
+                    pos = draw_text(frame, f"Team Alive: {game_state_record['team_alive']:05b} | Enemy Alive: {game_state_record['enemy_alive']:05b}", pos)
+                    pos = draw_text(frame, "-"*60, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
                     pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
                     pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
                     pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
-                    pos = draw_text(frame, f"Keyboard Mask: {int(player_input_record['keyboard_bitmask'])}", pos)
-                    pos = draw_text(frame, f"Eco Mask: {int(player_input_record['eco_bitmask'][0])} {int(player_input_record['eco_bitmask'][1])}", pos)
-                    pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
-                    pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
+                    
+                    if overlay_state == 1: # Bitmask Mode
+                        pos = draw_text(frame, f"Keyboard Mask: {int(player_input_record['keyboard_bitmask'])}", pos)
+                        pos = draw_text(frame, f"Eco Mask: {int(player_input_record['eco_bitmask'][0])} {int(player_input_record['eco_bitmask'][1])}", pos)
+                        pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
+                        pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
+                    elif overlay_state == 2: # String Mode
+                        pos = draw_text(frame, "Keyboard: " + decode_bitmask(player_input_record['keyboard_bitmask'], BIT_TO_KEYBOARD), pos)
+                        pos = draw_text(frame, "Eco: " + decode_bitmask_array(player_input_record['eco_bitmask'], BIT_TO_ECO), pos)
+                        pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
+                        pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
                 
                 if not run_mode_on:
                     print("\n" + "="*80); print(f"Displaying: {key_str}")
@@ -197,7 +238,7 @@ def main():
         key = cv2.waitKey(wait_time) & 0xFF
         
         if key == ord('r'):
-            run_mode_on = not run_on
+            run_mode_on = not run_mode_on
             status = "ON" if run_mode_on else "OFF"
             print(f"Run mode toggled {status}")
             continue
@@ -214,10 +255,10 @@ def main():
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
             elif key == ord('a'): play_audio(audio, blocking=True)
-            elif key == ord('o'): overlay_on = not overlay_on
+            elif key == ord('o'): overlay_state = (overlay_state + 1) % 3
 
     cv2.destroyAllWindows()
     env.close()
-    
+
 if __name__ == "__main__":
     main()
