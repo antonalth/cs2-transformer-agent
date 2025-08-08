@@ -82,7 +82,7 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
         player_input, jpeg, audio = player_data_list[living_players_before]
         return player_input, jpeg, audio
     
-  def main():
+def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.",
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("lmdb_path", type=Path, help="Path to the LMDB directory.")
@@ -207,6 +207,6 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
 
     cv2.destroyAllWindows()
     env.close()
-    
+
 if __name__ == "__main__":
     main()
