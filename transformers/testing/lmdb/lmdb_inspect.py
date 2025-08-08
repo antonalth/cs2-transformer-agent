@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import sys
+import os
 from pathlib import Path
 
 import cv2
@@ -21,6 +22,28 @@ import msgpack
 import msgpack_numpy as m
 import numpy as np
 import sounddevice as sd
+
+# --- Platform-specific key press detection for interactive debug ---
+try:
+    # Unix-like systems (Linux, macOS)
+    import tty, termios
+    def getch():
+        """Gets a single character from standard input."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+except ImportError:
+    # Windows
+    import msvcrt
+    def getch():
+        """Gets a single character from standard input."""
+        return msvcrt.getch().decode('utf-8')
+
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64
@@ -117,6 +140,69 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
     
     return None # Data inconsistent or player just died this tick
 
+def debug_interactive_search(env):
+    """Provides an interactive search interface for LMDB keys."""
+    print("Loading all keys into memory for searching...")
+    with env.begin() as txn:
+        all_keys = [key.decode('utf-8') for key, _ in txn.cursor()]
+    print(f"Loaded {len(all_keys)} keys. Starting interactive search...")
+
+    search_query = ""
+    try:
+        while True:
+            # Filter keys
+            if search_query:
+                matching_keys = [k for k in all_keys if search_query in k]
+            else:
+                matching_keys = all_keys[:50] # Show first 50 keys if query is empty
+
+            # Clear screen
+            os.system('cls' if os.name == 'nt' else 'clear')
+
+            # Display results
+            print("--- LMDB Interactive Key Search (Press Ctrl+C to exit) ---")
+            print(f"\nSearch: {search_query}", end="", flush=True)
+            print("\n\n--- Matched Keys ---")
+
+            if not matching_keys:
+                print("No matches found.")
+            else:
+                try:
+                    terminal_width = os.get_terminal_size().columns
+                except OSError:
+                    terminal_width = 80 # Default width
+
+                max_len = max(len(k) for k in matching_keys) if matching_keys else 0
+                num_columns = max(1, terminal_width // (max_len + 2)) # +2 for padding
+                
+                # Limit displayed results for performance and readability
+                display_limit = 200
+                for i, key in enumerate(matching_keys[:display_limit]):
+                    if (i > 0) and (i % num_columns == 0):
+                        print()
+                    print(f"{key:<{max_len}}  ", end="")
+                print() # Final newline
+
+                if len(matching_keys) > display_limit:
+                    print(f"\n...and {len(matching_keys) - display_limit} more.")
+            
+            # Get next character
+            char = getch()
+
+            if char in ('\x03', '\x04'): # Ctrl+C, Ctrl+D
+                break
+            elif char in ('\x7f', '\b'): # Backspace
+                search_query = search_query[:-1]
+            # Add any printable character to the query
+            elif char.isprintable():
+                search_query += char
+
+    except KeyboardInterrupt:
+        print("\nExiting interactive search.")
+    finally:
+        env.close()
+        sys.exit(0)
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.",
                                      formatter_class=argparse.RawTextHelpFormatter)
@@ -125,7 +211,7 @@ def main():
     parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'], help="Starting team (default: T).")
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
-    parser.add_argument("--debug", action='store_true', help="List the first 50 keys in the LMDB and exit.")
+    parser.add_argument("--debug", action='store_true', help="Run an interactive search to find keys in the LMDB and exit.")
     parser.add_argument("--autoplay", action='store_true', help="Automatically play non-blocking audio for each frame (overridden by run mode).")
     args = parser.parse_args()
 
@@ -135,14 +221,8 @@ def main():
     env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
 
     if args.debug:
-        print(f"--- DUMPING FIRST 50 KEYS FROM {args.lmdb_path} ---")
-        count = 0
-        with env.begin() as txn:
-            cursor = txn.cursor()
-            for key, _ in cursor:
-                print(key.decode('utf-8')); count += 1
-                if count >= 50: break
-        print("--- END OF KEY DUMP ---"); env.close(); sys.exit(0)
+        debug_interactive_search(env)
+        # The script will exit from within the debug function
 
     with env.begin() as txn:
         info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
@@ -153,9 +233,7 @@ def main():
 
     current_round, current_team, current_player_idx = args.round, args.team, args.player_idx
     run_mode_on = False
-    # --- NEW: Three-state overlay ---
-    # 0 = OFF, 1 = Bitmasks, 2 = Strings
-    overlay_state = 1 
+    overlay_state = 1 # 0=OFF, 1=Bitmasks, 2=Strings
 
     if args.tick == -1:
         if current_round not in round_info:
@@ -189,43 +267,45 @@ def main():
             if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
-                player_input_record = player_input_array[0]
-
-                # --- NEW: Three-state overlay drawing logic ---
-                if overlay_state > 0:
-                    overlay_mode_str = "MASKS" if overlay_state == 1 else "STRINGS"
-                    run_status = "ON" if run_mode_on else "OFF"
-                    pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
-                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN: {run_status} | OVERLAY: {overlay_mode_str}", pos)
-                    pos = draw_text(frame, "-"*60, pos)
-                    pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
-                    pos = draw_text(frame, f"Team Alive: {game_state_record['team_alive']:05b} | Enemy Alive: {game_state_record['enemy_alive']:05b}", pos)
-                    pos = draw_text(frame, "-"*60, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
-                    pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
-                    pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
-                    pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
+                if pov_data and player_input_array.size > 0:
+                    player_input_record = player_input_array[0]
                     
-                    if overlay_state == 1: # Bitmask Mode
-                        pos = draw_text(frame, f"Keyboard Mask: {int(player_input_record['keyboard_bitmask'])}", pos)
-                        pos = draw_text(frame, f"Eco Mask: {int(player_input_record['eco_bitmask'][0])} {int(player_input_record['eco_bitmask'][1])}", pos)
-                        pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
-                        pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
-                    elif overlay_state == 2: # String Mode
-                        pos = draw_text(frame, "Keyboard: " + decode_bitmask(player_input_record['keyboard_bitmask'], BIT_TO_KEYBOARD), pos)
-                        pos = draw_text(frame, "Eco: " + decode_bitmask_array(player_input_record['eco_bitmask'], BIT_TO_ECO), pos)
-                        pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
-                        pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
-                
+                    if overlay_state > 0:
+                        overlay_mode_str = "MASKS" if overlay_state == 1 else "STRINGS"
+                        run_status = "ON" if run_mode_on else "OFF"
+                        pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
+                        pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN: {run_status} | OVERLAY: {overlay_mode_str}", pos)
+                        pos = draw_text(frame, "-"*60, pos)
+                        pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
+                        pos = draw_text(frame, f"Team Alive: {game_state_record['team_alive']:05b} | Enemy Alive: {game_state_record['enemy_alive']:05b}", pos)
+                        pos = draw_text(frame, "-"*60, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
+                        pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
+                        pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
+                        pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
+                        
+                        if overlay_state == 1: # Bitmask Mode
+                            pos = draw_text(frame, f"Keyboard Mask: {int(player_input_record['keyboard_bitmask'])}", pos)
+                            pos = draw_text(frame, f"Eco Mask: {int(player_input_record['eco_bitmask'][0])} {int(player_input_record['eco_bitmask'][1])}", pos)
+                            pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
+                            pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
+                        elif overlay_state == 2: # String Mode
+                            pos = draw_text(frame, "Keyboard: " + decode_bitmask(player_input_record['keyboard_bitmask'], BIT_TO_KEYBOARD), pos)
+                            pos = draw_text(frame, "Eco: " + decode_bitmask_array(player_input_record['eco_bitmask'], BIT_TO_ECO), pos)
+                            pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
+                            pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
+                else: # pov_data exists but player_input_array is empty
+                     frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
+                     if not run_mode_on: print(f"POV data for player {current_player_idx} exists, but input array is empty (likely dead).")
+
                 if not run_mode_on:
                     print("\n" + "="*80); print(f"Displaying: {key_str}")
-                    print("\n--- GAME STATE ---"); print(game_state_record)
-                    print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record)
                     print("\n--- CONTROLS ---"); print("q: quit | j/k: tick | p: player | t: team | a: audio | o: overlay | r: RUN MODE")
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
         else:
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK")
-            print(f"No data found for key: {key_str}")
+            if not run_mode_on:
+                print(f"No data found for key: {key_str}")
             audio = None
             if run_mode_on: run_mode_on = False; print("Run mode stopped: No data for tick.")
 
@@ -254,7 +334,7 @@ def main():
             elif key == ord('k'): current_tick -= TICKS_PER_FRAME
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
-            elif key == ord('a'): play_audio(audio, blocking=True)
+            elif key == ord('a') and audio: play_audio(audio, blocking=True)
             elif key == ord('o'): overlay_state = (overlay_state + 1) % 3
 
     cv2.destroyAllWindows()
