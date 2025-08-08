@@ -97,85 +97,91 @@ def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_d
     worker_data['rounds_info'] = rounds_info
     worker_data['recordings_map'] = recordings_map
     worker_data['player_data_cache'] = player_data_cache
-
 def process_round_perspective(task_args):
-    round_num, team, demoname = task_args
-    gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
-    rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
-    player_data_cache = worker_data['player_data_cache']
-    free_q, result_q = worker_data['free_q'], worker_data['result_q']
-
-    round_data = rounds_info[round_num]
-    team_recordings = recordings_map[(round_num, team)]
-    if len(team_recordings) != 5: return
-    
-    # ... (core processing logic remains identical to previous version) ...
-    t_roster = [p[0] for p in json.loads(round_data['t_team'])]; ct_roster = [p[0] for p in json.loads(round_data['ct_team'])]
-    current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
-    caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in team_recordings}
-    auds = {rec['playername']: open(rec['wav_path'], 'rb') for rec in team_recordings}
-    for aud_file in auds.values(): aud_file.seek(44)
-    round_start_tick, round_end_tick = round_data['starttick'], max(rec['stoptick'] for rec in team_recordings)
-    results = []
-    for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
-        game_state = np.zeros(1, dtype=gs_dtype); game_state[0]['tick'] = current_tick
-        rs_mask = 0
-        if round_data.get('freezetime_endtick') is not None and current_tick < round_data['freezetime_endtick']: rs_mask |= (1 << 0)
-        if round_data.get('starttick') is not None and round_data.get('endtick') is not None and current_tick >= round_data['starttick'] and current_tick <= round_data['endtick']: rs_mask |= (1 << 1)
-        if round_data.get('bomb_planted_tick', -1) != -1 and current_tick >= round_data['bomb_planted_tick']: rs_mask |= (1 << 2)
-        game_state[0]['round_state'] = rs_mask
-        team_deaths = {p[0]: p[1] for p in json.loads(round_data[f"{team.lower()}_team"])}; enemy_deaths = {p[0]: p[1] for p in json.loads(round_data[f"{'ct' if team == 'T' else 't'}_team"])}
-        team_alive_mask = sum(1 << i for i, n in enumerate(current_roster) if team_deaths.get(n, 0) == -1 or current_tick < team_deaths.get(n, 0))
-        enemy_alive_mask = sum(1 << i for i, n in enumerate(enemy_roster) if enemy_deaths.get(n, 0) == -1 or current_tick < enemy_deaths.get(n, 0))
-        game_state[0]['team_alive'], game_state[0]['enemy_alive'] = team_alive_mask, enemy_alive_mask
-        for i, name in enumerate(enemy_roster):
-            if (enemy_alive_mask >> i) & 1:
-                lookup_key = f"{name}:{current_tick}"
-                if lookup_key in player_data_cache:
-                    e_data = player_data_cache[lookup_key]; game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
-        player_data_list = []
-        for i, rec in enumerate(team_recordings):
-            if not ((team_alive_mask >> i) & 1) or current_tick >= rec['stoptick']: continue
-            playername = rec['playername']; ret, frame = caps[playername].read(); audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
-            if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME: continue
-            jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes(); lookup_key = f"{playername}:{current_tick}"; tick_data = player_data_cache.get(lookup_key); player_input = np.zeros(1, dtype=pi_dtype)
-            if tick_data:
-                kb_input_str, buy_sell_input_str = tick_data.get('keyboard_input', '') or '', tick_data.get('buy_sell_input', '') or ''
-                all_kb_actions = kb_input_str.split(','); keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]; player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT)
-                drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]; eco_actions_list = drop_actions + buy_sell_input_str.split(',')
-                if tick_data.get('is_in_buyzone') == 1: eco_actions_list.append('IN_BUYZONE')
-                player_input[0]['eco_bitmask'] = get_bitmask_array(filter(None, eco_actions_list), ECO_TO_BIT)
-                player_input[0]['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]; player_input[0]['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
-                player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
-                inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX); player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
-            player_data_list.append((player_input, jpeg_bytes, audio_chunk))
-        if not player_data_list: continue
-        key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8'); tick_payload = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True); results.append((key, tick_payload))
-    
-    for cap in caps.values(): cap.release()
-    for aud in auds.values(): aud.close()
-    if not results: return
-
-    packed_results = msgpack.packb(results, use_bin_type=True)
-    if len(packed_results) > RESULT_BUFFER_SIZE:
-        # This will crash the worker and propagate a clear error to the main process.
-        raise ValueError(
-            f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) "
-            f"exceeds the configured RESULT_BUFFER_SIZE ({RESULT_BUFFER_SIZE/(1024**2):.2f}MB). "
-            f"Please increase the RESULT_BUFFER_SIZE constant at the top of the script."
-        )
-
-    # Use a buffer from the managed pool
-    buffer_name = free_q.get()
+    """
+    This is the main function executed by each worker. It processes a single
+    round/team perspective and returns the results via a temporary shared memory block.
+    Includes a top-level exception handler to ensure no failures are silent.
+    """
     try:
+        round_num, team, demoname = task_args
+        gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
+        rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
+        player_data_cache = worker_data['player_data_cache']
+        free_q, result_q = worker_data['free_q'], worker_data['result_q']
+
+        round_data = rounds_info[round_num]
+        team_recordings = recordings_map[(round_num, team)]
+        if len(team_recordings) != 5: return
+
+        # ... (the entire core processing logic remains here, unchanged) ...
+        t_roster = [p[0] for p in json.loads(round_data['t_team'])]; ct_roster = [p[0] for p in json.loads(round_data['ct_team'])]
+        current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
+        caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in team_recordings}
+        auds = {rec['playername']: open(rec['wav_path'], 'rb') for rec in team_recordings}
+        for aud_file in auds.values(): aud_file.seek(44)
+        round_start_tick, round_end_tick = round_data['starttick'], max(rec['stoptick'] for rec in team_recordings)
+        results = []
+        for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
+            game_state = np.zeros(1, dtype=gs_dtype); game_state[0]['tick'] = current_tick
+            rs_mask = 0
+            if round_data.get('freezetime_endtick') is not None and current_tick < round_data['freezetime_endtick']: rs_mask |= (1 << 0)
+            if round_data.get('starttick') is not None and round_data.get('endtick') is not None and current_tick >= round_data['starttick'] and current_tick <= round_data['endtick']: rs_mask |= (1 << 1)
+            if round_data.get('bomb_planted_tick', -1) != -1 and current_tick >= round_data['bomb_planted_tick']: rs_mask |= (1 << 2)
+            game_state[0]['round_state'] = rs_mask
+            team_deaths = {p[0]: p[1] for p in json.loads(round_data[f"{team.lower()}_team"])}; enemy_deaths = {p[0]: p[1] for p in json.loads(round_data[f"{'ct' if team == 'T' else 't'}_team"])}
+            team_alive_mask = sum(1 << i for i, n in enumerate(current_roster) if team_deaths.get(n, 0) == -1 or current_tick < team_deaths.get(n, 0))
+            enemy_alive_mask = sum(1 << i for i, n in enumerate(enemy_roster) if enemy_deaths.get(n, 0) == -1 or current_tick < enemy_deaths.get(n, 0))
+            game_state[0]['team_alive'], game_state[0]['enemy_alive'] = team_alive_mask, enemy_alive_mask
+            for i, name in enumerate(enemy_roster):
+                if (enemy_alive_mask >> i) & 1:
+                    lookup_key = f"{name}:{current_tick}"
+                    if lookup_key in player_data_cache:
+                        e_data = player_data_cache[lookup_key]; game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
+            player_data_list = []
+            for i, rec in enumerate(team_recordings):
+                if not ((team_alive_mask >> i) & 1) or current_tick >= rec['stoptick']: continue
+                playername = rec['playername']; ret, frame = caps[playername].read(); audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
+                if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME: continue
+                jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes(); lookup_key = f"{playername}:{current_tick}"; tick_data = player_data_cache.get(lookup_key); player_input = np.zeros(1, dtype=pi_dtype)
+                if tick_data:
+                    kb_input_str, buy_sell_input_str = tick_data.get('keyboard_input', '') or '', tick_data.get('buy_sell_input', '') or ''
+                    all_kb_actions = kb_input_str.split(','); keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]; player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT)
+                    drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]; eco_actions_list = drop_actions + buy_sell_input_str.split(',')
+                    if tick_data.get('is_in_buyzone') == 1: eco_actions_list.append('IN_BUYZONE')
+                    player_input[0]['eco_bitmask'] = get_bitmask_array(filter(None, eco_actions_list), ECO_TO_BIT)
+                    player_input[0]['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]; player_input[0]['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
+                    player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
+                    inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX); player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
+                player_data_list.append((player_input, jpeg_bytes, audio_chunk))
+            if not player_data_list: continue
+            key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8'); tick_payload = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True); results.append((key, tick_payload))
+        
+        for cap in caps.values(): cap.release()
+        for aud in auds.values(): aud.close()
+        if not results: return
+
+        packed_results = msgpack.packb(results, use_bin_type=True)
+        if len(packed_results) > RESULT_BUFFER_SIZE:
+            raise ValueError(
+                f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) "
+                f"exceeds the configured RESULT_BUFFER_SIZE ({RESULT_BUFFER_SIZE/(1024**2):.2f}MB). "
+                f"Increase RESULT_BUFFER_SIZE constant."
+            )
+
+        buffer_name = free_q.get()
         shm = SharedMemory(name=buffer_name)
         shm.buf[:len(packed_results)] = packed_results
         shm.close()
         result_q.put((buffer_name, len(packed_results)))
-    except Exception as e:
-        LOG.error(f"Worker failed to write to buffer {buffer_name}: {e}")
-        # Put the buffer back if we failed to use it
-        free_q.put(buffer_name)
+
+    except Exception:
+        # --- NEW: Catch ANY exception, log it, and report failure ---
+        import traceback
+        # Log the full traceback from the worker
+        LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}")
+        # Put an error marker on the queue so the main process can exit
+        result_q.put(("ERROR", None))
 
 # =============================================================================
 # MAIN DRIVER
