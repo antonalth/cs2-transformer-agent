@@ -158,8 +158,12 @@ def process_round_perspective(task_args):
 
     packed_results = msgpack.packb(results, use_bin_type=True)
     if len(packed_results) > RESULT_BUFFER_SIZE:
-        LOG.error(f"FATAL: Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size ({RESULT_BUFFER_SIZE/(1024**2):.2f}MB). Increase RESULT_BUFFER_SIZE constant.")
-        return
+        # This will crash the worker and propagate a clear error to the main process.
+        raise ValueError(
+            f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) "
+            f"exceeds the configured RESULT_BUFFER_SIZE ({RESULT_BUFFER_SIZE/(1024**2):.2f}MB). "
+            f"Please increase the RESULT_BUFFER_SIZE constant at the top of the script."
+        )
 
     # Use a buffer from the managed pool
     buffer_name = free_q.get()
@@ -287,9 +291,12 @@ if __name__ == '__main__':
                         for key, payload in round_results:
                             txn.put(key, payload)
                 except Exception as e:
-                    LOG.error(f"Error handling result from buffer {result_shm_name}: {e}")
-                    free_buffers_q.put(result_shm_name)
-                    raise
+                    # Log the error and immediately halt the pool and the script.
+                    LOG.error(f"FATAL: A critical error occurred while processing results. Shutting down.")
+                    pool.terminate() # Forcibly stop all worker processes
+                    pool.join()
+                    # Re-raise the original exception for a full traceback
+                    raise e
     
     finally:
         LOG.info("-> Phase 3: Finalizing and cleaning up...")
