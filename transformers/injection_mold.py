@@ -392,44 +392,45 @@ def main():
     tasks = sorted(recordings_map.keys())
     
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_round_perspective, r, t, demoname, gs_dtype, pi_dtype, rounds_info, recordings_map, player_data_cache): (r,t) for r, t in tasks}
+        futures = {executor.submit(process_round_perspective, r, t, demoname, gs_dtype, pi_dtype, rounds_info, recordings_map, player_data_cache): (r, t) for r, t in tasks}
         
-        for future in tqdm(as_completed(futures), total=len(tasks), desc="Processing Round/Team Perspectives"):
+        # Use a tqdm instance that we can manually close
+        pbar = tqdm(as_completed(futures), total=len(tasks), desc="Processing Round/Team Perspectives")
+        
+        for future in pbar:
             try:
                 round_results = future.result()
                 
                 if not round_results: continue
 
-                # --- FIX: Proactive resizing logic ---
-                # 1. Calculate the size of the incoming batch of data
+                # Proactive resizing logic
                 batch_size = sum(len(payload) for key, payload in round_results)
-
-                # 2. Check if there is enough space, and resize in a loop if not.
-                info = env.info()
-                stats = env.stat()
+                info, stats = env.info(), env.stat()
                 available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
-
                 while available_space < batch_size:
-                    LOG.warning(
-                        f"Resizing LMDB: Need {batch_size / (1024*1024):.2f} MB, "
-                        f"only {available_space / (1024*1024):.2f} MB available."
-                    )
+                    LOG.warning(f"Resizing LMDB: Need {batch_size / (1024*1024):.2f} MB, have {available_space / (1024*1024):.2f} MB.")
                     new_size = info['map_size'] + MAP_RESIZE_INCREMENT
                     env.set_mapsize(new_size)
-                    # Update the info for the next loop check
-                    info = env.info()
-                    available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
+                    info, available_space = env.info(), info['map_size'] - (info['last_pgno'] * stats['psize'])
 
-                # 3. Now it is safe to write the entire batch.
                 with env.begin(write=True) as txn:
                     for key, payload in round_results:
                         txn.put(key, payload)
 
             except Exception as exc:
+                # --- FIX: Graceful handling of exceptions from workers ---
+                # 1. Close the tqdm progress bar to prevent it from garbling the output.
+                pbar.close()
+                
+                # 2. Log the error clearly. The detailed ValueError message will be part of 'exc'.
                 task_id = futures[future]
-                LOG.error(f"Task {task_id} generated an exception: {exc}")
-                # Ensure the program stops on worker failure
+                LOG.error(f"FATAL ERROR in worker task for Round/Team {task_id}.")
+                
+                # 3. Shutdown the executor immediately, cancelling pending tasks.
                 executor.shutdown(wait=False, cancel_futures=True)
+                
+                # 4. Re-raise the original exception to show the full traceback and stop the script.
+                # This will trigger the signal handler for cleanup.
                 raise exc
 
     LOG.info("-> Phase 3: Writing final metadata...")
