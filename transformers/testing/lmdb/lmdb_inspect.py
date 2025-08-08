@@ -142,7 +142,15 @@ def main():
             data = msgpack.unpackb(value, raw=False, object_hook=m.decode)
             game_state_record = data['game_state'][0]
             player_data_list = data['player_data']
-            player_input_array, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
+            
+            # --- FIX: Defensive call and unpacking ---
+            pov_data = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
+            
+            # Initialize variables
+            player_input_array, jpeg, audio = None, None, None
+            if pov_data:
+                # Only unpack if the player is alive and data exists
+                player_input_array, jpeg, audio = pov_data
 
             if not run_mode_on and args.autoplay and audio:
                 play_audio(audio, blocking=False)
@@ -182,30 +190,24 @@ def main():
 
         cv2.imshow("LMDB Inspector", frame)
         
-        # --- FIX: Reordered logic for synchronization ---
-        # In run mode, play audio *after* showing the frame. The blocking sd.wait()
-        # will now pause the loop, effectively setting the framerate.
         if run_mode_on and audio:
             play_audio(audio, blocking=True)
         
         wait_time = 1 if run_mode_on else 0
         key = cv2.waitKey(wait_time) & 0xFF
         
-        # Always check for run mode toggle first for responsiveness
         if key == ord('r'):
-            run_mode_on = not run_mode_on
+            run_mode_on = not run_on
             status = "ON" if run_mode_on else "OFF"
             print(f"Run mode toggled {status}")
-            continue # Restart loop to immediately apply new mode
+            continue
 
         if run_mode_on:
-            # If still in run mode, automatically advance frame
             current_tick += TICKS_PER_FRAME
             if current_round in round_info and current_tick > round_info[current_round]['end']:
                 print("Run mode stopped: End of round reached.")
                 run_mode_on = False
         else:
-            # Handle other keys only when not in run mode
             if key == ord('q'): break
             elif key == ord('j'): current_tick += TICKS_PER_FRAME
             elif key == ord('k'): current_tick -= TICKS_PER_FRAME
@@ -216,6 +218,6 @@ def main():
 
     cv2.destroyAllWindows()
     env.close()
-
+    
 if __name__ == "__main__":
     main()
