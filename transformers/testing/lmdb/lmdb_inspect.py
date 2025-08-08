@@ -11,17 +11,10 @@ processed correctly.
 
 import argparse
 import json
+import logging
 import sys
 import os
 from pathlib import Path
-
-# --- Curses is used for the improved, low-memory interactive debug mode ---
-try:
-    import curses
-except ImportError:
-    print("The 'curses' library is required for the interactive --debug mode.")
-    print("If you are on Windows, you can install it with: pip install windows-curses")
-    curses = None
 
 import cv2
 import lmdb
@@ -29,6 +22,27 @@ import msgpack
 import msgpack_numpy as m
 import numpy as np
 import sounddevice as sd
+
+# --- Platform-specific key press detection for interactive debug ---
+try:
+    # Windows
+    import msvcrt
+    def getch():
+        """Gets a single character from standard input on Windows."""
+        return msvcrt.getch().decode('utf-8', errors='ignore')
+except ImportError:
+    # Unix-like systems (Linux, macOS)
+    import tty, termios
+    def getch():
+        """Gets a single character from standard input on Unix."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
 
 
 # --- Configuration ---
@@ -88,7 +102,7 @@ def decode_bitmask_array(mask_array, reverse_map):
 def play_audio(audio_chunk, blocking=False):
     """Plays a raw PCM audio chunk using sounddevice."""
     if not audio_chunk:
-        print("No audio chunk to play for this frame.")
+        # This is a normal occurrence, so we don't print anything here.
         return
     try:
         audio_array = np.frombuffer(audio_chunk, dtype=np.int16).reshape(-1, 2)
@@ -126,88 +140,89 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
     
     return None # Data inconsistent or player just died this tick
 
-def debug_interactive_search(stdscr, env):
+def debug_interactive_search(env):
     """
-    Provides a low-memory, curses-based interactive search for LMDB keys.
-    This function is intended to be run via curses.wrapper.
+    Provides a memory-efficient, interactive search interface for LMDB keys
+    that dynamically fits the terminal window.
     """
-    curses.curs_set(1)  # Make cursor visible
-    stdscr.nodelay(True) # Make getch() non-blocking
     search_query = ""
-    
-    # Pre-calculate counts for display
-    with env.begin() as txn:
-        total_keys = txn.stat()['entries']
+    total_keys = env.stat()['entries']
 
     try:
         while True:
-            rows, cols = stdscr.getmaxyx()
-            stdscr.clear()
-
-            # --- Handle Input ---
+            # --- Prepare for redraw ---
             try:
-                key = stdscr.getch()
-                if key != -1:
-                    if key in (curses.KEY_BACKSPACE, 127, 8): # Handle backspace
-                        search_query = search_query[:-1]
-                    elif 32 <= key <= 126: # Handle printable characters
-                        search_query += chr(key)
-            except curses.error:
-                pass
-
-            # --- UI Rendering ---
-            header = "--- LMDB Interactive Key Search (Ctrl+C to exit) ---"
-            stdscr.addstr(0, 0, header)
-            stdscr.addstr(2, 0, f"Search: {search_query}")
-            stdscr.hline(3, 0, '-', cols)
-
-            # --- Perform Search and Display (Low Memory) ---
-            # Only fetch enough keys to fill the display
-            results_start_row = 4
-            results_height = rows - results_start_row
+                # Get terminal dimensions
+                term_width, term_height = os.get_terminal_size()
+            except OSError:
+                # Fallback for environments where this fails (e.g., some IDEs)
+                term_width, term_height = 80, 24
             
+            # Calculate how many results can be displayed
+            header_lines = 4
+            prompt_lines = 2
+            available_lines = term_height - header_lines - prompt_lines
+
+            # --- Search Logic (Memory Efficient) ---
+            # This block iterates the DB instead of loading all keys into RAM
             matching_keys = []
-            count = 0
-            
-            with env.begin(write=False) as txn:
+            with env.begin() as txn:
                 cursor = txn.cursor()
-                # Iterate through all keys without loading them all into memory
                 for key_bytes, _ in cursor:
-                    key_str = key_bytes.decode('utf-8', 'ignore')
-                    # If query is empty, show from the start. Otherwise, filter.
-                    if not search_query or search_query in key_str:
-                        # Stop collecting keys if we have enough to fill the screen
-                        if len(matching_keys) >= results_height * 5: # Generous limit
-                             break
+                    # If we have enough keys to fill the screen, stop searching
+                    if len(matching_keys) >= 500: # Safety limit
+                         break
+                    key_str = key_bytes.decode('utf-8', errors='ignore')
+                    if search_query in key_str:
                         matching_keys.append(key_str)
-                    count += 1
+
+            # --- Render Output ---
+            # Clear screen
+            os.system('cls' if os.name == 'nt' else 'clear')
             
-            # --- Display Results ---
+            # Print header
+            print("--- LMDB Interactive Key Search ---")
+            print(f"Searching {total_keys} keys. Display is limited to fit terminal. (Press Ctrl+C to exit)\n")
+            
+            # Print results in columns
             if not matching_keys:
-                stdscr.addstr(results_start_row, 2, "No matches found.")
+                print("No matches found.")
             else:
                 max_len = max(len(k) for k in matching_keys) if matching_keys else 0
-                num_columns = max(1, cols // (max_len + 2))
-                
-                row, col = results_start_row, 0
-                for i, key_str in enumerate(matching_keys):
-                    if row >= rows -1:
-                        stdscr.addstr(rows - 1, 0, f"...and more. Displaying first {i} matches.")
-                        break
-                    
-                    stdscr.addstr(row, col * (max_len + 2), key_str)
-                    
-                    col += 1
-                    if col >= num_columns:
-                        col = 0
-                        row += 1
+                num_columns = max(1, term_width // (max_len + 2)) # +2 for padding
+                display_limit = min(len(matching_keys), available_lines * num_columns)
 
-            stdscr.move(2, len(f"Search: {search_query}")) # Move cursor to end of search query
-            stdscr.refresh()
-            curses.napms(20) # Small delay to prevent high CPU usage
+                for i, key in enumerate(matching_keys[:display_limit]):
+                    if (i > 0) and (i % num_columns == 0):
+                        print()
+                    print(f"{key:<{max_len}}  ", end="")
+                print() # Final newline
+
+                if len(matching_keys) > display_limit:
+                    print(f"\n...and {len(matching_keys) - display_limit} more matches found.")
+
+            # Print search prompt at the bottom (so it doesn't move)
+            print("\n" + "="*term_width)
+            print(f"Search: {search_query}", end="", flush=True)
+
+            # --- Handle Input ---
+            char = getch()
+            
+            if char in ('\x03', '\x04'): # Ctrl+C, Ctrl+D
+                break
+            elif char == '\r': # Enter key
+                break
+            elif char in ('\x08', '\x7f'): # Backspace
+                search_query = search_query[:-1]
+            # Add any printable character to the query
+            elif char and char.isprintable():
+                search_query += char
 
     except KeyboardInterrupt:
-        return # Exit gracefully on Ctrl+C
+        print("\nExiting interactive search.")
+    finally:
+        env.close()
+        sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.",
@@ -217,26 +232,24 @@ def main():
     parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'], help="Starting team (default: T).")
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
-    parser.add_argument("--debug", action='store_true', help="Run a low-memory, interactive search to find keys in the LMDB and exit.")
+    parser.add_argument("--debug", action='store_true', help="Run an interactive search to find keys in the LMDB and exit.")
     parser.add_argument("--autoplay", action='store_true', help="Automatically play non-blocking audio for each frame (overridden by run mode).")
     args = parser.parse_args()
 
     if not args.lmdb_path.exists():
         print(f"Error: LMDB path not found at: {args.lmdb_path}"); sys.exit(1)
 
-    env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False, readahead=False)
+    env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
 
     if args.debug:
-        if curses:
-            curses.wrapper(debug_interactive_search, env)
-        env.close()
-        sys.exit(0)
+        debug_interactive_search(env)
+        # The script will exit from within the debug function
 
     with env.begin() as txn:
-        info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
-        if not info_key: print("Error: Could not find INFO key in the database."); sys.exit(1)
-        demoname = info_key[0].removesuffix(b'_INFO').decode('utf-8')
-        metadata = json.loads(txn.get(info_key[0]))
+        info_key_bytes = next((k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')), None)
+        if not info_key_bytes: print("Error: Could not find INFO key in the database."); sys.exit(1)
+        demoname = info_key_bytes.removesuffix(b'_INFO').decode('utf-8')
+        metadata = json.loads(txn.get(info_key_bytes))
         round_info = {r[0]: {'start': r[1], 'end': r[2]} for r in metadata['rounds']}
 
     current_round, current_team, current_player_idx = args.round, args.team, args.player_idx
@@ -272,7 +285,7 @@ def main():
             if not run_mode_on and args.autoplay and audio:
                 play_audio(audio, blocking=False)
 
-            if jpeg:
+            if jpeg is not None:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
                 if pov_data and player_input_array is not None and player_input_array.size > 0:
@@ -301,17 +314,11 @@ def main():
                             pos = draw_text(frame, "Eco: " + decode_bitmask_array(player_input_record['eco_bitmask'], BIT_TO_ECO), pos)
                             pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
                             pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
-                else: 
-                     frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-
-                if not run_mode_on:
-                    print("\n" + "="*80); print(f"Displaying: {key_str}")
-                    print("\n--- CONTROLS ---"); print("q: quit | j/k: tick | p: player | t: team | a: audio | o: overlay | r: RUN MODE")
-            else:
-                frame = create_placeholder_frame(1280, 720, "PLAYER DEAD or NO DATA")
-                if not run_mode_on: print(f"No viewable frame for key: {key_str} (Player may be dead or data unavailable)")
-        
-        else:
+                else: # Player is dead or has no input record
+                    frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
+            else: # No pov_data or no jpeg
+                frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
+        else: # No value for key
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK")
             if not run_mode_on: print(f"No data found for key: {key_str}")
             audio = None
@@ -329,6 +336,10 @@ def main():
             run_mode_on = not run_mode_on
             status = "ON" if run_mode_on else "OFF"
             print(f"Run mode toggled {status}")
+            if not run_mode_on: # Print controls when stopping run mode
+                print("\n--- CONTROLS ---")
+                print("q: quit | j/k: next/prev tick | p: next player | t: switch team")
+                print("a: play audio | o: toggle overlay | r: toggle RUN mode")
             continue
 
         if run_mode_on:
@@ -342,7 +353,7 @@ def main():
             elif key == ord('k'): current_tick -= TICKS_PER_FRAME
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
-            elif key == ord('a') and audio: play_audio(audio, blocking=True)
+            elif key == ord('a'): play_audio(audio, blocking=True)
             elif key == ord('o'): overlay_state = (overlay_state + 1) % 3
 
     cv2.destroyAllWindows()
