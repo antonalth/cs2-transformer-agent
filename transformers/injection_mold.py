@@ -87,7 +87,7 @@ def init_worker(shm_cache_name, shm_cache_size, gs_dtype, pi_dtype, rounds_info,
     worker_data['rounds_info'] = rounds_info
     worker_data['recordings_map'] = recordings_map
     worker_data['player_data_cache'] = player_data_cache
-
+    
 def process_round_perspective(task_args):
     """
     This is the main function executed by each worker. It processes a single
@@ -102,7 +102,6 @@ def process_round_perspective(task_args):
     recordings_map = worker_data['recordings_map']
     player_data_cache = worker_data['player_data_cache']
 
-    # (The core processing logic from the previous version is placed here, unchanged)
     round_data = rounds_info[round_num]
     team_recordings = recordings_map[(round_num, team)]
     if len(team_recordings) != 5: return None
@@ -120,7 +119,6 @@ def process_round_perspective(task_args):
     round_end_tick = max(rec['stoptick'] for rec in team_recordings)
     
     results = []
-    # (Identical processing loop as before)
     for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
         game_state = np.zeros(1, dtype=gs_dtype)
         game_state[0]['tick'] = current_tick
@@ -134,39 +132,32 @@ def process_round_perspective(task_args):
         team_alive_mask = sum(1 << i for i, n in enumerate(current_roster) if team_deaths.get(n, 0) == -1 or current_tick < team_deaths.get(n, 0))
         enemy_alive_mask = sum(1 << i for i, n in enumerate(enemy_roster) if enemy_deaths.get(n, 0) == -1 or current_tick < enemy_deaths.get(n, 0))
         game_state[0]['team_alive'], game_state[0]['enemy_alive'] = team_alive_mask, enemy_alive_mask
+        
         for i, name in enumerate(enemy_roster):
             if (enemy_alive_mask >> i) & 1:
-                if (name, current_tick) in player_data_cache:
-                    e_data = player_data_cache[(name, current_tick)]
+                # --- FIX 1: Use string key for lookup ---
+                lookup_key = f"{name}:{current_tick}"
+                if lookup_key in player_data_cache:
+                    e_data = player_data_cache[lookup_key]
                     game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
+        
         player_data_list = []
         for i, rec in enumerate(team_recordings):
             if not ((team_alive_mask >> i) & 1) or current_tick >= rec['stoptick']: continue
+            
             playername = rec['playername']
             ret, frame = caps[playername].read()
             audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
             if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME:
-                player_start_tick = rec['starttick']
-                player_stop_tick = rec['stoptick']
-
-                # Calculate expected vs actual frames processed for this player's POV
-                expected_total_frames = (player_stop_tick - player_start_tick) // TICKS_PER_FRAME
-                # The current frame index within this player's own video timeline
-                current_frame_index = (current_tick - player_start_tick) // TICKS_PER_FRAME
-                
-                # To avoid negative numbers if the stream is longer than expected
-                frames_missing = max(0, expected_total_frames - current_frame_index)
-
-                LOG.warning(
-                    f"Media stream for {playername} ended unexpectedly at tick {current_tick}. "
-                    f"({current_frame_index}/{expected_total_frames} frames processed, "
-                    f"approx. {frames_missing} frames missing from recording)."
-                )
-                continue # Skip processing this player for this tick
+                continue # Gracefully skip missing frames
             
             jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
-            tick_data = player_data_cache.get((playername, current_tick))
+            
+            # --- FIX 2: Use string key for lookup ---
+            lookup_key = f"{playername}:{current_tick}"
+            tick_data = player_data_cache.get(lookup_key)
             player_input = np.zeros(1, dtype=pi_dtype)
+
             if tick_data:
                 # This part is identical to the single-threaded version
                 kb_input_str, buy_sell_input_str = tick_data.get('keyboard_input', '') or '', tick_data.get('buy_sell_input', '') or ''
@@ -182,7 +173,9 @@ def process_round_perspective(task_args):
                 player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
                 inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX)
                 player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
+            
             player_data_list.append((player_input, jpeg_bytes, audio_chunk))
+        
         if not player_data_list: continue
         key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
         tick_payload = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True)
@@ -193,16 +186,13 @@ def process_round_perspective(task_args):
     
     if not results: return None
 
-    # Serialize results and put them in a temporary shared memory block
     packed_results = msgpack.packb(results, use_bin_type=True)
     result_shm_name = f"result_{uuid.uuid4()}"
     result_shm = SharedMemory(name=result_shm_name, create=True, size=len(packed_results))
     result_shm.buf[:len(packed_results)] = packed_results
     result_shm.close()
     
-    # Return the name and size of the block
     return (result_shm_name, len(packed_results))
-
 
 # =============================================================================
 # MAIN DRIVER
@@ -310,7 +300,8 @@ if __name__ == '__main__':
     
     # Create the shared memory block for the large player data cache
     LOG.info("   - Caching player data into shared memory...")
-    player_data_cache = { (r['playername'], r['tick']): dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }
+    # --- FIX: Use a robust string key instead of a tuple ---
+    player_data_cache = { f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }  
     conn.close()
     packed_cache = msgpack.packb(player_data_cache, use_bin_type=True)
     shm_cache_name = f"cache_{uuid.uuid4()}"
