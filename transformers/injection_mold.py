@@ -2,7 +2,7 @@
 """
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
 for model training. (Robust Multiprocessing Version with a Managed Pool
-of Shared Memory Buffers)
+of Shared Memory Buffers and pickle for IPC)
 """
 
 import argparse
@@ -16,7 +16,8 @@ import sys
 from pathlib import Path
 import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
-import time
+import uuid
+import pickle # <-- NEW: Import pickle
 
 import cv2
 import lmdb
@@ -32,8 +33,7 @@ AUDIO_SAMPLE_RATE = 44100; AUDIO_CHANNELS = 2; AUDIO_BIT_DEPTH = 2
 AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNELS * AUDIO_BIT_DEPTH
 INITIAL_MAP_SIZE = 20 * 1024**3; MAP_RESIZE_INCREMENT = 5 * 1024**3
 MAP_RESIZE_THRESHOLD = 500 * 1024**2
-# Size of each reusable buffer for worker results. Should be larger than any single round's data.
-RESULT_BUFFER_SIZE = 3000 * 1024**2
+RESULT_BUFFER_SIZE = 500 * 1024**2
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None; m.patch()
@@ -89,20 +89,16 @@ def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_d
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
     shm.close()
-    player_data_cache = msgpack.unpackb(packed_cache_copy, raw=False, object_hook=m.decode)
+    # Use pickle to deserialize the initial cache
+    worker_data['player_data_cache'] = pickle.loads(packed_cache_copy)
     worker_data['free_q'] = free_q
     worker_data['result_q'] = result_q
     worker_data['gs_dtype'] = gs_dtype
     worker_data['pi_dtype'] = pi_dtype
     worker_data['rounds_info'] = rounds_info
     worker_data['recordings_map'] = recordings_map
-    worker_data['player_data_cache'] = player_data_cache
+
 def process_round_perspective(task_args):
-    """
-    This is the main function executed by each worker. It processes a single
-    round/team perspective and returns the results via a temporary shared memory block.
-    Includes a top-level exception handler to ensure no failures are silent.
-    """
     try:
         round_num, team, demoname = task_args
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
@@ -114,7 +110,7 @@ def process_round_perspective(task_args):
         team_recordings = recordings_map[(round_num, team)]
         if len(team_recordings) != 5: return
 
-        # ... (the entire core processing logic remains here, unchanged) ...
+        # ... (core processing logic remains identical) ...
         t_roster = [p[0] for p in json.loads(round_data['t_team'])]; ct_roster = [p[0] for p in json.loads(round_data['ct_team'])]
         current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
         caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in team_recordings}
@@ -155,19 +151,21 @@ def process_round_perspective(task_args):
                     inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX); player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
                 player_data_list.append((player_input, jpeg_bytes, audio_chunk))
             if not player_data_list: continue
-            key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8'); tick_payload = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True); results.append((key, tick_payload))
+            
+            # For LMDB, we still use msgpack for efficiency
+            final_payload_for_lmdb = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True)
+            key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
+            results.append((key, final_payload_for_lmdb))
         
         for cap in caps.values(): cap.release()
         for aud in auds.values(): aud.close()
         if not results: return
 
-        packed_results = msgpack.packb(results, use_bin_type=True)
+        # --- CHANGE: Serialize results using pickle for IPC ---
+        packed_results = pickle.dumps(results)
+        
         if len(packed_results) > RESULT_BUFFER_SIZE:
-            raise ValueError(
-                f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) "
-                f"exceeds the configured RESULT_BUFFER_SIZE ({RESULT_BUFFER_SIZE/(1024**2):.2f}MB). "
-                f"Increase RESULT_BUFFER_SIZE constant."
-            )
+            raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size. Increase RESULT_BUFFER_SIZE.")
 
         buffer_name = free_q.get()
         shm = SharedMemory(name=buffer_name)
@@ -176,36 +174,28 @@ def process_round_perspective(task_args):
         result_q.put((buffer_name, len(packed_results)))
 
     except Exception:
-        # --- NEW: Catch ANY exception, log it, and report failure ---
         import traceback
-        # Log the full traceback from the worker
         LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}")
-        # Put an error marker on the queue so the main process can exit
         result_q.put(("ERROR", None))
 
 # =============================================================================
 # MAIN DRIVER
 # =============================================================================
 if __name__ == '__main__':
-    try:
-        mp.set_start_method('spawn')
-    except RuntimeError:
-        pass
+    try: mp.set_start_method('spawn')
+    except RuntimeError: pass
 
     class TqdmLoggingHandler(logging.Handler):
         def emit(self, record):
             try: msg = self.format(record); tqdm.write(msg, file=sys.stderr); self.flush()
             except Exception: self.handleError(record)
-
     def setup_logging(debug=False):
         level = logging.DEBUG if debug else logging.INFO; log = logging.getLogger(); log.setLevel(level)
         if log.hasHandlers(): log.handlers.clear()
         handler = TqdmLoggingHandler(); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'); handler.setFormatter(formatter); log.addHandler(handler)
-
     def signal_handler(sig, frame):
         LOG.warning("Interruption detected. Forcing cleanup...")
         os._exit(1)
-        
     def define_numpy_dtypes():
         gs_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
         pi_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (2,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
@@ -215,8 +205,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--workers", type=int, default=os.cpu_count()); parser.add_argument("--buffers", type=int, default=8, help="Number of shared memory buffers to use for results. Independent of workers.")
-    args = parser.parse_args()
+    parser.add_argument("--workers", type=int, default=os.cpu_count()); parser.add_argument("--buffers", type=int, default=8); args = parser.parse_args()
 
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
@@ -243,7 +232,10 @@ if __name__ == '__main__':
     
     LOG.info("   - Caching player data into shared memory...")
     player_data_cache = { f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }; conn.close()
-    packed_cache = msgpack.packb(player_data_cache, use_bin_type=True)
+    
+    # --- CHANGE: Serialize initial cache with pickle ---
+    packed_cache = pickle.dumps(player_data_cache)
+    
     shm_cache = SharedMemory(create=True, size=len(packed_cache)); shm_cache.buf[:len(packed_cache)] = packed_cache
     LOG.info(f"   - Player data cache ({len(packed_cache)/(1024**2):.2f} MB) created in shared memory.")
 
@@ -255,6 +247,7 @@ if __name__ == '__main__':
     manager = mp.Manager()
     free_buffers_q = manager.Queue()
     results_q = manager.Queue()
+    
     num_buffers = args.buffers
     buffer_pool = [SharedMemory(create=True, size=RESULT_BUFFER_SIZE) for _ in range(num_buffers)]
     for buf in buffer_pool: free_buffers_q.put(buf.name)
@@ -265,29 +258,24 @@ if __name__ == '__main__':
         with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
             pool.map_async(process_round_perspective, tasks)
             
-            pbar = tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives")
-            for i in pbar:
+            for i in tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives"):
                 result = results_q.get()
-
-                # Handle potential error messages from workers
                 if result[0] == "ERROR":
-                    LOG.error("A worker process has failed. See previous log messages for details. Shutting down.")
-                    pool.terminate()
-                    pool.join()
-                    break # Exit the loop
-
+                    raise RuntimeError("A worker process encountered a fatal error. Check logs above for details.")
+                
                 result_shm_name, result_size = result
                 
                 try:
                     result_shm = SharedMemory(name=result_shm_name)
                     packed_results = bytes(result_shm.buf[:result_size])
                     
-                    # --- FIX: Provide the max_buffer_size to the unpacker ---
-                    round_results = msgpack.unpackb(packed_results, raw=False, max_buffer_size=0)
+                    # --- CHANGE: Deserialize results using pickle ---
+                    round_results = pickle.loads(packed_results)
                     
                     result_shm.close()
                     free_buffers_q.put(result_shm_name)
 
+                    # Note: batch_size is now the size of the *pickled* data, not msgpack.
                     batch_size = sum(len(payload) for key, payload in round_results)
                     info, stats = env.info(), env.stat()
                     available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
@@ -301,33 +289,36 @@ if __name__ == '__main__':
                         for key, payload in round_results:
                             txn.put(key, payload)
                 except Exception as e:
-                    LOG.error(f"FATAL: A critical error occurred while processing results from buffer {result_shm_name}. Shutting down.")
-                    pool.terminate()
-                    pool.join()
-                    # Re-raise the exception to show the full traceback
-                    raise e
+                    LOG.error(f"Error handling result from buffer {result_shm_name}: {e}")
+                    free_buffers_q.put(result_shm_name)
+                    raise
     
     finally:
         LOG.info("-> Phase 3: Finalizing and cleaning up...")
-        # Check if the env is still open, as it might have failed before initialization
-        if 'env' in locals() and env.is_open():
-            metadata = {"demoname": demoname, "rounds": [[r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())]}
-            with env.begin(write=True) as txn:
-                key = f"{demoname}_INFO".encode('utf-8'); txn.put(key, json.dumps(metadata).encode('utf-8'))
-            env.close()
+        metadata = {"demoname": demoname, "rounds": [[r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())]}
+        with env.begin(write=True) as txn:
+            key = f"{demoname}_INFO".encode('utf-8'); txn.put(key, json.dumps(metadata).encode('utf-8'))
+        env.close()
 
-        if 'shm_cache' in locals():
-            shm_cache.close(); shm_cache.unlink(); LOG.info("Shared memory cache unlinked.")
+        shm_cache.close(); shm_cache.unlink(); LOG.info("Shared memory cache unlinked.")
         
-        if 'buffer_pool' in locals():
-            for buf in buffer_pool:
-                try: buf.close(); buf.unlink()
-                except FileNotFoundError: pass
-            LOG.info("Result buffer pool unlinked.")
-        
-        if 'manager' in locals():
-            manager.shutdown()
+        # Cleanup buffer pool
+        active_buffers = []
+        # Drain the queue to find all buffer names
+        while not free_buffers_q.empty():
+            try: active_buffers.append(SharedMemory(name=free_buffers_q.get_nowait()))
+            except (FileNotFoundError, InterruptedError): pass
+        # Add original pool objects in case some were not in the queue
+        for buf in buffer_pool:
+            if buf.name not in [b.name for b in active_buffers]:
+                active_buffers.append(buf)
+        for buf in active_buffers:
+            try: buf.close(); buf.unlink()
+            except FileNotFoundError: pass
+
+        LOG.info("Result buffer pool unlinked.")
+        manager.shutdown()
 
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-        LOG.info("Processing finished.")
+        LOG.info("All processing steps completed successfully.")
         LOG.info(f"Final LMDB database is at: {args.outlmdb}")
