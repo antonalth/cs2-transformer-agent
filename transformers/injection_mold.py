@@ -204,10 +204,9 @@ def process_round_perspective(task_args):
 
     packed_results = msgpack.packb(results, use_bin_type=True)
     result_shm_name = f"result_{uuid.uuid4()}"
+# CORRECTED CODE
     result_shm = SharedMemory(name=result_shm_name, create=True, size=len(packed_results))
     result_shm.buf[:len(packed_results)] = packed_results
-    result_shm.close()
-    
     return (result_shm_name, len(packed_results))
 
 # =============================================================================
