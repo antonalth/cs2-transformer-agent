@@ -60,18 +60,43 @@ LMDB_PATH_FOR_CLEANUP = None
 # 1. DATA ENCODING MAPPINGS (No changes here)
 # =============================================================================
 
+# Actions related to player movement and weapon handling
 KEYBOARD_ONLY_ACTIONS = [
     "IN_ATTACK", "IN_JUMP", "IN_DUCK", "IN_FORWARD", "IN_BACK", "IN_USE", "IN_CANCEL", "IN_TURNLEFT", "IN_TURNRIGHT", "IN_MOVELEFT", "IN_MOVERIGHT", "IN_ATTACK2", "IN_RELOAD", "IN_ALT1", "IN_ALT2", "IN_SPEED", "IN_WALK", "IN_ZOOM", "IN_WEAPON1", "IN_WEAPON2", "IN_BULLRUSH", "IN_GRENADE1", "IN_GRENADE2", "IN_ATTACK3", "IN_SCORE", "IN_INSPECT", "SWITCH_1", "SWITCH_2", "SWITCH_3", "SWITCH_4", "SWITCH_5",
 ]
+
+# Actions related to economy (buying, selling, dropping)
 ECO_ACTIONS = [
     "IN_BUYZONE", "DROP_deagle", "DROP_elite", "DROP_fiveseven", "DROP_glock", "DROP_ak47", "DROP_aug", "DROP_awp", "DROP_famas", "DROP_g3sg1", "DROP_galilar", "DROP_m249", "DROP_m4a1", "DROP_mac10", "DROP_p90", "DROP_mp5sd", "DROP_ump45", "DROP_xm1014", "DROP_bizon", "DROP_mag7", "DROP_negev", "DROP_sawedoff", "DROP_tec9", "DROP_p2000", "DROP_mp7", "DROP_mp9", "DROP_nova", "DROP_p250", "DROP_scar20", "DROP_sg556", "DROP_ssg08", "DROP_knife", "DROP_flashbang", "DROP_hegrenade", "DROP_smokegrenade", "DROP_molotov", "DROP_decoy", "DROP_incgrenade", "DROP_c4", "DROP_m4a1_silencer", "DROP_usp_silencer", "DROP_cz75a", "DROP_revolver", "DROP_defuser", "BUY_deagle", "BUY_elite", "BUY_fiveseven", "BUY_glock", "BUY_ak47", "BUY_aug", "BUY_awp", "BUY_famas", "BUY_g3sg1", "BUY_galilar", "BUY_m249", "BUY_m4a1", "BUY_mac10", "BUY_p90", "BUY_mp5sd", "BUY_ump45", "BUY_xm1014", "BUY_bizon", "BUY_mag7", "BUY_negev", "BUY_sawedoff", "BUY_tec9", "BUY_p2000", "BUY_mp7", "BUY_mp9", "BUY_nova", "BUY_p250", "BUY_scar20", "BUY_sg556", "BUY_ssg08", "BUY_knife", "BUY_flashbang", "BUY_hegrenade", "BUY_smokegrenade", "BUY_molotov", "BUY_decoy", "BUY_incgrenade", "BUY_c4", "BUY_m4a1_silencer", "BUY_usp_silencer", "BUY_cz75a", "BUY_revolver", "BUY_defuser", "BUY_vest", "BUY_vesthelm", "SELL_deagle", "SELL_fiveseven", "SELL_glock", "SELL_ak47", "SELL_aug", "SELL_awp", "SELL_famas", "SELL_galilar", "SELL_m4a1", "SELL_mac10", "SELL_p90", "SELL_ump45", "SELL_xm1014", "SELL_bizon", "SELL_mag7", "SELL_sawedoff", "SELL_tec9", "SELL_p2000", "SELL_mp7", "SELL_mp9", "SELL_nova", "SELL_p250", "SELL_ssg08", "SELL_flashbang", "SELL_hegrenade", "SELL_smokegrenade", "SELL_molotov", "SELL_decoy", "SELL_incgrenade",
 ]
+
+# --- FIX: A comprehensive, canonical list of all official item names ---
+ITEM_NAMES = sorted(list(set([
+    # Rifles
+    "AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553", "AWP", "SSG 08", "G3SG1", "SCAR-20",
+    # Pistols
+    "Glock-18", "USP-S", "P250", "P2000", "Dual Berettas", "Five-SeveN", "Tec-9", "CZ75-Auto", "R8 Revolver", "Desert Eagle",
+    # SMGs
+    "MP9", "MAC-10", "MP7", "MP5-SD", "UMP-45", "P90", "PP-Bizon",
+    # Heavy
+    "Nova", "XM1014", "MAG-7", "Sawed-Off", "M249", "Negev",
+    # Knives (now comprehensive to reduce reliance on fallbacks)
+    "Knife", "knife_t", "knife_ct", "Bayonet", "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife", "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers", "Ursus Knife", "Navaja Knife", "Stiletto Knife", "Talon Knife", "Classic Knife", "Paracord Knife", "Survival Knife", "Nomad Knife", "Skeleton Knife",
+    # Grenades
+    "High Explosive Grenade", "Flashbang", "Smoke Grenade", "Molotov", "Incendiary Grenade", "Decoy Grenade",
+    # Gear & Other
+    "C4 Explosive", "Defuse Kit", "Zeus x27", "Kevlar Vest", "Helmet"
+])))
+
+# Reverse mappings for decoding are generated from the canonical lists
 KEYBOARD_TO_BIT = {action: i for i, action in enumerate(KEYBOARD_ONLY_ACTIONS)}
 ECO_TO_BIT = {action: i for i, action in enumerate(ECO_ACTIONS)}
-ITEM_NAMES = [
-    "AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553", "AWP", "SSG 08", "G3SG1", "SCAR-20", "Glock-18", "USP-S", "P250", "P2000", "Dual Berettas", "Five-SeveN", "Tec-9", "CZ75-Auto", "R8 Revolver", "Desert Eagle", "MP9", "MAC-10", "MP7", "MP5-SD", "UMP-45", "P90", "PP-Bizon", "Nova", "XM1014", "MAG-7", "Sawed-Off", "M249", "Negev", "Knife", "Bayonet", "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife", "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers", "Ursus Knife", "Navaja Knife", "Stiletto Knife", "Talon Knife", "Classic Knife", "Paracord Knife", "Survival Knife", "Nomad Knife", "Skeleton Knife", "High Explosive Grenade", "Flashbang", "Smoke Grenade", "Molotov", "Incendiary Grenade", "Decoy Grenade", "C4 Explosive", "Defuse Kit", "Zeus x27", "Kevlar Vest", "Helmet", "knife_ct", "knife_t",
-]
-ITEM_TO_INDEX = {item: i for i, item in enumerate(sorted(list(set(ITEM_NAMES))))}
+ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
+
+BIT_TO_KEYBOARD = {i: action for i, action in enumerate(KEYBOARD_ONLY_ACTIONS)}
+BIT_TO_ECO = {i: action for i, action in enumerate(ECO_ACTIONS)}
+BIT_TO_ITEM = {i: item for i, item in enumerate(ITEM_NAMES)}
+
 m.patch()
 
 # =============================================================================
@@ -178,16 +203,52 @@ def get_bitmask_array(actions, mapping):
     return mask
 
 def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
+    """
+    Creates 128-bit bitmasks for the player's inventory and active weapon.
+    Includes a fail-loud mechanism for unknown items.
+    """
     inventory_mask, active_weapon_mask = np.zeros(2, dtype=np.uint64), np.zeros(2, dtype=np.uint64)
+
     def set_bit(mask, item_name):
-        bit_pos = mapping.get(item_name) or mapping.get("Knife") if item_name and ("knife" in item_name.lower() or "bayonet" in item_name.lower()) else None
-        if bit_pos is not None:
-            idx, pos_in_idx = bit_pos // 64, bit_pos % 64
-            if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
-    if active_weapon: set_bit(active_weapon_mask, active_weapon)
+        # Gracefully handle potential None or non-string item names
+        if not isinstance(item_name, str):
+            return
+
+        bit_pos = mapping.get(item_name)
+        # Handle knife variations as a fallback
+        if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()):
+            bit_pos = mapping.get("Knife")
+
+        # --- NEW: Fail-Loud Error Check ---
+        # If after the lookup and the fallback, the item is still unknown, raise an error.
+        if bit_pos is None:
+            raise ValueError(
+                f"\n\n"
+                f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                f"FATAL: Unknown item name encountered during encoding: '{item_name}'\n"
+                f"This item is not in the canonical ITEM_NAMES list.\n"
+                f"To fix, add '{item_name}' to the ITEM_NAMES list in both:\n"
+                f"  - injection_mold.py\n"
+                f"  - lmdb_inspect.py\n"
+                f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            )
+
+        # If we get here, bit_pos is valid.
+        idx = bit_pos // 64
+        pos_in_idx = bit_pos % 64
+        if idx < 2:
+            mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
+
+    # Process the active weapon and inventory
+    if active_weapon:
+        set_bit(active_weapon_mask, active_weapon)
     try:
-        for item in json.loads(inventory_json) if inventory_json else []: set_bit(inventory_mask, item)
-    except (json.JSONDecodeError, TypeError): pass
+        inventory_list = json.loads(inventory_json) if inventory_json else []
+        for item in inventory_list:
+            set_bit(inventory_mask, item)
+    except (json.JSONDecodeError, TypeError):
+        pass  # Ignore malformed inventory JSON, but individual items will still be checked
+
     return inventory_mask, active_weapon_mask
 
 # =============================================================================
