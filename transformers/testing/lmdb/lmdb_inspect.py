@@ -27,14 +27,35 @@ import sounddevice as sd
 try:
     # Windows
     import msvcrt
+    import ctypes
+
+    class COORD(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+        _fields_ = [("dwSize", COORD),
+                    ("dwCursorPosition", COORD),
+                    ("wAttributes", ctypes.c_ushort),
+                    ("srWindow", ctypes.c_short * 4),
+                    ("dwMaximumWindowSize", COORD)]
+
+    STD_OUTPUT_HANDLE = -11
+    handle = ctypes.windll.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+
     def getch():
-        """Gets a single character from standard input on Windows."""
-        return msvcrt.getch().decode('utf-8', errors='ignore')
+        """Gets a single character from standard input (Windows)."""
+        return msvcrt.getch()
+
+    def move_cursor(y, x):
+        """Moves the console cursor to the specified position (Windows)."""
+        pos = COORD(x, y)
+        ctypes.windll.kernel32.SetConsoleCursorPosition(handle, pos)
+
 except ImportError:
     # Unix-like systems (Linux, macOS)
     import tty, termios
     def getch():
-        """Gets a single character from standard input on Unix."""
+        """Gets a single character from standard input (Unix)."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
@@ -42,8 +63,11 @@ except ImportError:
             ch = sys.stdin.read(1)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return ch
+        return ch.encode('utf-8')
 
+    def move_cursor(y, x):
+        """Moves the console cursor to the specified position (ANSI)."""
+        sys.stdout.write(f"\x1b[{y};{x}H")
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64
@@ -102,7 +126,7 @@ def decode_bitmask_array(mask_array, reverse_map):
 def play_audio(audio_chunk, blocking=False):
     """Plays a raw PCM audio chunk using sounddevice."""
     if not audio_chunk:
-        # This is a normal occurrence, so we don't print anything here.
+        print("No audio chunk to play for this frame.")
         return
     try:
         audio_array = np.frombuffer(audio_chunk, dtype=np.int16).reshape(-1, 2)
@@ -141,87 +165,89 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
     return None # Data inconsistent or player just died this tick
 
 def debug_interactive_search(env):
-    """
-    Provides a memory-efficient, interactive search interface for LMDB keys
-    that dynamically fits the terminal window.
-    """
-    search_query = ""
-    total_keys = env.stat()['entries']
+    """Provides a memory-efficient, interactive search interface for LMDB keys."""
+    print("Loading all keys into memory for searching (this may take a moment)...")
+    try:
+        with env.begin(write=False) as txn:
+            # Use keys=True, values=False for efficiency
+            all_keys = [key.decode('utf-8') for key in txn.cursor().iternext(keys=True, values=False)]
+    except Exception as e:
+        print(f"Error loading keys: {e}"); sys.exit(1)
+    finally:
+        # CRITICAL: Close the environment to release the memory map
+        env.close()
 
+    total_keys = len(all_keys)
+    print(f"Loaded {total_keys} keys. Starting interactive search...")
+    
+    search_query = ""
     try:
         while True:
-            # --- Prepare for redraw ---
+            # --- Filtering ---
+            if search_query:
+                matching_keys = [k for k in all_keys if search_query in k]
+            else:
+                matching_keys = all_keys[:200] # Show a subset if query is empty
+
+            # --- Drawing ---
             try:
-                # Get terminal dimensions
                 term_width, term_height = os.get_terminal_size()
             except OSError:
-                # Fallback for environments where this fails (e.g., some IDEs)
-                term_width, term_height = 80, 24
-            
-            # Calculate how many results can be displayed
-            header_lines = 4
-            prompt_lines = 2
-            available_lines = term_height - header_lines - prompt_lines
+                term_width, term_height = 80, 24 # Default size
 
-            # --- Search Logic (Memory Efficient) ---
-            # This block iterates the DB instead of loading all keys into RAM
-            matching_keys = []
-            with env.begin() as txn:
-                cursor = txn.cursor()
-                for key_bytes, _ in cursor:
-                    # If we have enough keys to fill the screen, stop searching
-                    if len(matching_keys) >= 500: # Safety limit
-                         break
-                    key_str = key_bytes.decode('utf-8', errors='ignore')
-                    if search_query in key_str:
-                        matching_keys.append(key_str)
-
-            # --- Render Output ---
             # Clear screen
             os.system('cls' if os.name == 'nt' else 'clear')
             
-            # Print header
-            print("--- LMDB Interactive Key Search ---")
-            print(f"Searching {total_keys} keys. Display is limited to fit terminal. (Press Ctrl+C to exit)\n")
-            
-            # Print results in columns
-            if not matching_keys:
-                print("No matches found.")
-            else:
-                max_len = max(len(k) for k in matching_keys) if matching_keys else 0
-                num_columns = max(1, term_width // (max_len + 2)) # +2 for padding
-                display_limit = min(len(matching_keys), available_lines * num_columns)
+            # --- Header ---
+            print("--- LMDB Interactive Key Search (Press Ctrl+C to exit) ---")
 
+            # --- Content (Results) ---
+            display_rows = term_height - 4 # Reserve rows for header, status, and prompt
+            if display_rows > 0 and matching_keys:
+                max_len = max(len(k) for k in matching_keys[:display_rows*5]) if matching_keys else 0
+                num_columns = max(1, term_width // (max_len + 2))
+                column_width = (term_width // num_columns)
+                
+                display_limit = min(len(matching_keys), display_rows * num_columns)
+                
                 for i, key in enumerate(matching_keys[:display_limit]):
-                    if (i > 0) and (i % num_columns == 0):
+                    if i > 0 and i % num_columns == 0:
                         print()
-                    print(f"{key:<{max_len}}  ", end="")
-                print() # Final newline
+                    print(f"{key:<{column_width-1}}", end="")
+                print()
 
-                if len(matching_keys) > display_limit:
-                    print(f"\n...and {len(matching_keys) - display_limit} more matches found.")
+            # --- Footer (Status and Prompt) ---
+            status_line = f"Showing {min(len(matching_keys), display_limit)} of {len(matching_keys)} matches. Total keys: {total_keys}"
+            # Move cursor to the second to last line
+            move_cursor(term_height - 2, 0)
+            print(status_line.ljust(term_width))
 
-            # Print search prompt at the bottom (so it doesn't move)
-            print("\n" + "="*term_width)
-            print(f"Search: {search_query}", end="", flush=True)
-
-            # --- Handle Input ---
-            char = getch()
+            prompt_line = f"Search: {search_query}"
+            print(prompt_line.ljust(term_width), end="")
             
-            if char in ('\x03', '\x04'): # Ctrl+C, Ctrl+D
+            # Move cursor to end of prompt
+            move_cursor(term_height - 1, len(prompt_line))
+            sys.stdout.flush()
+
+            # --- Input ---
+            char_bytes = getch()
+            if char_bytes in (b'\x03', b'\x04'): # Ctrl+C, Ctrl+D
                 break
-            elif char == '\r': # Enter key
-                break
-            elif char in ('\x08', '\x7f'): # Backspace
+            elif char_bytes == b'\x08': # Backspace
                 search_query = search_query[:-1]
-            # Add any printable character to the query
-            elif char and char.isprintable():
-                search_query += char
+            else:
+                try:
+                    char = char_bytes.decode('utf-8')
+                    if char.isprintable():
+                        search_query += char
+                except UnicodeDecodeError:
+                    pass # Ignore non-printable keys
 
     except KeyboardInterrupt:
         print("\nExiting interactive search.")
     finally:
-        env.close()
+        # Ensure cursor is visible and screen is clear on exit
+        os.system('cls' if os.name == 'nt' else 'clear')
         sys.exit(0)
 
 def main():
@@ -239,12 +265,15 @@ def main():
     if not args.lmdb_path.exists():
         print(f"Error: LMDB path not found at: {args.lmdb_path}"); sys.exit(1)
 
-    env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
-
+    # For debug mode, we open, process, and close the env inside the function
     if args.debug:
+        # Open with a large map_size to accommodate potentially huge key lists, but readonly.
+        env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False, map_size=1024**4)
         debug_interactive_search(env)
         # The script will exit from within the debug function
 
+    # --- Normal Operation ---
+    env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
     with env.begin() as txn:
         info_key_bytes = next((k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')), None)
         if not info_key_bytes: print("Error: Could not find INFO key in the database."); sys.exit(1)
@@ -285,10 +314,10 @@ def main():
             if not run_mode_on and args.autoplay and audio:
                 play_audio(audio, blocking=False)
 
-            if jpeg is not None:
+            if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
-                if pov_data and player_input_array is not None and player_input_array.size > 0:
+                if pov_data and player_input_array.size > 0:
                     player_input_record = player_input_array[0]
                     
                     if overlay_state > 0:
@@ -314,13 +343,19 @@ def main():
                             pos = draw_text(frame, "Eco: " + decode_bitmask_array(player_input_record['eco_bitmask'], BIT_TO_ECO), pos)
                             pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
                             pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
-                else: # Player is dead or has no input record
-                    frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-            else: # No pov_data or no jpeg
+                else: 
+                     frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
+                     if not run_mode_on: print(f"POV data for player {current_player_idx} is inconsistent (likely dead).")
+
+                if not run_mode_on:
+                    print("\n" + "="*80); print(f"Displaying: {key_str}")
+                    print("\n--- CONTROLS ---"); print("q: quit | j/k: tick | p: player | t: team | a: audio | o: overlay | r: RUN MODE")
+            else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-        else: # No value for key
+        else:
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK")
-            if not run_mode_on: print(f"No data found for key: {key_str}")
+            if not run_mode_on:
+                print(f"No data found for key: {key_str}")
             audio = None
             if run_mode_on: run_mode_on = False; print("Run mode stopped: No data for tick.")
 
@@ -336,10 +371,6 @@ def main():
             run_mode_on = not run_mode_on
             status = "ON" if run_mode_on else "OFF"
             print(f"Run mode toggled {status}")
-            if not run_mode_on: # Print controls when stopping run mode
-                print("\n--- CONTROLS ---")
-                print("q: quit | j/k: next/prev tick | p: next player | t: switch team")
-                print("a: play audio | o: toggle overlay | r: toggle RUN mode")
             continue
 
         if run_mode_on:
@@ -353,7 +384,7 @@ def main():
             elif key == ord('k'): current_tick -= TICKS_PER_FRAME
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
-            elif key == ord('a'): play_audio(audio, blocking=True)
+            elif key == ord('a') and audio: play_audio(audio, blocking=True)
             elif key == ord('o'): overlay_state = (overlay_state + 1) % 3
 
     cv2.destroyAllWindows()
