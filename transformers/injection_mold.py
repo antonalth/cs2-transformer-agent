@@ -33,7 +33,7 @@ AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNE
 INITIAL_MAP_SIZE = 20 * 1024**3; MAP_RESIZE_INCREMENT = 5 * 1024**3
 MAP_RESIZE_THRESHOLD = 500 * 1024**2
 # Size of each reusable buffer for worker results. Should be larger than any single round's data.
-RESULT_BUFFER_SIZE = 3000 * 1024**2
+RESULT_BUFFER_SIZE = 5000 * 1024**2
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None; m.patch()
