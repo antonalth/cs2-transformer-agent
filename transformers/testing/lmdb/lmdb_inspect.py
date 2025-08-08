@@ -85,7 +85,6 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
     if living_players_before < len(player_data_list):
         player_input, jpeg, audio = player_data_list[living_players_before]
         return player_input, jpeg, audio
-    
 def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.",
                                      formatter_class=argparse.RawTextHelpFormatter)
@@ -122,7 +121,6 @@ def main():
 
     current_round, current_team, current_player_idx = args.round, args.team, args.player_idx
     overlay_on = True
-    # --- NEW: State variable for run mode ---
     run_mode_on = False
 
     if args.tick == -1:
@@ -146,10 +144,7 @@ def main():
             player_data_list = data['player_data']
             player_input_array, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
 
-            # --- NEW: Run mode has priority for audio playback ---
-            if run_mode_on:
-                play_audio(audio, blocking=True)
-            elif args.autoplay and audio:
+            if not run_mode_on and args.autoplay and audio:
                 play_audio(audio, blocking=False)
 
             if jpeg:
@@ -172,7 +167,7 @@ def main():
                     pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
                     pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
                 
-                if not run_mode_on: # Only print full details when paused
+                if not run_mode_on:
                     print("\n" + "="*80); print(f"Displaying: {key_str}")
                     print("\n--- GAME STATE ---"); print(game_state_record)
                     print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record)
@@ -187,28 +182,37 @@ def main():
 
         cv2.imshow("LMDB Inspector", frame)
         
-        # --- NEW: Conditional waitKey and run mode logic ---
+        # --- FIX: Reordered logic for synchronization ---
+        # In run mode, play audio *after* showing the frame. The blocking sd.wait()
+        # will now pause the loop, effectively setting the framerate.
+        if run_mode_on and audio:
+            play_audio(audio, blocking=True)
+        
         wait_time = 1 if run_mode_on else 0
         key = cv2.waitKey(wait_time) & 0xFF
         
+        # Always check for run mode toggle first for responsiveness
+        if key == ord('r'):
+            run_mode_on = not run_mode_on
+            status = "ON" if run_mode_on else "OFF"
+            print(f"Run mode toggled {status}")
+            continue # Restart loop to immediately apply new mode
+
         if run_mode_on:
-             # If in run mode, automatically advance frame
+            # If still in run mode, automatically advance frame
             current_tick += TICKS_PER_FRAME
             if current_round in round_info and current_tick > round_info[current_round]['end']:
                 print("Run mode stopped: End of round reached.")
                 run_mode_on = False
-        
-        if key == ord('q'): break
-        elif key == ord('j'): current_tick += TICKS_PER_FRAME
-        elif key == ord('k'): current_tick -= TICKS_PER_FRAME
-        elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
-        elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
-        elif key == ord('a'): play_audio(audio, blocking=True)
-        elif key == ord('o'): overlay_on = not overlay_on
-        elif key == ord('r'):
-            run_mode_on = not run_mode_on
-            status = "ON" if run_mode_on else "OFF"
-            print(f"Run mode toggled {status}")
+        else:
+            # Handle other keys only when not in run mode
+            if key == ord('q'): break
+            elif key == ord('j'): current_tick += TICKS_PER_FRAME
+            elif key == ord('k'): current_tick -= TICKS_PER_FRAME
+            elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
+            elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
+            elif key == ord('a'): play_audio(audio, blocking=True)
+            elif key == ord('o'): overlay_on = not overlay_on
 
     cv2.destroyAllWindows()
     env.close()
