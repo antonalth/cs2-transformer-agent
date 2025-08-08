@@ -67,9 +67,18 @@ def init_worker(shm_cache_name, shm_cache_size, gs_dtype, pi_dtype, rounds_info,
     """Initializer for each worker process."""
     # Connect to the shared memory block for the player data cache
     shm = SharedMemory(name=shm_cache_name)
-    # Deserialize the cache into the worker's own memory
-    packed_cache = shm.buf[:shm_cache_size]
-    player_data_cache = msgpack.unpackb(packed_cache, raw=False)
+    
+    # --- FIX: Create a copy of the buffer to prevent BufferError on exit ---
+    # This reads all data from shared memory into the worker's private RAM
+    # and severs the link to the shared memory block.
+    packed_cache_copy = bytes(shm.buf[:shm_cache_size])
+    
+    # We can now close the shared memory handle immediately
+    shm.close()
+    
+    # --- FIX: Use explicit object_hook to solve the unhashable list TypeError ---
+    # Deserialize the local copy of the cache.
+    player_data_cache = msgpack.unpackb(packed_cache_copy, raw=False, object_hook=m.decode)
     
     # Store all necessary data in the worker's global state
     worker_data['gs_dtype'] = gs_dtype
@@ -77,8 +86,6 @@ def init_worker(shm_cache_name, shm_cache_size, gs_dtype, pi_dtype, rounds_info,
     worker_data['rounds_info'] = rounds_info
     worker_data['recordings_map'] = recordings_map
     worker_data['player_data_cache'] = player_data_cache
-    
-    shm.close() # Can close after reading, the block persists
 
 def process_round_perspective(task_args):
     """
