@@ -33,7 +33,7 @@ AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNE
 INITIAL_MAP_SIZE = 20 * 1024**3; MAP_RESIZE_INCREMENT = 5 * 1024**3
 MAP_RESIZE_THRESHOLD = 500 * 1024**2
 # Size of each reusable buffer for worker results. Should be larger than any single round's data.
-RESULT_BUFFER_SIZE = 5000 * 1024**2
+RESULT_BUFFER_SIZE = 3000 * 1024**2
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None; m.patch()
@@ -204,7 +204,6 @@ if __name__ == '__main__':
 
     def signal_handler(sig, frame):
         LOG.warning("Interruption detected. Forcing cleanup...")
-        # Force exit to prevent hanging on process cleanup
         os._exit(1)
         
     def define_numpy_dtypes():
@@ -214,15 +213,9 @@ if __name__ == '__main__':
         return gs_dtype, pi_dtype
 
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--recdir", required=True, type=Path, help="Path to recordings directory.")
-    parser.add_argument("--dbfile", required=True, type=Path, help="Path to SQLite DB file.")
-    parser.add_argument("--outlmdb", required=True, type=Path, help="Path for output LMDB.")
-    parser.add_argument("--overwrite", action='store_true', help="Overwrite existing LMDB.")
-    parser.add_argument("--overridesql", action='store_true', help="Ignore 'is_recorded=False' flags.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-    parser.add_argument("--workers", type=int, default=4, help="Number of worker processes to use.")
-    # --- NEW: Independent argument for number of buffers ---
-    parser.add_argument("--buffers", type=int, default=2, help="Number of shared memory buffers to use for results. Independent of workers.")
+    parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
+    parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--workers", type=int, default=os.cpu_count()); parser.add_argument("--buffers", type=int, default=8, help="Number of shared memory buffers to use for results. Independent of workers.")
     args = parser.parse_args()
 
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
@@ -262,8 +255,6 @@ if __name__ == '__main__':
     manager = mp.Manager()
     free_buffers_q = manager.Queue()
     results_q = manager.Queue()
-    
-    # --- FIX: Use the new --buffers argument ---
     num_buffers = args.buffers
     buffer_pool = [SharedMemory(create=True, size=RESULT_BUFFER_SIZE) for _ in range(num_buffers)]
     for buf in buffer_pool: free_buffers_q.put(buf.name)
@@ -274,13 +265,26 @@ if __name__ == '__main__':
         with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
             pool.map_async(process_round_perspective, tasks)
             
-            for _ in tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives"):
-                result_shm_name, result_size = results_q.get()
+            pbar = tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives")
+            for i in pbar:
+                result = results_q.get()
+
+                # Handle potential error messages from workers
+                if result[0] == "ERROR":
+                    LOG.error("A worker process has failed. See previous log messages for details. Shutting down.")
+                    pool.terminate()
+                    pool.join()
+                    break # Exit the loop
+
+                result_shm_name, result_size = result
                 
                 try:
                     result_shm = SharedMemory(name=result_shm_name)
                     packed_results = bytes(result_shm.buf[:result_size])
-                    round_results = msgpack.unpackb(packed_results, raw=False)
+                    
+                    # --- FIX: Provide the max_buffer_size to the unpacker ---
+                    round_results = msgpack.unpackb(packed_results, raw=False, max_buffer_size=0)
+                    
                     result_shm.close()
                     free_buffers_q.put(result_shm_name)
 
@@ -297,40 +301,33 @@ if __name__ == '__main__':
                         for key, payload in round_results:
                             txn.put(key, payload)
                 except Exception as e:
-                    # Log the error and immediately halt the pool and the script.
-                    LOG.error(f"FATAL: A critical error occurred while processing results. Shutting down.")
-                    pool.terminate() # Forcibly stop all worker processes
+                    LOG.error(f"FATAL: A critical error occurred while processing results from buffer {result_shm_name}. Shutting down.")
+                    pool.terminate()
                     pool.join()
-                    # Re-raise the original exception for a full traceback
+                    # Re-raise the exception to show the full traceback
                     raise e
     
     finally:
         LOG.info("-> Phase 3: Finalizing and cleaning up...")
-        metadata = {"demoname": demoname, "rounds": [[r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())]}
-        with env.begin(write=True) as txn:
-            key = f"{demoname}_INFO".encode('utf-8'); txn.put(key, json.dumps(metadata).encode('utf-8'))
-        env.close()
+        # Check if the env is still open, as it might have failed before initialization
+        if 'env' in locals() and env.is_open():
+            metadata = {"demoname": demoname, "rounds": [[r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())]}
+            with env.begin(write=True) as txn:
+                key = f"{demoname}_INFO".encode('utf-8'); txn.put(key, json.dumps(metadata).encode('utf-8'))
+            env.close()
 
-        shm_cache.close(); shm_cache.unlink(); LOG.info("Shared memory cache unlinked.")
+        if 'shm_cache' in locals():
+            shm_cache.close(); shm_cache.unlink(); LOG.info("Shared memory cache unlinked.")
         
-        # Cleanup buffer pool
-        active_buffers = []
-        while not free_buffers_q.empty():
-            try: active_buffers.append(SharedMemory(name=free_buffers_q.get_nowait()))
-            except (FileNotFoundError, InterruptedError): pass
-        for buf in buffer_pool:
-            try:
-                # Add buffers that were not in the free queue, in case of an error
-                if buf.name not in [b.name for b in active_buffers]:
-                    active_buffers.append(buf)
-            except: pass
-        for buf in active_buffers:
-            try: buf.close(); buf.unlink()
-            except FileNotFoundError: pass
-
-        LOG.info("Result buffer pool unlinked.")
-        manager.shutdown()
+        if 'buffer_pool' in locals():
+            for buf in buffer_pool:
+                try: buf.close(); buf.unlink()
+                except FileNotFoundError: pass
+            LOG.info("Result buffer pool unlinked.")
+        
+        if 'manager' in locals():
+            manager.shutdown()
 
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-        LOG.info("All processing steps completed successfully.")
+        LOG.info("Processing finished.")
         LOG.info(f"Final LMDB database is at: {args.outlmdb}")
