@@ -92,6 +92,8 @@ def main():
     parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'], help="Starting team (default: T).")
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
+    # --- NEW: Added debug flag ---
+    parser.add_argument("--debug", action='store_true', help="List the first 50 keys in the LMDB and exit.")
     args = parser.parse_args()
 
     if not args.lmdb_path.exists():
@@ -99,7 +101,22 @@ def main():
         sys.exit(1)
 
     env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
-    
+
+    # --- NEW: Debug functionality to dump keys ---
+    if args.debug:
+        print(f"--- DUMPING FIRST 50 KEYS FROM {args.lmdb_path} ---")
+        count = 0
+        with env.begin() as txn:
+            cursor = txn.cursor()
+            for key, _ in cursor:
+                print(key.decode('utf-8'))
+                count += 1
+                if count >= 50:
+                    break
+        print("--- END OF KEY DUMP ---")
+        env.close()
+        sys.exit(0)
+
     with env.begin() as txn:
         # Find the demoname and round start/end ticks
         info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
@@ -189,12 +206,12 @@ def main():
             break
         elif key == ord('j'):
             current_tick += TICKS_PER_FRAME
-            if current_tick > round_info[current_round]['end']:
+            if current_round in round_info and current_tick > round_info[current_round]['end']:
                 current_tick = round_info[current_round]['end']
                 print("At end of round.")
         elif key == ord('k'):
             current_tick -= TICKS_PER_FRAME
-            if current_tick < round_info[current_round]['start']:
+            if current_round in round_info and current_tick < round_info[current_round]['start']:
                 current_tick = round_info[current_round]['start']
                 print("At start of round.")
         elif key == ord('p'):
@@ -208,6 +225,6 @@ def main():
 
     cv2.destroyAllWindows()
     env.close()
-
+    
 if __name__ == "__main__":
     main()
