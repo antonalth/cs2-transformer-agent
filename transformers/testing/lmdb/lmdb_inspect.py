@@ -38,15 +38,14 @@ LINE_HEIGHT = 16
 m.patch()
 
 def play_audio(audio_chunk):
-    """Plays a raw PCM audio chunk using sounddevice."""
+    """Plays a raw PCM audio chunk using sounddevice in a non-blocking way."""
     if not audio_chunk:
         print("No audio chunk to play for this frame.")
         return
     try:
-        # The audio is raw PCM 16-bit stereo, so we need to convert it to a NumPy array
         audio_array = np.frombuffer(audio_chunk, dtype=np.int16).reshape(-1, 2)
+        # --- FIX: Removed sd.wait() to make playback non-blocking ---
         sd.play(audio_array, samplerate=AUDIO_SAMPLE_RATE)
-        sd.wait()
     except Exception as e:
         print(f"Error playing audio: {e}")
 
@@ -91,6 +90,8 @@ def main():
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
     parser.add_argument("--debug", action='store_true', help="List the first 50 keys in the LMDB and exit.")
+    # --- NEW: Added autoplay flag ---
+    parser.add_argument("--autoplay", action='store_true', help="Automatically play audio for each frame.")
     args = parser.parse_args()
 
     if not args.lmdb_path.exists():
@@ -107,17 +108,14 @@ def main():
             for key, _ in cursor:
                 print(key.decode('utf-8'))
                 count += 1
-                if count >= 50:
-                    break
+                if count >= 50: break
         print("--- END OF KEY DUMP ---")
         env.close()
         sys.exit(0)
 
     with env.begin() as txn:
         info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
-        if not info_key:
-            print("Error: Could not find INFO key in the database.")
-            sys.exit(1)
+        if not info_key: print("Error: Could not find INFO key in the database."); sys.exit(1)
         demoname = info_key[0].removesuffix(b'_INFO').decode('utf-8')
         metadata = json.loads(txn.get(info_key[0]))
         round_info = {r[0]: {'start': r[1], 'end': r[2]} for r in metadata['rounds']}
@@ -129,8 +127,7 @@ def main():
 
     if args.tick == -1:
         if current_round not in round_info:
-             print(f"Error: Round {current_round} not found in LMDB metadata. Valid rounds are: {list(round_info.keys())}")
-             sys.exit(1)
+             print(f"Error: Round {current_round} not found in LMDB metadata. Valid rounds are: {list(round_info.keys())}"); sys.exit(1)
         current_tick = round_info[current_round]['start']
     else:
         current_tick = args.tick
@@ -148,26 +145,22 @@ def main():
             data = msgpack.unpackb(value, raw=False, object_hook=m.decode)
             game_state_record = data['game_state'][0]
             player_data_list = data['player_data']
-
             player_input_array, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
+
+            # --- NEW: Autoplay logic ---
+            if args.autoplay and audio:
+                play_audio(audio)
 
             if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
-                
-                # --- FIX: Extract the scalar record from the single-element array ---
                 player_input_record = player_input_array[0]
-
                 if overlay_on:
                     pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
-                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team})", pos)
-                    pos = draw_text(frame, "-"*40, pos)
+                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team})", pos); pos = draw_text(frame, "-"*40, pos)
                     pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
-                    pos = draw_text(frame, f"Team Alive Mask: {game_state_record['team_alive']:05b} | Enemy Alive Mask: {game_state_record['enemy_alive']:05b}", pos)
-                    pos = draw_text(frame, "-"*40, pos)
+                    pos = draw_text(frame, f"Team Alive Mask: {game_state_record['team_alive']:05b} | Enemy Alive Mask: {game_state_record['enemy_alive']:05b}", pos); pos = draw_text(frame, "-"*40, pos)
                     pos = draw_text(frame, "[PLAYER INPUT]", pos)
-                    
-                    # --- FIX: Use the scalar record for all formatting and display ---
                     pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
                     pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
                     pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
@@ -175,11 +168,10 @@ def main():
                     pos = draw_text(frame, f"Eco Mask: {int(player_input_record['eco_bitmask'][0])} {int(player_input_record['eco_bitmask'][1])}", pos)
                     pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
                     pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
-
-                print("\n" + "="*80)
-                print(f"Displaying: {key_str}")
+                
+                print("\n" + "="*80); print(f"Displaying: {key_str}")
                 print("\n--- GAME STATE ---"); print(game_state_record)
-                print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record) # Print the record, not the array
+                print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record)
                 print("\n--- CONTROLS ---"); print("q: quit | j: next tick | k: prev tick | p: next player | t: switch team | a: play audio | o: toggle overlay")
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
