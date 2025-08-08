@@ -92,7 +92,6 @@ def main():
     parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'], help="Starting team (default: T).")
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
-    # --- NEW: Added debug flag ---
     parser.add_argument("--debug", action='store_true', help="List the first 50 keys in the LMDB and exit.")
     args = parser.parse_args()
 
@@ -102,7 +101,6 @@ def main():
 
     env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
 
-    # --- NEW: Debug functionality to dump keys ---
     if args.debug:
         print(f"--- DUMPING FIRST 50 KEYS FROM {args.lmdb_path} ---")
         count = 0
@@ -118,7 +116,6 @@ def main():
         sys.exit(0)
 
     with env.begin() as txn:
-        # Find the demoname and round start/end ticks
         info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
         if not info_key:
             print("Error: Could not find INFO key in the database.")
@@ -127,13 +124,16 @@ def main():
         metadata = json.loads(txn.get(info_key[0]))
         round_info = {r[0]: {'start': r[1], 'end': r[2]} for r in metadata['rounds']}
 
-    # --- Initial State ---
     current_round = args.round
     current_team = args.team
     current_player_idx = args.player_idx
     overlay_on = True
 
     if args.tick == -1:
+        # Check if the requested round exists in the metadata
+        if current_round not in round_info:
+             print(f"Error: Round {current_round} not found in LMDB metadata. Valid rounds are: {list(round_info.keys())}")
+             sys.exit(1)
         current_tick = round_info[current_round]['start']
     else:
         current_tick = args.tick
@@ -141,7 +141,6 @@ def main():
     cv2.namedWindow("LMDB Inspector")
     
     while True:
-        # Construct the key and fetch data
         key_str = f"{demoname}_round_{current_round:03d}_team_{current_team}_tick_{current_tick:08d}"
         key_bytes = key_str.encode('utf-8')
         
@@ -149,27 +148,26 @@ def main():
             value = txn.get(key_bytes)
         
         if value:
-            data = msgpack.unpackb(value)
-            game_state = data['game_state'][0] # Unpack from the single-element array
+            # --- FIX: Explicitly provide the object_hook for deserialization ---
+            # This ensures NumPy arrays are correctly reconstructed.
+            data = msgpack.unpackb(value, raw=False, object_hook=m.decode)
+
+            # The rest of the logic can now safely assume `data` is a dictionary
+            game_state = data['game_state'][0]
             player_data_list = data['player_data']
 
-            # Get the specific POV we want to display
             player_input, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state['team_alive'])
 
             if jpeg:
-                # Decode the JPEG image
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
                 
-                # Draw overlay if enabled
                 if overlay_on:
                     pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
                     pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team})", pos)
                     pos = draw_text(frame, "-"*40, pos)
-                    # Display game state
                     pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state['tick']}", pos)
                     pos = draw_text(frame, f"Team Alive Mask: {game_state['team_alive']:05b} | Enemy Alive Mask: {game_state['enemy_alive']:05b}", pos)
-                    # Display player state
                     pos = draw_text(frame, "-"*40, pos)
                     pos = draw_text(frame, "[PLAYER INPUT]", pos)
                     pos = draw_text(frame, f"Health: {player_input['health']} | Armor: {player_input['armor']} | Money: ${player_input['money']}", pos)
@@ -182,49 +180,35 @@ def main():
 
                 print("\n" + "="*80)
                 print(f"Displaying: {key_str}")
-                print("\n--- GAME STATE ---")
-                print(game_state)
-                print("\n--- PLAYER INPUT (POV) ---")
-                print(player_input)
-                print("\n--- CONTROLS ---")
-                print("q: quit | j: next tick | k: prev tick | p: next player | t: switch team | a: play audio | o: toggle overlay")
-
+                print("\n--- GAME STATE ---"); print(game_state)
+                print("\n--- PLAYER INPUT (POV) ---"); print(player_input)
+                print("\n--- CONTROLS ---"); print("q: quit | j: next tick | k: prev tick | p: next player | t: switch team | a: play audio | o: toggle overlay")
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-
         else:
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK")
             print(f"No data found for key: {key_str}")
             audio = None
 
         cv2.imshow("LMDB Inspector", frame)
-        
-        # --- Handle User Input ---
         key = cv2.waitKey(0) & 0xFF
         
-        if key == ord('q'):
-            break
+        if key == ord('q'): break
         elif key == ord('j'):
             current_tick += TICKS_PER_FRAME
             if current_round in round_info and current_tick > round_info[current_round]['end']:
-                current_tick = round_info[current_round]['end']
-                print("At end of round.")
+                current_tick = round_info[current_round]['end']; print("At end of round.")
         elif key == ord('k'):
             current_tick -= TICKS_PER_FRAME
             if current_round in round_info and current_tick < round_info[current_round]['start']:
-                current_tick = round_info[current_round]['start']
-                print("At start of round.")
-        elif key == ord('p'):
-            current_player_idx = (current_player_idx + 1) % 5
-        elif key == ord('t'):
-            current_team = 'CT' if current_team == 'T' else 'T'
-        elif key == ord('a'):
-            play_audio(audio)
-        elif key == ord('o'):
-            overlay_on = not overlay_on
+                current_tick = round_info[current_round]['start']; print("At start of round.")
+        elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
+        elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
+        elif key == ord('a'): play_audio(audio)
+        elif key == ord('o'): overlay_on = not overlay_on
 
     cv2.destroyAllWindows()
     env.close()
-    
+
 if __name__ == "__main__":
     main()
