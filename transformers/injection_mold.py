@@ -39,7 +39,7 @@ AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNE
 # LMDB Configuration
 INITIAL_MAP_SIZE = 20 * 1024 * 1024 * 1024
 MAP_RESIZE_INCREMENT = 5 * 1024 * 1024 * 1024
-MAP_RESIZE_THRESHOLD = 500 * 1024 * 1024 # Increased threshold for larger batches
+MAP_RESIZE_THRESHOLD = 500 * 1024 * 1024
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold")
@@ -57,45 +57,65 @@ ECO_TO_BIT = {action: i for i, action in enumerate(ECO_ACTIONS)}
 ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
 
 # =============================================================================
+# WORKER-SPECIFIC HELPER FUNCTIONS
+# =============================================================================
+
+def get_bitmask(actions, mapping):
+    mask = 0
+    if actions:
+        for action in actions:
+            if action in mapping: mask |= (1 << mapping[action])
+    return mask
+
+def get_bitmask_array(actions, mapping):
+    mask = np.zeros(2, dtype=np.uint64)
+    if actions:
+        for action in actions:
+            if action in mapping:
+                bit_pos, idx, pos_in_idx = mapping[action], mapping[action] // 64, mapping[action] % 64
+                if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
+    return mask
+
+def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
+    inventory_mask, active_weapon_mask = np.zeros(2, dtype=np.uint64), np.zeros(2, dtype=np.uint64)
+    def set_bit(mask, item_name):
+        if not isinstance(item_name, str): return
+        bit_pos = mapping.get(item_name)
+        if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()): bit_pos = mapping.get("Knife")
+        if bit_pos is None: raise ValueError(f"Unknown item name encountered: '{item_name}'. Please add it to ITEM_NAMES list.")
+        idx, pos_in_idx = bit_pos // 64, bit_pos % 64
+        if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
+    if active_weapon: set_bit(active_weapon_mask, active_weapon)
+    try:
+        for item in json.loads(inventory_json) if inventory_json else []: set_bit(inventory_mask, item)
+    except (json.JSONDecodeError, TypeError): pass
+    return inventory_mask, active_weapon_mask
+
+# =============================================================================
 # WORKER INITIALIZATION AND PROCESSING
 # =============================================================================
 
-# These global variables will be populated in each worker process upon initialization.
 worker_data = {}
 
 def init_worker(shm_cache_name, shm_cache_size, gs_dtype, pi_dtype, rounds_info, recordings_map):
     """Initializer for each worker process."""
-    # --- FIX: Patch msgpack-numpy inside each new worker process ---
-    # This is crucial because spawned processes do not inherit the parent's patched state.
     m.patch()
-
-    # Connect to the shared memory block for the player data cache
     shm = SharedMemory(name=shm_cache_name)
-    
-    # Create a copy of the buffer to prevent BufferError on exit
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
-    
-    # We can now close the shared memory handle immediately
     shm.close()
-    
-    # Deserialize the local copy of the cache. This will now work correctly.
     player_data_cache = msgpack.unpackb(packed_cache_copy, raw=False, object_hook=m.decode)
-    
-    # Store all necessary data in the worker's global state
     worker_data['gs_dtype'] = gs_dtype
     worker_data['pi_dtype'] = pi_dtype
     worker_data['rounds_info'] = rounds_info
     worker_data['recordings_map'] = recordings_map
     worker_data['player_data_cache'] = player_data_cache
-    
+
 def process_round_perspective(task_args):
     """
     This is the main function executed by each worker. It processes a single
     round/team perspective and returns the results via a temporary shared memory block.
     """
     round_num, team, demoname = task_args
-    
-    # Retrieve data from the initialized worker state
     gs_dtype = worker_data['gs_dtype']
     pi_dtype = worker_data['pi_dtype']
     rounds_info = worker_data['rounds_info']
@@ -135,7 +155,6 @@ def process_round_perspective(task_args):
         
         for i, name in enumerate(enemy_roster):
             if (enemy_alive_mask >> i) & 1:
-                # --- FIX 1: Use string key for lookup ---
                 lookup_key = f"{name}:{current_tick}"
                 if lookup_key in player_data_cache:
                     e_data = player_data_cache[lookup_key]
@@ -149,17 +168,14 @@ def process_round_perspective(task_args):
             ret, frame = caps[playername].read()
             audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
             if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME:
-                continue # Gracefully skip missing frames
+                continue
             
             jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
-            
-            # --- FIX 2: Use string key for lookup ---
             lookup_key = f"{playername}:{current_tick}"
             tick_data = player_data_cache.get(lookup_key)
             player_input = np.zeros(1, dtype=pi_dtype)
 
             if tick_data:
-                # This part is identical to the single-threaded version
                 kb_input_str, buy_sell_input_str = tick_data.get('keyboard_input', '') or '', tick_data.get('buy_sell_input', '') or ''
                 all_kb_actions = kb_input_str.split(',')
                 keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
@@ -199,21 +215,21 @@ def process_round_perspective(task_args):
 # =============================================================================
 
 if __name__ == '__main__':
-    # Set start method for multiprocessing (important for Windows/macOS)
     try:
         mp.set_start_method('spawn')
     except RuntimeError:
-        pass # Can only be set once
+        pass
 
-    # --- HELPER FUNCTIONS (must be defined or imported here for spawn) ---
     class TqdmLoggingHandler(logging.Handler):
         def emit(self, record):
             try: msg = self.format(record); tqdm.write(msg, file=sys.stderr); self.flush()
             except Exception: self.handleError(record)
+
     def setup_logging(debug=False):
         level = logging.DEBUG if debug else logging.INFO; log = logging.getLogger(); log.setLevel(level)
         if log.hasHandlers(): log.handlers.clear()
         handler = TqdmLoggingHandler(); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'); handler.setFormatter(formatter); log.addHandler(handler)
+
     def signal_handler(sig, frame):
         LOG.warning("Interruption detected. Cleaning up partial LMDB database...")
         if LMDB_PATH_FOR_CLEANUP and os.path.exists(LMDB_PATH_FOR_CLEANUP):
@@ -221,45 +237,14 @@ if __name__ == '__main__':
             except OSError as e: LOG.error(f"Error removing LMDB directory: {e}")
         os._exit(1)
         
-    # --- NEW: Re-introducing the missing function ---
     def define_numpy_dtypes():
         game_state_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
         player_input_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (2,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
-        assert len(KEYBOARD_TO_BIT) <= 32, "Too many keyboard actions for uint32 bitmask"
-        assert len(ECO_TO_BIT) <= 128, "Too many economic actions for 128-bit bitmask (2x uint64)"
-        assert len(ITEM_TO_INDEX) <= 128, "Too many items for inventory/weapon bitmasks (2x uint64)"
+        assert len(KEYBOARD_TO_BIT) <= 32
+        assert len(ECO_TO_BIT) <= 128
+        assert len(ITEM_TO_INDEX) <= 128
         return game_state_dtype, player_input_dtype
 
-    def get_bitmask(actions, mapping):
-        mask = 0;
-        if actions:
-            for action in actions:
-                if action in mapping: mask |= (1 << mapping[action])
-        return mask
-    def get_bitmask_array(actions, mapping):
-        mask = np.zeros(2, dtype=np.uint64);
-        if actions:
-            for action in actions:
-                if action in mapping:
-                    bit_pos, idx, pos_in_idx = mapping[action], mapping[action] // 64, mapping[action] % 64
-                    if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
-        return mask
-    def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
-        inventory_mask, active_weapon_mask = np.zeros(2, dtype=np.uint64), np.zeros(2, dtype=np.uint64)
-        def set_bit(mask, item_name):
-            if not isinstance(item_name, str): return
-            bit_pos = mapping.get(item_name)
-            if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()): bit_pos = mapping.get("Knife")
-            if bit_pos is None: raise ValueError(f"Unknown item name encountered: '{item_name}'. Please add it to ITEM_NAMES list.")
-            idx, pos_in_idx = bit_pos // 64, bit_pos % 64
-            if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
-        if active_weapon: set_bit(active_weapon_mask, active_weapon)
-        try:
-            for item in json.loads(inventory_json) if inventory_json else []: set_bit(inventory_mask, item)
-        except (json.JSONDecodeError, TypeError): pass
-        return inventory_mask, active_weapon_mask
-
-    # --- Main Execution Logic ---
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path, help="Path to recordings directory.")
     parser.add_argument("--dbfile", required=True, type=Path, help="Path to SQLite DB file.")
@@ -278,7 +263,6 @@ if __name__ == '__main__':
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path {args.outlmdb} exists. Use --overwrite."); sys.exit(1)
 
-    # Load metadata in the main process
     LOG.info("-> Phase 1: Validating database and loading metadata...")
     conn = sqlite3.connect(f"file:{args.dbfile}?mode=ro", uri=True); conn.row_factory = sqlite3.Row
     rounds_info = {r['round']: dict(r) for r in conn.execute("SELECT * FROM rounds").fetchall()}; LOG.info(f"   - Loaded info for {len(rounds_info)} rounds.")
@@ -298,10 +282,8 @@ if __name__ == '__main__':
         recordings_map[key].append(rec)
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
     
-    # Create the shared memory block for the large player data cache
     LOG.info("   - Caching player data into shared memory...")
-    # --- FIX: Use a robust string key instead of a tuple ---
-    player_data_cache = { f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }  
+    player_data_cache = { f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }
     conn.close()
     packed_cache = msgpack.packb(player_data_cache, use_bin_type=True)
     shm_cache_name = f"cache_{uuid.uuid4()}"
@@ -316,7 +298,6 @@ if __name__ == '__main__':
     LOG.info(f"-> Phase 2: Processing rounds with {args.workers} worker processes...")
     tasks = [(r, t, demoname) for r, t in sorted(recordings_map.keys())]
     
-    # Initialize the pool, passing the shared memory name to each worker
     initargs = (shm_cache_name, len(packed_cache), gs_dtype, pi_dtype, rounds_info, recordings_map)
     with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
         
