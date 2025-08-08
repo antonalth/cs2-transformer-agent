@@ -37,15 +37,20 @@ LINE_HEIGHT = 16
 # Make msgpack aware of numpy for deserialization
 m.patch()
 
-def play_audio(audio_chunk):
-    """Plays a raw PCM audio chunk using sounddevice in a non-blocking way."""
+def play_audio(audio_chunk, blocking=False):
+    """
+    Plays a raw PCM audio chunk using sounddevice.
+    Can be blocking or non-blocking.
+    """
     if not audio_chunk:
         print("No audio chunk to play for this frame.")
         return
     try:
         audio_array = np.frombuffer(audio_chunk, dtype=np.int16).reshape(-1, 2)
-        # --- FIX: Removed sd.wait() to make playback non-blocking ---
         sd.play(audio_array, samplerate=AUDIO_SAMPLE_RATE)
+        # --- FIX: Re-introduced blocking logic ---
+        if blocking:
+            sd.wait()
     except Exception as e:
         print(f"Error playing audio: {e}")
 
@@ -90,13 +95,11 @@ def main():
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
     parser.add_argument("--debug", action='store_true', help="List the first 50 keys in the LMDB and exit.")
-    # --- NEW: Added autoplay flag ---
-    parser.add_argument("--autoplay", action='store_true', help="Automatically play audio for each frame.")
+    parser.add_argument("--autoplay", action='store_true', help="Automatically play non-blocking audio for each frame (overridden by run mode).")
     args = parser.parse_args()
 
     if not args.lmdb_path.exists():
-        print(f"Error: LMDB path not found at: {args.lmdb_path}")
-        sys.exit(1)
+        print(f"Error: LMDB path not found at: {args.lmdb_path}"); sys.exit(1)
 
     env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
 
@@ -106,12 +109,9 @@ def main():
         with env.begin() as txn:
             cursor = txn.cursor()
             for key, _ in cursor:
-                print(key.decode('utf-8'))
-                count += 1
+                print(key.decode('utf-8')); count += 1
                 if count >= 50: break
-        print("--- END OF KEY DUMP ---")
-        env.close()
-        sys.exit(0)
+        print("--- END OF KEY DUMP ---"); env.close(); sys.exit(0)
 
     with env.begin() as txn:
         info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
@@ -120,14 +120,14 @@ def main():
         metadata = json.loads(txn.get(info_key[0]))
         round_info = {r[0]: {'start': r[1], 'end': r[2]} for r in metadata['rounds']}
 
-    current_round = args.round
-    current_team = args.team
-    current_player_idx = args.player_idx
+    current_round, current_team, current_player_idx = args.round, args.team, args.player_idx
     overlay_on = True
+    # --- NEW: State variable for run mode ---
+    run_mode_on = False
 
     if args.tick == -1:
         if current_round not in round_info:
-             print(f"Error: Round {current_round} not found in LMDB metadata. Valid rounds are: {list(round_info.keys())}"); sys.exit(1)
+             print(f"Error: Round {current_round} not found. Valid rounds: {list(round_info.keys())}"); sys.exit(1)
         current_tick = round_info[current_round]['start']
     else:
         current_tick = args.tick
@@ -138,8 +138,7 @@ def main():
         key_str = f"{demoname}_round_{current_round:03d}_team_{current_team}_tick_{current_tick:08d}"
         key_bytes = key_str.encode('utf-8')
         
-        with env.begin() as txn:
-            value = txn.get(key_bytes)
+        with env.begin() as txn: value = txn.get(key_bytes)
         
         if value:
             data = msgpack.unpackb(value, raw=False, object_hook=m.decode)
@@ -147,9 +146,11 @@ def main():
             player_data_list = data['player_data']
             player_input_array, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
 
-            # --- NEW: Autoplay logic ---
-            if args.autoplay and audio:
-                play_audio(audio)
+            # --- NEW: Run mode has priority for audio playback ---
+            if run_mode_on:
+                play_audio(audio, blocking=True)
+            elif args.autoplay and audio:
+                play_audio(audio, blocking=False)
 
             if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
@@ -157,10 +158,12 @@ def main():
                 player_input_record = player_input_array[0]
                 if overlay_on:
                     pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
-                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team})", pos); pos = draw_text(frame, "-"*40, pos)
+                    run_status = "ON" if run_mode_on else "OFF"
+                    pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN MODE: {run_status}", pos)
+                    pos = draw_text(frame, "-"*40, pos)
                     pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
-                    pos = draw_text(frame, f"Team Alive Mask: {game_state_record['team_alive']:05b} | Enemy Alive Mask: {game_state_record['enemy_alive']:05b}", pos); pos = draw_text(frame, "-"*40, pos)
-                    pos = draw_text(frame, "[PLAYER INPUT]", pos)
+                    pos = draw_text(frame, f"Team Alive Mask: {game_state_record['team_alive']:05b} | Enemy Alive Mask: {game_state_record['enemy_alive']:05b}", pos)
+                    pos = draw_text(frame, "-"*40, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
                     pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
                     pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
                     pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
@@ -169,33 +172,43 @@ def main():
                     pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
                     pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
                 
-                print("\n" + "="*80); print(f"Displaying: {key_str}")
-                print("\n--- GAME STATE ---"); print(game_state_record)
-                print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record)
-                print("\n--- CONTROLS ---"); print("q: quit | j: next tick | k: prev tick | p: next player | t: switch team | a: play audio | o: toggle overlay")
+                if not run_mode_on: # Only print full details when paused
+                    print("\n" + "="*80); print(f"Displaying: {key_str}")
+                    print("\n--- GAME STATE ---"); print(game_state_record)
+                    print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record)
+                    print("\n--- CONTROLS ---"); print("q: quit | j/k: tick | p: player | t: team | a: audio | o: overlay | r: RUN MODE")
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
         else:
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK")
             print(f"No data found for key: {key_str}")
             audio = None
+            if run_mode_on: run_mode_on = False; print("Run mode stopped: No data for tick.")
 
         cv2.imshow("LMDB Inspector", frame)
-        key = cv2.waitKey(0) & 0xFF
         
-        if key == ord('q'): break
-        elif key == ord('j'):
+        # --- NEW: Conditional waitKey and run mode logic ---
+        wait_time = 1 if run_mode_on else 0
+        key = cv2.waitKey(wait_time) & 0xFF
+        
+        if run_mode_on:
+             # If in run mode, automatically advance frame
             current_tick += TICKS_PER_FRAME
             if current_round in round_info and current_tick > round_info[current_round]['end']:
-                current_tick = round_info[current_round]['end']; print("At end of round.")
-        elif key == ord('k'):
-            current_tick -= TICKS_PER_FRAME
-            if current_round in round_info and current_tick < round_info[current_round]['start']:
-                current_tick = round_info[current_round]['start']; print("At start of round.")
+                print("Run mode stopped: End of round reached.")
+                run_mode_on = False
+        
+        if key == ord('q'): break
+        elif key == ord('j'): current_tick += TICKS_PER_FRAME
+        elif key == ord('k'): current_tick -= TICKS_PER_FRAME
         elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
         elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
-        elif key == ord('a'): play_audio(audio)
+        elif key == ord('a'): play_audio(audio, blocking=True)
         elif key == ord('o'): overlay_on = not overlay_on
+        elif key == ord('r'):
+            run_mode_on = not run_mode_on
+            status = "ON" if run_mode_on else "OFF"
+            print(f"Run mode toggled {status}")
 
     cv2.destroyAllWindows()
     env.close()
