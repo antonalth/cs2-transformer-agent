@@ -28,7 +28,7 @@ try:
     # Unix-like systems (Linux, macOS)
     import tty, termios
     def getch():
-        """Gets a single character from standard input."""
+        """Gets a single character from standard input, returns a string."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
@@ -41,8 +41,8 @@ except ImportError:
     # Windows
     import msvcrt
     def getch():
-        """Gets a single character from standard input."""
-        return msvcrt.getch().decode('utf-8')
+        """Gets a single character from standard input, returns bytes."""
+        return msvcrt.getch()
 
 
 # --- Configuration ---
@@ -141,65 +141,95 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
     return None # Data inconsistent or player just died this tick
 
 def debug_interactive_search(env):
-    """Provides an interactive search interface for LMDB keys."""
-    print("Loading all keys into memory for searching...")
-    with env.begin() as txn:
-        all_keys = [key.decode('utf-8') for key, _ in txn.cursor()]
-    print(f"Loaded {len(all_keys)} keys. Starting interactive search...")
-
+    """
+    Provides a memory-efficient, interactive search interface for LMDB keys
+    with a stable UI that adapts to terminal size.
+    """
     search_query = ""
     try:
         while True:
-            # Filter keys
-            if search_query:
-                matching_keys = [k for k in all_keys if search_query in k]
-            else:
-                matching_keys = all_keys[:50] # Show first 50 keys if query is empty
+            # Get terminal dimensions for dynamic layout
+            try:
+                term_height, term_width = os.get_terminal_size()
+                # Reserve rows for header, status, and search prompt
+                display_rows = max(1, term_height - 4)
+            except OSError:
+                term_height, term_width = 24, 80 # Default fallback
+                display_rows = 20
 
+            # Search LMDB without loading all keys into memory
+            matching_keys = []
+            total_matches = 0
+            with env.begin() as txn:
+                cursor = txn.cursor()
+                query_bytes = search_query.encode('utf-8')
+                # Use set_range to seek to the first potential match.
+                if cursor.set_range(query_bytes):
+                    # Iterate from the found position
+                    for key_bytes, _ in cursor.iternext(values=False):
+                        # The crucial optimization: stop when keys no longer match the prefix
+                        if not key_bytes.startswith(query_bytes):
+                            break
+                        
+                        total_matches += 1
+                        # Only store enough keys to fill the screen
+                        # A buffer (e.g., 200) prevents stutter on fast key presses
+                        if len(matching_keys) < display_rows * 10 and len(matching_keys) < 500:
+                            matching_keys.append(key_bytes.decode('utf-8', errors='ignore'))
+
+            # --- REDRAW THE ENTIRE SCREEN ---
             # Clear screen
             os.system('cls' if os.name == 'nt' else 'clear')
-
-            # Display results
             print("--- LMDB Interactive Key Search (Press Ctrl+C to exit) ---")
-            print(f"\nSearch: {search_query}", end="", flush=True)
-            print("\n\n--- Matched Keys ---")
 
+            # Dynamic column formatting
             if not matching_keys:
-                print("No matches found.")
+                 print(f"\nNo matches found for '{search_query}'" if search_query else "\nNo keys in DB. Start typing to search.")
             else:
-                try:
-                    terminal_width = os.get_terminal_size().columns
-                except OSError:
-                    terminal_width = 80 # Default width
-
                 max_len = max(len(k) for k in matching_keys) if matching_keys else 0
-                num_columns = max(1, terminal_width // (max_len + 2)) # +2 for padding
+                num_columns = max(1, term_width // (max_len + 2))
+                display_limit = min(len(matching_keys), display_rows * num_columns)
                 
-                # Limit displayed results for performance and readability
-                display_limit = 200
+                # Print keys in columns
                 for i, key in enumerate(matching_keys[:display_limit]):
                     if (i > 0) and (i % num_columns == 0):
                         print()
                     print(f"{key:<{max_len}}  ", end="")
-                print() # Final newline
+                print() # Final newline for the results block
 
-                if len(matching_keys) > display_limit:
-                    print(f"\n...and {len(matching_keys) - display_limit} more.")
-            
-            # Get next character
-            char = getch()
+            # Display status footer and the search prompt (the key to a stable UI)
+            status = f"Displaying {display_limit} of {total_matches} matches." if search_query else f"Showing first {len(matching_keys)} keys. Start typing to search."
+            print(f"\n{status}")
+            print(f"Search: {search_query}", end="", flush=True)
 
-            if char in ('\x03', '\x04'): # Ctrl+C, Ctrl+D
+            # --- INPUT HANDLING ---
+            raw_char = getch()
+
+            # Ctrl+C handler
+            if raw_char in (b'\x03', '\x03'):
                 break
-            elif char in ('\x7f', '\b'): # Backspace
+            # Backspace handler for Windows (bytes) and Unix (str)
+            elif raw_char in (b'\x08', '\x7f', '\b'):
                 search_query = search_query[:-1]
-            # Add any printable character to the query
-            elif char.isprintable():
-                search_query += char
+            else:
+                # Decode bytes to string if needed
+                char_to_add = ""
+                if isinstance(raw_char, bytes):
+                    try:
+                        char_to_add = raw_char.decode('utf-8')
+                    except UnicodeDecodeError:
+                        pass # Ignore bytes that can't be decoded
+                elif isinstance(raw_char, str):
+                    char_to_add = raw_char
+                
+                if char_to_add.isprintable():
+                    search_query += char_to_add
 
     except KeyboardInterrupt:
-        print("\nExiting interactive search.")
+        print("\n\nExiting interactive search.")
     finally:
+        # Leave a clean terminal on exit
+        os.system('cls' if os.name == 'nt' else 'clear')
         env.close()
         sys.exit(0)
 
@@ -211,18 +241,19 @@ def main():
     parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'], help="Starting team (default: T).")
     parser.add_argument("player_idx", type=int, nargs='?', default=0, help="Starting player index [0-4] (default: 0).")
     parser.add_argument("tick", type=int, nargs='?', default=-1, help="Starting tick. If -1, starts at the beginning of the round (default: -1).")
-    parser.add_argument("--debug", action='store_true', help="Run an interactive search to find keys in the LMDB and exit.")
+    parser.add_argument("--debug", action='store_true', help="Run an interactive, memory-efficient search for keys and exit.")
     parser.add_argument("--autoplay", action='store_true', help="Automatically play non-blocking audio for each frame (overridden by run mode).")
     args = parser.parse_args()
 
     if not args.lmdb_path.exists():
         print(f"Error: LMDB path not found at: {args.lmdb_path}"); sys.exit(1)
 
-    env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False)
+    # Increase max DB size to handle large datasets.
+    # map_size is the max potential size, not allocated memory.
+    env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False, map_size=int(50e9))
 
     if args.debug:
-        debug_interactive_search(env)
-        # The script will exit from within the debug function
+        debug_interactive_search(env) # Script will exit from within this function
 
     with env.begin() as txn:
         info_key = [k for k in txn.cursor().iternext(keys=True, values=False) if k.endswith(b'_INFO')]
@@ -267,9 +298,12 @@ def main():
             if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
-                if pov_data and player_input_array.size > 0:
+
+                # Safer check to ensure player_input_array is not empty before access
+                if player_input_array is not None and player_input_array.size > 0:
                     player_input_record = player_input_array[0]
-                    
+
+                    # Overlay drawing logic
                     if overlay_state > 0:
                         overlay_mode_str = "MASKS" if overlay_state == 1 else "STRINGS"
                         run_status = "ON" if run_mode_on else "OFF"
@@ -293,9 +327,8 @@ def main():
                             pos = draw_text(frame, "Eco: " + decode_bitmask_array(player_input_record['eco_bitmask'], BIT_TO_ECO), pos)
                             pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
                             pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
-                else: # pov_data exists but player_input_array is empty
-                     frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-                     if not run_mode_on: print(f"POV data for player {current_player_idx} exists, but input array is empty (likely dead).")
+                else: # Handle cases where player is alive but no input data is available for the tick
+                    frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
 
                 if not run_mode_on:
                     print("\n" + "="*80); print(f"Displaying: {key_str}")
