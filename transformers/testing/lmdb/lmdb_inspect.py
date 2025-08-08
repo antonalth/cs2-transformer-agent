@@ -82,9 +82,7 @@ def get_player_data_for_pov(player_data_list, player_idx, team_alive_mask):
         player_input, jpeg, audio = player_data_list[living_players_before]
         return player_input, jpeg, audio
     
-    return None, None, None # Should not happen if data is consistent
-
-def main():
+  def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.",
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("lmdb_path", type=Path, help="Path to the LMDB directory.")
@@ -130,7 +128,6 @@ def main():
     overlay_on = True
 
     if args.tick == -1:
-        # Check if the requested round exists in the metadata
         if current_round not in round_info:
              print(f"Error: Round {current_round} not found in LMDB metadata. Valid rounds are: {list(round_info.keys())}")
              sys.exit(1)
@@ -148,40 +145,41 @@ def main():
             value = txn.get(key_bytes)
         
         if value:
-            # --- FIX: Explicitly provide the object_hook for deserialization ---
-            # This ensures NumPy arrays are correctly reconstructed.
             data = msgpack.unpackb(value, raw=False, object_hook=m.decode)
-
-            # The rest of the logic can now safely assume `data` is a dictionary
-            game_state = data['game_state'][0]
+            game_state_record = data['game_state'][0]
             player_data_list = data['player_data']
 
-            player_input, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state['team_alive'])
+            player_input_array, jpeg, audio = get_player_data_for_pov(player_data_list, current_player_idx, game_state_record['team_alive'])
 
             if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
                 
+                # --- FIX: Extract the scalar record from the single-element array ---
+                player_input_record = player_input_array[0]
+
                 if overlay_on:
                     pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
                     pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team})", pos)
                     pos = draw_text(frame, "-"*40, pos)
-                    pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state['tick']}", pos)
-                    pos = draw_text(frame, f"Team Alive Mask: {game_state['team_alive']:05b} | Enemy Alive Mask: {game_state['enemy_alive']:05b}", pos)
+                    pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
+                    pos = draw_text(frame, f"Team Alive Mask: {game_state_record['team_alive']:05b} | Enemy Alive Mask: {game_state_record['enemy_alive']:05b}", pos)
                     pos = draw_text(frame, "-"*40, pos)
                     pos = draw_text(frame, "[PLAYER INPUT]", pos)
-                    pos = draw_text(frame, f"Health: {player_input['health']} | Armor: {player_input['armor']} | Money: ${player_input['money']}", pos)
-                    pos = draw_text(frame, f"Pos: ({player_input['pos'][0]:.1f}, {player_input['pos'][1]:.1f}, {player_input['pos'][2]:.1f})", pos)
-                    pos = draw_text(frame, f"Mouse: ({player_input['mouse'][0]:.3f}, {player_input['mouse'][1]:.3f})", pos)
-                    pos = draw_text(frame, f"Keyboard Mask: {int(player_input['keyboard_bitmask'])}", pos)
-                    pos = draw_text(frame, f"Eco Mask: {int(player_input['eco_bitmask'][0])} {int(player_input['eco_bitmask'][1])}", pos)
-                    pos = draw_text(frame, f"Inv Mask: {int(player_input['inventory_bitmask'][0])} {int(player_input['inventory_bitmask'][1])}", pos)
-                    pos = draw_text(frame, f"Wep Mask: {int(player_input['active_weapon_bitmask'][0])} {int(player_input['active_weapon_bitmask'][1])}", pos)
+                    
+                    # --- FIX: Use the scalar record for all formatting and display ---
+                    pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
+                    pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
+                    pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
+                    pos = draw_text(frame, f"Keyboard Mask: {int(player_input_record['keyboard_bitmask'])}", pos)
+                    pos = draw_text(frame, f"Eco Mask: {int(player_input_record['eco_bitmask'][0])} {int(player_input_record['eco_bitmask'][1])}", pos)
+                    pos = draw_text(frame, f"Inv Mask: {int(player_input_record['inventory_bitmask'][0])} {int(player_input_record['inventory_bitmask'][1])}", pos)
+                    pos = draw_text(frame, f"Wep Mask: {int(player_input_record['active_weapon_bitmask'][0])} {int(player_input_record['active_weapon_bitmask'][1])}", pos)
 
                 print("\n" + "="*80)
                 print(f"Displaying: {key_str}")
-                print("\n--- GAME STATE ---"); print(game_state)
-                print("\n--- PLAYER INPUT (POV) ---"); print(player_input)
+                print("\n--- GAME STATE ---"); print(game_state_record)
+                print("\n--- PLAYER INPUT (POV) ---"); print(player_input_record) # Print the record, not the array
                 print("\n--- CONTROLS ---"); print("q: quit | j: next tick | k: prev tick | p: next player | t: switch team | a: play audio | o: toggle overlay")
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
@@ -209,6 +207,6 @@ def main():
 
     cv2.destroyAllWindows()
     env.close()
-
+    
 if __name__ == "__main__":
     main()
