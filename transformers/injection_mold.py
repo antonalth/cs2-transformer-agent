@@ -65,19 +65,20 @@ worker_data = {}
 
 def init_worker(shm_cache_name, shm_cache_size, gs_dtype, pi_dtype, rounds_info, recordings_map):
     """Initializer for each worker process."""
+    # --- FIX: Patch msgpack-numpy inside each new worker process ---
+    # This is crucial because spawned processes do not inherit the parent's patched state.
+    m.patch()
+
     # Connect to the shared memory block for the player data cache
     shm = SharedMemory(name=shm_cache_name)
     
-    # --- FIX: Create a copy of the buffer to prevent BufferError on exit ---
-    # This reads all data from shared memory into the worker's private RAM
-    # and severs the link to the shared memory block.
+    # Create a copy of the buffer to prevent BufferError on exit
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
     
     # We can now close the shared memory handle immediately
     shm.close()
     
-    # --- FIX: Use explicit object_hook to solve the unhashable list TypeError ---
-    # Deserialize the local copy of the cache.
+    # Deserialize the local copy of the cache. This will now work correctly.
     player_data_cache = msgpack.unpackb(packed_cache_copy, raw=False, object_hook=m.decode)
     
     # Store all necessary data in the worker's global state
