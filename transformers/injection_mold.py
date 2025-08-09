@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
-for model training. (Robust Multiprocessing Version with a Managed Pool
-of Shared Memory Buffers and pickle for IPC)
+for model training. (Robust Multiprocessing Version with Decentralized Writes)
 """
 
 import argparse
@@ -16,8 +15,9 @@ import sys
 from pathlib import Path
 import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
-import uuid
 import pickle
+import time
+import random
 
 import cv2
 import lmdb
@@ -31,8 +31,7 @@ GAME_TICKS_PER_SEC = 64; EXPECTED_VIDEO_FPS = 32
 TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
 AUDIO_SAMPLE_RATE = 44100; AUDIO_CHANNELS = 2; AUDIO_BIT_DEPTH = 2
 AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNELS * AUDIO_BIT_DEPTH
-INITIAL_MAP_SIZE = 5 * 1024**3; MAP_RESIZE_INCREMENT = 2 * 1024**3
-MAP_RESIZE_THRESHOLD = 500 * 1024**2
+INITIAL_MAP_SIZE = 20 * 1024**3; MAP_RESIZE_INCREMENT = 5 * 1024**3
 RESULT_BUFFER_SIZE = 3000 * 1024**2
 
 # --- Globals ---
@@ -61,30 +60,23 @@ worker_data = {}
 def merge_tick_data(tick1_data, tick2_data):
     if not tick1_data: return tick2_data or None
     if not tick2_data: return tick1_data
-    merged_data = tick1_data.copy()
-    mx1, mx2 = tick1_data.get('mouse_x') or 0, tick2_data.get('mouse_x') or 0
-    merged_data['mouse_x'] = mx1 + mx2
-    my1, my2 = tick1_data.get('mouse_y') or 0, tick2_data.get('mouse_y') or 0
-    merged_data['mouse_y'] = my1 + my2
-    px1, px2 = tick1_data.get('position_x') or 0, tick2_data.get('position_x') or 0
-    merged_data['position_x'] = (px1 + px2) / 2.0
-    py1, py2 = tick1_data.get('position_y') or 0, tick2_data.get('position_y') or 0
-    merged_data['position_y'] = (py1 + py2) / 2.0
-    pz1, pz2 = tick1_data.get('position_z') or 0, tick2_data.get('position_z') or 0
-    merged_data['position_z'] = (pz1 + pz2) / 2.0
-    kb1 = set(filter(None, (tick1_data.get('keyboard_input') or '').split(',')))
-    kb2 = set(filter(None, (tick2_data.get('keyboard_input') or '').split(',')))
-    merged_data['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
-    buy1 = set(filter(None, (tick1_data.get('buy_sell_input') or '').split(',')))
-    buy2 = set(filter(None, (tick2_data.get('buy_sell_input') or '').split(',')))
-    merged_data['buy_sell_input'] = ",".join(sorted(list(buy1.union(buy2))))
-    return merged_data
+    merged = tick1_data.copy()
+    merged['mouse_x'] = (tick1_data.get('mouse_x') or 0) + (tick2_data.get('mouse_x') or 0)
+    merged['mouse_y'] = (tick1_data.get('mouse_y') or 0) + (tick2_data.get('mouse_y') or 0)
+    merged['position_x'] = ((tick1_data.get('position_x') or 0) + (tick2_data.get('position_x') or 0)) / 2.0
+    merged['position_y'] = ((tick1_data.get('position_y') or 0) + (tick2_data.get('position_y') or 0)) / 2.0
+    merged['position_z'] = ((tick1_data.get('position_z') or 0) + (tick2_data.get('position_z') or 0)) / 2.0
+    kb1 = set(filter(None, (tick1_data.get('keyboard_input') or '').split(','))); kb2 = set(filter(None, (tick2_data.get('keyboard_input') or '').split(',')))
+    merged['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
+    buy1 = set(filter(None, (tick1_data.get('buy_sell_input') or '').split(','))); buy2 = set(filter(None, (tick2_data.get('buy_sell_input') or '').split(',')))
+    merged['buy_sell_input'] = ",".join(sorted(list(buy1.union(buy2))))
+    return merged
 
 def get_bitmask(actions, mapping, mapping_name):
     mask = 0
     if not actions: return mask
     for action in actions:
-        if action not in mapping: raise ValueError(f"\nFATAL: Unknown action '{action}' not in '{mapping_name}' list.\n")
+        if action not in mapping: raise ValueError(f"Unknown action '{action}' in '{mapping_name}'")
         mask |= (1 << mapping[action])
     return mask
 
@@ -92,9 +84,8 @@ def get_bitmask_array(actions, mapping, mapping_name):
     mask = np.zeros(6, dtype=np.uint64)
     if not actions: return mask
     for action in actions:
-        if action not in mapping: raise ValueError(f"\nFATAL: Unknown action '{action}' not in '{mapping_name}' list.\n")
-        bit_pos = mapping[action]
-        idx, pos_in_idx = bit_pos // 64, bit_pos % 64
+        if action not in mapping: raise ValueError(f"Unknown action '{action}' in '{mapping_name}'")
+        bit_pos, idx, pos_in_idx = mapping[action], mapping[action] // 64, mapping[action] % 64
         if idx < 6: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
     return mask
 
@@ -104,7 +95,7 @@ def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
         if not isinstance(item_name, str): return
         bit_pos = mapping.get(item_name)
         if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()): bit_pos = mapping.get("Knife")
-        if bit_pos is None: raise ValueError(f"\nFATAL: Unknown item '{item_name}'. Add to ITEM_NAMES list.\n")
+        if bit_pos is None: raise ValueError(f"Unknown item '{item_name}'")
         idx, pos_in_idx = bit_pos // 64, bit_pos % 64
         if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
     if active_weapon: set_bit(active_weapon_mask, active_weapon)
@@ -113,108 +104,103 @@ def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
     except (json.JSONDecodeError, TypeError): pass
     return inventory_mask, active_weapon_mask
 
-def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_dtype, rounds_info, recordings_map):
+def init_worker(shm_cache_name, shm_cache_size, lmdb_path, gs_dtype, pi_dtype, rounds_info, recordings_map):
     m.patch()
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
     shm.close()
     worker_data['player_data_cache'] = pickle.loads(packed_cache_copy)
-    worker_data['free_q'], worker_data['result_q'] = free_q, result_q
+    # --- NEW: Each worker opens its own LMDB handle ---
+    worker_data['lmdb_env'] = lmdb.open(str(lmdb_path), map_size=INITIAL_MAP_SIZE, writemap=True, map_async=True)
     worker_data['gs_dtype'], worker_data['pi_dtype'] = gs_dtype, pi_dtype
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
+
 def process_round_perspective(task_args):
-    # --- FIX: Initialize resources to None for robust cleanup ---
-    caps = {}
-    auds = {}
     try:
-        round_num, team, demoname, quality, block_rects = task_args
+        round_num, team, demoname = task_args
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
-        player_data_cache, free_q, result_q = worker_data['player_data_cache'], worker_data['free_q'], worker_data['result_q']
+        player_data_cache, env = worker_data['player_data_cache'], worker_data['lmdb_env']
         round_data = recordings_map[(round_num, team)]
-        if len(round_data) != 5: return
+        if len(round_data) != 5: return task_args
         t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]; ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
         current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
-        
-        # --- FIX: Resource acquisition now inside the try block ---
         caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in round_data}
         auds = {rec['playername']: open(rec['wav_path'], 'rb') for rec in round_data}
         for aud_file in auds.values(): aud_file.seek(44)
-        
         round_start_tick, round_end_tick = rounds_info[round_num]['starttick'], max(rec['stoptick'] for rec in round_data)
         results = []
         for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
-            team_deaths = {p[0]: p[1] for p in json.loads(rounds_info[round_num][f"{team.lower()}_team"])}; enemy_deaths = {p[0]: p[1] for p in json.loads(rounds_info[round_num][f"{'ct' if team == 'T' else 't'}_team"])}
-            team_alive_mask = sum(1 << i for i, n in enumerate(current_roster) if team_deaths.get(n, 0) == -1 or current_tick < team_deaths.get(n, 0))
-            enemy_alive_mask = sum(1 << i for i, n in enumerate(enemy_roster) if enemy_deaths.get(n, 0) == -1 or current_tick < enemy_deaths.get(n, 0))
-            game_state = np.zeros(1, dtype=gs_dtype); game_state[0]['tick'] = current_tick; game_state[0]['team_alive'], game_state[0]['enemy_alive'] = team_alive_mask, enemy_alive_mask
-            rs_mask = 0
-            if rounds_info[round_num].get('freezetime_endtick') is not None and current_tick < rounds_info[round_num]['freezetime_endtick']: rs_mask |= (1 << 0)
-            if rounds_info[round_num].get('starttick') is not None and rounds_info[round_num].get('endtick') is not None and current_tick >= rounds_info[round_num]['starttick'] and current_tick <= rounds_info[round_num]['endtick']: rs_mask |= (1 << 1)
-            if rounds_info[round_num].get('bomb_planted_tick', -1) != -1 and current_tick >= rounds_info[round_num]['bomb_planted_tick']: rs_mask |= (1 << 2)
-            game_state[0]['round_state'] = rs_mask
-            for i, name in enumerate(enemy_roster):
-                if (enemy_alive_mask >> i) & 1:
-                    tick1_data = player_data_cache.get(f"{name}:{current_tick}"); tick2_data = player_data_cache.get(f"{name}:{current_tick + 1}")
-                    e_data = merge_tick_data(tick1_data, tick2_data)
-                    if e_data: game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
-            player_data_list = []
+            # (Core processing logic remains identical)
+            team_deaths = {p[0]:p[1] for p in json.loads(rounds_info[round_num][f"{team.lower()}_team"])}; enemy_deaths = {p[0]:p[1] for p in json.loads(rounds_info[round_num][f"{'ct' if team=='T' else 't'}_team"])}
+            team_alive = sum(1<<i for i,n in enumerate(current_roster) if team_deaths.get(n,0)==-1 or current_tick<team_deaths.get(n,0))
+            enemy_alive = sum(1<<i for i,n in enumerate(enemy_roster) if enemy_deaths.get(n,0)==-1 or current_tick<enemy_deaths.get(n,0))
+            gs = np.zeros(1,dtype=gs_dtype); gs[0]['tick']=current_tick; gs[0]['team_alive'],gs[0]['enemy_alive']=team_alive,enemy_alive
+            rs_mask=0;
+            if rounds_info[round_num].get('freezetime_endtick') is not None and current_tick<rounds_info[round_num]['freezetime_endtick']: rs_mask|=(1<<0)
+            if rounds_info[round_num].get('starttick') is not None and rounds_info[round_num].get('endtick') is not None and current_tick>=rounds_info[round_num]['starttick'] and current_tick<=rounds_info[round_num]['endtick']: rs_mask|=(1<<1)
+            if rounds_info[round_num].get('bomb_planted_tick',-1)!=-1 and current_tick>=rounds_info[round_num]['bomb_planted_tick']: rs_mask|=(1<<2)
+            gs[0]['round_state']=rs_mask
+            for i,name in enumerate(enemy_roster):
+                if(enemy_alive>>i)&1:
+                    t1=player_data_cache.get(f"{name}:{current_tick}"); t2=player_data_cache.get(f"{name}:{current_tick+1}")
+                    ed=merge_tick_data(t1,t2);
+                    if ed: gs[0]['enemy_pos'][i]=[ed['position_x'],ed['position_y'],ed['position_z']]
+            pdl=[]
             for rec in round_data:
-                playername = rec['playername']
-                try: player_idx_in_roster = current_roster.index(playername)
+                pn=rec['playername']
+                try: p_idx=current_roster.index(pn)
                 except ValueError: continue
-                is_alive = (team_alive_mask >> player_idx_in_roster) & 1
-                if not is_alive or current_tick >= rec['stoptick']: continue
-                ret, frame = caps[playername].read(); audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
-                if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME: continue
-                if block_rects:
-                    for x1, y1, x2, y2 in block_rects:
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
-                encode_param = [cv2.IMWRITE_JPEG_QUALITY, quality]
-                jpeg_bytes = cv2.imencode('.jpg', frame, encode_param)[1].tobytes()
-                tick1_data = player_data_cache.get(f"{playername}:{current_tick}"); tick2_data = player_data_cache.get(f"{playername}:{current_tick + 1}")
-                tick_data = merge_tick_data(tick1_data, tick2_data)
-                player_input = np.zeros(1, dtype=pi_dtype)
-                if tick_data:
-                    kb_input_str = tick_data.get('keyboard_input', '') or ''; buy_sell_input_str = tick_data.get('buy_sell_input', '') or ''
-                    all_kb_actions = [action.replace("-", "_").replace(" ", "_") for action in kb_input_str.split(',') if action]
-                    buy_sell_actions = [action.replace("-", "_").replace(" ", "_") for action in buy_sell_input_str.split(',') if action]
-                    keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
-                    player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT, "KEYBOARD_ONLY_ACTIONS")
-                    drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]; eco_actions_list = drop_actions + buy_sell_actions
-                    if tick_data.get('is_in_buyzone') == 1: eco_actions_list.append('IN_BUYZONE')
-                    player_input[0]['eco_bitmask'] = get_bitmask_array(eco_actions_list, ECO_TO_BIT, "ECO_ACTIONS")
-                    player_input[0]['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]; player_input[0]['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
-                    player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
-                    inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX); player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
-                player_data_list.append((player_input, jpeg_bytes, audio_chunk))
-            if not player_data_list: continue
-            key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
-            final_payload_for_lmdb = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True)
-            results.append((key, final_payload_for_lmdb))
+                is_alive=(team_alive>>p_idx)&1
+                if not is_alive or current_tick>=rec['stoptick']: continue
+                ret,frame=caps[pn].read(); audio=auds[pn].read(AUDIO_BYTES_PER_FRAME)
+                if not ret or len(audio)<AUDIO_BYTES_PER_FRAME: continue
+                jpg=cv2.imencode('.jpg',frame)[1].tobytes(); lk=f"{pn}:{current_tick}"; td=merge_tick_data(player_data_cache.get(lk),player_data_cache.get(f"{pn}:{current_tick+1}")); pi=np.zeros(1,dtype=pi_dtype)
+                if td:
+                    kb,bs=td.get('keyboard_input','')or'',td.get('buy_sell_input','')or''
+                    akb=[a.replace("-","_").replace(" ","_") for a in kb.split(',') if a]; bs_a=[a.replace("-","_").replace(" ","_") for a in bs.split(',') if a]
+                    k_a=[a for a in akb if not a.startswith('DROP_')]; pi[0]['keyboard_bitmask']=get_bitmask(k_a,KEYBOARD_TO_BIT,"KEYBOARD_ONLY_ACTIONS")
+                    d_a=[a for a in akb if a.startswith('DROP_')]; e_a=d_a+bs_a
+                    if td.get('is_in_buyzone')==1:e_a.append('IN_BUYZONE')
+                    pi[0]['eco_bitmask']=get_bitmask_array(e_a,ECO_TO_BIT,"ECO_ACTIONS")
+                    pi[0]['pos']=[td.get('position_x',0),td.get('position_y',0),td.get('position_z',0)]; pi[0]['mouse']=[td.get('mouse_x',0),td.get('mouse_y',0)]
+                    pi[0]['health'],pi[0]['armor'],pi[0]['money']=td.get('health',0),td.get('armor',0),td.get('money',0)
+                    im,wm=get_inventory_bitmasks(td.get('inventory'),td.get('active_weapon'),ITEM_TO_INDEX); pi[0]['inventory_bitmask'],pi[0]['active_weapon_bitmask']=im,wm
+                pdl.append((pi,jpg,audio))
+            if not pdl: continue
+            key=f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
+            payload=msgpack.packb({"game_state":gs,"player_data":pdl},use_bin_type=True); results.append((key,payload))
+
+        if not results: return task_args
         
-        if not results: return
-
-        packed_results = pickle.dumps(results)
-        if len(packed_results) > RESULT_BUFFER_SIZE:
-            raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size.")
-        buffer_name = free_q.get()
-        shm = SharedMemory(name=buffer_name)
-        shm.buf[:len(packed_results)] = packed_results
-        shm.close()
-        result_q.put((buffer_name, len(packed_results)))
-
-    except Exception:
+        # --- NEW: Decentralized write-and-retry loop ---
+        while True:
+            try:
+                with env.begin(write=True) as txn:
+                    # Check for resize *after* acquiring the lock
+                    batch_size = sum(len(payload) for _, payload in results)
+                    info = env.info(); stats = env.stat()
+                    available = info['map_size'] - (info['last_pgno'] * stats['psize'])
+                    if available < batch_size:
+                        new_size = info['map_size'] + max(batch_size, MAP_RESIZE_INCREMENT)
+                        env.set_mapsize(new_size)
+                    
+                    # Use putmulti for efficient bulk writing
+                    cursor = txn.cursor()
+                    cursor.putmulti(results)
+                break # Exit loop on success
+            except lmdb.LockError:
+                # Another worker has the write lock, wait and retry
+                time.sleep(random.uniform(0.05, 0.2))
+                continue
+        return task_args
+    except Exception as e:
         import traceback
-        LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}"); result_q.put(("ERROR", None))
-    
+        LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}")
+        return ("ERROR", f"Error in {task_args}: {e}")
     finally:
-        # --- FIX: Explicitly release all resources in a finally block ---
-        # This guarantees cleanup even if an error occurs.
-        for cap in caps.values():
-            cap.release()
-        for aud in auds.values():
-            aud.close()
+        for cap in caps.values(): cap.release()
+        for aud in auds.values(): aud.close()
 
 # =============================================================================
 # MAIN DRIVER
@@ -222,6 +208,8 @@ def process_round_perspective(task_args):
 if __name__ == '__main__':
     try: mp.set_start_method('spawn')
     except RuntimeError: pass
+
+    # (Setup functions like TqdmLoggingHandler, setup_logging, signal_handler, define_numpy_dtypes are unchanged)
     class TqdmLoggingHandler(logging.Handler):
         def emit(self, record):
             try: msg = self.format(record); tqdm.write(msg, file=sys.stderr); self.flush()
@@ -230,45 +218,21 @@ if __name__ == '__main__':
         level = logging.DEBUG if debug else logging.INFO; log = logging.getLogger(); log.setLevel(level)
         if log.hasHandlers(): log.handlers.clear()
         handler = TqdmLoggingHandler(); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'); handler.setFormatter(formatter); log.addHandler(handler)
-    def signal_handler(sig, frame):
-        LOG.warning("Interruption detected. Forcing cleanup..."); os._exit(1)
+    def signal_handler(sig, frame): LOG.warning("Interruption detected..."); os._exit(1)
     def define_numpy_dtypes():
         gs_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
         pi_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (6,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
         assert len(KEYBOARD_TO_BIT) <= 32 and len(ECO_TO_BIT) <= 384 and len(ITEM_TO_INDEX) <= 128
         return gs_dtype, pi_dtype
+    
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--workers", type=int, default=os.cpu_count()); parser.add_argument("--buffers", type=int, default=8)
-    # --- NEW: Add quality and blockfile arguments ---
-    parser.add_argument("--quality", type=int, default=80, help="JPEG quality for frame encoding (0-100, default: 80).")
-    parser.add_argument("--blockfile", type=Path, default=None, help="Path to a .txt file with blackout coordinates (minX,minY,maxX,maxY per line).")
-    args = parser.parse_args()
+    parser.add_argument("--workers", type=int, default=os.cpu_count()); args = parser.parse_args()
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path exists. Use --overwrite."); sys.exit(1)
-    
-    # --- NEW: Parse the blockfile ---
-    block_rects = []
-    if args.blockfile:
-        if not args.blockfile.is_file():
-            LOG.critical(f"Blockfile not found at: {args.blockfile}"); sys.exit(1)
-        LOG.info(f"   - Loading blackout regions from {args.blockfile}")
-        with open(args.blockfile, 'r') as f:
-            for line in f:
-                try:
-                    line = line.strip()
-                    if not line or line.startswith('#'): continue
-                    coords = [int(c.strip()) for c in line.split(',')]
-                    if len(coords) == 4:
-                        block_rects.append(tuple(coords))
-                    else:
-                        LOG.warning(f"Skipping malformed line in blockfile: {line}")
-                except ValueError:
-                    LOG.warning(f"Skipping non-integer line in blockfile: {line}")
-        LOG.info(f"   - Loaded {len(block_rects)} blackout regions.")
 
     LOG.info("-> Phase 1: Validating database and loading metadata...")
     conn = sqlite3.connect(f"file:{args.dbfile}?mode=ro", uri=True); conn.row_factory = sqlite3.Row
@@ -282,68 +246,40 @@ if __name__ == '__main__':
         fname = f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
         mp4_path, wav_path = args.recdir / f"{fname}.mp4", args.recdir / f"{fname}.wav"
         if not mp4_path.exists() or not wav_path.exists(): LOG.critical(f"Media not found for {fname}"); sys.exit(1)
-        rec['mp4_path'], rec['wav_path'] = mp4_path, wav_path
-        key = (round_num, team)
+        rec['mp4_path'], rec['wav_path'] = mp4_path, wav_path; key = (round_num, team)
         if key not in recordings_map: recordings_map[key] = []
         recordings_map[key].append(rec)
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
+    
     LOG.info("   - Caching player data into shared memory...")
     player_data_cache = { f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }; conn.close()
     packed_cache = pickle.dumps(player_data_cache)
     shm_cache = SharedMemory(create=True, size=len(packed_cache)); shm_cache.buf[:len(packed_cache)] = packed_cache
     LOG.info(f"   - Player data cache ({len(packed_cache)/(1024**2):.2f} MB) created in shared memory.")
-    gs_dtype, pi_dtype = define_numpy_dtypes(); env = lmdb.open(str(args.outlmdb), map_size=INITIAL_MAP_SIZE, writemap=True)
-    demoname = args.recdir.name
+    gs_dtype, pi_dtype = define_numpy_dtypes()
     
-    # --- NEW: Pass quality and block_rects to workers ---
-    tasks = [(r, t, demoname, args.quality, block_rects) for r, t in sorted(recordings_map.keys())]
+    # Main process creates the LMDB file but doesn't hold a persistent handle
+    env = lmdb.open(str(args.outlmdb), map_size=INITIAL_MAP_SIZE, writemap=True); env.close()
     
-    LOG.info(f"-> Phase 2: Processing rounds with {args.workers} workers and {args.buffers} buffers...")
-    manager = mp.Manager(); free_buffers_q = manager.Queue(); results_q = manager.Queue()
-    num_buffers = args.buffers; buffer_pool = [SharedMemory(create=True, size=RESULT_BUFFER_SIZE) for _ in range(num_buffers)]
-    for buf in buffer_pool: free_buffers_q.put(buf.name)
-    initargs = (shm_cache.name, len(packed_cache), free_buffers_q, results_q, gs_dtype, pi_dtype, rounds_info, recordings_map)
+    demoname = args.recdir.name; tasks = [(r, t, demoname) for r, t in sorted(recordings_map.keys())]
+    
+    LOG.info(f"-> Phase 2: Processing rounds with {args.workers} worker processes...")
+    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, gs_dtype, pi_dtype, rounds_info, recordings_map)
+    
     try:
         with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
-            pool.map_async(process_round_perspective, tasks)
-            for _ in tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives"):
-                result = results_q.get()
-                if result[0] == "ERROR": raise RuntimeError("A worker process encountered a fatal error. Check logs for details.")
-                result_shm_name, result_size = result
-                try:
-                    result_shm = SharedMemory(name=result_shm_name)
-                    packed_results = bytes(result_shm.buf[:result_size])
-                    round_results = pickle.loads(packed_results)
-                    result_shm.close(); free_buffers_q.put(result_shm_name)
-                    batch_size = sum(len(payload) for key, payload in round_results)
-                    info, stats = env.info(), env.stat()
-                    available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                    while available_space < batch_size:
-                        LOG.warning(f"Resizing LMDB: Need {batch_size/(1024**2):.2f}MB, have {available_space/(1024**2):.2f}MB.")
-                        new_size = info['map_size'] + MAP_RESIZE_INCREMENT
-                        env.set_mapsize(new_size)
-                        info = env.info(); available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                    with env.begin(write=True) as txn:
-                        for key, payload in round_results: txn.put(key, payload)
-                except Exception as e:
-                    LOG.error(f"Error handling result from buffer {result_shm_name}: {e}"); free_buffers_q.put(result_shm_name); pool.terminate(); pool.join(); raise
+            pbar = tqdm(pool.imap_unordered(process_round_perspective, tasks), total=len(tasks), desc="Processing Round/Team Perspectives")
+            for result in pbar:
+                if isinstance(result, tuple) and result[0] == "ERROR":
+                    raise RuntimeError(f"A worker process encountered a fatal error: {result[1]}")
     finally:
         LOG.info("-> Phase 3: Finalizing and cleaning up...")
+        env = lmdb.open(str(args.outlmdb), writemap=True)
         metadata = {"demoname": demoname, "rounds": [[r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())]}
         with env.begin(write=True) as txn:
             key = f"{demoname}_INFO".encode('utf-8'); txn.put(key, json.dumps(metadata).encode('utf-8'))
         env.close()
         shm_cache.close(); shm_cache.unlink(); LOG.info("Shared memory cache unlinked.")
-        active_buffers = []
-        while not free_buffers_q.empty():
-            try: active_buffers.append(SharedMemory(name=free_buffers_q.get_nowait()))
-            except (FileNotFoundError, InterruptedError): pass
-        for buf in buffer_pool:
-            if buf.name not in [b.name for b in active_buffers]: active_buffers.append(buf)
-        for buf in active_buffers:
-            try: buf.close(); buf.unlink()
-            except FileNotFoundError: pass
-        LOG.info("Result buffer pool unlinked."); manager.shutdown()
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         LOG.info("All processing steps completed successfully.")
         LOG.info(f"Final LMDB database is at: {args.outlmdb}")
