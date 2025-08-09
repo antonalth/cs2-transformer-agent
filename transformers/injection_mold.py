@@ -58,6 +58,37 @@ ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
 # =============================================================================
 worker_data = {}
 
+def merge_tick_data(tick1_data, tick2_data):
+    """Merges data from two consecutive ticks into a single representative record."""
+    if not tick1_data:
+        return None
+    if not tick2_data:
+        return tick1_data # Return the first tick if the second is missing
+
+    # Start with the first tick's data as the base
+    merged_data = tick1_data.copy()
+
+    # Sum mouse inputs
+    merged_data['mouse_x'] = tick1_data.get('mouse_x', 0) + tick2_data.get('mouse_x', 0)
+    merged_data['mouse_y'] = tick1_data.get('mouse_y', 0) + tick2_data.get('mouse_y', 0)
+
+    # Average positions
+    merged_data['position_x'] = (tick1_data.get('position_x', 0) + tick2_data.get('position_x', 0)) / 2.0
+    merged_data['position_y'] = (tick1_data.get('position_y', 0) + tick2_data.get('position_y', 0)) / 2.0
+    merged_data['position_z'] = (tick1_data.get('position_z', 0) + tick2_data.get('position_z', 0)) / 2.0
+
+    # Combine unique keyboard inputs
+    kb1 = set(filter(None, (tick1_data.get('keyboard_input', '') or '').split(',')))
+    kb2 = set(filter(None, (tick2_data.get('keyboard_input', '') or '').split(',')))
+    merged_data['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
+
+    # Combine unique buy/sell inputs
+    buy1 = set(filter(None, (tick1_data.get('buy_sell_input', '') or '').split(',')))
+    buy2 = set(filter(None, (tick2_data.get('buy_sell_input', '') or '').split(',')))
+    merged_data['buy_sell_input'] = ",".join(sorted(list(buy1.union(buy2))))
+
+    return merged_data
+
 def get_bitmask(actions, mapping, mapping_name):
     mask = 0
     if not actions: return mask
@@ -67,14 +98,12 @@ def get_bitmask(actions, mapping, mapping_name):
     return mask
 
 def get_bitmask_array(actions, mapping, mapping_name):
-    # --- FIX: Increased size of mask to match new dtype ---
     mask = np.zeros(6, dtype=np.uint64)
     if not actions: return mask
     for action in actions:
         if action not in mapping: raise ValueError(f"\n\nFATAL: Unknown action '{action}' not found in '{mapping_name}' list.\n")
         bit_pos = mapping[action]
         idx, pos_in_idx = bit_pos // 64, bit_pos % 64
-        # --- FIX: Updated index check for new size ---
         if idx < 6: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
     return mask
 
@@ -102,16 +131,15 @@ def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_d
     worker_data['free_q'], worker_data['result_q'] = free_q, result_q
     worker_data['gs_dtype'], worker_data['pi_dtype'] = gs_dtype, pi_dtype
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
+
 def process_round_perspective(task_args):
     try:
         round_num, team, demoname = task_args
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
         player_data_cache, free_q, result_q = worker_data['player_data_cache'], worker_data['free_q'], worker_data['result_q']
-
         round_data = recordings_map[(round_num, team)]
         if len(round_data) != 5: return
-
         t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]; ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
         current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
         caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in round_data}
@@ -131,9 +159,12 @@ def process_round_perspective(task_args):
             game_state[0]['round_state'] = rs_mask
             for i, name in enumerate(enemy_roster):
                 if (enemy_alive_mask >> i) & 1:
-                    lookup_key = f"{name}:{current_tick}"
-                    if lookup_key in player_data_cache:
-                        e_data = player_data_cache[lookup_key]; game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
+                    # --- FIX: Fetch and merge both ticks for enemies ---
+                    tick1_data = player_data_cache.get(f"{name}:{current_tick}")
+                    tick2_data = player_data_cache.get(f"{name}:{current_tick + 1}")
+                    e_data = merge_tick_data(tick1_data, tick2_data)
+                    if e_data:
+                        game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
             player_data_list = []
             for rec in round_data:
                 playername = rec['playername']
@@ -143,23 +174,23 @@ def process_round_perspective(task_args):
                 if not is_alive or current_tick >= rec['stoptick']: continue
                 ret, frame = caps[playername].read(); audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
                 if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME: continue
-                jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes(); lookup_key = f"{playername}:{current_tick}"; tick_data = player_data_cache.get(lookup_key); player_input = np.zeros(1, dtype=pi_dtype)
+                jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
+                
+                # --- FIX: Fetch and merge both ticks for the current player ---
+                tick1_data = player_data_cache.get(f"{playername}:{current_tick}")
+                tick2_data = player_data_cache.get(f"{playername}:{current_tick + 1}")
+                tick_data = merge_tick_data(tick1_data, tick2_data)
+                
+                player_input = np.zeros(1, dtype=pi_dtype)
                 if tick_data:
                     kb_input_str = tick_data.get('keyboard_input', '') or ''; buy_sell_input_str = tick_data.get('buy_sell_input', '') or ''
-                    
-                    # --- FIX: Sanitize all input strings to replace hyphens/spaces with underscores to match the canonical ECO_ACTIONS list ---
                     all_kb_actions = [action.replace("-", "_").replace(" ", "_") for action in kb_input_str.split(',') if action]
                     buy_sell_actions = [action.replace("-", "_").replace(" ", "_") for action in buy_sell_input_str.split(',') if action]
-                    
                     keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
                     player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT, "KEYBOARD_ONLY_ACTIONS")
-                    
-                    drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]
-                    eco_actions_list = drop_actions + buy_sell_actions
+                    drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]; eco_actions_list = drop_actions + buy_sell_actions
                     if tick_data.get('is_in_buyzone') == 1: eco_actions_list.append('IN_BUYZONE')
-                    
                     player_input[0]['eco_bitmask'] = get_bitmask_array(eco_actions_list, ECO_TO_BIT, "ECO_ACTIONS")
-                    
                     player_input[0]['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]; player_input[0]['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
                     player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
                     inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX); player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
@@ -171,7 +202,6 @@ def process_round_perspective(task_args):
         for cap in caps.values(): cap.release()
         for aud in auds.values(): aud.close()
         if not results: return
-
         packed_results = pickle.dumps(results)
         if len(packed_results) > RESULT_BUFFER_SIZE:
             raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size. Increase RESULT_BUFFER_SIZE.")
@@ -180,10 +210,10 @@ def process_round_perspective(task_args):
         shm.buf[:len(packed_results)] = packed_results
         shm.close()
         result_q.put((buffer_name, len(packed_results)))
-
     except Exception:
         import traceback
         LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}"); result_q.put(("ERROR", None))
+
 # =============================================================================
 # MAIN DRIVER
 # =============================================================================
@@ -203,7 +233,6 @@ if __name__ == '__main__':
     def define_numpy_dtypes():
         gs_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
         pi_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (6,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
-        # --- FIX: Update assertion to new 384-bit size ---
         assert len(KEYBOARD_TO_BIT) <= 32 and len(ECO_TO_BIT) <= 384 and len(ITEM_TO_INDEX) <= 128
         return gs_dtype, pi_dtype
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
@@ -249,7 +278,7 @@ if __name__ == '__main__':
             pool.map_async(process_round_perspective, tasks)
             for _ in tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives"):
                 result = results_q.get()
-                if result[0] == "ERROR": raise RuntimeError("A worker process encountered a fatal error. Check logs for details.")
+                if result[0] == "ERROR": raise RuntimeError("A worker process encountered a fatal error. Check logs above for details.")
                 result_shm_name, result_size = result
                 try:
                     result_shm = SharedMemory(name=result_shm_name)
