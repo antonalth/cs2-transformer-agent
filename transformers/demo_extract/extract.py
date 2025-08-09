@@ -62,7 +62,7 @@ WEAPON_CATEGORIES = {
     "Glock-18": "SWITCH_2", "USP-S": "SWITCH_2", "P250": "SWITCH_2", "P2000": "SWITCH_2", "Dual Berettas": "SWITCH_2", "Five-SeveN": "SWITCH_2", "Tec-9": "SWITCH_2", "CZ75-Auto": "SWITCH_2", "R8 Revolver": "SWITCH_2",
     "knife":"SWITCH_3","knife_ct": "SWITCH_3", "knife_t": "SWITCH_3", "Bayonet": "SWITCH_3", "Flip Knife": "SWITCH_3", "Gut Knife": "SWITCH_3", "Karambit": "SWITCH_3", "M9 Bayonet": "SWITCH_3", "Huntsman Knife": "SWITCH_3", "Falchion Knife": "SWITCH_3", "Bowie Knife": "SWITCH_3", "Butterfly Knife": "SWITCH_3", "Shadow Daggers": "SWITCH_3", "Ursus Knife": "SWITCH_3", "Navaja Knife": "SWITCH_3", "Stiletto Knife": "SWITCH_3", "Talon Knife": "SWITCH_3", "Classic Knife": "SWITCH_3", "Paracord Knife": "SWITCH_3", "Survival Knife": "SWITCH_3", "Nomad Knife": "SWITCH_3", "Skeleton Knife": "SWITCH_3",
     "High Explosive Grenade": "SWITCH_4", "Flashbang": "SWITCH_4", "Smoke Grenade": "SWITCH_4", "Molotov": "SWITCH_4", "Incendiary Grenade": "SWITCH_4", "Decoy Grenade": "SWITCH_4",
-    "C4 Explosive": "SWITCH_5", "Defuse Kit": "SWITCH_5", "Zeus x27": "SWITCH_3",
+    "C4 Explosive": "SWITCH_5", "Defuse Kit": "SWITCH_5", "Zeus x27": "SWITCH_3","Desert Eagle":"SWITCH_2"
 }
 KEY_MAPPING = {
     "IN_ATTACK": 1<<0, "IN_JUMP": 1<<1, "IN_DUCK": 1<<2, "IN_FORWARD": 1<<3, "IN_BACK": 1<<4, "IN_USE": 1<<5, "IN_CANCEL": 1<<6, "IN_TURNLEFT": 1<<7, "IN_TURNRIGHT": 1<<8, "IN_MOVELEFT": 1<<9, "IN_MOVERIGHT": 1<<10, "IN_ATTACK2": 1<<11, "IN_RELOAD": 1<<13, "IN_ALT1": 1<<14, "IN_ALT2": 1<<15, "IN_SPEED": 1<<16, "IN_WALK": 1<<17, "IN_ZOOM": 1<<18, "IN_WEAPON1": 1<<19, "IN_WEAPON2": 1<<20, "IN_BULLRUSH": 1<<21, "IN_GRENADE1": 1<<22, "IN_GRENADE2": 1<<23, "IN_ATTACK3": 1<<24, "IN_SCORE": 1<<33, "IN_INSPECT": 1<<35,
