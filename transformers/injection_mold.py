@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
-for model training. (Robust Multiprocessing Version with Decentralized Writes)
+for model training. (Robust Multiprocessing Version with Decentralized Writes
+and a Global Lock for safe LMDB resizing.)
 """
 
 import argparse
@@ -32,7 +33,6 @@ TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
 AUDIO_SAMPLE_RATE = 44100; AUDIO_CHANNELS = 2; AUDIO_BIT_DEPTH = 2
 AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNELS * AUDIO_BIT_DEPTH
 INITIAL_MAP_SIZE = 20 * 1024**3; MAP_RESIZE_INCREMENT = 5 * 1024**3
-RESULT_BUFFER_SIZE = 3000 * 1024**2
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None; m.patch()
@@ -57,142 +57,131 @@ ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
 # =============================================================================
 worker_data = {}
 
-def merge_tick_data(tick1_data, tick2_data):
-    if not tick1_data: return tick2_data or None
-    if not tick2_data: return tick1_data
-    merged = tick1_data.copy()
-    merged['mouse_x'] = (tick1_data.get('mouse_x') or 0) + (tick2_data.get('mouse_x') or 0)
-    merged['mouse_y'] = (tick1_data.get('mouse_y') or 0) + (tick2_data.get('mouse_y') or 0)
-    merged['position_x'] = ((tick1_data.get('position_x') or 0) + (tick2_data.get('position_x') or 0)) / 2.0
-    merged['position_y'] = ((tick1_data.get('position_y') or 0) + (tick2_data.get('position_y') or 0)) / 2.0
-    merged['position_z'] = ((tick1_data.get('position_z') or 0) + (tick2_data.get('position_z') or 0)) / 2.0
-    kb1 = set(filter(None, (tick1_data.get('keyboard_input') or '').split(','))); kb2 = set(filter(None, (tick2_data.get('keyboard_input') or '').split(',')))
-    merged['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
-    buy1 = set(filter(None, (tick1_data.get('buy_sell_input') or '').split(','))); buy2 = set(filter(None, (tick2_data.get('buy_sell_input') or '').split(',')))
-    merged['buy_sell_input'] = ",".join(sorted(list(buy1.union(buy2))))
-    return merged
+def merge_tick_data(tick1, tick2):
+    if not tick1: return tick2 or None
+    if not tick2: return tick1
+    m = tick1.copy()
+    m['mouse_x']=(tick1.get('mouse_x')or 0)+(tick2.get('mouse_x')or 0); m['mouse_y']=(tick1.get('mouse_y')or 0)+(tick2.get('mouse_y')or 0)
+    m['position_x']=((tick1.get('position_x')or 0)+(tick2.get('position_x')or 0))/2.0; m['position_y']=((tick1.get('position_y')or 0)+(tick2.get('position_y')or 0))/2.0; m['position_z']=((tick1.get('position_z')or 0)+(tick2.get('position_z')or 0))/2.0
+    kb1=set(filter(None,(tick1.get('keyboard_input')or'').split(','))); kb2=set(filter(None,(tick2.get('keyboard_input')or'').split(','))); m['keyboard_input']=",".join(sorted(list(kb1.union(kb2))))
+    b1=set(filter(None,(tick1.get('buy_sell_input')or'').split(','))); b2=set(filter(None,(tick2.get('buy_sell_input')or'').split(','))); m['buy_sell_input']=",".join(sorted(list(b1.union(b2))))
+    return m
 
-def get_bitmask(actions, mapping, mapping_name):
-    mask = 0
+def get_bitmask(actions, mapping, name):
+    mask=0
     if not actions: return mask
-    for action in actions:
-        if action not in mapping: raise ValueError(f"Unknown action '{action}' in '{mapping_name}'")
-        mask |= (1 << mapping[action])
+    for a in actions:
+        if a not in mapping: raise ValueError(f"Unknown action '{a}' in '{name}'")
+        mask|=(1<<mapping[a])
     return mask
 
-def get_bitmask_array(actions, mapping, mapping_name):
-    mask = np.zeros(6, dtype=np.uint64)
+def get_bitmask_array(actions, mapping, name):
+    mask=np.zeros(6,dtype=np.uint64)
     if not actions: return mask
-    for action in actions:
-        if action not in mapping: raise ValueError(f"Unknown action '{action}' in '{mapping_name}'")
-        bit_pos, idx, pos_in_idx = mapping[action], mapping[action] // 64, mapping[action] % 64
-        if idx < 6: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
+    for a in actions:
+        if a not in mapping: raise ValueError(f"Unknown action '{a}' in '{name}'")
+        bp,idx,pi=mapping[a],mapping[a]//64,mapping[a]%64
+        if idx<6:mask[idx]|=(np.uint64(1)<<np.uint64(pi))
     return mask
 
-def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
-    inventory_mask, active_weapon_mask = np.zeros(2, dtype=np.uint64), np.zeros(2, dtype=np.uint64)
-    def set_bit(mask, item_name):
-        if not isinstance(item_name, str): return
-        bit_pos = mapping.get(item_name)
-        if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()): bit_pos = mapping.get("Knife")
-        if bit_pos is None: raise ValueError(f"Unknown item '{item_name}'")
-        idx, pos_in_idx = bit_pos // 64, bit_pos % 64
-        if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
-    if active_weapon: set_bit(active_weapon_mask, active_weapon)
+def get_inventory_bitmasks(inv_json, weapon, mapping):
+    im,wm=np.zeros(2,dtype=np.uint64),np.zeros(2,dtype=np.uint64)
+    def set_bit(m, item):
+        if not isinstance(item,str): return
+        bp=mapping.get(item)
+        if bp is None and("knife"in item.lower()or"bayonet"in item.lower()):bp=mapping.get("Knife")
+        if bp is None: raise ValueError(f"Unknown item '{item}'")
+        idx,pi=bp//64,bp%64
+        if idx<2:m[idx]|=(np.uint64(1)<<np.uint64(pi))
+    if weapon:set_bit(wm,weapon)
     try:
-        for item in json.loads(inventory_json) if inventory_json else []: set_bit(inventory_mask, item)
-    except (json.JSONDecodeError, TypeError): pass
-    return inventory_mask, active_weapon_mask
+        for item in json.loads(inv_json)if inv_json else[]:set_bit(im,item)
+    except(json.JSONDecodeError,TypeError):pass
+    return im,wm
 
-def init_worker(shm_cache_name, shm_cache_size, lmdb_path, gs_dtype, pi_dtype, rounds_info, recordings_map):
+def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map):
     m.patch()
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
     shm.close()
     worker_data['player_data_cache'] = pickle.loads(packed_cache_copy)
-    # --- NEW: Each worker opens its own LMDB handle ---
-    worker_data['lmdb_env'] = lmdb.open(str(lmdb_path), map_size=INITIAL_MAP_SIZE, writemap=True, map_async=True)
+    worker_data['lmdb_path'] = lmdb_path
+    worker_data['lock'] = lock
     worker_data['gs_dtype'], worker_data['pi_dtype'] = gs_dtype, pi_dtype
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
 
 def process_round_perspective(task_args):
+    caps, auds = {}, {}
     try:
         round_num, team, demoname = task_args
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
-        player_data_cache, env = worker_data['player_data_cache'], worker_data['lmdb_env']
+        player_data_cache, lock, lmdb_path = worker_data['player_data_cache'], worker_data['lock'], worker_data['lmdb_path']
         round_data = recordings_map[(round_num, team)]
         if len(round_data) != 5: return task_args
-        t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]; ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
-        current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
-        caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in round_data}
-        auds = {rec['playername']: open(rec['wav_path'], 'rb') for rec in round_data}
-        for aud_file in auds.values(): aud_file.seek(44)
-        round_start_tick, round_end_tick = rounds_info[round_num]['starttick'], max(rec['stoptick'] for rec in round_data)
-        results = []
-        for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
-            # (Core processing logic remains identical)
-            team_deaths = {p[0]:p[1] for p in json.loads(rounds_info[round_num][f"{team.lower()}_team"])}; enemy_deaths = {p[0]:p[1] for p in json.loads(rounds_info[round_num][f"{'ct' if team=='T' else 't'}_team"])}
-            team_alive = sum(1<<i for i,n in enumerate(current_roster) if team_deaths.get(n,0)==-1 or current_tick<team_deaths.get(n,0))
-            enemy_alive = sum(1<<i for i,n in enumerate(enemy_roster) if enemy_deaths.get(n,0)==-1 or current_tick<enemy_deaths.get(n,0))
-            gs = np.zeros(1,dtype=gs_dtype); gs[0]['tick']=current_tick; gs[0]['team_alive'],gs[0]['enemy_alive']=team_alive,enemy_alive
-            rs_mask=0;
-            if rounds_info[round_num].get('freezetime_endtick') is not None and current_tick<rounds_info[round_num]['freezetime_endtick']: rs_mask|=(1<<0)
-            if rounds_info[round_num].get('starttick') is not None and rounds_info[round_num].get('endtick') is not None and current_tick>=rounds_info[round_num]['starttick'] and current_tick<=rounds_info[round_num]['endtick']: rs_mask|=(1<<1)
-            if rounds_info[round_num].get('bomb_planted_tick',-1)!=-1 and current_tick>=rounds_info[round_num]['bomb_planted_tick']: rs_mask|=(1<<2)
+        t_roster=[p[0]for p in json.loads(rounds_info[round_num]['t_team'])];ct_roster=[p[0]for p in json.loads(rounds_info[round_num]['ct_team'])]
+        current_roster=t_roster if team=='T'else ct_roster;enemy_roster=ct_roster if team=='T'else t_roster
+        caps={rec['playername']:cv2.VideoCapture(str(rec['mp4_path']))for rec in round_data}
+        auds={rec['playername']:open(rec['wav_path'],'rb')for rec in round_data}
+        for aud in auds.values():aud.seek(44)
+        start_tick,end_tick=rounds_info[round_num]['starttick'],max(rec['stoptick']for rec in round_data)
+        results=[]
+        for tick in range(start_tick,end_tick+1,TICKS_PER_FRAME):
+            team_deaths={p[0]:p[1]for p in json.loads(rounds_info[round_num][f"{team.lower()}_team"])};enemy_deaths={p[0]:p[1]for p in json.loads(rounds_info[round_num][f"{'ct'if team=='T'else't'}_team"])}
+            team_alive=sum(1<<i for i,n in enumerate(current_roster)if team_deaths.get(n,0)==-1 or tick<team_deaths.get(n,0))
+            enemy_alive=sum(1<<i for i,n in enumerate(enemy_roster)if enemy_deaths.get(n,0)==-1 or tick<enemy_deaths.get(n,0))
+            gs=np.zeros(1,dtype=gs_dtype);gs[0]['tick']=tick;gs[0]['team_alive'],gs[0]['enemy_alive']=team_alive,enemy_alive
+            rs_mask=0
+            if rounds_info[round_num].get('freezetime_endtick')is not None and tick<rounds_info[round_num]['freezetime_endtick']:rs_mask|=(1<<0)
+            if rounds_info[round_num].get('starttick')is not None and rounds_info[round_num].get('endtick')is not None and tick>=rounds_info[round_num]['starttick']and tick<=rounds_info[round_num]['endtick']:rs_mask|=(1<<1)
+            if rounds_info[round_num].get('bomb_planted_tick',-1)!=-1 and tick>=rounds_info[round_num]['bomb_planted_tick']:rs_mask|=(1<<2)
             gs[0]['round_state']=rs_mask
             for i,name in enumerate(enemy_roster):
                 if(enemy_alive>>i)&1:
-                    t1=player_data_cache.get(f"{name}:{current_tick}"); t2=player_data_cache.get(f"{name}:{current_tick+1}")
-                    ed=merge_tick_data(t1,t2);
-                    if ed: gs[0]['enemy_pos'][i]=[ed['position_x'],ed['position_y'],ed['position_z']]
+                    lk=f"{name}:{tick}";t1=player_data_cache.get(lk);t2=player_data_cache.get(f"{name}:{tick+1}");ed=merge_tick_data(t1,t2)
+                    if ed:gs[0]['enemy_pos'][i]=[ed['position_x'],ed['position_y'],ed['position_z']]
             pdl=[]
             for rec in round_data:
                 pn=rec['playername']
-                try: p_idx=current_roster.index(pn)
-                except ValueError: continue
+                try:p_idx=current_roster.index(pn)
+                except ValueError:continue
                 is_alive=(team_alive>>p_idx)&1
-                if not is_alive or current_tick>=rec['stoptick']: continue
-                ret,frame=caps[pn].read(); audio=auds[pn].read(AUDIO_BYTES_PER_FRAME)
-                if not ret or len(audio)<AUDIO_BYTES_PER_FRAME: continue
-                jpg=cv2.imencode('.jpg',frame)[1].tobytes(); lk=f"{pn}:{current_tick}"; td=merge_tick_data(player_data_cache.get(lk),player_data_cache.get(f"{pn}:{current_tick+1}")); pi=np.zeros(1,dtype=pi_dtype)
+                if not is_alive or tick>=rec['stoptick']:continue
+                ret,frame=caps[pn].read();audio=auds[pn].read(AUDIO_BYTES_PER_FRAME)
+                if not ret or len(audio)<AUDIO_BYTES_PER_FRAME:continue
+                jpg=cv2.imencode('.jpg',frame)[1].tobytes();lk=f"{pn}:{tick}";td=merge_tick_data(player_data_cache.get(lk),player_data_cache.get(f"{pn}:{tick+1}"));pi=np.zeros(1,dtype=pi_dtype)
                 if td:
                     kb,bs=td.get('keyboard_input','')or'',td.get('buy_sell_input','')or''
-                    akb=[a.replace("-","_").replace(" ","_") for a in kb.split(',') if a]; bs_a=[a.replace("-","_").replace(" ","_") for a in bs.split(',') if a]
-                    k_a=[a for a in akb if not a.startswith('DROP_')]; pi[0]['keyboard_bitmask']=get_bitmask(k_a,KEYBOARD_TO_BIT,"KEYBOARD_ONLY_ACTIONS")
-                    d_a=[a for a in akb if a.startswith('DROP_')]; e_a=d_a+bs_a
+                    akb=[a.replace("-","_").replace(" ","_") for a in kb.split(',')if a];bs_a=[a.replace("-","_").replace(" ","_")for a in bs.split(',')if a]
+                    k_a=[a for a in akb if not a.startswith('DROP_')];pi[0]['keyboard_bitmask']=get_bitmask(k_a,KEYBOARD_TO_BIT,"KEYBOARD_ONLY_ACTIONS")
+                    d_a=[a for a in akb if a.startswith('DROP_')];e_a=d_a+bs_a
                     if td.get('is_in_buyzone')==1:e_a.append('IN_BUYZONE')
                     pi[0]['eco_bitmask']=get_bitmask_array(e_a,ECO_TO_BIT,"ECO_ACTIONS")
-                    pi[0]['pos']=[td.get('position_x',0),td.get('position_y',0),td.get('position_z',0)]; pi[0]['mouse']=[td.get('mouse_x',0),td.get('mouse_y',0)]
+                    pi[0]['pos']=[td.get('position_x',0),td.get('position_y',0),td.get('position_z',0)];pi[0]['mouse']=[td.get('mouse_x',0),td.get('mouse_y',0)]
                     pi[0]['health'],pi[0]['armor'],pi[0]['money']=td.get('health',0),td.get('armor',0),td.get('money',0)
-                    im,wm=get_inventory_bitmasks(td.get('inventory'),td.get('active_weapon'),ITEM_TO_INDEX); pi[0]['inventory_bitmask'],pi[0]['active_weapon_bitmask']=im,wm
+                    im,wm=get_inventory_bitmasks(td.get('inventory'),td.get('active_weapon'),ITEM_TO_INDEX);pi[0]['inventory_bitmask'],pi[0]['active_weapon_bitmask']=im,wm
                 pdl.append((pi,jpg,audio))
-            if not pdl: continue
-            key=f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
-            payload=msgpack.packb({"game_state":gs,"player_data":pdl},use_bin_type=True); results.append((key,payload))
-
+            if not pdl:continue
+            key=f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode('utf-8')
+            payload=msgpack.packb({"game_state":gs,"player_data":pdl},use_bin_type=True);results.append((key,payload))
         if not results: return task_args
         
-        # --- NEW: Decentralized write-and-retry loop ---
-        while True:
+        # --- NEW: Use global lock for all LMDB interactions ---
+        with lock:
+            env = None
             try:
+                env = lmdb.open(str(lmdb_path), map_size=INITIAL_MAP_SIZE, writemap=True)
                 with env.begin(write=True) as txn:
-                    # Check for resize *after* acquiring the lock
                     batch_size = sum(len(payload) for _, payload in results)
                     info = env.info(); stats = env.stat()
                     available = info['map_size'] - (info['last_pgno'] * stats['psize'])
                     if available < batch_size:
                         new_size = info['map_size'] + max(batch_size, MAP_RESIZE_INCREMENT)
                         env.set_mapsize(new_size)
-                    
-                    # Use putmulti for efficient bulk writing
-                    cursor = txn.cursor()
-                    cursor.putmulti(results)
-                break # Exit loop on success
-            except lmdb.LockError:
-                # Another worker has the write lock, wait and retry
-                time.sleep(random.uniform(0.05, 0.2))
-                continue
+                    cursor = txn.cursor(); cursor.putmulti(results)
+            finally:
+                if env: env.close()
+        
         return task_args
     except Exception as e:
         import traceback
@@ -208,23 +197,20 @@ def process_round_perspective(task_args):
 if __name__ == '__main__':
     try: mp.set_start_method('spawn')
     except RuntimeError: pass
-
-    # (Setup functions like TqdmLoggingHandler, setup_logging, signal_handler, define_numpy_dtypes are unchanged)
     class TqdmLoggingHandler(logging.Handler):
         def emit(self, record):
             try: msg = self.format(record); tqdm.write(msg, file=sys.stderr); self.flush()
             except Exception: self.handleError(record)
     def setup_logging(debug=False):
-        level = logging.DEBUG if debug else logging.INFO; log = logging.getLogger(); log.setLevel(level)
-        if log.hasHandlers(): log.handlers.clear()
-        handler = TqdmLoggingHandler(); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'); handler.setFormatter(formatter); log.addHandler(handler)
+        level=logging.DEBUG if debug else logging.INFO; log=logging.getLogger(); log.setLevel(level)
+        if log.hasHandlers():log.handlers.clear()
+        handler=TqdmLoggingHandler();formatter=logging.Formatter('%(asctime)s-%(name)s-%(levelname)s-%(message)s');handler.setFormatter(formatter);log.addHandler(handler)
     def signal_handler(sig, frame): LOG.warning("Interruption detected..."); os._exit(1)
     def define_numpy_dtypes():
-        gs_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
-        pi_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (6,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
-        assert len(KEYBOARD_TO_BIT) <= 32 and len(ECO_TO_BIT) <= 384 and len(ITEM_TO_INDEX) <= 128
-        return gs_dtype, pi_dtype
-    
+        gs_dtype=np.dtype([('tick',np.int32),('round_state',np.uint8),('team_alive',np.uint8),('enemy_alive',np.uint8),('enemy_pos',np.float32,(5,3))])
+        pi_dtype=np.dtype([('pos',np.float32,(3,)),('mouse',np.float32,(2,)),('health',np.uint8),('armor',np.uint8),('money',np.int32),('keyboard_bitmask',np.uint32),('eco_bitmask',np.uint64,(6,)),('inventory_bitmask',np.uint64,(2,)),('active_weapon_bitmask',np.uint64,(2,))])
+        assert len(KEYBOARD_TO_BIT)<=32 and len(ECO_TO_BIT)<=384 and len(ITEM_TO_INDEX)<=128
+        return gs_dtype,pi_dtype
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
@@ -240,31 +226,33 @@ if __name__ == '__main__':
     recordings_map = {}
     db_recordings = conn.execute("SELECT * FROM RECORDING ORDER BY roundnumber, team, playername").fetchall()
     for rec in db_recordings:
-        rec = dict(rec); round_num, team = rec['roundnumber'], rec['team']
+        rec=dict(rec); round_num,team=rec['roundnumber'],rec['team']
         if round_num not in rounds_info or rounds_info[round_num].get('starttick') is None: continue
         if not rec['is_recorded'] and not args.overridesql: LOG.critical(f"Rec for {rec['playername']} in round {round_num} not recorded."); sys.exit(1)
-        fname = f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
-        mp4_path, wav_path = args.recdir / f"{fname}.mp4", args.recdir / f"{fname}.wav"
-        if not mp4_path.exists() or not wav_path.exists(): LOG.critical(f"Media not found for {fname}"); sys.exit(1)
-        rec['mp4_path'], rec['wav_path'] = mp4_path, wav_path; key = (round_num, team)
-        if key not in recordings_map: recordings_map[key] = []
+        fname=f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
+        mp4,wav=args.recdir/f"{fname}.mp4",args.recdir/f"{fname}.wav"
+        if not mp4.exists()or not wav.exists():LOG.critical(f"Media not found for {fname}");sys.exit(1)
+        rec['mp4_path'],rec['wav_path']=mp4,wav;key=(round_num,team)
+        if key not in recordings_map:recordings_map[key]=[]
         recordings_map[key].append(rec)
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
     
     LOG.info("   - Caching player data into shared memory...")
-    player_data_cache = { f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall() }; conn.close()
-    packed_cache = pickle.dumps(player_data_cache)
-    shm_cache = SharedMemory(create=True, size=len(packed_cache)); shm_cache.buf[:len(packed_cache)] = packed_cache
+    player_data_cache={f"{r['playername']}:{r['tick']}":dict(r)for r in conn.execute("SELECT * FROM player").fetchall()};conn.close()
+    packed_cache=pickle.dumps(player_data_cache)
+    shm_cache=SharedMemory(create=True,size=len(packed_cache));shm_cache.buf[:len(packed_cache)]=packed_cache
     LOG.info(f"   - Player data cache ({len(packed_cache)/(1024**2):.2f} MB) created in shared memory.")
-    gs_dtype, pi_dtype = define_numpy_dtypes()
+    gs_dtype,pi_dtype=define_numpy_dtypes()
     
-    # Main process creates the LMDB file but doesn't hold a persistent handle
-    env = lmdb.open(str(args.outlmdb), map_size=INITIAL_MAP_SIZE, writemap=True); env.close()
+    env=lmdb.open(str(args.outlmdb),map_size=INITIAL_MAP_SIZE,writemap=True);env.close()
     
-    demoname = args.recdir.name; tasks = [(r, t, demoname) for r, t in sorted(recordings_map.keys())]
+    demoname=args.recdir.name;tasks=[(r,t,demoname)for r,t in sorted(recordings_map.keys())]
     
     LOG.info(f"-> Phase 2: Processing rounds with {args.workers} worker processes...")
-    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, gs_dtype, pi_dtype, rounds_info, recordings_map)
+    
+    # --- NEW: Create a global lock for workers ---
+    lock = mp.Lock()
+    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, lock, gs_dtype, pi_dtype, rounds_info, recordings_map)
     
     try:
         with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
