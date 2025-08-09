@@ -59,57 +59,32 @@ ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
 worker_data = {}
 
 def merge_tick_data(tick1_data, tick2_data):
-    """Merges data from two consecutive ticks into a single representative record."""
-    if not tick1_data:
-        return tick2_data or None # Return tick2 if it exists, otherwise None
-    if not tick2_data:
-        return tick1_data
-
-    # Start with the first tick's data as the base for stateful info
+    if not tick1_data: return tick2_data or None
+    if not tick2_data: return tick1_data
     merged_data = tick1_data.copy()
-
-    # --- FIX: Use a more robust pattern to handle cases where the value is None ---
-    # The `or 0` ensures that if .get() returns None, it is replaced by 0 before the operation.
-    
-    # Sum mouse inputs
-    mx1 = tick1_data.get('mouse_x') or 0
-    mx2 = tick2_data.get('mouse_x') or 0
+    mx1, mx2 = tick1_data.get('mouse_x') or 0, tick2_data.get('mouse_x') or 0
     merged_data['mouse_x'] = mx1 + mx2
-    
-    my1 = tick1_data.get('mouse_y') or 0
-    my2 = tick2_data.get('mouse_y') or 0
+    my1, my2 = tick1_data.get('mouse_y') or 0, tick2_data.get('mouse_y') or 0
     merged_data['mouse_y'] = my1 + my2
-
-    # Average positions
-    px1 = tick1_data.get('position_x') or 0
-    px2 = tick2_data.get('position_x') or 0
+    px1, px2 = tick1_data.get('position_x') or 0, tick2_data.get('position_x') or 0
     merged_data['position_x'] = (px1 + px2) / 2.0
-
-    py1 = tick1_data.get('position_y') or 0
-    py2 = tick2_data.get('position_y') or 0
+    py1, py2 = tick1_data.get('position_y') or 0, tick2_data.get('position_y') or 0
     merged_data['position_y'] = (py1 + py2) / 2.0
-    
-    pz1 = tick1_data.get('position_z') or 0
-    pz2 = tick2_data.get('position_z') or 0
+    pz1, pz2 = tick1_data.get('position_z') or 0, tick2_data.get('position_z') or 0
     merged_data['position_z'] = (pz1 + pz2) / 2.0
-
-    # Combine unique keyboard inputs
     kb1 = set(filter(None, (tick1_data.get('keyboard_input') or '').split(',')))
     kb2 = set(filter(None, (tick2_data.get('keyboard_input') or '').split(',')))
     merged_data['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
-
-    # Combine unique buy/sell inputs
     buy1 = set(filter(None, (tick1_data.get('buy_sell_input') or '').split(',')))
     buy2 = set(filter(None, (tick2_data.get('buy_sell_input') or '').split(',')))
     merged_data['buy_sell_input'] = ",".join(sorted(list(buy1.union(buy2))))
-
     return merged_data
 
 def get_bitmask(actions, mapping, mapping_name):
     mask = 0
     if not actions: return mask
     for action in actions:
-        if action not in mapping: raise ValueError(f"\n\nFATAL: Unknown action '{action}' not found in '{mapping_name}' list.\n")
+        if action not in mapping: raise ValueError(f"\nFATAL: Unknown action '{action}' not in '{mapping_name}' list.\n")
         mask |= (1 << mapping[action])
     return mask
 
@@ -117,7 +92,7 @@ def get_bitmask_array(actions, mapping, mapping_name):
     mask = np.zeros(6, dtype=np.uint64)
     if not actions: return mask
     for action in actions:
-        if action not in mapping: raise ValueError(f"\n\nFATAL: Unknown action '{action}' not found in '{mapping_name}' list.\n")
+        if action not in mapping: raise ValueError(f"\nFATAL: Unknown action '{action}' not in '{mapping_name}' list.\n")
         bit_pos = mapping[action]
         idx, pos_in_idx = bit_pos // 64, bit_pos % 64
         if idx < 6: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
@@ -129,7 +104,7 @@ def get_inventory_bitmasks(inventory_json, active_weapon, mapping):
         if not isinstance(item_name, str): return
         bit_pos = mapping.get(item_name)
         if bit_pos is None and ("knife" in item_name.lower() or "bayonet" in item_name.lower()): bit_pos = mapping.get("Knife")
-        if bit_pos is None: raise ValueError(f"\n\nFATAL: Unknown item name '{item_name}'. Please add it to the ITEM_NAMES list.\n")
+        if bit_pos is None: raise ValueError(f"\nFATAL: Unknown item '{item_name}'. Add to ITEM_NAMES list.\n")
         idx, pos_in_idx = bit_pos // 64, bit_pos % 64
         if idx < 2: mask[idx] |= (np.uint64(1) << np.uint64(pos_in_idx))
     if active_weapon: set_bit(active_weapon_mask, active_weapon)
@@ -150,7 +125,7 @@ def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_d
 
 def process_round_perspective(task_args):
     try:
-        round_num, team, demoname = task_args
+        round_num, team, demoname, quality, block_rects = task_args # <-- UNPACK NEW ARGS
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
         player_data_cache, free_q, result_q = worker_data['player_data_cache'], worker_data['free_q'], worker_data['result_q']
@@ -175,12 +150,9 @@ def process_round_perspective(task_args):
             game_state[0]['round_state'] = rs_mask
             for i, name in enumerate(enemy_roster):
                 if (enemy_alive_mask >> i) & 1:
-                    # --- FIX: Fetch and merge both ticks for enemies ---
-                    tick1_data = player_data_cache.get(f"{name}:{current_tick}")
-                    tick2_data = player_data_cache.get(f"{name}:{current_tick + 1}")
+                    tick1_data = player_data_cache.get(f"{name}:{current_tick}"); tick2_data = player_data_cache.get(f"{name}:{current_tick + 1}")
                     e_data = merge_tick_data(tick1_data, tick2_data)
-                    if e_data:
-                        game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
+                    if e_data: game_state[0]['enemy_pos'][i] = [e_data['position_x'], e_data['position_y'], e_data['position_z']]
             player_data_list = []
             for rec in round_data:
                 playername = rec['playername']
@@ -190,13 +162,18 @@ def process_round_perspective(task_args):
                 if not is_alive or current_tick >= rec['stoptick']: continue
                 ret, frame = caps[playername].read(); audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
                 if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME: continue
-                jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes()
                 
-                # --- FIX: Fetch and merge both ticks for the current player ---
-                tick1_data = player_data_cache.get(f"{playername}:{current_tick}")
-                tick2_data = player_data_cache.get(f"{playername}:{current_tick + 1}")
+                # --- NEW: Apply blackout rectangles before encoding ---
+                if block_rects:
+                    for x1, y1, x2, y2 in block_rects:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
+
+                # --- NEW: Use quality parameter for JPEG encoding ---
+                encode_param = [cv2.IMWRITE_JPEG_QUALITY, quality]
+                jpeg_bytes = cv2.imencode('.jpg', frame, encode_param)[1].tobytes()
+                
+                tick1_data = player_data_cache.get(f"{playername}:{current_tick}"); tick2_data = player_data_cache.get(f"{playername}:{current_tick + 1}")
                 tick_data = merge_tick_data(tick1_data, tick2_data)
-                
                 player_input = np.zeros(1, dtype=pi_dtype)
                 if tick_data:
                     kb_input_str = tick_data.get('keyboard_input', '') or ''; buy_sell_input_str = tick_data.get('buy_sell_input', '') or ''
@@ -220,11 +197,9 @@ def process_round_perspective(task_args):
         if not results: return
         packed_results = pickle.dumps(results)
         if len(packed_results) > RESULT_BUFFER_SIZE:
-            raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size. Increase RESULT_BUFFER_SIZE.")
+            raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size.")
         buffer_name = free_q.get()
-        shm = SharedMemory(name=buffer_name)
-        shm.buf[:len(packed_results)] = packed_results
-        shm.close()
+        shm = SharedMemory(name=buffer_name); shm.buf[:len(packed_results)] = packed_results; shm.close()
         result_q.put((buffer_name, len(packed_results)))
     except Exception:
         import traceback
@@ -254,11 +229,36 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--workers", type=int, default=os.cpu_count()); parser.add_argument("--buffers", type=int, default=8); args = parser.parse_args()
+    parser.add_argument("--workers", type=int, default=os.cpu_count()); parser.add_argument("--buffers", type=int, default=8)
+    # --- NEW: Add quality and blockfile arguments ---
+    parser.add_argument("--quality", type=int, default=80, help="JPEG quality for frame encoding (0-100, default: 80).")
+    parser.add_argument("--blockfile", type=Path, default=None, help="Path to a .txt file with blackout coordinates (minX,minY,maxX,maxY per line).")
+    args = parser.parse_args()
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path exists. Use --overwrite."); sys.exit(1)
+    
+    # --- NEW: Parse the blockfile ---
+    block_rects = []
+    if args.blockfile:
+        if not args.blockfile.is_file():
+            LOG.critical(f"Blockfile not found at: {args.blockfile}"); sys.exit(1)
+        LOG.info(f"   - Loading blackout regions from {args.blockfile}")
+        with open(args.blockfile, 'r') as f:
+            for line in f:
+                try:
+                    line = line.strip()
+                    if not line or line.startswith('#'): continue
+                    coords = [int(c.strip()) for c in line.split(',')]
+                    if len(coords) == 4:
+                        block_rects.append(tuple(coords))
+                    else:
+                        LOG.warning(f"Skipping malformed line in blockfile: {line}")
+                except ValueError:
+                    LOG.warning(f"Skipping non-integer line in blockfile: {line}")
+        LOG.info(f"   - Loaded {len(block_rects)} blackout regions.")
+
     LOG.info("-> Phase 1: Validating database and loading metadata...")
     conn = sqlite3.connect(f"file:{args.dbfile}?mode=ro", uri=True); conn.row_factory = sqlite3.Row
     rounds_info = {r['round']: dict(r) for r in conn.execute("SELECT * FROM rounds").fetchall()}; LOG.info(f"   - Loaded info for {len(rounds_info)} rounds.")
@@ -282,10 +282,13 @@ if __name__ == '__main__':
     shm_cache = SharedMemory(create=True, size=len(packed_cache)); shm_cache.buf[:len(packed_cache)] = packed_cache
     LOG.info(f"   - Player data cache ({len(packed_cache)/(1024**2):.2f} MB) created in shared memory.")
     gs_dtype, pi_dtype = define_numpy_dtypes(); env = lmdb.open(str(args.outlmdb), map_size=INITIAL_MAP_SIZE, writemap=True)
-    demoname = args.recdir.name; tasks = [(r, t, demoname) for r, t in sorted(recordings_map.keys())]
+    demoname = args.recdir.name
+    
+    # --- NEW: Pass quality and block_rects to workers ---
+    tasks = [(r, t, demoname, args.quality, block_rects) for r, t in sorted(recordings_map.keys())]
+    
     LOG.info(f"-> Phase 2: Processing rounds with {args.workers} workers and {args.buffers} buffers...")
-    manager = mp.Manager()
-    free_buffers_q = manager.Queue(); results_q = manager.Queue()
+    manager = mp.Manager(); free_buffers_q = manager.Queue(); results_q = manager.Queue()
     num_buffers = args.buffers; buffer_pool = [SharedMemory(create=True, size=RESULT_BUFFER_SIZE) for _ in range(num_buffers)]
     for buf in buffer_pool: free_buffers_q.put(buf.name)
     initargs = (shm_cache.name, len(packed_cache), free_buffers_q, results_q, gs_dtype, pi_dtype, rounds_info, recordings_map)
@@ -294,7 +297,7 @@ if __name__ == '__main__':
             pool.map_async(process_round_perspective, tasks)
             for _ in tqdm(range(len(tasks)), desc="Processing Round/Team Perspectives"):
                 result = results_q.get()
-                if result[0] == "ERROR": raise RuntimeError("A worker process encountered a fatal error. Check logs above for details.")
+                if result[0] == "ERROR": raise RuntimeError("A worker process encountered a fatal error. Check logs for details.")
                 result_shm_name, result_size = result
                 try:
                     result_shm = SharedMemory(name=result_shm_name)
