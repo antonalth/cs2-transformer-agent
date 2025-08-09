@@ -102,7 +102,6 @@ def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_d
     worker_data['free_q'], worker_data['result_q'] = free_q, result_q
     worker_data['gs_dtype'], worker_data['pi_dtype'] = gs_dtype, pi_dtype
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
-
 def process_round_perspective(task_args):
     try:
         round_num, team, demoname = task_args
@@ -148,9 +147,9 @@ def process_round_perspective(task_args):
                 if tick_data:
                     kb_input_str = tick_data.get('keyboard_input', '') or ''; buy_sell_input_str = tick_data.get('buy_sell_input', '') or ''
                     
-                    # --- FIX: Filter out empty strings after splitting to prevent errors ---
-                    all_kb_actions = [action for action in kb_input_str.split(',') if action]
-                    buy_sell_actions = [action for action in buy_sell_input_str.split(',') if action]
+                    # --- FIX: Sanitize all input strings to replace hyphens/spaces with underscores to match the canonical ECO_ACTIONS list ---
+                    all_kb_actions = [action.replace("-", "_").replace(" ", "_") for action in kb_input_str.split(',') if action]
+                    buy_sell_actions = [action.replace("-", "_").replace(" ", "_") for action in buy_sell_input_str.split(',') if action]
                     
                     keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
                     player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT, "KEYBOARD_ONLY_ACTIONS")
