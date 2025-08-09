@@ -215,7 +215,7 @@ def process_round_perspective(task_args):
                 centerX, centerY = w // 2, h // 2
                 crosshair_color = (0, 255, 0)  # Green in BGR format
                 crosshair_size = 15
-                line_thickness = 4
+                line_thickness = 2
 
                 # Horizontal line
                 cv2.line(frame, (centerX - crosshair_size, centerY), (centerX + crosshair_size, centerY), crosshair_color, line_thickness)
