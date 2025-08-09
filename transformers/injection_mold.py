@@ -61,30 +61,46 @@ worker_data = {}
 def merge_tick_data(tick1_data, tick2_data):
     """Merges data from two consecutive ticks into a single representative record."""
     if not tick1_data:
-        return None
+        return tick2_data or None # Return tick2 if it exists, otherwise None
     if not tick2_data:
-        return tick1_data # Return the first tick if the second is missing
+        return tick1_data
 
-    # Start with the first tick's data as the base
+    # Start with the first tick's data as the base for stateful info
     merged_data = tick1_data.copy()
 
+    # --- FIX: Use a more robust pattern to handle cases where the value is None ---
+    # The `or 0` ensures that if .get() returns None, it is replaced by 0 before the operation.
+    
     # Sum mouse inputs
-    merged_data['mouse_x'] = tick1_data.get('mouse_x', 0) + tick2_data.get('mouse_x', 0)
-    merged_data['mouse_y'] = tick1_data.get('mouse_y', 0) + tick2_data.get('mouse_y', 0)
+    mx1 = tick1_data.get('mouse_x') or 0
+    mx2 = tick2_data.get('mouse_x') or 0
+    merged_data['mouse_x'] = mx1 + mx2
+    
+    my1 = tick1_data.get('mouse_y') or 0
+    my2 = tick2_data.get('mouse_y') or 0
+    merged_data['mouse_y'] = my1 + my2
 
     # Average positions
-    merged_data['position_x'] = (tick1_data.get('position_x', 0) + tick2_data.get('position_x', 0)) / 2.0
-    merged_data['position_y'] = (tick1_data.get('position_y', 0) + tick2_data.get('position_y', 0)) / 2.0
-    merged_data['position_z'] = (tick1_data.get('position_z', 0) + tick2_data.get('position_z', 0)) / 2.0
+    px1 = tick1_data.get('position_x') or 0
+    px2 = tick2_data.get('position_x') or 0
+    merged_data['position_x'] = (px1 + px2) / 2.0
+
+    py1 = tick1_data.get('position_y') or 0
+    py2 = tick2_data.get('position_y') or 0
+    merged_data['position_y'] = (py1 + py2) / 2.0
+    
+    pz1 = tick1_data.get('position_z') or 0
+    pz2 = tick2_data.get('position_z') or 0
+    merged_data['position_z'] = (pz1 + pz2) / 2.0
 
     # Combine unique keyboard inputs
-    kb1 = set(filter(None, (tick1_data.get('keyboard_input', '') or '').split(',')))
-    kb2 = set(filter(None, (tick2_data.get('keyboard_input', '') or '').split(',')))
+    kb1 = set(filter(None, (tick1_data.get('keyboard_input') or '').split(',')))
+    kb2 = set(filter(None, (tick2_data.get('keyboard_input') or '').split(',')))
     merged_data['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
 
     # Combine unique buy/sell inputs
-    buy1 = set(filter(None, (tick1_data.get('buy_sell_input', '') or '').split(',')))
-    buy2 = set(filter(None, (tick2_data.get('buy_sell_input', '') or '').split(',')))
+    buy1 = set(filter(None, (tick1_data.get('buy_sell_input') or '').split(',')))
+    buy2 = set(filter(None, (tick2_data.get('buy_sell_input') or '').split(',')))
     merged_data['buy_sell_input'] = ",".join(sorted(list(buy1.union(buy2))))
 
     return merged_data
