@@ -35,7 +35,7 @@ HTTP_SERVER_URL = "http://localhost:8080"
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXTRACT_SCRIPT_PATH = SCRIPT_DIR / "demo_extract" / "extract.py"
 RECORD_SCRIPT_PATH = SCRIPT_DIR / "recording" / "record2.py"
-INJECTION_MOLD_SCRIPT_PATH = SCRIPT_DIR / "transformers" / "injection_mold.py"
+INJECTION_MOLD_SCRIPT_PATH = SCRIPT_DIR / "to_lmdb" / "injection_mold.py"
 
 
 def run_subprocess(command_list, worker_prefix):
