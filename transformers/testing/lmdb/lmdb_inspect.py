@@ -84,8 +84,7 @@ def decode_bitmask_array(mask_array, reverse_map):
         for j in range(64):
             if (sub_mask >> j) & 1:
                 global_bit_pos = i * 64 + j
-                if global_bit_pos in reverse_map:
-                    actions.append(reverse_map[global_bit_pos])
+                if global_bit_pos in reverse_map: actions.append(reverse_map[global_bit_pos])
     return ", ".join(actions) if actions else "None"
 
 def play_audio(audio_chunk, blocking=False):
@@ -156,6 +155,45 @@ def debug_interactive_search(env):
     except KeyboardInterrupt: print("\nExiting interactive search.")
     finally: os.system('cls' if os.name == 'nt' else 'clear'); sys.exit(0)
 
+def print_detailed_info(key_str, game_state, player_input):
+    """Prints a comprehensive, decoded breakdown of the current frame's data to the console."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("="*80)
+    print(f"DISPLAYING DATA FOR: {key_str}")
+    print("="*80)
+    
+    # Game State Info
+    print("\n--- GLOBAL GAME STATE ---")
+    round_state_flags = []
+    if (game_state['round_state'] >> 0) & 1: round_state_flags.append("Freezetime")
+    if (game_state['round_state'] >> 1) & 1: round_state_flags.append("In Round")
+    if (game_state['round_state'] >> 2) & 1: round_state_flags.append("Bomb Planted")
+    print(f"  Tick: {game_state['tick']}")
+    print(f"  Round State: {', '.join(round_state_flags) or 'N/A'} (Mask: {game_state['round_state']})")
+    print(f"  Team Alive:    {game_state['team_alive']:05b}")
+    print(f"  Enemy Alive:   {game_state['enemy_alive']:05b}")
+    print("  Enemy Positions:")
+    for i in range(5):
+        is_alive = (game_state['enemy_alive'] >> i) & 1
+        pos = game_state['enemy_pos'][i]
+        status = "ALIVE" if is_alive else "DEAD"
+        print(f"    Enemy {i}: {status: <5} | Pos: ({pos[0]: 9.2f}, {pos[1]: 9.2f}, {pos[2]: 9.2f})")
+        
+    # Player of Interest Info
+    print("\n--- PLAYER POV STATE ---")
+    print(f"  Health / Armor / Money: {player_input['health']} / {player_input['armor']} / ${player_input['money']}")
+    print(f"  Position:  ({player_input['pos'][0]:.2f}, {player_input['pos'][1]:.2f}, {player_input['pos'][2]:.2f})")
+    print(f"  Mouse XY:  ({player_input['mouse'][0]:.3f}, {player_input['mouse'][1]:.3f})")
+    print("\n--- DECODED ACTIONS ---")
+    print(f"  Keyboard:  {decode_bitmask(player_input['keyboard_bitmask'], BIT_TO_KEYBOARD)}")
+    print(f"  Eco:       {decode_bitmask_array(player_input['eco_bitmask'], BIT_TO_ECO)}")
+    print(f"  Weapon:    {decode_bitmask_array(player_input['active_weapon_bitmask'], BIT_TO_ITEM)}")
+    print(f"  Inventory: {decode_bitmask_array(player_input['inventory_bitmask'], BIT_TO_ITEM)}")
+    
+    print("\n" + "="*80)
+    print("CONTROLS: q: quit | j/k: tick | p: player | t: team | a: audio | o: overlay | r: RUN")
+    sys.stdout.flush()
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("lmdb_path", type=Path); parser.add_argument("round", type=int, nargs='?', default=1); parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'])
@@ -178,6 +216,10 @@ def main():
         current_tick = round_info[current_round]['start']
     else: current_tick = args.tick
     cv2.namedWindow("LMDB Inspector")
+    
+    # Initial print
+    first_run = True
+
     while True:
         key_str = f"{demoname}_round_{current_round:03d}_team_{current_team}_tick_{current_tick:08d}"
         key_bytes = key_str.encode('utf-8')
@@ -217,8 +259,11 @@ def main():
                             pos = draw_text(frame, "Weapon: " + decode_bitmask_array(player_input_record['active_weapon_bitmask'], BIT_TO_ITEM), pos)
                             pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
                 else: frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-                if not run_mode_on: print("\n" + "="*80); print(f"Displaying: {key_str}"); print("\n--- CONTROLS ---"); print("q: quit|j/k: tick|p: player|t: team|a: audio|o: overlay|r: RUN")
-            else: frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
+                if not run_mode_on:
+                    # --- FIX: Call the new detailed print function ---
+                    print_detailed_info(key_str, game_state_record, player_input_record)
+            else:
+                frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
         else:
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK"); audio = None
             if not run_mode_on: print(f"No data found for key: {key_str}")
@@ -229,20 +274,12 @@ def main():
         if key == ord('r'): run_mode_on = not run_mode_on; print(f"Run mode toggled {'ON' if run_mode_on else 'OFF'}"); continue
         if run_mode_on:
             current_tick += TICKS_PER_FRAME
-            # --- FIX: Correctly check against the end tick value ---
             if current_round in round_info and current_tick > round_info[current_round]['end']:
                 print("Run mode stopped: End of round."); run_mode_on = False
         else:
             if key == ord('q'): break
-            elif key == ord('j'):
-                current_tick += TICKS_PER_FRAME
-                # --- FIX: Also correct the check here for consistency ---
-                if current_round in round_info and current_tick > round_info[current_round]['end']:
-                    current_tick = round_info[current_round]['end']; print("At end of round.")
-            elif key == ord('k'):
-                current_tick -= TICKS_PER_FRAME
-                if current_round in round_info and current_tick < round_info[current_round]['start']:
-                    current_tick = round_info[current_round]['start']; print("At start of round.")
+            elif key == ord('j'): current_tick += TICKS_PER_FRAME
+            elif key == ord('k'): current_tick -= TICKS_PER_FRAME
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
             elif key == ord('a') and audio: play_audio(audio, blocking=True)
