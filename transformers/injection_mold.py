@@ -5,6 +5,7 @@ for model training. (Robust multiprocess version with explicit msgpack handling)
 """
 try:
     import librosa
+    from librosa.core import intervals as _librosa_intervals
 except ImportError:
     print("Error: The 'librosa' library is required for spectrogram generation.", file=sys.stderr)
     print("Please install it using: pip install librosa", file=sys.stderr)
@@ -32,6 +33,15 @@ import msgpack
 import msgpack_numpy as mpnp
 import numpy as np
 from tqdm import tqdm
+
+import io, inspect, msgpack
+def _assert_msgpack_clean():
+    mod = getattr(msgpack.load, "__module__", "")
+    if "msgpack_numpy" in mod:
+        raise RuntimeError("msgpack has been monkey-patched; aborting to avoid librosa crash.")
+    # also verify strict_map_key works:
+    assert msgpack.load(io.BytesIO(b"\x80"), strict_map_key=False) == {}
+_assert_msgpack_clean()
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64; EXPECTED_VIDEO_FPS = 32
