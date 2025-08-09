@@ -122,10 +122,12 @@ def init_worker(shm_cache_name, shm_cache_size, free_q, result_q, gs_dtype, pi_d
     worker_data['free_q'], worker_data['result_q'] = free_q, result_q
     worker_data['gs_dtype'], worker_data['pi_dtype'] = gs_dtype, pi_dtype
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
-
 def process_round_perspective(task_args):
+    # --- FIX: Initialize resources to None for robust cleanup ---
+    caps = {}
+    auds = {}
     try:
-        round_num, team, demoname, quality, block_rects = task_args # <-- UNPACK NEW ARGS
+        round_num, team, demoname, quality, block_rects = task_args
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
         player_data_cache, free_q, result_q = worker_data['player_data_cache'], worker_data['free_q'], worker_data['result_q']
@@ -133,9 +135,12 @@ def process_round_perspective(task_args):
         if len(round_data) != 5: return
         t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]; ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
         current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
+        
+        # --- FIX: Resource acquisition now inside the try block ---
         caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in round_data}
         auds = {rec['playername']: open(rec['wav_path'], 'rb') for rec in round_data}
         for aud_file in auds.values(): aud_file.seek(44)
+        
         round_start_tick, round_end_tick = rounds_info[round_num]['starttick'], max(rec['stoptick'] for rec in round_data)
         results = []
         for current_tick in range(round_start_tick, round_end_tick + 1, TICKS_PER_FRAME):
@@ -162,16 +167,11 @@ def process_round_perspective(task_args):
                 if not is_alive or current_tick >= rec['stoptick']: continue
                 ret, frame = caps[playername].read(); audio_chunk = auds[playername].read(AUDIO_BYTES_PER_FRAME)
                 if not ret or len(audio_chunk) < AUDIO_BYTES_PER_FRAME: continue
-                
-                # --- NEW: Apply blackout rectangles before encoding ---
                 if block_rects:
                     for x1, y1, x2, y2 in block_rects:
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
-
-                # --- NEW: Use quality parameter for JPEG encoding ---
                 encode_param = [cv2.IMWRITE_JPEG_QUALITY, quality]
                 jpeg_bytes = cv2.imencode('.jpg', frame, encode_param)[1].tobytes()
-                
                 tick1_data = player_data_cache.get(f"{playername}:{current_tick}"); tick2_data = player_data_cache.get(f"{playername}:{current_tick + 1}")
                 tick_data = merge_tick_data(tick1_data, tick2_data)
                 player_input = np.zeros(1, dtype=pi_dtype)
@@ -192,18 +192,29 @@ def process_round_perspective(task_args):
             key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{current_tick:08d}".encode('utf-8')
             final_payload_for_lmdb = msgpack.packb({"game_state": game_state, "player_data": player_data_list}, use_bin_type=True)
             results.append((key, final_payload_for_lmdb))
-        for cap in caps.values(): cap.release()
-        for aud in auds.values(): aud.close()
+        
         if not results: return
+
         packed_results = pickle.dumps(results)
         if len(packed_results) > RESULT_BUFFER_SIZE:
             raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size.")
         buffer_name = free_q.get()
-        shm = SharedMemory(name=buffer_name); shm.buf[:len(packed_results)] = packed_results; shm.close()
+        shm = SharedMemory(name=buffer_name)
+        shm.buf[:len(packed_results)] = packed_results
+        shm.close()
         result_q.put((buffer_name, len(packed_results)))
+
     except Exception:
         import traceback
         LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}"); result_q.put(("ERROR", None))
+    
+    finally:
+        # --- FIX: Explicitly release all resources in a finally block ---
+        # This guarantees cleanup even if an error occurs.
+        for cap in caps.values():
+            cap.release()
+        for aud in auds.values():
+            aud.close()
 
 # =============================================================================
 # MAIN DRIVER
