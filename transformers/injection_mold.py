@@ -170,28 +170,37 @@ def process_round_perspective(task_args):
         with lock:
             # Stage 1: Check if a resize is needed
             batch_size = sum(len(payload) for _, payload in results)
-            env_check = lmdb.open(str(lmdb_path))
-            info = env_check.info()
-            stats = env_check.stat()
-            env_check.close() # Immediately close the handle
+            env = lmdb.open(str(lmdb_path), map_size=INITIAL_MAP_SIZE, writemap=True)
+            # compute batch_size up front
 
-            available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
-            
-            # Stage 2: Perform the resize if needed, with an exclusive handle
-            if available_space < batch_size:
-                new_size = info['map_size'] + max(batch_size, MAP_RESIZE_INCREMENT)
-                # Open, resize, and immediately close
-                env_resize = lmdb.open(str(lmdb_path))
-                env_resize.set_mapsize(new_size)
-                env_resize.close()
+            # open a write txn
+            txn = env.begin(write=True)
+            try:
+                info = env.info(); stats = env.stat()
+                used_bytes = info['last_pgno'] * stats['psize']
+                available = info['map_size'] - used_bytes
+                if available < batch_size:
+                    # end the txn BEFORE resizing
+                    txn.abort()  # or txn.commit() if you prefer
+                    # grow by the larger of: your increment or exactly what’s needed
+                    grow_by = max(batch_size, MAP_RESIZE_INCREMENT)
+                    # (optional) round to page size
+                    psize = stats['psize']
+                    new_size = info['map_size'] + ((grow_by + psize - 1) // psize) * psize
+                    env.set_mapsize(new_size)
 
-            # Stage 3: Perform the write with a fresh handle
-            env_write = lmdb.open(str(lmdb_path), map_async=True)
-            with env_write.begin(write=True) as txn:
+                    # reopen a fresh write txn
+                    txn = env.begin(write=True)
+
                 cursor = txn.cursor()
                 cursor.putmulti(results)
-            env_write.close()
-        
+                txn.commit()
+            except:
+                txn.abort()
+                raise
+            finally:
+                env.close()
+
         return task_args
     except Exception as e:
         import traceback
@@ -274,9 +283,22 @@ if __name__ == '__main__':
         LOG.info("-> Phase 3: Finalizing and cleaning up...")
         env = lmdb.open(str(args.outlmdb), writemap=True)
         metadata = {"demoname": demoname, "rounds": [[r, rounds_info[r]['starttick'], rounds_info[r]['endtick']] for r in sorted(rounds_info.keys())]}
-        with env.begin(write=True) as txn:
-            key = f"{demoname}_INFO".encode('utf-8'); txn.put(key, json.dumps(metadata).encode('utf-8'))
-        env.close()
+        try:
+            try:
+                with env.begin(write=True) as txn:
+                    key = f"{demoname}_INFO".encode('utf-8')
+                    txn.put(key, json.dumps(metadata).encode('utf-8'))
+            except lmdb.MapFullError:
+                info = env.info(); stats = env.stat()
+                psize = stats['psize']
+                grow_by = max(64 * 1024**2, MAP_RESIZE_INCREMENT)  # at least 64MB, or your increment
+                new_size = info['map_size'] + ((grow_by + psize - 1)//psize)*psize
+                env.set_mapsize(new_size)
+                with env.begin(write=True) as txn:
+                    key = f"{demoname}_INFO".encode('utf-8')
+                    txn.put(key, json.dumps(metadata).encode('utf-8'))
+        finally:
+            env.close()
         shm_cache.close(); shm_cache.unlink(); LOG.info("Shared memory cache unlinked.")
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         LOG.info("All processing steps completed successfully.")
