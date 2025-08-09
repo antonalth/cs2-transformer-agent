@@ -109,8 +109,10 @@ def process_round_perspective(task_args):
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
         player_data_cache, free_q, result_q = worker_data['player_data_cache'], worker_data['free_q'], worker_data['result_q']
+
         round_data = recordings_map[(round_num, team)]
         if len(round_data) != 5: return
+
         t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]; ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
         current_roster = t_roster if team == 'T' else ct_roster; enemy_roster = ct_roster if team == 'T' else t_roster
         caps = {rec['playername']: cv2.VideoCapture(str(rec['mp4_path'])) for rec in round_data}
@@ -145,11 +147,20 @@ def process_round_perspective(task_args):
                 jpeg_bytes = cv2.imencode('.jpg', frame)[1].tobytes(); lookup_key = f"{playername}:{current_tick}"; tick_data = player_data_cache.get(lookup_key); player_input = np.zeros(1, dtype=pi_dtype)
                 if tick_data:
                     kb_input_str = tick_data.get('keyboard_input', '') or ''; buy_sell_input_str = tick_data.get('buy_sell_input', '') or ''
-                    all_kb_actions = kb_input_str.split(','); keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
+                    
+                    # --- FIX: Filter out empty strings after splitting to prevent errors ---
+                    all_kb_actions = [action for action in kb_input_str.split(',') if action]
+                    buy_sell_actions = [action for action in buy_sell_input_str.split(',') if action]
+                    
+                    keyboard_actions = [a for a in all_kb_actions if not a.startswith('DROP_')]
                     player_input[0]['keyboard_bitmask'] = get_bitmask(keyboard_actions, KEYBOARD_TO_BIT, "KEYBOARD_ONLY_ACTIONS")
-                    drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]; eco_actions_list = drop_actions + buy_sell_input_str.split(',')
+                    
+                    drop_actions = [a for a in all_kb_actions if a.startswith('DROP_')]
+                    eco_actions_list = drop_actions + buy_sell_actions
                     if tick_data.get('is_in_buyzone') == 1: eco_actions_list.append('IN_BUYZONE')
-                    player_input[0]['eco_bitmask'] = get_bitmask_array(filter(None, eco_actions_list), ECO_TO_BIT, "ECO_ACTIONS")
+                    
+                    player_input[0]['eco_bitmask'] = get_bitmask_array(eco_actions_list, ECO_TO_BIT, "ECO_ACTIONS")
+                    
                     player_input[0]['pos'] = [tick_data.get('position_x', 0), tick_data.get('position_y', 0), tick_data.get('position_z', 0)]; player_input[0]['mouse'] = [tick_data.get('mouse_x', 0), tick_data.get('mouse_y', 0)]
                     player_input[0]['health'], player_input[0]['armor'], player_input[0]['money'] = tick_data.get('health', 0), tick_data.get('armor', 0), tick_data.get('money', 0)
                     inv_mask, wep_mask = get_inventory_bitmasks(tick_data.get('inventory'), tick_data.get('active_weapon'), ITEM_TO_INDEX); player_input[0]['inventory_bitmask'], player_input[0]['active_weapon_bitmask'] = inv_mask, wep_mask
@@ -161,6 +172,7 @@ def process_round_perspective(task_args):
         for cap in caps.values(): cap.release()
         for aud in auds.values(): aud.close()
         if not results: return
+
         packed_results = pickle.dumps(results)
         if len(packed_results) > RESULT_BUFFER_SIZE:
             raise ValueError(f"Round {round_num}/{team} result size ({len(packed_results)/(1024**2):.2f}MB) exceeds buffer size. Increase RESULT_BUFFER_SIZE.")
@@ -169,10 +181,10 @@ def process_round_perspective(task_args):
         shm.buf[:len(packed_results)] = packed_results
         shm.close()
         result_q.put((buffer_name, len(packed_results)))
+
     except Exception:
         import traceback
         LOG.error(f"FATAL ERROR in worker for task {task_args}:\n{traceback.format_exc()}"); result_q.put(("ERROR", None))
-
 # =============================================================================
 # MAIN DRIVER
 # =============================================================================
