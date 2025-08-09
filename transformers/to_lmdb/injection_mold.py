@@ -211,6 +211,17 @@ def process_round_perspective(task_args):
                     for (minX, minY, maxX, maxY) in worker_data['block_regions']:
                         cv2.rectangle(frame, (minX, minY), (maxX, maxY), (0, 0, 0), -1)
 
+                h, w, _ = frame.shape
+                centerX, centerY = w // 2, h // 2
+                crosshair_color = (0, 255, 0)  # Green in BGR format
+                crosshair_size = 15
+                line_thickness = 4
+
+                # Horizontal line
+                cv2.line(frame, (centerX - crosshair_size, centerY), (centerX + crosshair_size, centerY), crosshair_color, line_thickness)
+                # Vertical line
+                cv2.line(frame, (centerX, centerY - crosshair_size), (centerX, centerY + crosshair_size), crosshair_color, line_thickness)
+
                 jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, worker_data['jpeg_quality']]
                 jpg=cv2.imencode('.jpg', frame, jpeg_params)[1].tobytes()
 
