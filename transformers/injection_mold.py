@@ -99,7 +99,7 @@ def get_inventory_bitmasks(inv_json, weapon, mapping):
     except(json.JSONDecodeError,TypeError):pass
     return im,wm
 
-def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map):
+def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, jpeg_quality, block_regions):
     m.patch()
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
@@ -109,6 +109,9 @@ def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dt
     worker_data['lock'] = lock
     worker_data['gs_dtype'], worker_data['pi_dtype'] = gs_dtype, pi_dtype
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
+    worker_data['jpeg_quality'] = jpeg_quality
+    worker_data['block_regions'] = block_regions
+
 
 def process_round_perspective(task_args):
     caps, auds = {}, {}
@@ -149,7 +152,17 @@ def process_round_perspective(task_args):
                 if not is_alive or tick>=rec['stoptick']:continue
                 ret,frame=caps[pn].read();audio=auds[pn].read(AUDIO_BYTES_PER_FRAME)
                 if not ret or len(audio)<AUDIO_BYTES_PER_FRAME:continue
-                jpg=cv2.imencode('.jpg',frame)[1].tobytes();lk=f"{pn}:{tick}";td=merge_tick_data(player_data_cache.get(lk),player_data_cache.get(f"{pn}:{tick+1}"));pi=np.zeros(1,dtype=pi_dtype)
+
+                # --- NEW: Apply blockout regions ---
+                if worker_data['block_regions']:
+                    for (minX, minY, maxX, maxY) in worker_data['block_regions']:
+                        cv2.rectangle(frame, (minX, minY), (maxX, maxY), (0, 0, 0), -1)
+
+                # --- NEW: Use specified JPEG quality ---
+                jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, worker_data['jpeg_quality']]
+                jpg=cv2.imencode('.jpg', frame, jpeg_params)[1].tobytes()
+
+                lk=f"{pn}:{tick}";td=merge_tick_data(player_data_cache.get(lk),player_data_cache.get(f"{pn}:{tick+1}"));pi=np.zeros(1,dtype=pi_dtype)
                 if td:
                     kb,bs=td.get('keyboard_input','')or'',td.get('buy_sell_input','')or''
                     akb=[a.replace("-","_").replace(" ","_") for a in kb.split(',')if a];bs_a=[a.replace("-","_").replace(" ","_")for a in bs.split(',')if a]
@@ -233,11 +246,33 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--workers", type=int, default=os.cpu_count()); args = parser.parse_args()
+    parser.add_argument("--workers", type=int, default=os.cpu_count()); 
+    # --- NEW: Add arguments for quality and blockfile ---
+    parser.add_argument("--quality", type=int, default=80, help="JPEG compression quality (0-100).")
+    parser.add_argument("--blockfile", type=Path, help="Path to a file with regions to black out (minX,minY,maxX,maxY per line).")
+    args = parser.parse_args()
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path exists. Use --overwrite."); sys.exit(1)
+    
+    # --- NEW: Process the blockfile ---
+    block_regions = []
+    if args.blockfile:
+        if not args.blockfile.exists():
+            LOG.critical(f"Blockfile not found at: {args.blockfile}")
+            sys.exit(1)
+        with open(args.blockfile, 'r') as f:
+            for line in f:
+                try:
+                    parts = [int(p.strip()) for p in line.split(',')]
+                    if len(parts) == 4:
+                        block_regions.append(tuple(parts))
+                    else:
+                        LOG.warning(f"Skipping malformed line in blockfile: {line.strip()}")
+                except ValueError:
+                    LOG.warning(f"Skipping non-integer line in blockfile: {line.strip()}")
+        LOG.info(f"   - Loaded {len(block_regions)} blockout regions.")
 
     LOG.info("-> Phase 1: Validating database and loading metadata...")
     conn = sqlite3.connect(f"file:{args.dbfile}?mode=ro", uri=True); conn.row_factory = sqlite3.Row
@@ -269,10 +304,10 @@ if __name__ == '__main__':
     
     LOG.info(f"-> Phase 2: Processing rounds with {args.workers} worker processes...")
     
-    # --- NEW: Create a global lock for workers ---
     lock = mp.Lock()
-    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, lock, gs_dtype, pi_dtype, rounds_info, recordings_map)
-    
+    # --- NEW: Add quality and block_regions to initargs ---
+    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, args.quality, block_regions)
+
     try:
         with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
             pbar = tqdm(pool.imap_unordered(process_round_perspective, tasks), total=len(tasks), desc="Processing Round/Team Perspectives")
