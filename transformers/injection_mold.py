@@ -3,6 +3,10 @@
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
 for model training. (Robust multiprocess version with explicit msgpack handling)
 """
+# pure pain to get c version
+#pip uninstall -y msgpack
+#pip install --no-binary=msgpack msgpack
+
 try:
     import librosa
     from librosa.core import intervals as _librosa_intervals
@@ -51,7 +55,6 @@ AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNE
 INITIAL_MAP_SIZE = 2 * 1024**3; MAP_RESIZE_INCREMENT = 1 * 1024**3
 
 # --- Globals ---
-# --- CHANGE: Removed m.patch() ---
 LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None;
 
 # =============================================================================
@@ -117,7 +120,6 @@ def get_inventory_bitmasks(inv_json, weapon, mapping):
     return im,wm
 
 def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, jpeg_quality, block_regions, audio_params):
-    # --- CHANGE: Removed m.patch() ---
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
     shm.close()
@@ -185,9 +187,19 @@ def process_round_perspective(task_args):
                         waveform_float = waveform_int.astype(np.float32) / 32768.0
                         waveform_mono = waveform_float.reshape((-1, AUDIO_CHANNELS)).mean(axis=1)
 
+                        # --- START OF FIX ---
+                        # Explicitly pad the audio signal if it's shorter than n_fft.
+                        # This prevents the UserWarning from librosa.
+                        n_fft = audio_params['n_fft']
+                        if len(waveform_mono) < n_fft:
+                            pad_width = n_fft - len(waveform_mono)
+                            # Pad on both sides (centered)
+                            waveform_mono = np.pad(waveform_mono, (pad_width // 2, pad_width - pad_width // 2), mode='constant')
+                        # --- END OF FIX ---
+
                         S = librosa.feature.melspectrogram(
                             y=waveform_mono, sr=AUDIO_SAMPLE_RATE,
-                            n_mels=audio_params['n_mels'], n_fft=audio_params['n_fft'],
+                            n_mels=audio_params['n_mels'], n_fft=n_fft,
                             hop_length=audio_params['hop_length']
                         )
                         mel_spectrogram = librosa.power_to_db(S, ref=np.max)
@@ -216,7 +228,6 @@ def process_round_perspective(task_args):
                 pdl.append((pi,jpg,mel_spectrogram))
             if not pdl:continue
             key=f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode('utf-8')
-            # --- CHANGE: Use explicit encoder for numpy arrays ---
             payload = msgpack.packb(
                 {"game_state": gs, "player_data": pdl},
                 use_bin_type=True,
@@ -290,14 +301,12 @@ if __name__ == '__main__':
     audio_group.add_argument('--n-mels', type=int, default=128, help="Number of Mel bands to generate. This is the 'height' of the spectrogram. Default: 128.")
     audio_group.add_argument('--n-fft', type=int, default=2048, help="Length of the FFT window, which determines frequency resolution. Default: 2048.")
     audio_group.add_argument('--hop-length', type=int, default=512, help="Number of samples between successive frames (hop size). Determines time resolution. Default: 512.")
-    
+
     args = parser.parse_args()
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path exists. Use --overwrite."); sys.exit(1)
-
-    # ... (rest of the main driver code is identical) ...
     
     block_regions = []
     if args.blockfile:
