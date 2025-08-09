@@ -138,6 +138,17 @@ def process_round_perspective(task_args):
             if rounds_info[round_num].get('freezetime_endtick')is not None and tick<rounds_info[round_num]['freezetime_endtick']:rs_mask|=(1<<0)
             if rounds_info[round_num].get('starttick')is not None and rounds_info[round_num].get('endtick')is not None and tick>=rounds_info[round_num]['starttick']and tick<=rounds_info[round_num]['endtick']:rs_mask|=(1<<1)
             if rounds_info[round_num].get('bomb_planted_tick',-1)!=-1 and tick>=rounds_info[round_num]['bomb_planted_tick']:rs_mask|=(1<<2)
+            
+            # --- START MINIMAL PATCH ---
+            win_tick = rounds_info[round_num].get('win_tick')
+            if win_tick is not None and tick >= win_tick:
+                win_team = rounds_info[round_num].get('win_team')
+                if win_team == 'T':
+                    rs_mask |= (1 << 3)  # Set bit 3 for T-won
+                elif win_team == 'CT':
+                    rs_mask |= (1 << 4)  # Set bit 4 for CT-won
+            # --- END MINIMAL PATCH ---
+            
             gs[0]['round_state']=rs_mask
             for i,name in enumerate(enemy_roster):
                 if(enemy_alive>>i)&1:
@@ -153,12 +164,10 @@ def process_round_perspective(task_args):
                 ret,frame=caps[pn].read();audio=auds[pn].read(AUDIO_BYTES_PER_FRAME)
                 if not ret or len(audio)<AUDIO_BYTES_PER_FRAME:continue
 
-                # --- NEW: Apply blockout regions ---
                 if worker_data['block_regions']:
                     for (minX, minY, maxX, maxY) in worker_data['block_regions']:
                         cv2.rectangle(frame, (minX, minY), (maxX, maxY), (0, 0, 0), -1)
 
-                # --- NEW: Use specified JPEG quality ---
                 jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, worker_data['jpeg_quality']]
                 jpg=cv2.imencode('.jpg', frame, jpeg_params)[1].tobytes()
 
@@ -179,30 +188,22 @@ def process_round_perspective(task_args):
             payload=msgpack.packb({"game_state":gs,"player_data":pdl},use_bin_type=True);results.append((key,payload))
         if not results: return task_args
         
-        # --- NEW: Use global lock for all LMDB interactions ---
         with lock:
-            # Stage 1: Check if a resize is needed
             batch_size = sum(len(payload) for _, payload in results)
             env = lmdb.open(str(lmdb_path), writemap=True)
-            # compute batch_size up front
 
-            # open a write txn
             txn = env.begin(write=True)
             try:
                 info = env.info(); stats = env.stat()
                 used_bytes = info['last_pgno'] * stats['psize']
                 available = info['map_size'] - used_bytes
                 if available < batch_size:
-                    # end the txn BEFORE resizing
-                    txn.abort()  # or txn.commit() if you prefer
-                    # grow by the larger of: your increment or exactly what’s needed
+                    txn.abort()
                     grow_by = max(batch_size, MAP_RESIZE_INCREMENT)
-                    # (optional) round to page size
                     psize = stats['psize']
                     new_size = info['map_size'] + (((int(grow_by * 1.5) + psize - 1) // psize) * psize)
                     env.set_mapsize(new_size)
 
-                    # reopen a fresh write txn
                     txn = env.begin(write=True)
 
                 cursor = txn.cursor()
@@ -247,7 +248,6 @@ if __name__ == '__main__':
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
     parser.add_argument("--workers", type=int, default=os.cpu_count()); 
-    # --- NEW: Add arguments for quality and blockfile ---
     parser.add_argument("--quality", type=int, default=80, help="JPEG compression quality (0-100).")
     parser.add_argument("--blockfile", type=Path, help="Path to a file with regions to black out (minX,minY,maxX,maxY per line).")
     args = parser.parse_args()
@@ -256,7 +256,6 @@ if __name__ == '__main__':
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path exists. Use --overwrite."); sys.exit(1)
     
-    # --- NEW: Process the blockfile ---
     block_regions = []
     if args.blockfile:
         if not args.blockfile.exists():
@@ -305,7 +304,6 @@ if __name__ == '__main__':
     LOG.info(f"-> Phase 2: Processing rounds with {args.workers} worker processes...")
     
     lock = mp.Lock()
-    # --- NEW: Add quality and block_regions to initargs ---
     initargs = (shm_cache.name, len(packed_cache), args.outlmdb, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, args.quality, block_regions)
 
     try:
@@ -326,7 +324,7 @@ if __name__ == '__main__':
             except lmdb.MapFullError:
                 info = env.info(); stats = env.stat()
                 psize = stats['psize']
-                grow_by = max(64 * 1024**2, MAP_RESIZE_INCREMENT)  # at least 64MB, or your increment
+                grow_by = max(64 * 1024**2, MAP_RESIZE_INCREMENT)
                 new_size = info['map_size'] + ((grow_by + psize - 1)//psize)*psize
                 env.set_mapsize(new_size)
                 with env.begin(write=True) as txn:

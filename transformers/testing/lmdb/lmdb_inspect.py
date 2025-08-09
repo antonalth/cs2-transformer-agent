@@ -162,12 +162,17 @@ def print_detailed_info(key_str, game_state, player_input):
     print(f"DISPLAYING DATA FOR: {key_str}")
     print("="*80)
     
+    # --- START FIX ---
     # Game State Info
     print("\n--- GLOBAL GAME STATE ---")
     round_state_flags = []
     if (game_state['round_state'] >> 0) & 1: round_state_flags.append("Freezetime")
     if (game_state['round_state'] >> 1) & 1: round_state_flags.append("In Round")
     if (game_state['round_state'] >> 2) & 1: round_state_flags.append("Bomb Planted")
+    if (game_state['round_state'] >> 3) & 1: round_state_flags.append("T-won")
+    if (game_state['round_state'] >> 4) & 1: round_state_flags.append("CT-won")
+    # --- END FIX ---
+
     print(f"  Tick: {game_state['tick']}")
     print(f"  Round State: {', '.join(round_state_flags) or 'N/A'} (Mask: {game_state['round_state']})")
     print(f"  Team Alive:    {game_state['team_alive']:05b}")
@@ -217,9 +222,6 @@ def main():
     else: current_tick = args.tick
     cv2.namedWindow("LMDB Inspector")
     
-    # Initial print
-    first_run = True
-
     while True:
         key_str = f"{demoname}_round_{current_round:03d}_team_{current_team}_tick_{current_tick:08d}"
         key_bytes = key_str.encode('utf-8')
@@ -239,7 +241,19 @@ def main():
                         overlay_mode_str = "MASKS" if overlay_state == 1 else "STRINGS"; run_status = "ON" if run_mode_on else "OFF"
                         pos = draw_text(frame, f"KEY: {key_str}", TEXT_START_POS)
                         pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN: {run_status} | OVERLAY: {overlay_mode_str}", pos)
-                        pos = draw_text(frame, "-"*60, pos); pos = draw_text(frame, f"[GAME STATE] Round: {current_round} | Tick: {game_state_record['tick']}", pos)
+                        pos = draw_text(frame, "-"*60, pos)
+                        
+                        # --- START FIX: Decode and display full round state on overlay ---
+                        round_state_flags = []
+                        if (game_state_record['round_state'] >> 0) & 1: round_state_flags.append("Freezetime")
+                        if (game_state_record['round_state'] >> 1) & 1: round_state_flags.append("In Round")
+                        if (game_state_record['round_state'] >> 2) & 1: round_state_flags.append("Bomb Planted")
+                        if (game_state_record['round_state'] >> 3) & 1: round_state_flags.append("T-won")
+                        if (game_state_record['round_state'] >> 4) & 1: round_state_flags.append("CT-won")
+                        round_state_str = ", ".join(round_state_flags) or "N/A"
+                        pos = draw_text(frame, f"[GAME STATE] Tick: {game_state_record['tick']} | State: {round_state_str}", pos)
+                        # --- END FIX ---
+
                         pos = draw_text(frame, f"Team Alive: {game_state_record['team_alive']:05b} | Enemy Alive: {game_state_record['enemy_alive']:05b}", pos)
                         pos = draw_text(frame, "-"*60, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
                         pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
@@ -260,7 +274,6 @@ def main():
                             pos = draw_text(frame, "Inventory: " + decode_bitmask_array(player_input_record['inventory_bitmask'], BIT_TO_ITEM), pos)
                 else: frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
                 if not run_mode_on:
-                    # --- FIX: Call the new detailed print function ---
                     print_detailed_info(key_str, game_state_record, player_input_record)
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
