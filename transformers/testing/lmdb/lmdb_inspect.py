@@ -4,9 +4,8 @@ lmdb_inspect.py - An interactive tool to inspect and verify the contents
 of a CS2 data LMDB.
 
 This script allows you to navigate through the dataset frame-by-frame,
-switch player perspectives, play audio, and view detailed metadata overlays
-in multiple modes (off, bitmasks, strings) to ensure the data was
-processed correctly.
+switch player perspectives, view detailed metadata overlays, and see a
+visualization of the corresponding Mel spectrogram.
 """
 
 import argparse
@@ -21,7 +20,7 @@ import lmdb
 import msgpack
 import msgpack_numpy as m
 import numpy as np
-import sounddevice as sd
+import matplotlib.pyplot as plt
 
 # --- Platform-specific key press detection ---
 try:
@@ -37,6 +36,7 @@ try:
         ctypes.windll.kernel32.SetConsoleCursorPosition(handle, pos)
 except ImportError:
     import tty, termios
+    # (Linux/macOS-specific console code remains the same)
     def getch():
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
@@ -46,12 +46,11 @@ except ImportError:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         return ch.encode('utf-8')
-    def move_cursor(y, x): sys.stdout.write(f"\x1b[{y};{x}H")
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64; EXPECTED_VIDEO_FPS = 32
 TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
-AUDIO_SAMPLE_RATE = 44100; FONT = cv2.FONT_HERSHEY_SIMPLEX; FONT_SCALE = 0.4
+FONT = cv2.FONT_HERSHEY_SIMPLEX; FONT_SCALE = 0.4
 FONT_COLOR = (0, 255, 0); SHADOW_COLOR = (0, 0, 0); LINE_TYPE = 1
 TEXT_START_POS = (10, 20); LINE_HEIGHT = 16
 m.patch()
@@ -87,13 +86,28 @@ def decode_bitmask_array(mask_array, reverse_map):
                 if global_bit_pos in reverse_map: actions.append(reverse_map[global_bit_pos])
     return ", ".join(actions) if actions else "None"
 
-def play_audio(audio_chunk, blocking=False):
-    if not audio_chunk: print("No audio chunk to play."); return
-    try:
-        audio_array = np.frombuffer(audio_chunk, dtype=np.int16).reshape(-1, 2)
-        sd.play(audio_array, samplerate=AUDIO_SAMPLE_RATE)
-        if blocking: sd.wait()
-    except Exception as e: print(f"Error playing audio: {e}")
+def visualize_spectrogram(spec, target_height):
+    """Converts a Mel spectrogram numpy array into a colorized, resized image."""
+    if spec is None or spec.size == 0: return None
+    # Normalize the spectrogram to the 0-1 range for the colormap
+    spec_min, spec_max = spec.min(), spec.max()
+    if spec_max - spec_min > 1e-6:
+        spec_norm = (spec - spec_min) / (spec_max - spec_min)
+    else:
+        spec_norm = np.zeros_like(spec)
+
+    # Apply a colormap (magma is good for spectrograms) and convert to 8-bit BGR
+    spec_img_rgba = plt.cm.magma(spec_norm)
+    spec_img_bgr = (spec_img_rgba[:, :, [2, 1, 0]] * 255).astype(np.uint8)
+
+    # Flip vertically so low frequencies are at the bottom
+    spec_img_bgr = cv2.flip(spec_img_bgr, 0)
+
+    # Resize to match the video frame height
+    h, w, _ = spec_img_bgr.shape
+    new_w = int(w * (target_height / h))
+    spec_resized = cv2.resize(spec_img_bgr, (new_w, target_height), interpolation=cv2.INTER_NEAREST)
+    return spec_resized
 
 def create_placeholder_frame(width, height, text):
     frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -162,8 +176,6 @@ def print_detailed_info(key_str, game_state, player_input):
     print(f"DISPLAYING DATA FOR: {key_str}")
     print("="*80)
     
-    # --- START FIX ---
-    # Game State Info
     print("\n--- GLOBAL GAME STATE ---")
     round_state_flags = []
     if (game_state['round_state'] >> 0) & 1: round_state_flags.append("Freezetime")
@@ -171,7 +183,6 @@ def print_detailed_info(key_str, game_state, player_input):
     if (game_state['round_state'] >> 2) & 1: round_state_flags.append("Bomb Planted")
     if (game_state['round_state'] >> 3) & 1: round_state_flags.append("T-won")
     if (game_state['round_state'] >> 4) & 1: round_state_flags.append("CT-won")
-    # --- END FIX ---
 
     print(f"  Tick: {game_state['tick']}")
     print(f"  Round State: {', '.join(round_state_flags) or 'N/A'} (Mask: {game_state['round_state']})")
@@ -179,12 +190,10 @@ def print_detailed_info(key_str, game_state, player_input):
     print(f"  Enemy Alive:   {game_state['enemy_alive']:05b}")
     print("  Enemy Positions:")
     for i in range(5):
-        is_alive = (game_state['enemy_alive'] >> i) & 1
-        pos = game_state['enemy_pos'][i]
+        is_alive = (game_state['enemy_alive'] >> i) & 1; pos = game_state['enemy_pos'][i]
         status = "ALIVE" if is_alive else "DEAD"
         print(f"    Enemy {i}: {status: <5} | Pos: ({pos[0]: 9.2f}, {pos[1]: 9.2f}, {pos[2]: 9.2f})")
         
-    # Player of Interest Info
     print("\n--- PLAYER POV STATE ---")
     print(f"  Health / Armor / Money: {player_input['health']} / {player_input['armor']} / ${player_input['money']}")
     print(f"  Position:  ({player_input['pos'][0]:.2f}, {player_input['pos'][1]:.2f}, {player_input['pos'][2]:.2f})")
@@ -196,14 +205,14 @@ def print_detailed_info(key_str, game_state, player_input):
     print(f"  Inventory: {decode_bitmask_array(player_input['inventory_bitmask'], BIT_TO_ITEM)}")
     
     print("\n" + "="*80)
-    print("CONTROLS: q: quit | j/k: tick | p: player | t: team | a: audio | o: overlay | r: RUN")
+    print("CONTROLS: q: quit | j/k: tick | p: player | t: team | o: overlay | r: RUN")
     sys.stdout.flush()
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive LMDB Inspector for CS2 Data.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("lmdb_path", type=Path); parser.add_argument("round", type=int, nargs='?', default=1); parser.add_argument("team", type=str, nargs='?', default='T', choices=['T', 'CT'])
     parser.add_argument("player_idx", type=int, nargs='?', default=0); parser.add_argument("tick", type=int, nargs='?', default=-1)
-    parser.add_argument("--debug", action='store_true'); parser.add_argument("--autoplay", action='store_true'); args = parser.parse_args()
+    parser.add_argument("--debug", action='store_true'); args = parser.parse_args()
     if not args.lmdb_path.exists(): print(f"Error: LMDB path not found: {args.lmdb_path}"); sys.exit(1)
     if args.debug:
         env = lmdb.open(str(args.lmdb_path), readonly=True, lock=False, map_size=1024**4); debug_interactive_search(env)
@@ -214,10 +223,11 @@ def main():
         demoname = info_key_bytes.removesuffix(b'_INFO').decode('utf-8')
         metadata = json.loads(txn.get(info_key_bytes))
         round_info = {r[0]: {'start': r[1], 'end': r[2]} for r in metadata['rounds']}
+        
     current_round, current_team, current_player_idx = args.round, args.team, args.player_idx
     run_mode_on = False; overlay_state = 1
     if args.tick == -1:
-        if current_round not in round_info: print(f"Error: Round {current_round} not found. Valid rounds: {list(round_info.keys())}"); sys.exit(1)
+        if current_round not in round_info: print(f"Error: Round {current_round} not found. Valid: {list(round_info.keys())}"); sys.exit(1)
         current_tick = round_info[current_round]['start']
     else: current_tick = args.tick
     cv2.namedWindow("LMDB Inspector")
@@ -226,15 +236,24 @@ def main():
         key_str = f"{demoname}_round_{current_round:03d}_team_{current_team}_tick_{current_tick:08d}"
         key_bytes = key_str.encode('utf-8')
         with env.begin() as txn: value = txn.get(key_bytes)
+        
+        frame = None
+        spec_vis = None
+        
         if value:
             data = msgpack.unpackb(value, raw=False, object_hook=m.decode)
             game_state_record = data['game_state'][0]
             pov_data = get_player_data_for_pov(data['player_data'], current_player_idx, game_state_record['team_alive'])
-            player_input_array, jpeg, audio = (None, None, None)
-            if pov_data: player_input_array, jpeg, audio = pov_data
-            if not run_mode_on and args.autoplay and audio: play_audio(audio, blocking=False)
+            
+            player_input_array, jpeg, spectrogram = (None, None, None)
+            if pov_data: player_input_array, jpeg, spectrogram = pov_data
+            
             if jpeg:
                 frame_np = np.frombuffer(jpeg, dtype=np.uint8); frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
+                spec_vis = visualize_spectrogram(spectrogram, frame.shape[0])
+                if spec_vis is None:
+                    spec_vis = create_placeholder_frame(300, frame.shape[0], "NO AUDIO DATA")
+
                 if pov_data and player_input_array.size > 0:
                     player_input_record = player_input_array[0]
                     if overlay_state > 0:
@@ -243,7 +262,6 @@ def main():
                         pos = draw_text(frame, f"POV: Player {current_player_idx} ({current_team}) | RUN: {run_status} | OVERLAY: {overlay_mode_str}", pos)
                         pos = draw_text(frame, "-"*60, pos)
                         
-                        # --- START FIX: Decode and display full round state on overlay ---
                         round_state_flags = []
                         if (game_state_record['round_state'] >> 0) & 1: round_state_flags.append("Freezetime")
                         if (game_state_record['round_state'] >> 1) & 1: round_state_flags.append("In Round")
@@ -252,10 +270,10 @@ def main():
                         if (game_state_record['round_state'] >> 4) & 1: round_state_flags.append("CT-won")
                         round_state_str = ", ".join(round_state_flags) or "N/A"
                         pos = draw_text(frame, f"[GAME STATE] Tick: {game_state_record['tick']} | State: {round_state_str}", pos)
-                        # --- END FIX ---
 
                         pos = draw_text(frame, f"Team Alive: {game_state_record['team_alive']:05b} | Enemy Alive: {game_state_record['enemy_alive']:05b}", pos)
                         pos = draw_text(frame, "-"*60, pos); pos = draw_text(frame, "[PLAYER INPUT]", pos)
+                        # (The rest of the overlay drawing code is unchanged)
                         pos = draw_text(frame, f"Health: {player_input_record['health']} | Armor: {player_input_record['armor']} | Money: ${player_input_record['money']}", pos)
                         pos = draw_text(frame, f"Pos: ({player_input_record['pos'][0]:.1f}, {player_input_record['pos'][1]:.1f}, {player_input_record['pos'][2]:.1f})", pos)
                         pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
@@ -277,13 +295,21 @@ def main():
                     print_detailed_info(key_str, game_state_record, player_input_record)
             else:
                 frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
-        else:
-            frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK"); audio = None
+                spec_vis = create_placeholder_frame(300, 720, "NO AUDIO DATA")
+
+        if frame is None:
+            frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK")
+            spec_vis = create_placeholder_frame(300, 720, "NO AUDIO DATA")
             if not run_mode_on: print(f"No data found for key: {key_str}")
             if run_mode_on: run_mode_on = False; print("Run mode stopped: No data for tick.")
-        cv2.imshow("LMDB Inspector", frame)
-        if run_mode_on and audio: play_audio(audio, blocking=True)
-        wait_time = 1 if run_mode_on else 0; key = cv2.waitKey(wait_time) & 0xFF
+            
+        # Create the final composite canvas
+        canvas = np.concatenate((frame, spec_vis), axis=1)
+        cv2.imshow("LMDB Inspector", canvas)
+
+        wait_time = 30 if run_mode_on else 0 # Wait ~33ms in run mode for ~30fps playback
+        key = cv2.waitKey(wait_time) & 0xFF
+
         if key == ord('r'): run_mode_on = not run_mode_on; print(f"Run mode toggled {'ON' if run_mode_on else 'OFF'}"); continue
         if run_mode_on:
             current_tick += TICKS_PER_FRAME
@@ -295,8 +321,8 @@ def main():
             elif key == ord('k'): current_tick -= TICKS_PER_FRAME
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
-            elif key == ord('a') and audio: play_audio(audio, blocking=True)
             elif key == ord('o'): overlay_state = (overlay_state + 1) % 3
+
     cv2.destroyAllWindows(); env.close()
 
 if __name__ == "__main__":

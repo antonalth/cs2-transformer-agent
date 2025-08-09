@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
-for model training. This version computes and stores Mel spectrograms instead
-of raw audio.
+for model training. (Robust multiprocess version with explicit msgpack handling)
 """
 
 import argparse
@@ -22,8 +21,9 @@ import random
 
 import cv2
 import lmdb
+# --- CHANGE: Import msgpack and numpy extension separately ---
 import msgpack
-import msgpack_numpy as m
+import msgpack_numpy as mpnp
 import numpy as np
 from tqdm import tqdm
 
@@ -43,7 +43,8 @@ AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNE
 INITIAL_MAP_SIZE = 2 * 1024**3; MAP_RESIZE_INCREMENT = 1 * 1024**3
 
 # --- Globals ---
-LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None; m.patch()
+# --- CHANGE: Removed m.patch() ---
+LOG = logging.getLogger("InjectionMold"); LMDB_PATH_FOR_CLEANUP = None;
 
 # =============================================================================
 # DATA ENCODING MAPPINGS (Canonical Source)
@@ -108,7 +109,7 @@ def get_inventory_bitmasks(inv_json, weapon, mapping):
     return im,wm
 
 def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, jpeg_quality, block_regions, audio_params):
-    m.patch()
+    # --- CHANGE: Removed m.patch() ---
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
     shm.close()
@@ -130,7 +131,7 @@ def process_round_perspective(task_args):
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
         player_data_cache, lock, lmdb_path = worker_data['player_data_cache'], worker_data['lock'], worker_data['lmdb_path']
         audio_params = worker_data['audio_params']
-        
+
         round_data = recordings_map[(round_num, team)]
         if len(round_data) != 5: return task_args
         t_roster=[p[0]for p in json.loads(rounds_info[round_num]['t_team'])];ct_roster=[p[0]for p in json.loads(rounds_info[round_num]['ct_team'])]
@@ -168,31 +169,23 @@ def process_round_perspective(task_args):
                 if not is_alive or tick>=rec['stoptick']:continue
                 ret,frame=caps[pn].read()
                 
-                # --- START AUDIO PROCESSING CHANGE ---
                 mel_spectrogram = None
                 if not audio_params['no_audio']:
                     audio_bytes = auds[pn].read(AUDIO_BYTES_PER_FRAME)
                     if ret and len(audio_bytes) == AUDIO_BYTES_PER_FRAME:
-                        # Convert 16-bit stereo PCM bytes to a mono float waveform
                         waveform_int = np.frombuffer(audio_bytes, dtype=np.int16)
                         waveform_float = waveform_int.astype(np.float32) / 32768.0
                         waveform_mono = waveform_float.reshape((-1, AUDIO_CHANNELS)).mean(axis=1)
 
-                        # Compute Mel Spectrogram
                         S = librosa.feature.melspectrogram(
-                            y=waveform_mono,
-                            sr=AUDIO_SAMPLE_RATE,
-                            n_mels=audio_params['n_mels'],
-                            n_fft=audio_params['n_fft'],
+                            y=waveform_mono, sr=AUDIO_SAMPLE_RATE,
+                            n_mels=audio_params['n_mels'], n_fft=audio_params['n_fft'],
                             hop_length=audio_params['hop_length']
                         )
-                        # Convert to decibel scale
                         mel_spectrogram = librosa.power_to_db(S, ref=np.max)
-                    else:
-                        continue # Skip frame if video or audio is corrupted
-                else: # if ret is True but audio is disabled
+                    else: continue
+                else:
                     if not ret: continue
-                # --- END AUDIO PROCESSING CHANGE ---
 
                 if worker_data['block_regions']:
                     for (minX, minY, maxX, maxY) in worker_data['block_regions']:
@@ -215,7 +208,13 @@ def process_round_perspective(task_args):
                 pdl.append((pi,jpg,mel_spectrogram))
             if not pdl:continue
             key=f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode('utf-8')
-            payload=msgpack.packb({"game_state":gs,"player_data":pdl},use_bin_type=True);results.append((key,payload))
+            # --- CHANGE: Use explicit encoder for numpy arrays ---
+            payload = msgpack.packb(
+                {"game_state": gs, "player_data": pdl},
+                use_bin_type=True,
+                default=mpnp.encode
+            )
+            results.append((key,payload))
         if not results: return task_args
         
         with lock:
@@ -278,28 +277,12 @@ if __name__ == '__main__':
     parser.add_argument("--quality", type=int, default=80, help="JPEG compression quality (0-100).")
     parser.add_argument("--blockfile", type=Path, help="Path to a file with regions to black out (minX,minY,maxX,maxY per line).")
 
-    # --- Audio Spectrogram Arguments with Solid Defaults ---
     audio_group = parser.add_argument_group('Audio Spectrogram Parameters')
     audio_group.add_argument('--no-audio', action='store_true', help="Disable audio processing entirely and store None for audio.")
-    audio_group.add_argument(
-        '--n-mels',
-        type=int,
-        default=128,
-        help="Number of Mel bands to generate. This is the 'height' of the spectrogram. Default: 128."
-    )
-    audio_group.add_argument(
-        '--n-fft',
-        type=int,
-        default=2048,
-        help="Length of the FFT window, which determines frequency resolution. Default: 2048."
-    )
-    audio_group.add_argument(
-        '--hop-length',
-        type=int,
-        default=512,
-        help="Number of samples between successive frames (hop size). Determines time resolution. Default: 512."
-    )
-
+    audio_group.add_argument('--n-mels', type=int, default=128, help="Number of Mel bands to generate. This is the 'height' of the spectrogram. Default: 128.")
+    audio_group.add_argument('--n-fft', type=int, default=2048, help="Length of the FFT window, which determines frequency resolution. Default: 2048.")
+    audio_group.add_argument('--hop-length', type=int, default=512, help="Number of samples between successive frames (hop size). Determines time resolution. Default: 512.")
+    
     args = parser.parse_args()
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
