@@ -205,7 +205,6 @@ def main():
                         pos = draw_text(frame, f"Mouse: ({player_input_record['mouse'][0]:.3f}, {player_input_record['mouse'][1]:.3f})", pos)
                         if overlay_state == 1:
                             pos = draw_text(frame, f"Keyboard Mask: {int(player_input_record['keyboard_bitmask'])}", pos)
-                            # --- FIX: Dynamically create the string for the larger mask ---
                             eco_mask_str = " ".join(map(str, player_input_record['eco_bitmask']))
                             pos = draw_text(frame, f"Eco Mask: {eco_mask_str}", pos)
                             inv_mask_str = " ".join(map(str, player_input_record['inventory_bitmask']))
@@ -222,7 +221,7 @@ def main():
             else: frame = create_placeholder_frame(1280, 720, "PLAYER DEAD")
         else:
             frame = create_placeholder_frame(1280, 720, "NO DATA FOR TICK"); audio = None
-            if not run_mode_on: print(f"No data for key: {key_str}")
+            if not run_mode_on: print(f"No data found for key: {key_str}")
             if run_mode_on: run_mode_on = False; print("Run mode stopped: No data for tick.")
         cv2.imshow("LMDB Inspector", frame)
         if run_mode_on and audio: play_audio(audio, blocking=True)
@@ -230,12 +229,20 @@ def main():
         if key == ord('r'): run_mode_on = not run_mode_on; print(f"Run mode toggled {'ON' if run_mode_on else 'OFF'}"); continue
         if run_mode_on:
             current_tick += TICKS_PER_FRAME
-            if current_round in round_info and current_tick > round_info[round_info[current_round]['end']]:
+            # --- FIX: Correctly check against the end tick value ---
+            if current_round in round_info and current_tick > round_info[current_round]['end']:
                 print("Run mode stopped: End of round."); run_mode_on = False
         else:
             if key == ord('q'): break
-            elif key == ord('j'): current_tick += TICKS_PER_FRAME
-            elif key == ord('k'): current_tick -= TICKS_PER_FRAME
+            elif key == ord('j'):
+                current_tick += TICKS_PER_FRAME
+                # --- FIX: Also correct the check here for consistency ---
+                if current_round in round_info and current_tick > round_info[current_round]['end']:
+                    current_tick = round_info[current_round]['end']; print("At end of round.")
+            elif key == ord('k'):
+                current_tick -= TICKS_PER_FRAME
+                if current_round in round_info and current_tick < round_info[current_round]['start']:
+                    current_tick = round_info[current_round]['start']; print("At start of round.")
             elif key == ord('p'): current_player_idx = (current_player_idx + 1) % 5
             elif key == ord('t'): current_team = 'CT' if current_team == 'T' else 'T'
             elif key == ord('a') and audio: play_audio(audio, blocking=True)
