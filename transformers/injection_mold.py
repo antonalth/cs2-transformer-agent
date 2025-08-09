@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
-for model training. (Robust Multiprocessing Version with Decentralized Writes
-and a Global Lock for safe LMDB resizing.)
+for model training. This version computes and stores Mel spectrograms instead
+of raw audio.
 """
 
 import argparse
@@ -26,6 +26,14 @@ import msgpack
 import msgpack_numpy as m
 import numpy as np
 from tqdm import tqdm
+
+try:
+    import librosa
+except ImportError:
+    print("Error: The 'librosa' library is required for spectrogram generation.", file=sys.stderr)
+    print("Please install it using: pip install librosa", file=sys.stderr)
+    sys.exit(1)
+
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64; EXPECTED_VIDEO_FPS = 32
@@ -99,7 +107,7 @@ def get_inventory_bitmasks(inv_json, weapon, mapping):
     except(json.JSONDecodeError,TypeError):pass
     return im,wm
 
-def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, jpeg_quality, block_regions):
+def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, jpeg_quality, block_regions, audio_params):
     m.patch()
     shm = SharedMemory(name=shm_cache_name)
     packed_cache_copy = bytes(shm.buf[:shm_cache_size])
@@ -111,6 +119,7 @@ def init_worker(shm_cache_name, shm_cache_size, lmdb_path, lock, gs_dtype, pi_dt
     worker_data['rounds_info'], worker_data['recordings_map'] = rounds_info, recordings_map
     worker_data['jpeg_quality'] = jpeg_quality
     worker_data['block_regions'] = block_regions
+    worker_data['audio_params'] = audio_params
 
 
 def process_round_perspective(task_args):
@@ -120,6 +129,8 @@ def process_round_perspective(task_args):
         gs_dtype, pi_dtype = worker_data['gs_dtype'], worker_data['pi_dtype']
         rounds_info, recordings_map = worker_data['rounds_info'], worker_data['recordings_map']
         player_data_cache, lock, lmdb_path = worker_data['player_data_cache'], worker_data['lock'], worker_data['lmdb_path']
+        audio_params = worker_data['audio_params']
+        
         round_data = recordings_map[(round_num, team)]
         if len(round_data) != 5: return task_args
         t_roster=[p[0]for p in json.loads(rounds_info[round_num]['t_team'])];ct_roster=[p[0]for p in json.loads(rounds_info[round_num]['ct_team'])]
@@ -138,17 +149,11 @@ def process_round_perspective(task_args):
             if rounds_info[round_num].get('freezetime_endtick')is not None and tick<rounds_info[round_num]['freezetime_endtick']:rs_mask|=(1<<0)
             if rounds_info[round_num].get('starttick')is not None and rounds_info[round_num].get('endtick')is not None and tick>=rounds_info[round_num]['starttick']and tick<=rounds_info[round_num]['endtick']:rs_mask|=(1<<1)
             if rounds_info[round_num].get('bomb_planted_tick',-1)!=-1 and tick>=rounds_info[round_num]['bomb_planted_tick']:rs_mask|=(1<<2)
-            
-            # --- START MINIMAL PATCH ---
             win_tick = rounds_info[round_num].get('win_tick')
             if win_tick is not None and tick >= win_tick:
                 win_team = rounds_info[round_num].get('win_team')
-                if win_team == 't':
-                    rs_mask |= (1 << 3)  # Set bit 3 for T-won
-                elif win_team == 'ct':
-                    rs_mask |= (1 << 4)  # Set bit 4 for CT-won
-            # --- END MINIMAL PATCH ---
-            
+                if win_team == 't': rs_mask |= (1 << 3)
+                elif win_team == 'ct': rs_mask |= (1 << 4)
             gs[0]['round_state']=rs_mask
             for i,name in enumerate(enemy_roster):
                 if(enemy_alive>>i)&1:
@@ -161,8 +166,33 @@ def process_round_perspective(task_args):
                 except ValueError:continue
                 is_alive=(team_alive>>p_idx)&1
                 if not is_alive or tick>=rec['stoptick']:continue
-                ret,frame=caps[pn].read();audio=auds[pn].read(AUDIO_BYTES_PER_FRAME)
-                if not ret or len(audio)<AUDIO_BYTES_PER_FRAME:continue
+                ret,frame=caps[pn].read()
+                
+                # --- START AUDIO PROCESSING CHANGE ---
+                mel_spectrogram = None
+                if not audio_params['no_audio']:
+                    audio_bytes = auds[pn].read(AUDIO_BYTES_PER_FRAME)
+                    if ret and len(audio_bytes) == AUDIO_BYTES_PER_FRAME:
+                        # Convert 16-bit stereo PCM bytes to a mono float waveform
+                        waveform_int = np.frombuffer(audio_bytes, dtype=np.int16)
+                        waveform_float = waveform_int.astype(np.float32) / 32768.0
+                        waveform_mono = waveform_float.reshape((-1, AUDIO_CHANNELS)).mean(axis=1)
+
+                        # Compute Mel Spectrogram
+                        S = librosa.feature.melspectrogram(
+                            y=waveform_mono,
+                            sr=AUDIO_SAMPLE_RATE,
+                            n_mels=audio_params['n_mels'],
+                            n_fft=audio_params['n_fft'],
+                            hop_length=audio_params['hop_length']
+                        )
+                        # Convert to decibel scale
+                        mel_spectrogram = librosa.power_to_db(S, ref=np.max)
+                    else:
+                        continue # Skip frame if video or audio is corrupted
+                else: # if ret is True but audio is disabled
+                    if not ret: continue
+                # --- END AUDIO PROCESSING CHANGE ---
 
                 if worker_data['block_regions']:
                     for (minX, minY, maxX, maxY) in worker_data['block_regions']:
@@ -182,7 +212,7 @@ def process_round_perspective(task_args):
                     pi[0]['pos']=[td.get('position_x',0),td.get('position_y',0),td.get('position_z',0)];pi[0]['mouse']=[td.get('mouse_x',0),td.get('mouse_y',0)]
                     pi[0]['health'],pi[0]['armor'],pi[0]['money']=td.get('health',0),td.get('armor',0),td.get('money',0)
                     im,wm=get_inventory_bitmasks(td.get('inventory'),td.get('active_weapon'),ITEM_TO_INDEX);pi[0]['inventory_bitmask'],pi[0]['active_weapon_bitmask']=im,wm
-                pdl.append((pi,jpg,audio))
+                pdl.append((pi,jpg,mel_spectrogram))
             if not pdl:continue
             key=f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode('utf-8')
             payload=msgpack.packb({"game_state":gs,"player_data":pdl},use_bin_type=True);results.append((key,payload))
@@ -191,7 +221,6 @@ def process_round_perspective(task_args):
         with lock:
             batch_size = sum(len(payload) for _, payload in results)
             env = lmdb.open(str(lmdb_path), writemap=True)
-
             txn = env.begin(write=True)
             try:
                 info = env.info(); stats = env.stat()
@@ -203,9 +232,7 @@ def process_round_perspective(task_args):
                     psize = stats['psize']
                     new_size = info['map_size'] + (((int(grow_by * 1.5) + psize - 1) // psize) * psize)
                     env.set_mapsize(new_size)
-
                     txn = env.begin(write=True)
-
                 cursor = txn.cursor()
                 cursor.putmulti(results)
                 txn.commit()
@@ -244,33 +271,53 @@ if __name__ == '__main__':
         pi_dtype=np.dtype([('pos',np.float32,(3,)),('mouse',np.float32,(2,)),('health',np.uint8),('armor',np.uint8),('money',np.int32),('keyboard_bitmask',np.uint32),('eco_bitmask',np.uint64,(6,)),('inventory_bitmask',np.uint64,(2,)),('active_weapon_bitmask',np.uint64,(2,))])
         assert len(KEYBOARD_TO_BIT)<=32 and len(ECO_TO_BIT)<=384 and len(ITEM_TO_INDEX)<=128
         return gs_dtype,pi_dtype
-    parser = argparse.ArgumentParser(description="Compile CS2 recordings into an LMDB using multiprocessing.", formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description="Compile CS2 recordings into a model-ready LMDB.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--recdir", required=True, type=Path); parser.add_argument("--dbfile", required=True, type=Path); parser.add_argument("--outlmdb", required=True, type=Path)
     parser.add_argument("--overwrite", action='store_true'); parser.add_argument("--overridesql", action='store_true'); parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--workers", type=int, default=os.cpu_count()); 
+    parser.add_argument("--workers", type=int, default=os.cpu_count());
     parser.add_argument("--quality", type=int, default=80, help="JPEG compression quality (0-100).")
     parser.add_argument("--blockfile", type=Path, help="Path to a file with regions to black out (minX,minY,maxX,maxY per line).")
+
+    # --- Audio Spectrogram Arguments with Solid Defaults ---
+    audio_group = parser.add_argument_group('Audio Spectrogram Parameters')
+    audio_group.add_argument('--no-audio', action='store_true', help="Disable audio processing entirely and store None for audio.")
+    audio_group.add_argument(
+        '--n-mels',
+        type=int,
+        default=128,
+        help="Number of Mel bands to generate. This is the 'height' of the spectrogram. Default: 128."
+    )
+    audio_group.add_argument(
+        '--n-fft',
+        type=int,
+        default=2048,
+        help="Length of the FFT window, which determines frequency resolution. Default: 2048."
+    )
+    audio_group.add_argument(
+        '--hop-length',
+        type=int,
+        default=512,
+        help="Number of samples between successive frames (hop size). Determines time resolution. Default: 512."
+    )
+
     args = parser.parse_args()
     setup_logging(args.debug); LMDB_PATH_FOR_CLEANUP = args.outlmdb; signal.signal(signal.SIGINT, signal_handler)
     if args.outlmdb.exists():
         if args.overwrite: shutil.rmtree(args.outlmdb); LOG.warning(f"Removed existing LMDB: {args.outlmdb}")
         else: LOG.critical(f"Output path exists. Use --overwrite."); sys.exit(1)
+
+    # ... (rest of the main driver code is identical) ...
     
     block_regions = []
     if args.blockfile:
-        if not args.blockfile.exists():
-            LOG.critical(f"Blockfile not found at: {args.blockfile}")
-            sys.exit(1)
+        if not args.blockfile.exists(): LOG.critical(f"Blockfile not found: {args.blockfile}"); sys.exit(1)
         with open(args.blockfile, 'r') as f:
             for line in f:
                 try:
-                    parts = [int(p.strip()) for p in line.split(',')]
-                    if len(parts) == 4:
-                        block_regions.append(tuple(parts))
-                    else:
-                        LOG.warning(f"Skipping malformed line in blockfile: {line.strip()}")
-                except ValueError:
-                    LOG.warning(f"Skipping non-integer line in blockfile: {line.strip()}")
+                    parts = [int(p.strip()) for p in line.split(',')];
+                    if len(parts) == 4: block_regions.append(tuple(parts))
+                    else: LOG.warning(f"Skipping malformed blockfile line: {line.strip()}")
+                except ValueError: LOG.warning(f"Skipping non-integer blockfile line: {line.strip()}")
         LOG.info(f"   - Loaded {len(block_regions)} blockout regions.")
 
     LOG.info("-> Phase 1: Validating database and loading metadata...")
@@ -281,10 +328,10 @@ if __name__ == '__main__':
     for rec in db_recordings:
         rec=dict(rec); round_num,team=rec['roundnumber'],rec['team']
         if round_num not in rounds_info or rounds_info[round_num].get('starttick') is None: continue
-        if not rec['is_recorded'] and not args.overridesql: LOG.critical(f"Rec for {rec['playername']} in round {round_num} not recorded."); sys.exit(1)
+        if not rec['is_recorded'] and not args.overridesql: LOG.critical(f"Rec for {rec['playername']} round {round_num} not recorded."); sys.exit(1)
         fname=f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
         mp4,wav=args.recdir/f"{fname}.mp4",args.recdir/f"{fname}.wav"
-        if not mp4.exists()or not wav.exists():LOG.critical(f"Media not found for {fname}");sys.exit(1)
+        if not mp4.exists()or not wav.exists():LOG.critical(f"Media not found: {fname}");sys.exit(1)
         rec['mp4_path'],rec['wav_path']=mp4,wav;key=(round_num,team)
         if key not in recordings_map:recordings_map[key]=[]
         recordings_map[key].append(rec)
@@ -294,7 +341,7 @@ if __name__ == '__main__':
     player_data_cache={f"{r['playername']}:{r['tick']}":dict(r)for r in conn.execute("SELECT * FROM player").fetchall()};conn.close()
     packed_cache=pickle.dumps(player_data_cache)
     shm_cache=SharedMemory(create=True,size=len(packed_cache));shm_cache.buf[:len(packed_cache)]=packed_cache
-    LOG.info(f"   - Player data cache ({len(packed_cache)/(1024**2):.2f} MB) created in shared memory.")
+    LOG.info(f"   - Player data cache ({len(packed_cache)/(1024**2):.2f} MB) created in SHM.")
     gs_dtype,pi_dtype=define_numpy_dtypes()
     
     env=lmdb.open(str(args.outlmdb),map_size=INITIAL_MAP_SIZE,writemap=True);env.close()
@@ -304,14 +351,15 @@ if __name__ == '__main__':
     LOG.info(f"-> Phase 2: Processing rounds with {args.workers} worker processes...")
     
     lock = mp.Lock()
-    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, args.quality, block_regions)
+    audio_params = {'no_audio': args.no_audio, 'n_mels': args.n_mels, 'n_fft': args.n_fft, 'hop_length': args.hop_length}
+    initargs = (shm_cache.name, len(packed_cache), args.outlmdb, lock, gs_dtype, pi_dtype, rounds_info, recordings_map, args.quality, block_regions, audio_params)
 
     try:
         with mp.Pool(processes=args.workers, initializer=init_worker, initargs=initargs) as pool:
-            pbar = tqdm(pool.imap_unordered(process_round_perspective, tasks), total=len(tasks), desc="Processing Round/Team Perspectives")
+            pbar = tqdm(pool.imap_unordered(process_round_perspective, tasks), total=len(tasks), desc="Processing Perspectives")
             for result in pbar:
                 if isinstance(result, tuple) and result[0] == "ERROR":
-                    raise RuntimeError(f"A worker process encountered a fatal error: {result[1]}")
+                    raise RuntimeError(f"Worker process fatal error: {result[1]}")
     finally:
         LOG.info("-> Phase 3: Finalizing and cleaning up...")
         env = lmdb.open(str(args.outlmdb), writemap=True)
