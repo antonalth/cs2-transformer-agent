@@ -168,19 +168,29 @@ def process_round_perspective(task_args):
         
         # --- NEW: Use global lock for all LMDB interactions ---
         with lock:
-            env = None
-            try:
-                env = lmdb.open(str(lmdb_path), map_size=INITIAL_MAP_SIZE, writemap=True)
-                with env.begin(write=True) as txn:
-                    batch_size = sum(len(payload) for _, payload in results)
-                    info = env.info(); stats = env.stat()
-                    available = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                    if available < batch_size:
-                        new_size = info['map_size'] + max(batch_size, MAP_RESIZE_INCREMENT)
-                        env.set_mapsize(new_size)
-                    cursor = txn.cursor(); cursor.putmulti(results)
-            finally:
-                if env: env.close()
+            # Stage 1: Check if a resize is needed
+            batch_size = sum(len(payload) for _, payload in results)
+            env_check = lmdb.open(str(lmdb_path))
+            info = env_check.info()
+            stats = env_check.stat()
+            env_check.close() # Immediately close the handle
+
+            available_space = info['map_size'] - (info['last_pgno'] * stats['psize'])
+            
+            # Stage 2: Perform the resize if needed, with an exclusive handle
+            if available_space < batch_size:
+                new_size = info['map_size'] + max(batch_size, MAP_RESIZE_INCREMENT)
+                # Open, resize, and immediately close
+                env_resize = lmdb.open(str(lmdb_path))
+                env_resize.set_mapsize(new_size)
+                env_resize.close()
+
+            # Stage 3: Perform the write with a fresh handle
+            env_write = lmdb.open(str(lmdb_path), map_async=True)
+            with env_write.begin(write=True) as txn:
+                cursor = txn.cursor()
+                cursor.putmulti(results)
+            env_write.close()
         
         return task_args
     except Exception as e:
