@@ -199,7 +199,7 @@ def process_round_perspective(task_args):
                     grow_by = max(batch_size, MAP_RESIZE_INCREMENT)
                     # (optional) round to page size
                     psize = stats['psize']
-                    new_size = info['map_size'] + ((grow_by + psize - 1) // psize) * psize
+                    new_size = info['map_size'] + (((int(grow_by * 1.5) + psize - 1) // psize) * psize)
                     env.set_mapsize(new_size)
 
                     # reopen a fresh write txn
