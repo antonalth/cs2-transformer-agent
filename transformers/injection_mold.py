@@ -183,7 +183,7 @@ def process_round_perspective(task_args):
         with lock:
             # Stage 1: Check if a resize is needed
             batch_size = sum(len(payload) for _, payload in results)
-            env = lmdb.open(str(lmdb_path), map_size=INITIAL_MAP_SIZE, writemap=True)
+            env = lmdb.open(str(lmdb_path), writemap=True)
             # compute batch_size up front
 
             # open a write txn
