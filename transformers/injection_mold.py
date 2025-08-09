@@ -143,9 +143,9 @@ def process_round_perspective(task_args):
             win_tick = rounds_info[round_num].get('win_tick')
             if win_tick is not None and tick >= win_tick:
                 win_team = rounds_info[round_num].get('win_team')
-                if win_team == 'T':
+                if win_team == 't':
                     rs_mask |= (1 << 3)  # Set bit 3 for T-won
-                elif win_team == 'CT':
+                elif win_team == 'ct':
                     rs_mask |= (1 << 4)  # Set bit 4 for CT-won
             # --- END MINIMAL PATCH ---
             
