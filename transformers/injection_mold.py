@@ -3,6 +3,12 @@
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
 for model training. (Robust multiprocess version with explicit msgpack handling)
 """
+try:
+    import librosa
+except ImportError:
+    print("Error: The 'librosa' library is required for spectrogram generation.", file=sys.stderr)
+    print("Please install it using: pip install librosa", file=sys.stderr)
+    sys.exit(1)
 
 import argparse
 import json
@@ -26,14 +32,6 @@ import msgpack
 import msgpack_numpy as mpnp
 import numpy as np
 from tqdm import tqdm
-
-try:
-    import librosa
-except ImportError:
-    print("Error: The 'librosa' library is required for spectrogram generation.", file=sys.stderr)
-    print("Please install it using: pip install librosa", file=sys.stderr)
-    sys.exit(1)
-
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64; EXPECTED_VIDEO_FPS = 32
