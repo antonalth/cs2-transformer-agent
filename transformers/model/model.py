@@ -38,50 +38,29 @@ class AudioEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.spectrogram_shape = spectrogram_shape
 
-        # --- CNN Feature Extractor ---
-        # A simple stack of 2D convolutional layers to process the spectrogram image.
         self.cnn = nn.Sequential(
-            # Input shape: [Batch, 1, 128, 6] (Channels, Height, Width)
             nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2), # Shape -> [Batch, 16, 64, 3]
+            nn.MaxPool2d(kernel_size=2),
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2), # Shape -> [Batch, 32, 32, 1]
+            nn.MaxPool2d(kernel_size=2),
         )
 
-        # --- Projection Layer ---
-        # After the CNN, we flatten the output and project it to the hidden_dim.
-        # We need to calculate the flattened size first.
         cnn_output_shape = self._get_cnn_output_shape()
         self.projection = nn.Linear(cnn_output_shape, hidden_dim)
-
-        # --- Learnable "No Audio" Token ---
-        # A parameter that will be used if the input audio is None.
-        # This allows the model to learn a representation for missing audio.
         self.no_audio_embedding = nn.Parameter(torch.randn(1, hidden_dim))
 
     def _get_cnn_output_shape(self) -> int:
         """Helper function to dynamically calculate the output size of the CNN."""
-        # Create a dummy tensor with the expected input shape and pass it through the CNN
         dummy_input = torch.randn(1, 1, *self.spectrogram_shape)
         with torch.no_grad():
             output = self.cnn(dummy_input)
         return output.flatten().shape[0]
 
     def forward(self, spectrogram: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass for the AudioEncoder.
-        
-        Args:
-            spectrogram (Optional[torch.Tensor]): A tensor of shape 
-                [Batch, n_mels, time_frames] or None.
-        
-        Returns:
-            torch.Tensor: The audio embedding of shape [Batch, hidden_dim].
-        """
+        """Forward pass for the AudioEncoder."""
         if spectrogram is None:
-            # If input is None, broadcast the learned "no_audio" embedding to the batch size.
             return self.no_audio_embedding
 
         x = spectrogram.unsqueeze(1)
@@ -95,9 +74,9 @@ class VisionEncoder(nn.Module):
     """
     Encodes a player's Point-of-View (POV) into a fixed-size embedding.
     
-    This module uses two views of the input frame (a foveal/center crop and a
-    full peripheral view) and processes them through a SHARED, pre-trained
-    ViT-Large model that was pre-trained on 384x384 images.
+    This module uses two views of the input frame (a 384x384 foveal/center crop
+    and a 384x384 scaled peripheral view) and processes them through a SHARED, 
+    pre-trained ViT-Large model.
     """
     def __init__(self, hidden_dim: int = 2048, freeze_vit: bool = True):
         """
@@ -111,30 +90,22 @@ class VisionEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # --- Load Pre-trained ViT-Large (384x384 version) ---
-        # We now use the model pre-trained on 384x384 images. This is a better
-        # fit for our peripheral view. The library will automatically handle
-        # interpolating positional embeddings for the smaller 224x224 foveal view.
-        vit_model_name = "google/vit-large-patch16-384" # <-- CHANGE HERE
+        # Use the ViT model pre-trained on 384x384 images. This is now the
+        # native resolution for BOTH of our visual inputs.
+        vit_model_name = "google/vit-large-patch16-384"
         
         self.vit_config = ViTConfig.from_pretrained(vit_model_name)
         self.vit = ViTModel.from_pretrained(vit_model_name, config=self.vit_config)
         
-        # --- Projection Layer ---
-        # The ViT-Large model has a hidden size of 1024. We concatenate the two
-        # [CLS] tokens (1024 + 1024 = 2048) and project them.
         vit_output_dim = self.vit_config.hidden_size # 1024
         self.projection = nn.Linear(vit_output_dim * 2, hidden_dim)
         
-        # --- Freezing Logic ---
         if freeze_vit:
             for param in self.vit.parameters():
                 param.requires_grad = False
 
     def unfreeze_vit(self):
-        """
-        Public method to unfreeze the ViT weights for fine-tuning.
-        """
+        """Public method to unfreeze the ViT weights for fine-tuning."""
         print("Unfreezing Vision Transformer for fine-tuning.")
         for param in self.vit.parameters():
             param.requires_grad = True
@@ -144,8 +115,10 @@ class VisionEncoder(nn.Module):
         Forward pass for the VisionEncoder.
         
         Args:
-            foveal_view (torch.Tensor): The center-cropped view. Shape: [Batch, 3, 224, 224].
-            peripheral_view (torch.Tensor): The resized full view. Shape: [Batch, 3, 384, 384].
+            foveal_view (torch.Tensor): The 384x384 center-cropped (non-scaled) view.
+                                        Shape: [Batch, 3, 384, 384].
+            peripheral_view (torch.Tensor): The 384x384 scaled full view.
+                                            Shape: [Batch, 3, 384, 384].
         
         Returns:
             torch.Tensor: The final visual embedding of shape [Batch, hidden_dim].
@@ -181,13 +154,10 @@ class PlayerEncoder(nn.Module):
                 foveal_view: torch.Tensor,
                 peripheral_view: torch.Tensor,
                 spectrogram: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass for the full player encoder.
-        """
+        """Forward pass for the full player encoder."""
         visual_embedding = self.vision_encoder(foveal_view, peripheral_view)
         audio_embedding = self.audio_encoder(spectrogram)
         
-        # Fuse by simple addition and normalize
         fused_embedding = visual_embedding + audio_embedding
         final_token = self.final_norm(fused_embedding)
         
@@ -202,11 +172,13 @@ if __name__ == '__main__':
     BATCH_SIZE = 4
     HIDDEN_DIM = 2048
     
-    dummy_foveal_view = torch.randn(BATCH_SIZE, 3, 224, 224)
+    # --- Create Dummy Inputs ---
+    # Both visual inputs are now 384x384
+    dummy_foveal_view = torch.randn(BATCH_SIZE, 3, 384, 384) # <-- CHANGE HERE
     dummy_peripheral_view = torch.randn(BATCH_SIZE, 3, 384, 384)
     dummy_spectrogram = torch.randn(BATCH_SIZE, 128, 6)
     
-    print("--- Initializing PlayerEncoder with ViT-Large-384 (Frozen) ---")
+    print("--- Initializing PlayerEncoder (ViT Frozen) ---")
     player_encoder = PlayerEncoder(hidden_dim=HIDDEN_DIM, freeze_vit=True)
     
     vit_params = sum(p.numel() for p in player_encoder.vision_encoder.vit.parameters() if p.requires_grad)
@@ -224,4 +196,4 @@ if __name__ == '__main__':
     print(f"Number of trainable parameters in ViT after unfreezing: {vit_params_unfrozen}")
     assert vit_params_unfrozen > 300_000_000
     
-    print("\nStage 1 module updated and built successfully!")
+    print("\nStage 1 module (with 384x384 foveal view) built successfully!")
