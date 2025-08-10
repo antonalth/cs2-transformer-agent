@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, List, Tuple, Dict
 import argparse # Import argparse for command-line flags
+import time
 
 # We will use the `transformers` library from Hugging Face to easily load
 # a pre-trained ViT-Large model. Make sure to install it:
