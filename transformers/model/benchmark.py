@@ -1,159 +1,199 @@
 # benchmark.py
+# A script to benchmark the performance of individual model components.
 
 import torch
-import time
+import torch.nn as nn
 import argparse
-import humanize  # For formatting numbers nicely (pip install humanize)
+import time
+import math
+from transformers import ViTModel, ViTConfig
 
-# Import the model definition from the adjacent model.py file
-from model import CS2Transformer
-from torch.cuda.amp import autocast
+def get_model_params(model: nn.Module) -> float:
+    """Calculates the number of trainable parameters in a model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
 
-def run_benchmark_for_config(config: dict, args: argparse.Namespace):
+def benchmark_vit(vit_version: str, batch_size: int, device: torch.device, reps: int):
     """
-    Instantiates and benchmarks a single model configuration.
-    
+    Benchmarks a specified Vision Transformer model.
+
     Args:
-        config (dict): A dictionary describing the model parameters.
-        args (argparse.Namespace): Command-line arguments.
-    
-    Returns:
-        A tuple containing (parameter_count, average_time_ms).
+        vit_version (str): The version of ViT to test ('224' or '384').
+        batch_size (int): The number of images to process in a batch.
+        device (torch.device): The device (CPU or CUDA) to run on.
+        reps (int): The number of repetitions for the benchmark.
     """
-    device = torch.device(args.device)
+    if vit_version == '224':
+        model_name = "google/vit-large-patch16-224-in21k"
+        image_size = 224
+    elif vit_version == '384':
+        model_name = "google/vit-large-patch16-384"
+        image_size = 384
+    else:
+        raise ValueError("Invalid ViT version specified. Use '224' or '384'.")
+
+    print(f"\n--- Benchmarking ViT Model: {model_name} ---")
+    print(f"Batch Size: {batch_size}, Image Size: {image_size}x{image_size}, Device: {device}, Reps: {reps}")
+
+    # Load model and set to evaluation mode
+    model = ViTModel.from_pretrained(model_name, add_pooling_layer=False).to(device)
+    model.eval()
+
+    # Create dummy input data
+    dummy_data = torch.randn(batch_size, 3, image_size, image_size, device=device)
     
-    print(f"\n--- Benchmarking Config: {config['name']} ---")
-    print(f"  Layers: {config['layers']}, Dim: {config['dim']}, Heads: {config['heads']}")
+    # Get model size
+    params_m = get_model_params(model)
+    print(f"Model Parameters: {params_m:.2f}M")
 
-    try:
-        # --- 1. Model Initialization ---
-        # We freeze the ViT because we only want to measure the performance
-        # of the main transformer backbone that we are scaling.
-        model = CS2Transformer(
-            hidden_dim=config['dim'],
-            num_layers=config['layers'],
-            num_heads=config['heads'],
-            freeze_vit=True
-        ).to(device)
-        model.eval() # Set to evaluation mode
+    with torch.no_grad():
+        # Warmup for accurate GPU timing
+        if device.type == 'cuda':
+            print("Warming up GPU...")
+            for _ in range(5):
+                _ = model(dummy_data)
+            torch.cuda.synchronize()
 
-        # Calculate the number of trainable parameters (ViT is frozen)
-        params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Trainable Parameters: {humanize.intword(params)} ({params:,})")
-
-        # --- 2. Dummy Data Creation ---
-        B, S, P = args.batch_size, args.frames, 5 # Batch, Sequence, Players
-        dummy_round_data = {
-            'foveal_views': torch.randn(B, S, P, 3, 384, 384, device=device),
-            'peripheral_views': torch.randn(B, S, P, 3, 384, 384, device=device),
-            'spectrograms': torch.randn(B, S, P, 128, 6, device=device),
-            'is_alive_mask': torch.ones((B, S, P), dtype=torch.bool, device=device),
-            'is_masked_frame_mask': torch.zeros((B, S), dtype=torch.bool, device=device),
-        }
-        # For inference speed, we don't need to mask, but the model expects the key.
-
-        # --- 3. Benchmarking Loop ---
-        with torch.no_grad(), autocast():
-            # Warmup loop for GPU to handle kernel launch overhead
-            if device.type == 'cuda':
-                print("  Warming up GPU...")
-                for _ in range(5):
-                    _ = model(dummy_round_data)
-                torch.cuda.synchronize()
-
-            # Timed loop
-            print("  Running benchmark...")
-            start_time = time.perf_counter()
-            for _ in range(args.iterations):
-                _ = model(dummy_round_data)
-            
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            end_time = time.perf_counter()
-
-        total_time = end_time - start_time
-        avg_time_ms = (total_time / args.iterations) * 1000
-        print(f"  Done. Average forward pass: {avg_time_ms:.2f} ms")
+        # Timed benchmark loop
+        print("Running benchmark...")
+        start_time = time.perf_counter()
+        for _ in range(reps):
+            _ = model(dummy_data)
         
-        return params, avg_time_ms
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
 
-    except torch.cuda.OutOfMemoryError:
-        print("  ERROR: Ran out of memory on GPU for this configuration.")
-        return params, "OOM"
-    except Exception as e:
-        print(f"  An unexpected error occurred: {e}")
-        return 0, "Error"
+    # Calculate and display results
+    total_time = end_time - start_time
+    avg_latency = (total_time / reps) * 1000  # in ms
+    throughput = (reps * batch_size) / total_time  # in images/sec
+
+    print("--- Results ---")
+    print(f"Average Latency: {avg_latency:.3f} ms")
+    print(f"Throughput: {throughput:.2f} images/sec")
+    print("---------------")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Benchmark different sizes of the CS2Transformer model.")
-    parser.add_argument('--frames', type=int, default=100, help="Number of frames in the benchmark sequence.")
-    parser.add_argument('--batch-size', type=int, default=2, help="Batch size for the benchmark.")
-    parser.add_argument('--iterations', type=int, default=10, help="Number of timed iterations to average.")
+def benchmark_transformer(param_choice: str, seq_len: int, batch_size: int, device: torch.device, reps: int):
+    """
+    Benchmarks a standard nn.TransformerEncoder at a given parameter scale.
+
+    Args:
+        param_choice (str): The desired parameter scale ('50M', '150M', '500M', '1B').
+        seq_len (int): The length of the input sequence.
+        batch_size (int): The number of sequences to process in a batch.
+        device (torch.device): The device (CPU or CUDA) to run on.
+        reps (int): The number of repetitions for the benchmark.
+    """
+    # Define model configurations for different parameter counts
+    TRANSFORMER_CONFIGS = {
+        '50M':   {'layers': 6,  'dim': 1024, 'heads': 16},
+        '150M':  {'layers': 12, 'dim': 1280, 'heads': 16},
+        '500M':  {'layers': 16, 'dim': 2048, 'heads': 32},
+        '1B':    {'layers': 24, 'dim': 2560, 'heads': 32}
+    }
+
+    if param_choice not in TRANSFORMER_CONFIGS:
+        raise ValueError(f"Invalid param choice. Use one of {list(TRANSFORMER_CONFIGS.keys())}")
+
+    config = TRANSFORMER_CONFIGS[param_choice]
+    d_model = config['dim']
+    n_head = config['heads']
+    n_layers = config['layers']
+    dim_feedforward = d_model * 4
+
+    print(f"\n--- Benchmarking Transformer Model: ~{param_choice} ---")
+    print(f"Config: {n_layers} layers, {d_model} dim, {n_head} heads")
+    print(f"Batch Size: {batch_size}, Sequence Length: {seq_len}, Device: {device}, Reps: {reps}")
+
+    # Create the model
+    encoder_layer = nn.TransformerEncoderLayer(
+        d_model=d_model,
+        nhead=n_head,
+        dim_feedforward=dim_feedforward,
+        dropout=0.1,
+        batch_first=False # Use [S, B, E] format
+    )
+    model = nn.TransformerEncoder(encoder_layer, num_layers=n_layers).to(device)
+    model.eval()
+
+    # Create dummy input data
+    # Shape: [Sequence Length, Batch Size, Embedding Dim]
+    dummy_data = torch.randn(seq_len, batch_size, d_model, device=device)
+
+    # Get model size
+    params_m = get_model_params(model)
+    print(f"Actual Model Parameters: {params_m:.2f}M")
     
-    # Auto-select device
-    default_device = "cuda" if torch.cuda.is_available() else "cpu"
-    parser.add_argument('--device', type=str, default=default_device, help="Device to run on (e.g., 'cuda', 'cpu').")
-    
-    args = parser.parse_args()
+    with torch.no_grad():
+        # Warmup
+        if device.type == 'cuda':
+            print("Warming up GPU...")
+            for _ in range(5):
+                _ = model(dummy_data)
+            torch.cuda.synchronize()
 
-    print("="*60)
-    print("CS2Transformer Performance Benchmark")
-    print("="*60)
-    print(f"Device: {args.device.upper()}")
-    print(f"Sequence Length: {args.frames} frames")
-    print(f"Batch Size: {args.batch_size}")
-    print(f"Timed Iterations: {args.iterations}")
-    print("-"*60)
-    
-    # Define model configurations to test, from ~100M to ~1B
-    model_configs = [
-        {
-            'name': 'Small (~100M)',
-            'layers': 8,
-            'dim': 1024,
-            'heads': 16, # 1024 / 16 = 64
-        },
-        {
-            'name': 'Medium (~200M)',
-            'layers': 4,
-            'dim': 2048,
-            'heads': 32, # 2048 / 32 = 64
-        },
-        {
-            'name': 'Large (~500M)',
-            'layers': 10,
-            'dim': 2048,
-            'heads': 32,
-        },
-        {
-            'name': 'XL (~1B)',
-            'layers': 20,
-            'dim': 2048,
-            'heads': 32,
-        },
-    ]
+        # Timed benchmark loop
+        print("Running benchmark...")
+        start_time = time.perf_counter()
+        for _ in range(reps):
+            _ = model(dummy_data)
+        
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
 
-    results = []
-    for config in model_configs:
-        params, avg_time = run_benchmark_for_config(config, args)
-        results.append((config['name'], params, avg_time))
-        # Clean up memory between runs
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    # Calculate and display results
+    total_time = end_time - start_time
+    avg_latency = (total_time / reps) * 1000  # in ms
+    throughput_seq = (reps * batch_size) / total_time  # in sequences/sec
+    throughput_tok = (reps * batch_size * seq_len) / total_time # in tokens/sec
 
-    # --- Print Final Summary Table ---
-    print("\n" + "="*60)
-    print("Benchmark Summary")
-    print("="*60)
-    print(f"{'Configuration':<20} | {'Parameters':<20} | {'Avg. Time (ms/pass)':<25}")
-    print("-"*60)
-    for name, params, avg_time in results:
-        param_str = f"{humanize.intword(params)} ({params:,})" if params > 0 else "N/A"
-        time_str = f"{avg_time:.2f}" if isinstance(avg_time, float) else avg_time
-        print(f"{name:<20} | {param_str:<20} | {time_str:<25}")
-    print("-"*60)
+    print("--- Results ---")
+    print(f"Average Latency: {avg_latency:.3f} ms")
+    print(f"Throughput (Sequences/sec): {throughput_seq:.2f}")
+    print(f"Throughput (Tokens/sec): {throughput_tok:,.0f}")
+    print("---------------")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Benchmark script for core model components.")
+    
+    # General arguments
+    parser.add_argument('--model', type=str, required=True, choices=['vit', 'transformer'], help="The component to benchmark.")
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], help="The device to run the benchmark on.")
+    parser.add_argument('--batch-size', type=int, default=8, help="Batch size for the benchmark.")
+    parser.add_argument('--reps', type=int, default=20, help="Number of repetitions for timing.")
+
+    # ViT-specific arguments
+    parser.add_argument('--vit-version', type=str, default='384', choices=['224', '384'], help="Version of the ViT model to test.")
+
+    # Transformer-specific arguments
+    parser.add_argument('--seq-len', type=int, default=1024, help="Sequence length for the transformer benchmark.")
+    parser.add_argument('--params', type=str, default='150M', choices=['50M', '150M', '500M', '1B'], help="Target parameter count for the transformer.")
+    
+    args = parser.parse_args()
+    
+    # Set device
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA is not available on this system. Falling back to CPU.")
+        device = torch.device('cpu')
+    else:
+        device = torch.device(args.device)
+
+    # Run the selected benchmark
+    if args.model == 'vit':
+        benchmark_vit(
+            vit_version=args.vit_version,
+            batch_size=args.batch_size,
+            device=device,
+            reps=args.reps
+        )
+    elif args.model == 'transformer':
+        benchmark_transformer(
+            param_choice=args.params,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            device=device,
+            reps=args.reps
+        )
