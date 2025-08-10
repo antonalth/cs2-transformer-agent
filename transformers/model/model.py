@@ -379,6 +379,7 @@ class CS2Transformer(nn.Module):
         x = input_sequence.permute(1, 0, 2, 3).reshape(S * (P + self.num_special_tokens), B, self.hidden_dim)
         
         rope_cos, rope_sin = self.rotary_embeddings(x)
+        for layer in self.transformer_encoder:
         predictions = {"player": [{} for _ in range(P)], "game_strategy": {}}
         
         # Player predictions
