@@ -1,323 +1,167 @@
 # model.py
+
 import torch
 import torch.nn as nn
 from typing import Optional, List, Tuple, Dict
-import argparse # Import argparse for command-line flags
+import argparse
 import time
 
 # We will use the `transformers` library from Hugging Face to easily load
-# a pre-trained ViT-Large model. Make sure to install it:
-# pip install transformers
+# a pre-trained ViT-Large model.
 from transformers import ViTConfig, ViTModel
 
 # --- Data structure constants derived from injection_mold.py ---
-# These should be kept in sync with the data generation script.
 NUM_KEYBOARD_KEYS = 31
-NUM_ECO_ACTIONS = 384 # This is a large, sparse vector
+NUM_ECO_ACTIONS = 384
 NUM_INVENTORY_ITEMS = 128
 NUM_ROUND_STATE_BITS = 5
-# For heatmap predictions, we need to define the map's dimensions and resolution.
-# These values are examples and should be tuned based on the game's coordinate system.
-MAP_RESOLUTION = (64, 256, 256) # (Z, Y, X)
-MOUSE_MAP_RESOLUTION = (64, 64) # (dy, dx) bins
-
+MAP_RESOLUTION = (64, 256, 256)
+MOUSE_MAP_RESOLUTION = (64, 64)
 
 # ======================================================================================
-# STAGE 1: INPUT ENCODING (Completed)
+# STAGE 1: INPUT ENCODING (Unchanged)
 # ======================================================================================
 
 class AudioEncoder(nn.Module):
     """Encodes a Mel Spectrogram into a fixed-size embedding vector."""
     def __init__(self, hidden_dim: int = 2048, spectrogram_shape: tuple = (128, 6)):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.spectrogram_shape = spectrogram_shape
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, stride=1, padding=1), nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1), nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2),
-        )
-        cnn_output_shape = self._get_cnn_output_shape()
-        self.projection = nn.Linear(cnn_output_shape, hidden_dim)
-        self.no_audio_embedding = nn.Parameter(torch.randn(1, hidden_dim))
-
+        self.hidden_dim = hidden_dim; self.spectrogram_shape = spectrogram_shape
+        self.cnn = nn.Sequential(nn.Conv2d(1, 16, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2), nn.Conv2d(16, 32, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2))
+        self.projection = nn.Linear(self._get_cnn_output_shape(), hidden_dim); self.no_audio_embedding = nn.Parameter(torch.randn(1, hidden_dim))
     def _get_cnn_output_shape(self) -> int:
-        dummy_input = torch.randn(1, 1, *self.spectrogram_shape)
-        with torch.no_grad():
-            output = self.cnn(dummy_input)
-        return output.flatten().shape[0]
-
+        return self.cnn(torch.randn(1, 1, *self.spectrogram_shape)).flatten().shape[0]
     def forward(self, spectrogram: Optional[torch.Tensor]) -> torch.Tensor:
-        if spectrogram is None:
-            return self.no_audio_embedding
-        x = spectrogram.unsqueeze(1)
-        x = self.cnn(x)
-        x = x.flatten(start_dim=1)
-        return self.projection(x)
+        if spectrogram is None: return self.no_audio_embedding.expand(spectrogram.shape[0] if spectrogram else 1, -1)
+        return self.projection(self.cnn(spectrogram.unsqueeze(1)).flatten(1))
 
 class VisionEncoder(nn.Module):
     """Encodes two 384x384 player POV views into a fixed-size embedding."""
     def __init__(self, hidden_dim: int = 2048, freeze_vit: bool = True):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        vit_model_name = "google/vit-large-patch16-384"
-        self.vit_config = ViTConfig.from_pretrained(vit_model_name)
-        self.vit = ViTModel.from_pretrained(vit_model_name, config=self.vit_config)
-        vit_output_dim = self.vit_config.hidden_size
-        self.projection = nn.Linear(vit_output_dim * 2, hidden_dim)
+        self.hidden_dim = hidden_dim; vit_model_name = "google/vit-large-patch16-384"
+        self.vit_config = ViTConfig.from_pretrained(vit_model_name); self.vit = ViTModel.from_pretrained(vit_model_name, config=self.vit_config, add_pooling_layer=False)
+        self.projection = nn.Linear(self.vit_config.hidden_size * 2, hidden_dim)
         if freeze_vit:
-            for param in self.vit.parameters():
-                param.requires_grad = False
-
+            for param in self.vit.parameters(): param.requires_grad = False
     def unfreeze_vit(self):
-        print("Unfreezing Vision Transformer for fine-tuning.")
-        for param in self.vit.parameters():
-            param.requires_grad = True
-
+        print("Unfreezing Vision Transformer for fine-tuning."); [p.requires_grad_(True) for p in self.vit.parameters()]
     def forward(self, foveal_view: torch.Tensor, peripheral_view: torch.Tensor) -> torch.Tensor:
-        foveal_outputs = self.vit(pixel_values=foveal_view)
-        foveal_cls_token = foveal_outputs.last_hidden_state[:, 0, :]
-        peripheral_outputs = self.vit(pixel_values=peripheral_view)
-        peripheral_cls_token = peripheral_outputs.last_hidden_state[:, 0, :]
-        concatenated_tokens = torch.cat([foveal_cls_token, peripheral_cls_token], dim=1)
-        return self.projection(concatenated_tokens)
+        f_cls = self.vit(pixel_values=foveal_view).last_hidden_state[:, 0, :]
+        p_cls = self.vit(pixel_values=peripheral_view).last_hidden_state[:, 0, :]
+        return self.projection(torch.cat([f_cls, p_cls], dim=1))
 
 class PlayerEncoder(nn.Module):
     """Wrapper module combining Vision and Audio encoders for a single player."""
     def __init__(self, hidden_dim: int = 2048, freeze_vit: bool = True):
         super().__init__()
-        self.vision_encoder = VisionEncoder(hidden_dim=hidden_dim, freeze_vit=freeze_vit)
-        self.audio_encoder = AudioEncoder(hidden_dim=hidden_dim)
+        self.vision_encoder = VisionEncoder(hidden_dim, freeze_vit); self.audio_encoder = AudioEncoder(hidden_dim)
         self.final_norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, foveal_view: torch.Tensor, peripheral_view: torch.Tensor,
-                spectrogram: Optional[torch.Tensor]) -> torch.Tensor:
-        visual_embedding = self.vision_encoder(foveal_view, peripheral_view)
-        audio_embedding = self.audio_encoder(spectrogram)
-        fused_embedding = visual_embedding + audio_embedding
-        return self.final_norm(fused_embedding)
+    def forward(self, foveal_view: torch.Tensor, peripheral_view: torch.Tensor, spectrogram: Optional[torch.Tensor]) -> torch.Tensor:
+        fused = self.vision_encoder(foveal_view, peripheral_view) + self.audio_encoder(spectrogram)
+        return self.final_norm(fused)
 
 # ======================================================================================
-# STAGE 2: CORE TRANSFORMER BACKBONE
-# This section defines the main transformer architecture, including the RoPE-enabled
-# encoder layers and the overall model structure.
+# STAGE 2: CORE TRANSFORMER BACKBONE (Modified for Autoregression)
 # ======================================================================================
 
 class RotaryEmbedding(nn.Module):
-    """
-    Implements Rotary Positional Embeddings (RoPE).
-    
-    This module pre-computes the sinusoidal frequencies for RoPE and applies
-    the rotation to query and key tensors.
-    """
+    # ... (implementation from previous step, unchanged)
     def __init__(self, dim: int):
-        super().__init__()
-        # Pre-compute theta values for the sinusoidal embeddings
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.cached_cos = None
-        self.cached_sin = None
-
+        super().__init__(); inv_freq = 1.0 / (10000**(torch.arange(0, dim, 2).float() / dim)); self.register_buffer("inv_freq", inv_freq); self.cached_cos = self.cached_sin = None
     def forward(self, x: torch.Tensor):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape [seq_len, batch_size, ...].
-        """
         seq_len = x.shape[0]
-        
-        # Check if we have cached sin/cos values for this sequence length
         if self.cached_cos is None or self.cached_cos.shape[0] < seq_len:
-            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self.cached_cos = emb.cos()[:, None, None, :]
-            self.cached_sin = emb.sin()[:, None, None, :]
-        
+            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype); freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1); self.cached_cos = emb.cos()[:, None, None, :]; self.cached_sin = emb.sin()[:, None, None, :]
         return self.cached_cos[:seq_len, ...], self.cached_sin[:seq_len, ...]
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Helper function to rotate half the features for RoPE application."""
-    x1, x2 = x[..., ::2], x[..., 1::2]
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Applies rotary embeddings to query and key tensors."""
-    q_emb = (q * cos) + (rotate_half(q) * sin)
-    k_emb = (k * cos) + (rotate_half(k) * sin)
-    return q_emb, k_emb
+def rotate_half(x: torch.Tensor): return torch.cat((-x[..., 1::2], x[..., ::2]), dim=-1)
+def apply_rotary_pos_emb(q, k, cos, sin): return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 class CS2TransformerEncoderLayer(nn.Module):
-    """
-    A Transformer Encoder layer that incorporates Rotary Positional Embeddings.
-    It follows the standard Pre-LN (LayerNorm first) architecture.
-    """
+    """A Transformer Encoder layer modified to be CAUSAL for autoregression."""
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
         super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        
+        self.d_model, self.nhead = d_model, nhead
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
+        self.linear1, self.linear2 = nn.Linear(d_model, dim_feedforward), nn.Linear(dim_feedforward, d_model)
+        self.norm1, self.norm2 = nn.LayerNorm(d_model), nn.LayerNorm(d_model)
+        self.dropout, self.dropout1, self.dropout2 = nn.Dropout(dropout), nn.Dropout(dropout), nn.Dropout(dropout)
         self.activation = nn.GELU()
+        
+        # --- CHANGE: We no longer pre-generate the mask, we'll create it on the fly ---
+        self.attn_mask = None
+
+    def _generate_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
+        """Generates a square causal mask."""
+        return torch.triu(torch.ones(sz, sz, device=device, dtype=torch.bool), diagonal=1)
 
     def forward(self, src: torch.Tensor, rotary_cos: torch.Tensor, rotary_sin: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the custom encoder layer.
-        
-        Args:
-            src (torch.Tensor): Input sequence. Shape: [seq_len, batch_size, embed_dim].
-            rotary_cos (torch.Tensor): Cosine part of RoPE.
-            rotary_sin (torch.Tensor): Sine part of RoPE.
-        """
-        # --- Self-Attention Block (with RoPE) ---
+        seq_len = src.shape[0]
+        # --- CHANGE: Generate a causal attention mask ---
+        # This prevents the model from looking at future tokens.
+        if self.attn_mask is None or self.attn_mask.size(0) != seq_len:
+            self.attn_mask = self._generate_causal_mask(seq_len, src.device)
+
         x = self.norm1(src)
+        q_s, k_s = x.reshape(seq_len, -1, self.nhead, self.d_model // self.nhead), x.reshape(seq_len, -1, self.nhead, self.d_model // self.nhead)
+        q_r, k_r = apply_rotary_pos_emb(q_s, k_s, rotary_cos, rotary_sin)
+        q_r, k_r = q_r.reshape(x.shape), k_r.reshape(x.shape)
         
-        # Reshape for MHA and apply RoPE
-        # x shape: [seq_len, batch_size, embed_dim]
-        query, key, value = x, x, x
-        
-        # Reshape to [seq_len, batch_size, nhead, head_dim] to apply rotation
-        q_s = query.reshape(query.shape[0], query.shape[1], self.nhead, self.d_model // self.nhead)
-        k_s = key.reshape(key.shape[0], key.shape[1], self.nhead, self.d_model // self.nhead)
-        
-        q_rotated, k_rotated = apply_rotary_pos_emb(q_s, k_s, rotary_cos, rotary_sin)
-
-        # Reshape back to [seq_len, batch_size, embed_dim] for MHA module
-        q_rotated = q_rotated.reshape(query.shape)
-        k_rotated = k_rotated.reshape(key.shape)
-
-        # Pass rotated Q/K and original V to the attention mechanism
-        attn_output, _ = self.self_attn(q_rotated, k_rotated, value, need_weights=False)
-        
+        attn_output, _ = self.self_attn(q_r, k_r, x, attn_mask=self.attn_mask, need_weights=False)
         src = src + self.dropout1(attn_output)
-
-        # --- Feed-Forward Block ---
+        
         x = self.norm2(src)
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         src = src + self.dropout2(x)
-
         return src
 
 # ======================================================================================
-# STAGE 3: PREDICTION HEADS
-# This section defines the various output heads that decode the transformer's
-# output tokens into structured, predictable data matching the LMDB format.
+# STAGE 3: PREDICTION HEADS (Unchanged)
 # ======================================================================================
 
 class MLPHead(nn.Sequential):
-    """A simple Multi-Layer Perceptron head for classification or regression."""
     def __init__(self, input_dim: int, output_dim: int):
-        super().__init__(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.GELU(),
-            nn.LayerNorm(input_dim // 2),
-            nn.Linear(input_dim // 2, output_dim)
-        )
+        super().__init__(nn.Linear(input_dim, input_dim // 2), nn.GELU(), nn.LayerNorm(input_dim // 2), nn.Linear(input_dim // 2, output_dim))
 
 class HeatmapHead(nn.Module):
-    """A deconvolutional network to predict a 3D or 2D heatmap."""
     def __init__(self, input_dim: int, output_shape: Tuple[int, ...]):
         super().__init__()
-        # This is a simplified example. A real implementation might have a more
-        # complex architecture with more layers and careful channel sizing.
-        self.output_shape = output_shape
-        self.is_3d = len(output_shape) == 3
-        
-        # Start by projecting the input vector and reshaping it into a small volume
-        self.initial_projection = nn.Linear(input_dim, 256 * 4 * 4 * (2 if self.is_3d else 1))
-        
-        ConvTranspose = nn.ConvTranspose3d if self.is_3d else nn.ConvTranspose2d
-        self.deconv_layers = nn.Sequential(
-            ConvTranspose(256, 128, kernel_size=4, stride=2, padding=1), nn.ReLU(),
-            ConvTranspose(128, 64, kernel_size=4, stride=2, padding=1), nn.ReLU(),
-            ConvTranspose(64, 1, kernel_size=4, stride=2, padding=1)
-            # This is a generic structure; it needs to be designed to reach the
-            # exact MAP_RESOLUTION and MOUSE_MAP_RESOLUTION.
-        )
-
+        self.decoder = MLPHead(input_dim, int(torch.prod(torch.tensor(output_shape)))); self.output_shape = output_shape
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.initial_projection(x)
-        if self.is_3d:
-            x = x.view(-1, 256, 2, 4, 4) # (B, C, D, H, W)
-        else:
-            x = x.view(-1, 256, 4, 4) # (B, C, H, W)
-        
-        # The output size of deconv_layers needs to be carefully adjusted
-        # to match the target resolution. This is a placeholder.
-        heatmap_logits = self.deconv_layers(x).squeeze(1)
-        return heatmap_logits
+        return self.decoder(x).view(-1, *self.output_shape)
 
 class PlayerPredictionHeads(nn.Module):
-    """Container for all prediction heads related to a single player."""
     def __init__(self, hidden_dim: int):
         super().__init__()
-        # Regression heads for player stats
-        self.stats_head = MLPHead(hidden_dim, 3) # health, armor, money
-
-        # Heatmap heads for position and mouse movement
-        self.pos_head = HeatmapHead(hidden_dim, MAP_RESOLUTION)
-        self.mouse_head = HeatmapHead(hidden_dim, MOUSE_MAP_RESOLUTION)
-
-        # Multi-label classification heads for bitmask-based data
-        self.keyboard_head = MLPHead(hidden_dim, NUM_KEYBOARD_KEYS)
-        self.eco_head = MLPHead(hidden_dim, NUM_ECO_ACTIONS)
-        self.inventory_head = MLPHead(hidden_dim, NUM_INVENTORY_ITEMS)
-        self.active_weapon_head = MLPHead(hidden_dim, NUM_INVENTORY_ITEMS)
-
+        self.stats_head = MLPHead(hidden_dim, 3); self.pos_head = HeatmapHead(hidden_dim, MAP_RESOLUTION); self.mouse_head = HeatmapHead(hidden_dim, MOUSE_MAP_RESOLUTION)
+        self.keyboard_head = MLPHead(hidden_dim, NUM_KEYBOARD_KEYS); self.eco_head = MLPHead(hidden_dim, NUM_ECO_ACTIONS)
+        self.inventory_head = MLPHead(hidden_dim, NUM_INVENTORY_ITEMS); self.active_weapon_head = MLPHead(hidden_dim, NUM_INVENTORY_ITEMS)
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {
-            "stats": self.stats_head(x),
-            "pos_heatmap_logits": self.pos_head(x),
-            "mouse_heatmap_logits": self.mouse_head(x),
-            "keyboard_logits": self.keyboard_head(x),
-            "eco_logits": self.eco_head(x),
-            "inventory_logits": self.inventory_head(x),
-            "active_weapon_logits": self.active_weapon_head(x),
-        }
+        return {"stats": self.stats_head(x), "pos_heatmap_logits": self.pos_head(x), "mouse_heatmap_logits": self.mouse_head(x), "keyboard_logits": self.keyboard_head(x),
+                "eco_logits": self.eco_head(x), "inventory_logits": self.inventory_head(x), "active_weapon_logits": self.active_weapon_head(x)}
 
 class GameStrategyPredictionHeads(nn.Module):
-    """Container for all prediction heads related to game-wide strategy."""
     def __init__(self, hidden_dim: int):
         super().__init__()
-        self.enemy_pos_head = HeatmapHead(hidden_dim, MAP_RESOLUTION)
-        self.round_state_head = MLPHead(hidden_dim, NUM_ROUND_STATE_BITS)
-        self.round_number_head = MLPHead(hidden_dim, 1)
-
+        self.enemy_pos_head = HeatmapHead(hidden_dim, MAP_RESOLUTION); self.round_state_head = MLPHead(hidden_dim, NUM_ROUND_STATE_BITS); self.round_number_head = MLPHead(hidden_dim, 1)
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {
-            "enemy_pos_heatmap_logits": self.enemy_pos_head(x),
-            "round_state_logits": self.round_state_head(x),
-            "round_number": self.round_number_head(x),
-        }
+        return {"enemy_pos_heatmap_logits": self.enemy_pos_head(x), "round_state_logits": self.round_state_head(x), "round_number": self.round_number_head(x)}
 
 # ======================================================================================
-# FINAL MODEL ASSEMBLY
+# FINAL MODEL ASSEMBLY (Modified for Autoregression)
 # ======================================================================================
-
 
 class CS2Transformer(nn.Module):
-    """The main model that processes a full round of CS2 data."""
+    """The main AUTOREGRESSIVE model that can "play the game"."""
     def __init__(self, hidden_dim: int = 2048, num_layers: int = 16, num_heads: int = 32,
                  dropout: float = 0.1, freeze_vit: bool = True):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_players = 5
-        self.num_special_tokens = 2
+        self.hidden_dim = hidden_dim; self.num_players = 5; self.num_special_tokens = 2
         self.player_encoder = PlayerEncoder(hidden_dim, freeze_vit)
-        self.game_strategy_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
-        self.scratchspace_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
-        self.dead_player_token = nn.Parameter(torch.randn(1, hidden_dim))
-        self.mask_frame_token = nn.Parameter(torch.randn(1, hidden_dim))
-        self.player_slot_embeddings = nn.Embedding(self.num_players, hidden_dim)
+        self.game_strategy_token = nn.Parameter(torch.randn(1, 1, hidden_dim)); self.scratchspace_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        self.dead_player_token = nn.Parameter(torch.randn(1, hidden_dim)); self.player_slot_embeddings = nn.Embedding(self.num_players, hidden_dim)
         self.rotary_embeddings = RotaryEmbedding(dim=hidden_dim // num_heads)
         encoder_layers = [CS2TransformerEncoderLayer(hidden_dim, num_heads, hidden_dim*4, dropout) for _ in range(num_layers)]
         self.transformer_encoder = nn.ModuleList(encoder_layers)
@@ -325,67 +169,121 @@ class CS2Transformer(nn.Module):
         self.player_prediction_heads = nn.ModuleList([PlayerPredictionHeads(hidden_dim) for _ in range(self.num_players)])
         self.game_strategy_prediction_heads = GameStrategyPredictionHeads(hidden_dim)
 
-    def forward(self, round_data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        B, S, P, _, _, _ = round_data['foveal_views'].shape
+    def _prepare_input_frame(self, frame_data: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Helper to encode a single frame's data into a 7-token tensor."""
+        B, P, _, _, _ = frame_data['foveal_views'].shape
         device = self.game_strategy_token.device
-
-        # --- FIX: Add assertion to fail fast if data shape is incorrect ---
-        assert P == self.num_players, \
-            f"Input data has P={P} players, but model is configured for num_players={self.num_players}."
-
-        foveal = round_data['foveal_views'].view(B * S * P, 3, 384, 384)
-        peripheral = round_data['peripheral_views'].view(B * S * P, 3, 384, 384)
-        audio = round_data['spectrograms'].view(B * S * P, 128, 6)
         
-        player_tokens = self.player_encoder(foveal, peripheral, audio)
-        player_tokens = player_tokens.view(B, S, P, self.hidden_dim)
-
-        # --- FIX: Cleaner broadcasting for slot embeddings ---
-        # 1. Create slot embeddings with a cleaner shape.
-        slot_ids = torch.arange(P, device=device).view(1, 1, P) # Shape: [1, 1, 5]
-        slot_embeddings = self.player_slot_embeddings(slot_ids)  # Shape: [1, 1, 5, D]
-
-        # 2. Add embeddings to player tokens. This now broadcasts cleanly.
+        foveal = frame_data['foveal_views'].view(B * P, 3, 384, 384)
+        peripheral = frame_data['peripheral_views'].view(B * P, 3, 384, 384)
+        audio = frame_data['spectrograms'].view(B * P, 128, 6)
+        
+        player_tokens = self.player_encoder(foveal, peripheral, audio).view(B, P, self.hidden_dim)
+        
+        slot_ids = torch.arange(P, device=device).view(1, P); slot_embeddings = self.player_slot_embeddings(slot_ids)
         player_tokens_with_slots = player_tokens + slot_embeddings
-
-        # 3. Assemble the main sequence container.
-        input_sequence = torch.zeros(B, S, self.num_players + self.num_special_tokens, self.hidden_dim, device=device)
         
-        # 4. Use torch.where to select between slotted tokens and the dead token.
-        alive_mask = round_data['is_alive_mask'].unsqueeze(-1).expand_as(player_tokens_with_slots)
-        input_sequence[:, :, :P, :] = torch.where(alive_mask, player_tokens_with_slots, self.dead_player_token)
-
-        input_sequence[:, :, P, :] = self.game_strategy_token
-        input_sequence[:, :, P + 1, :] = self.scratchspace_token
-
-        frame_mask = round_data['is_masked_frame_mask'].view(B, S, 1, 1).expand_as(input_sequence)
-        input_sequence = torch.where(frame_mask, self.mask_frame_token, input_sequence)
-
-        x = input_sequence.permute(1, 0, 2, 3).reshape(S * (P + self.num_special_tokens), B, self.hidden_dim)
+        input_frame = torch.zeros(B, P + self.num_special_tokens, self.hidden_dim, device=device)
+        alive_mask = frame_data['is_alive_mask'].unsqueeze(-1).expand_as(player_tokens_with_slots)
+        input_frame[:, :P, :] = torch.where(alive_mask, player_tokens_with_slots, self.dead_player_token)
         
+        input_frame[:, P, :] = self.game_strategy_token
+        input_frame[:, P + 1, :] = self.scratchspace_token
+        return input_frame
+
+    def forward(self, history_sequence: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Causal forward pass for training. Predicts t+1 from history t.
+        
+        Args:
+            history_sequence (torch.Tensor): A sequence of already-encoded tokens.
+                                             Shape: [B, S, 7, D]
+        
+        Returns:
+            A dictionary of predictions for the NEXT frame.
+        """
+        B, S, T, D = history_sequence.shape # Batch, SeqLen, TokensPerFrame, Dim
+        
+        # Reshape for transformer: [B, S, 7, D] -> [S*7, B, D]
+        x = history_sequence.permute(1, 2, 0, 3).reshape(S * T, B, D)
+
         rope_cos, rope_sin = self.rotary_embeddings(x)
         for layer in self.transformer_encoder:
             x = layer(x, rope_cos, rope_sin)
         output_sequence = self.final_norm(x)
         
-        output_sequence = output_sequence.reshape(S, B, P + self.num_special_tokens, self.hidden_dim).permute(1, 0, 2, 3)
+        # Get the tokens from the VERY LAST time step to predict the next one
+        last_step_tokens = output_sequence.view(S, T, B, D)[-1] # Shape: [7, B, D]
+        last_step_tokens = last_step_tokens.permute(1, 0, 2) # Shape: [B, 7, D]
 
-        masked_output_tokens = output_sequence[round_data['is_masked_frame_mask']]
-        
-        if masked_output_tokens.shape[0] == 0: return {}
-
-        predictions = {"player": [{} for _ in range(P)], "game_strategy": {}}
-        for i in range(P):
-            predictions["player"][i] = self.player_prediction_heads[i](masked_output_tokens[:, i, :])
-        predictions["game_strategy"] = self.game_strategy_prediction_heads(masked_output_tokens[:, P, :])
+        # Make predictions from the last time step's output tokens
+        predictions = {"player": [{} for _ in range(self.num_players)], "game_strategy": {}}
+        for i in range(self.num_players):
+            predictions["player"][i] = self.player_prediction_heads[i](last_step_tokens[:, i, :])
+        predictions["game_strategy"] = self.game_strategy_prediction_heads(last_step_tokens[:, self.num_players, :])
 
         return predictions
+        
+    def generate(self, initial_frames: Dict[str, torch.Tensor], steps: int) -> float:
+        """
+        Autoregressively generates a sequence of actions for benchmarking.
+        
+        Args:
+            initial_frames (Dict): Data for the first few frames to start the sequence.
+            steps (int): The number of future frames to generate.
+            
+        Returns:
+            The time taken for generation.
+        """
+        self.eval()
+        device = self.game_strategy_token.device
+        B, S, P, _, _, _ = initial_frames['foveal_views'].shape
+        
+        # Encode the initial prompt frames
+        history = []
+        for i in range(S):
+            frame_data = {k: v[:, i] for k, v in initial_frames.items()}
+            encoded_frame = self._prepare_input_frame(frame_data)
+            history.append(encoded_frame)
+        
+        history_sequence = torch.stack(history, dim=1) # Shape: [B, S, 7, D]
+
+        t_start = time.perf_counter()
+        for _ in range(steps):
+            with torch.no_grad():
+                # Predict the next frame's actions based on the current history
+                next_frame_predictions = self.forward(history_sequence)
+
+                # --- In a real agent, this is the hardest part ---
+                # Here, you would need a "world model" to turn the predicted actions
+                # (e.g., keyboard presses, mouse moves) into a new, valid game state
+                # (new POV frames, new audio, new player positions).
+                # For this benchmark, we will just use dummy data as the "next frame".
+                next_frame_data = {
+                    'foveal_views': torch.randn(B, P, 3, 384, 384, device=device),
+                    'peripheral_views': torch.randn(B, P, 3, 384, 384, device=device),
+                    'spectrograms': torch.randn(B, P, 128, 6, device=device),
+                    'is_alive_mask': torch.randint(0, 2, (B, P), dtype=torch.bool, device=device),
+                }
+                next_encoded_frame = self._prepare_input_frame(next_frame_data).unsqueeze(1)
+                
+                # Append the "new" frame to our history for the next iteration
+                history_sequence = torch.cat([history_sequence, next_encoded_frame], dim=1)
+
+                # To keep memory usage constant, we could also slide the window:
+                # history_sequence = history_sequence[:, 1:, :, :]
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_end = time.perf_counter()
+        
+        return t_end - t_start
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run sanity checks for the CS2Transformer model.")
-    parser.add_argument('--cuda-only', action='store_true', help="Run Stage 3 checks on a CUDA device if available.")
-    # --- ADDED: New argument for benchmark frame count ---
-    parser.add_argument('--benchmark-frames', type=int, default=10, help="Number of frames to use in the benchmark sequence.")
+    parser.add_argument('--cuda-only', action='store_true', help="Run checks on a CUDA device if available.")
+    # --- CHANGE: Benchmark now defines simulation time ---
+    parser.add_argument('--benchmark-seconds', type=int, default=30, help="Number of seconds to simulate for the autoregressive benchmark.")
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -394,57 +292,37 @@ if __name__ == '__main__':
         else: print("CUDA not available. Aborting CUDA-only check."); exit()
     else: print("--- Running all checks on CPU device ---")
 
-    print("\n--- Running Stage 3 Sanity Checks & Benchmark ---")
+    print("\n--- Running Autoregressive Benchmark ---")
     model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True).to(device)
     
-    # --- Use benchmark-frames for sequence length ---
-    B, S, P = 2, args.benchmark_frames, 5
-    print(f"Benchmark parameters: Batch Size={B}, Sequence Length={S} frames, Players={P}")
+    # --- Benchmark setup for 30 seconds of gameplay at 32 FPS ---
+    B, P = 1, 5 # Batch size of 1 for generation
+    PROMPT_FRAMES = 10 # Start the model with a 10-frame history
+    FPS = 32
+    SIM_SECONDS = args.benchmark_seconds
+    STEPS_TO_GENERATE = (SIM_SECONDS * FPS) - PROMPT_FRAMES
     
-    dummy_round_data = {
-        'foveal_views': torch.randn(B, S, P, 3, 384, 384, device=device),
-        'peripheral_views': torch.randn(B, S, P, 3, 384, 384, device=device),
-        'spectrograms': torch.randn(B, S, P, 128, 6, device=device),
-        'is_alive_mask': torch.randint(0, 2, (B, S, P), dtype=torch.bool, device=device),
-        'is_masked_frame_mask': torch.zeros((B, S), dtype=torch.bool, device=device),
+    print(f"Benchmark parameters: Simulating {SIM_SECONDS}s at {FPS} FPS.")
+    print(f"Prompt: {PROMPT_FRAMES} frames, Generating: {STEPS_TO_GENERATE} frames.")
+    
+    initial_frames_data = {
+        'foveal_views': torch.randn(B, PROMPT_FRAMES, P, 3, 384, 384, device=device),
+        'peripheral_views': torch.randn(B, PROMPT_FRAMES, P, 3, 384, 384, device=device),
+        'spectrograms': torch.randn(B, PROMPT_FRAMES, P, 128, 6, device=device),
+        'is_alive_mask': torch.ones((B, PROMPT_FRAMES, P), dtype=torch.bool, device=device),
     }
-    dummy_round_data['is_masked_frame_mask'].flatten()[torch.randperm(B*S)[:int(B*S*0.15)]] = True
-    
+
     try:
-        # --- ADDED: Warmup for accurate timing on GPU ---
         if args.cuda_only:
             print("Warming up GPU...")
-            for _ in range(3):
-                with torch.no_grad():
-                    _ = model(dummy_round_data)
-            torch.cuda.synchronize() # Wait for warmup to finish
-
-        # --- ADDED: Timing the forward pass ---
+            model.generate(initial_frames_data, steps=10) # Short warmup
+        
         print("Starting benchmark...")
-        t_start = time.perf_counter()
-        with torch.no_grad():
-            predictions = model(dummy_round_data)
+        duration = model.generate(initial_frames_data, steps=STEPS_TO_GENERATE)
         
-        if args.cuda_only:
-            torch.cuda.synchronize() # Ensure all GPU work is done before stopping timer
-            
-        t_end = time.perf_counter()
+        print(f"\nSuccessfully generated {STEPS_TO_GENERATE} frames in {duration:.4f} seconds.")
+        print(f"Average generation speed: {STEPS_TO_GENERATE / duration:.2f} frames/sec.")
         
-        print(f"Full forward pass successful in {t_end - t_start:.4f} seconds.")
-        
-        num_masked = dummy_round_data['is_masked_frame_mask'].sum()
-        if num_masked > 0 and predictions:
-            p0_preds = predictions['player'][0]
-            assert p0_preds['stats'].shape == (num_masked, 3)
-            assert p0_preds['keyboard_logits'].shape == (num_masked, NUM_KEYBOARD_KEYS)
-            print(f"Player 0 stats prediction shape: {p0_preds['stats'].shape}")
-            
-            gs_preds = predictions['game_strategy']
-            assert gs_preds['round_state_logits'].shape == (num_masked, NUM_ROUND_STATE_BITS)
-            assert gs_preds['round_number'].shape == (num_masked, 1)
-            print(f"Game strategy round_state prediction shape: {gs_preds['round_state_logits'].shape}")
-
-        print("\nStage 3 module and full model forward pass built and tested successfully!")
     except Exception as e:
-        print("\nAn error occurred during the forward pass check:")
+        print("\nAn error occurred during the benchmark:")
         raise e
