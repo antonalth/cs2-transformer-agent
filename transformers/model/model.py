@@ -383,22 +383,22 @@ class CS2Transformer(nn.Module):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run sanity checks for the CS2Transformer model.")
     parser.add_argument('--cuda-only', action='store_true', help="Run Stage 3 checks on a CUDA device if available.")
+    # --- ADDED: New argument for benchmark frame count ---
+    parser.add_argument('--benchmark-frames', type=int, default=10, help="Number of frames to use in the benchmark sequence.")
     args = parser.parse_args()
 
     device = torch.device("cpu")
     if args.cuda_only:
-        if torch.cuda.is_available():
-            device = torch.device("cuda"); print("--- Running all checks on CUDA device ---")
-        else:
-            print("CUDA not available. Aborting CUDA-only check."); exit()
-    else:
-        print("--- Running all checks on CPU device ---")
+        if torch.cuda.is_available(): device = torch.device("cuda"); print("--- Running all checks on CUDA device ---")
+        else: print("CUDA not available. Aborting CUDA-only check."); exit()
+    else: print("--- Running all checks on CPU device ---")
 
-    print("\n--- Running Stage 3 Sanity Checks ---")
+    print("\n--- Running Stage 3 Sanity Checks & Benchmark ---")
     model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True).to(device)
     
-    # --- FIX: The Player (P) dimension in test data MUST match the model's internal num_players ---
-    B, S, P = 2, 10, 5
+    # --- Use benchmark-frames for sequence length ---
+    B, S, P = 2, args.benchmark_frames, 5
+    print(f"Benchmark parameters: Batch Size={B}, Sequence Length={S} frames, Players={P}")
     
     dummy_round_data = {
         'foveal_views': torch.randn(B, S, P, 3, 384, 384, device=device),
@@ -410,9 +410,26 @@ if __name__ == '__main__':
     dummy_round_data['is_masked_frame_mask'].flatten()[torch.randperm(B*S)[:int(B*S*0.15)]] = True
     
     try:
+        # --- ADDED: Warmup for accurate timing on GPU ---
+        if args.cuda_only:
+            print("Warming up GPU...")
+            for _ in range(3):
+                with torch.no_grad():
+                    _ = model(dummy_round_data)
+            torch.cuda.synchronize() # Wait for warmup to finish
+
+        # --- ADDED: Timing the forward pass ---
+        print("Starting benchmark...")
+        t_start = time.perf_counter()
         with torch.no_grad():
             predictions = model(dummy_round_data)
-        print("Full forward pass successful.")
+        
+        if args.cuda_only:
+            torch.cuda.synchronize() # Ensure all GPU work is done before stopping timer
+            
+        t_end = time.perf_counter()
+        
+        print(f"Full forward pass successful in {t_end - t_start:.4f} seconds.")
         
         num_masked = dummy_round_data['is_masked_frame_mask'].sum()
         if num_masked > 0 and predictions:
