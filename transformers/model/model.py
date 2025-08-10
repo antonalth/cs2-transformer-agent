@@ -380,6 +380,19 @@ class CS2Transformer(nn.Module):
         
         rope_cos, rope_sin = self.rotary_embeddings(x)
         for layer in self.transformer_encoder:
+            x = layer(x, rope_cos, rope_sin)
+        output_sequence = self.final_norm(x)
+        
+        # Reshape back: [S*7, B, D] -> [B, S, 7, D]
+        output_sequence = output_sequence.reshape(S, B, P + self.num_special_tokens, self.hidden_dim).permute(1, 0, 2, 3)
+
+        # --- 4. Get Predictions from Heads ---
+        # We only care about predictions for the frames that were masked.
+        masked_output_tokens = output_sequence[round_data['is_masked_frame_mask']] # Shape: [NumMasked, 7, D]
+        
+        if masked_output_tokens.shape[0] == 0:
+            return {} # No masked frames in this batch, no loss to compute
+
         predictions = {"player": [{} for _ in range(P)], "game_strategy": {}}
         
         # Player predictions
