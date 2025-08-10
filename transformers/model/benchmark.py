@@ -7,6 +7,7 @@ import humanize  # For formatting numbers nicely (pip install humanize)
 
 # Import the model definition from the adjacent model.py file
 from model import CS2Transformer
+from torch.cuda.amp import autocast
 
 def run_benchmark_for_config(config: dict, args: argparse.Namespace):
     """
@@ -52,7 +53,7 @@ def run_benchmark_for_config(config: dict, args: argparse.Namespace):
         # For inference speed, we don't need to mask, but the model expects the key.
 
         # --- 3. Benchmarking Loop ---
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
             # Warmup loop for GPU to handle kernel launch overhead
             if device.type == 'cuda':
                 print("  Warming up GPU...")
