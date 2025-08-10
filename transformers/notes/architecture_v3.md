@@ -37,6 +37,10 @@ The game_strategy token predicts:
 
 Here is what we have to train as input/output (description: )
 
+Notably the context window of our model is one in game round, where with up to around 100k max context (7*32*180s), with only the last frame tokens being used to predict.
+
+During training, do masking on a per frame basis (e.g. all 7 tokens/frame can attend backwards, but not forwards)
+
 ##############
 
 Of course. Here is a comprehensive summary of the final structure of the LMDB created by your latest injection_mold.py script. This documentation reflects all the recent changes, including the Mel spectrograms, the explicit msgpack handling, and the updated round_state bitmask.
@@ -157,3 +161,128 @@ Content: It is a DB-scaled Mel spectrogram, ready to be fed into a model.
 Shape: The shape is (n_mels, time_frames), which with default settings is (128, ~5). This will look like a thin vertical bar when visualized as an image.
 
 None Value: This will be None if the --no-audio flag was used during processing.
+
+#########
+
+Of course. Here is the updated model architecture, incorporating the requested enhancements for longer context windows and improved performance: FlashAttention, Full (Bidirectional) Attention, and Rotary Positional Embeddings (RoPE).
+
+This update transforms the model from a decoder-style (auto-regressive) architecture into a more powerful encoder-style (bidirectional) architecture, similar to BERT. This allows the model to use the entire round—both past and future frames—to make the most informed predictions for any given moment.
+
+Model Architecture: End-to-End Data Flow (High-Performance, Bidirectional)
+Summary of Key Updates:
+
+Attention Mechanism: The standard self-attention is replaced with FlashAttention-2, a highly optimized implementation that is significantly faster and more memory-efficient, which is critical for handling the massive context window of a full CS2 round.
+
+Information Flow: The model now uses Full (Bidirectional) Attention. The causal mask is removed, allowing every token in the sequence to attend to every other token. This enables the model to build a holistic understanding of the entire round's dynamics.
+
+Positional Encoding: Additive positional encodings are replaced with Rotary Positional Embeddings (RoPE). RoPE is applied directly to the query and key vectors within the attention mechanism, providing excellent performance for very long sequences and a better sense of relative positions.
+
+Training Paradigm: The training objective shifts from next-frame prediction to Masked Frame Modeling (MFM). The model learns by predicting the content of randomly masked-out frames within the round.
+
+STAGE 1: Input Encoding (Unchanged)
+
+This stage remains the same. It processes raw multi-modal data for each of the 5 players per frame and creates a single unified token of dimension [1, D].
+
+code
+Code
+download
+content_copy
+expand_less
+
+INPUT (Single Player, Time t)
+│
+├── 👁️ VISUAL STREAM (Dual ViT-Base with shared weights) -> VISUAL EMBEDDING [1, D]
+│
+├── 🔊 AUDIO STREAM (Small 2D CNN on Mel Spectrogram) -> AUDIO EMBEDDING [1, D]
+│
+└── 🧩 PLAYER TOKEN FUSION
+    │
+    ├── Add Embeddings: Visual [1, D] + Audio [1, D]
+    │
+    └── Output: FINAL PLAYER TOKEN (shape: [1, D])
+STAGE 2: Core Transformer Backbone (Updated)
+
+This stage takes the sequence of team-level tokens and processes them using the enhanced transformer architecture. The key changes are in how positional information and attention are handled.
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+ASSEMBLY (Full Team, Time t)
+│
+├── Create 7-Token Sequence (shape: [7, D])
+│   ├── [PLAYER 1 TOKEN]
+│   ├── [PLAYER 2 TOKEN]   (or [DEAD] token)
+│   ├── [PLAYER 3 TOKEN]   (or [DEAD] token)
+│   ├── [PLAYER 4 TOKEN]   (or [DEAD] token)
+│   ├── [PLAYER 5 TOKEN]   (or [DEAD] token)
+│   ├── [GAME_STRATEGY]
+│   └── [SCRATCHSPACE]
+│
+└── Add Player-Slot Encoding
+    └── // Note: Temporal positional encodings are NO LONGER added here.
+        // RoPE handles this inside the attention mechanism.
+        └── + Player-Slot Encoding (Learned, a different embedding for each of the 5 player slots)
+
+
+INPUT SEQUENCE FOR TRANSFORMER (Full Round)
+│
+└── Shape: [Context_Window, 7, D] (e.g., [40320, 7, 768])
+
+🧠 BIDIRECTIONAL TRANSFORMER ENCODER (e.g., 12 Layers, ~100M Params)
+│
+├── For each layer:
+│   ├── ⭐ Multi-Head Full Self-Attention
+│   │    ├── Implementation: Uses **FlashAttention** for speed and memory efficiency.
+│   │    ├── Information Flow: **Full (Bidirectional)**. Every token attends to all other tokens.
+│   │    └── Positional Info: **Rotary Positional Embeddings (RoPE)** are applied to Query & Key vectors.
+│   │
+│   ├── Layer Normalization
+│   ├── Feed-Forward Network
+│   └── Layer Normalization
+│
+└── OUTPUT SEQUENCE (Shape: [Context_Window, 7, D])
+STAGE 3: Prediction Heads (Unchanged in Structure)
+
+The structure of the prediction heads remains the same. They still decode the information from the output tokens. However, the input they receive is now contextually informed by the entire round, not just the past.
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+TRANSFORMER OUTPUT (For a specific time step `t`, shape: [7, D])
+│
+├── 🎯 Player Prediction Heads (Takes tokens 0-4) -> Predict player stats, position, mouse, actions...
+│
+├── 🌍 Game Strategy Prediction Heads (Takes token 5) -> Predict enemy positions, game phase...
+│
+└── 💭 Scratchspace Token (Takes token 6) -> Discarded
+New Training Paradigm: Masked Frame Modeling (MFM)
+
+The switch to a bidirectional encoder necessitates a new training objective.
+
+Input Preparation: The model is presented with the entire sequence of tokens for a round [Context_Window, 7, D].
+
+Random Masking: Before feeding the sequence to the model, a certain percentage of frames (e.g., 15%) are randomly selected for masking.
+
+Applying the Mask: For each selected frame t:
+
+The 7 input tokens [t, :, :] are replaced with a special, learned [MASK] token of shape [1, D].
+
+Prediction Goal: The model processes this partially masked sequence. Its objective is to predict the original, unmasked content only for the frames that were masked.
+
+Loss Calculation:
+
+The output tokens from the transformer corresponding to the masked positions are fed into the prediction heads (Stage 3).
+
+The loss (e.g., MSE for stats, Cross-Entropy for heatmaps) is calculated by comparing the predictions to the ground-truth data of the original, unmasked frames.
+
+Crucially, no loss is calculated for the unmasked frames.
+
+This approach forces the model to learn a deep, contextual understanding of game flow, using surrounding events to infer what must be happening at a specific, unknown moment in time.
