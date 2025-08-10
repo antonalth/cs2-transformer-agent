@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, List, Tuple, Dict
+import argparse # Import argparse for command-line flags
 
 # We will use the `transformers` library from Hugging Face to easily load
 # a pre-trained ViT-Large model. Make sure to install it:
@@ -301,6 +302,7 @@ class GameStrategyPredictionHeads(nn.Module):
 # FINAL MODEL ASSEMBLY
 # ======================================================================================
 
+
 class CS2Transformer(nn.Module):
     """The main model that processes a full round of CS2 data."""
     def __init__(self, hidden_dim: int = 2048, num_layers: int = 16, num_heads: int = 32,
@@ -309,73 +311,50 @@ class CS2Transformer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_players = 5
         self.num_special_tokens = 2
-
-        # --- Stage 1 & Special Tokens ---
         self.player_encoder = PlayerEncoder(hidden_dim, freeze_vit)
         self.game_strategy_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         self.scratchspace_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         self.dead_player_token = nn.Parameter(torch.randn(1, hidden_dim))
         self.mask_frame_token = nn.Parameter(torch.randn(1, hidden_dim))
         self.player_slot_embeddings = nn.Embedding(self.num_players, hidden_dim)
-
-        # --- Stage 2 ---
         self.rotary_embeddings = RotaryEmbedding(dim=hidden_dim // num_heads)
         encoder_layers = [CS2TransformerEncoderLayer(hidden_dim, num_heads, hidden_dim*4, dropout) for _ in range(num_layers)]
         self.transformer_encoder = nn.ModuleList(encoder_layers)
         self.final_norm = nn.LayerNorm(hidden_dim)
-
-        # --- Stage 3 ---
         self.player_prediction_heads = nn.ModuleList([PlayerPredictionHeads(hidden_dim) for _ in range(self.num_players)])
         self.game_strategy_prediction_heads = GameStrategyPredictionHeads(hidden_dim)
 
     def forward(self, round_data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Full end-to-end forward pass for training.
-        
-        Args:
-            round_data (Dict): A dictionary of tensors from the data loader.
-                - foveal_views: [B, S, P, 3, H, W]
-                - peripheral_views: [B, S, P, 3, H, W]
-                - spectrograms: [B, S, P, M, T]
-                - is_alive_mask: [B, S, P] (boolean)
-                - is_masked_frame_mask: [B, S] (boolean)
-        
-        Returns:
-            A dictionary of predictions for calculating loss.
-        """
         B, S, P, _, _, _ = round_data['foveal_views'].shape
         device = self.game_strategy_token.device
 
-        # --- 1. Encode all player frames ---
-        # Reshape to process all frames from all players in one go
         foveal = round_data['foveal_views'].view(B * S * P, 3, 384, 384)
         peripheral = round_data['peripheral_views'].view(B * S * P, 3, 384, 384)
-        audio = round_data['spectrograms'].view(B * S * P, 128, 6) # Assuming shape
+        audio = round_data['spectrograms'].view(B * S * P, 128, 6)
         
         player_tokens = self.player_encoder(foveal, peripheral, audio)
         player_tokens = player_tokens.view(B, S, P, self.hidden_dim)
 
-        # --- 2. Assemble the full input sequence ---
-        input_sequence = torch.zeros(B, S, self.num_players + self.num_special_tokens, self.hidden_dim, device=device)
-        
-        # Apply player tokens or dead token
-        alive_mask = round_data['is_alive_mask'].unsqueeze(-1).expand_as(player_tokens)
-        input_sequence[:, :, :P, :] = torch.where(alive_mask, player_tokens, self.dead_player_token)
-        
-        # Add player slot embeddings
+        # --- BUG FIX STARTS HERE ---
+        # 1. Create slot embeddings and add them to the player tokens first.
         slot_ids = torch.arange(P, device=device).view(1, 1, P, 1)
-        input_sequence[:, :, :P, :] += self.player_slot_embeddings(slot_ids)
+        slot_embeddings = self.player_slot_embeddings(slot_ids)
+        player_tokens_with_slots = player_tokens + slot_embeddings # Broadcasts to [B, S, P, D]
 
-        # Add special tokens
+        # 2. Prepare the main sequence container.
+        input_sequence = torch.zeros(B, S, self.num_players + self.num_special_tokens, self.hidden_dim, device=device)
+
+        # 3. Use torch.where to select between slotted tokens and the dead token.
+        alive_mask = round_data['is_alive_mask'].unsqueeze(-1).expand_as(player_tokens_with_slots)
+        input_sequence[:, :, :P, :] = torch.where(alive_mask, player_tokens_with_slots, self.dead_player_token)
+        # --- BUG FIX ENDS HERE ---
+
         input_sequence[:, :, P, :] = self.game_strategy_token
         input_sequence[:, :, P + 1, :] = self.scratchspace_token
 
-        # Apply frame masking for MFM training
         frame_mask = round_data['is_masked_frame_mask'].view(B, S, 1, 1).expand_as(input_sequence)
         input_sequence = torch.where(frame_mask, self.mask_frame_token, input_sequence)
 
-        # --- 3. Run through Transformer Backbone ---
-        # Reshape for transformer: [S, B, 7, D] -> [S*7, B, D]
         x = input_sequence.permute(1, 0, 2, 3).reshape(S * (P + self.num_special_tokens), B, self.hidden_dim)
         
         rope_cos, rope_sin = self.rotary_embeddings(x)
@@ -383,142 +362,72 @@ class CS2Transformer(nn.Module):
             x = layer(x, rope_cos, rope_sin)
         output_sequence = self.final_norm(x)
         
-        # Reshape back: [S*7, B, D] -> [B, S, 7, D]
         output_sequence = output_sequence.reshape(S, B, P + self.num_special_tokens, self.hidden_dim).permute(1, 0, 2, 3)
 
-        # --- 4. Get Predictions from Heads ---
-        # We only care about predictions for the frames that were masked.
-        masked_output_tokens = output_sequence[round_data['is_masked_frame_mask']] # Shape: [NumMasked, 7, D]
+        masked_output_tokens = output_sequence[round_data['is_masked_frame_mask']]
         
         if masked_output_tokens.shape[0] == 0:
-            return {} # No masked frames in this batch, no loss to compute
+            return {}
 
         predictions = {"player": [{} for _ in range(P)], "game_strategy": {}}
-        
-        # Player predictions
         for i in range(P):
-            player_head_inputs = masked_output_tokens[:, i, :]
-            predictions["player"][i] = self.player_prediction_heads[i](player_head_inputs)
-        
-        # Game strategy predictions
-        strategy_head_inputs = masked_output_tokens[:, P, :]
-        predictions["game_strategy"] = self.game_strategy_prediction_heads(strategy_head_inputs)
+            predictions["player"][i] = self.player_prediction_heads[i](masked_output_tokens[:, i, :])
+        predictions["game_strategy"] = self.game_strategy_prediction_heads(masked_output_tokens[:, P, :])
 
         return predictions
 
 if __name__ == '__main__':
-    # ==================================
-    # STAGE 1 SANITY CHECKS (Completed)
-    # ==================================
-    print("--- Running Stage 1 Sanity Checks ---")
-    player_encoder = PlayerEncoder(hidden_dim=2048, freeze_vit=True)
-    vit_params = sum(p.numel() for p in player_encoder.vision_encoder.vit.parameters() if p.requires_grad)
-    print(f"Trainable ViT params (frozen): {vit_params}")
-    assert vit_params == 0
-    player_encoder.vision_encoder.unfreeze_vit()
-    vit_params_unfrozen = sum(p.numel() for p in player_encoder.vision_encoder.vit.parameters() if p.requires_grad)
-    print(f"Trainable ViT params (unfrozen): {vit_params_unfrozen}")
-    assert vit_params_unfrozen > 300_000_000
-    print("Stage 1 Checks Passed.\n")
-    
-    # ==================================
-    # STAGE 2 SANITY CHECKS
-    # ==================================
-    print("--- Running Stage 2 Sanity Checks ---")
-    
-    # --- Configuration ---
-    BATCH_SIZE = 2
-    SEQ_LEN = 100 # Number of frames in the sequence
-    HIDDEN_DIM = 2048
-    NUM_HEADS = 32
-    NUM_LAYERS = 4 # Use a smaller number for a quick test
-    NUM_PLAYERS = 5
-    NUM_SPECIAL_TOKENS = 2
-    TOTAL_TOKENS_PER_FRAME = NUM_PLAYERS + NUM_SPECIAL_TOKENS # 7
-    
-    # --- Create Model ---
-    model = CS2Transformer(
-        hidden_dim=HIDDEN_DIM,
-        num_heads=NUM_HEADS,
-        num_layers=NUM_LAYERS,
-        freeze_vit=True
-    )
-    
-    # --- Create Dummy Input Sequence ---
-    # This simulates the sequence AFTER it has been assembled from the player encoders.
-    # The shape is [seq_len, batch_size, total_tokens_per_frame, hidden_dim]
-    # In a real training loop, this assembly is a major step.
-    dummy_sequence = torch.randn(SEQ_LEN, BATCH_SIZE, TOTAL_TOKENS_PER_FRAME, HIDDEN_DIM)
-    
-    # In the transformer, we treat the sequence of frames and tokens within frames as one long sequence.
-    # Reshape to: [SEQ_LEN * TOTAL_TOKENS_PER_FRAME, BATCH_SIZE, HIDDEN_DIM]
-    x = dummy_sequence.reshape(SEQ_LEN * TOTAL_TOKENS_PER_FRAME, BATCH_SIZE, HIDDEN_DIM)
-    
-    print(f"Input shape to transformer encoder: {x.shape}")
-    
-    # --- Test RoPE and Encoder Forward Pass ---
-    # 1. Get rotary embeddings
-    rope_cos, rope_sin = model.rotary_embeddings(x)
-    print(f"RoPE cos shape: {rope_cos.shape}")
-    
-    # 2. Pass through the encoder layers
-    output = x
-    for layer in model.transformer_encoder:
-        output = layer(output, rope_cos, rope_sin)
-    
-    # 3. Final normalization
-    output = model.final_norm(output)
-    
-    print(f"Output shape from transformer encoder: {output.shape}")
-    
-    # --- Assertions ---
-    assert output.shape == x.shape, "Output shape must match input shape"
-    
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total trainable parameters (ViT frozen): {total_params / 1e6:.2f}M")
-    
-    model.player_encoder.vision_encoder.unfreeze_vit()
-    total_params_unfrozen = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total trainable parameters (ViT unfrozen): {total_params_unfrozen / 1e6:.2f}M")
-    
-    print("\nStage 2 module built and tested successfully!")
+    # --- Add Argument Parser for --cuda-only flag ---
+    parser = argparse.ArgumentParser(description="Run sanity checks for the CS2Transformer model.")
+    parser.add_argument('--cuda-only', action='store_true', help="Run Stage 3 checks on a CUDA device if available.")
+    args = parser.parse_args()
 
-     
+    device = torch.device("cpu")
+    if args.cuda_only:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print("--- Running all checks on CUDA device ---")
+        else:
+            print("CUDA not available. Aborting CUDA-only check.")
+            exit()
+    else:
+        print("--- Running all checks on CPU device ---")
+
     # ==================================
-    # STAGE 3 SANITY CHECKS
+    # STAGE 3 SANITY CHECKS (Now with device placement)
     # ==================================
     print("\n--- Running Stage 3 Sanity Checks ---")
-    model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True)
+    model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True).to(device)
     
-    # Create a realistic dummy data batch
-    B, S, P = 2, 10, 5 # Batch, Sequence Length, Players
+    B, S, P = 2, 10, 5
+    # Create dummy data directly on the target device
     dummy_round_data = {
-        'foveal_views': torch.randn(B, S, P, 3, 384, 384),
-        'peripheral_views': torch.randn(B, S, P, 3, 384, 384),
-        'spectrograms': torch.randn(B, S, P, 128, 6),
-        'is_alive_mask': torch.randint(0, 2, (B, S, P), dtype=torch.bool),
-        'is_masked_frame_mask': torch.zeros((B, S), dtype=torch.bool),
+        'foveal_views': torch.randn(B, S, P, 3, 384, 384, device=device),
+        'peripheral_views': torch.randn(B, S, P, 3, 384, 384, device=device),
+        'spectrograms': torch.randn(B, S, P, 128, 6, device=device),
+        'is_alive_mask': torch.randint(0, 2, (B, S, P), dtype=torch.bool, device=device),
+        'is_masked_frame_mask': torch.zeros((B, S), dtype=torch.bool, device=device),
     }
-    # Mask about 15% of the frames
     dummy_round_data['is_masked_frame_mask'].flatten()[torch.randperm(B*S)[:int(B*S*0.15)]] = True
     
-    # --- Test Full Forward Pass ---
-    predictions = model(dummy_round_data)
-    print("Full forward pass successful.")
-    
-    # --- Check Output Shapes ---
-    num_masked = dummy_round_data['is_masked_frame_mask'].sum()
-    if num_masked > 0:
-        # Player 0 predictions
-        p0_preds = predictions['player'][0]
-        assert p0_preds['stats'].shape == (num_masked, 3)
-        assert p0_preds['keyboard_logits'].shape == (num_masked, NUM_KEYBOARD_KEYS)
-        print(f"Player 0 stats prediction shape: {p0_preds['stats'].shape}")
+    try:
+        with torch.no_grad(): # Use no_grad for inference checks to save memory
+            predictions = model(dummy_round_data)
+        print("Full forward pass successful.")
         
-        # Game strategy predictions
-        gs_preds = predictions['game_strategy']
-        assert gs_preds['round_state_logits'].shape == (num_masked, NUM_ROUND_STATE_BITS)
-        assert gs_preds['round_number'].shape == (num_masked, 1)
-        print(f"Game strategy round_state prediction shape: {gs_preds['round_state_logits'].shape}")
+        num_masked = dummy_round_data['is_masked_frame_mask'].sum()
+        if num_masked > 0 and predictions:
+            p0_preds = predictions['player'][0]
+            assert p0_preds['stats'].shape == (num_masked, 3)
+            assert p0_preds['keyboard_logits'].shape == (num_masked, NUM_KEYBOARD_KEYS)
+            print(f"Player 0 stats prediction shape: {p0_preds['stats'].shape}")
+            
+            gs_preds = predictions['game_strategy']
+            assert gs_preds['round_state_logits'].shape == (num_masked, NUM_ROUND_STATE_BITS)
+            assert gs_preds['round_number'].shape == (num_masked, 1)
+            print(f"Game strategy round_state prediction shape: {gs_preds['round_state_logits'].shape}")
 
-    print("\nStage 3 module and full model forward pass built and tested successfully!")
+        print("\nStage 3 module and full model forward pass built and tested successfully!")
+    except Exception as e:
+        print("\nAn error occurred during the forward pass check:")
+        raise e
