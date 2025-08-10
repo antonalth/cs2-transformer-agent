@@ -1,13 +1,24 @@
 # model.py
-
 import torch
 import torch.nn as nn
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 # We will use the `transformers` library from Hugging Face to easily load
 # a pre-trained ViT-Large model. Make sure to install it:
 # pip install transformers
 from transformers import ViTConfig, ViTModel
+
+# --- Data structure constants derived from injection_mold.py ---
+# These should be kept in sync with the data generation script.
+NUM_KEYBOARD_KEYS = 31
+NUM_ECO_ACTIONS = 384 # This is a large, sparse vector
+NUM_INVENTORY_ITEMS = 128
+NUM_ROUND_STATE_BITS = 5
+# For heatmap predictions, we need to define the map's dimensions and resolution.
+# These values are examples and should be tuned based on the game's coordinate system.
+MAP_RESOLUTION = (64, 256, 256) # (Z, Y, X)
+MOUSE_MAP_RESOLUTION = (64, 64) # (dy, dx) bins
+
 
 # ======================================================================================
 # STAGE 1: INPUT ENCODING (Completed)
@@ -194,67 +205,192 @@ class CS2TransformerEncoderLayer(nn.Module):
 
         return src
 
+# ======================================================================================
+# STAGE 3: PREDICTION HEADS
+# This section defines the various output heads that decode the transformer's
+# output tokens into structured, predictable data matching the LMDB format.
+# ======================================================================================
+
+class MLPHead(nn.Sequential):
+    """A simple Multi-Layer Perceptron head for classification or regression."""
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(input_dim // 2),
+            nn.Linear(input_dim // 2, output_dim)
+        )
+
+class HeatmapHead(nn.Module):
+    """A deconvolutional network to predict a 3D or 2D heatmap."""
+    def __init__(self, input_dim: int, output_shape: Tuple[int, ...]):
+        super().__init__()
+        # This is a simplified example. A real implementation might have a more
+        # complex architecture with more layers and careful channel sizing.
+        self.output_shape = output_shape
+        self.is_3d = len(output_shape) == 3
+        
+        # Start by projecting the input vector and reshaping it into a small volume
+        self.initial_projection = nn.Linear(input_dim, 256 * 4 * 4 * (2 if self.is_3d else 1))
+        
+        ConvTranspose = nn.ConvTranspose3d if self.is_3d else nn.ConvTranspose2d
+        self.deconv_layers = nn.Sequential(
+            ConvTranspose(256, 128, kernel_size=4, stride=2, padding=1), nn.ReLU(),
+            ConvTranspose(128, 64, kernel_size=4, stride=2, padding=1), nn.ReLU(),
+            ConvTranspose(64, 1, kernel_size=4, stride=2, padding=1)
+            # This is a generic structure; it needs to be designed to reach the
+            # exact MAP_RESOLUTION and MOUSE_MAP_RESOLUTION.
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.initial_projection(x)
+        if self.is_3d:
+            x = x.view(-1, 256, 2, 4, 4) # (B, C, D, H, W)
+        else:
+            x = x.view(-1, 256, 4, 4) # (B, C, H, W)
+        
+        # The output size of deconv_layers needs to be carefully adjusted
+        # to match the target resolution. This is a placeholder.
+        heatmap_logits = self.deconv_layers(x).squeeze(1)
+        return heatmap_logits
+
+class PlayerPredictionHeads(nn.Module):
+    """Container for all prediction heads related to a single player."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        # Regression heads for player stats
+        self.stats_head = MLPHead(hidden_dim, 3) # health, armor, money
+
+        # Heatmap heads for position and mouse movement
+        self.pos_head = HeatmapHead(hidden_dim, MAP_RESOLUTION)
+        self.mouse_head = HeatmapHead(hidden_dim, MOUSE_MAP_RESOLUTION)
+
+        # Multi-label classification heads for bitmask-based data
+        self.keyboard_head = MLPHead(hidden_dim, NUM_KEYBOARD_KEYS)
+        self.eco_head = MLPHead(hidden_dim, NUM_ECO_ACTIONS)
+        self.inventory_head = MLPHead(hidden_dim, NUM_INVENTORY_ITEMS)
+        self.active_weapon_head = MLPHead(hidden_dim, NUM_INVENTORY_ITEMS)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {
+            "stats": self.stats_head(x),
+            "pos_heatmap_logits": self.pos_head(x),
+            "mouse_heatmap_logits": self.mouse_head(x),
+            "keyboard_logits": self.keyboard_head(x),
+            "eco_logits": self.eco_head(x),
+            "inventory_logits": self.inventory_head(x),
+            "active_weapon_logits": self.active_weapon_head(x),
+        }
+
+class GameStrategyPredictionHeads(nn.Module):
+    """Container for all prediction heads related to game-wide strategy."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.enemy_pos_head = HeatmapHead(hidden_dim, MAP_RESOLUTION)
+        self.round_state_head = MLPHead(hidden_dim, NUM_ROUND_STATE_BITS)
+        self.round_number_head = MLPHead(hidden_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {
+            "enemy_pos_heatmap_logits": self.enemy_pos_head(x),
+            "round_state_logits": self.round_state_head(x),
+            "round_number": self.round_number_head(x),
+        }
+
+# ======================================================================================
+# FINAL MODEL ASSEMBLY
+# ======================================================================================
 
 class CS2Transformer(nn.Module):
-    """
-    The main model that processes a full round of CS2 data.
-    """
+    """The main model that processes a full round of CS2 data."""
     def __init__(self, hidden_dim: int = 2048, num_layers: int = 16, num_heads: int = 32,
                  dropout: float = 0.1, freeze_vit: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_players = 5
-        self.num_special_tokens = 2 # GAME_STRATEGY and SCRATCHSPACE
+        self.num_special_tokens = 2
 
-        # --- Stage 1 Encoder ---
+        # --- Stage 1 & Special Tokens ---
         self.player_encoder = PlayerEncoder(hidden_dim, freeze_vit)
-
-        # --- Special Learnable Tokens ---
         self.game_strategy_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         self.scratchspace_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         self.dead_player_token = nn.Parameter(torch.randn(1, hidden_dim))
         self.mask_frame_token = nn.Parameter(torch.randn(1, hidden_dim))
-        
-        # --- Player Slot Embeddings ---
-        # A learned embedding for each of the 5 player slots to ensure the model
-        # can distinguish between Player 1, Player 2, etc., over time.
         self.player_slot_embeddings = nn.Embedding(self.num_players, hidden_dim)
 
-        # --- RoPE and Transformer Encoder Layers ---
+        # --- Stage 2 ---
         self.rotary_embeddings = RotaryEmbedding(dim=hidden_dim // num_heads)
-        
-        encoder_layers = [
-            CS2TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=hidden_dim * 4, # Standard 4x expansion
-                dropout=dropout
-            ) for _ in range(num_layers)
-        ]
+        encoder_layers = [CS2TransformerEncoderLayer(hidden_dim, num_heads, hidden_dim*4, dropout) for _ in range(num_layers)]
         self.transformer_encoder = nn.ModuleList(encoder_layers)
         self.final_norm = nn.LayerNorm(hidden_dim)
 
+        # --- Stage 3 ---
+        self.player_prediction_heads = nn.ModuleList([PlayerPredictionHeads(hidden_dim) for _ in range(self.num_players)])
+        self.game_strategy_prediction_heads = GameStrategyPredictionHeads(hidden_dim)
 
-    def forward(self, round_data: dict):
+    def forward(self, round_data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        The main forward pass. This is a placeholder for the complex data handling.
-        A real implementation requires a detailed data structure definition.
+        Full end-to-end forward pass for training.
         
         Args:
-            round_data (dict): A dictionary containing all data for a batch of rounds.
-                Expected to contain keys like 'foveal_views', 'peripheral_views',
-                'spectrograms', 'is_alive_mask', 'is_masked_frame_mask'.
+            round_data (Dict): A dictionary of tensors from the data loader.
+                - foveal_views: [B, S, P, 3, H, W]
+                - peripheral_views: [B, S, P, 3, H, W]
+                - spectrograms: [B, S, P, M, T]
+                - is_alive_mask: [B, S, P] (boolean)
+                - is_masked_frame_mask: [B, S] (boolean)
         
         Returns:
-            torch.Tensor: The output sequence from the transformer.
+            A dictionary of predictions for calculating loss.
         """
-        # For this script, we'll assume the input is pre-processed into a
-        # sequence of player tokens and pass it to the encoder.
-        # A full implementation would do the player encoding here.
-        # Let's assume `x` is the assembled sequence of shape:
-        # [seq_len * num_total_tokens, batch_size, hidden_dim]
-        # For simplicity, we'll use a dummy input in the __main__ block.
-        pass
+        B, S, P, _, _, _ = round_data['foveal_views'].shape
+        device = self.game_strategy_token.device
+
+        # --- 1. Encode all player frames ---
+        # Reshape to process all frames from all players in one go
+        foveal = round_data['foveal_views'].view(B * S * P, 3, 384, 384)
+        peripheral = round_data['peripheral_views'].view(B * S * P, 3, 384, 384)
+        audio = round_data['spectrograms'].view(B * S * P, 128, 6) # Assuming shape
+        
+        player_tokens = self.player_encoder(foveal, peripheral, audio)
+        player_tokens = player_tokens.view(B, S, P, self.hidden_dim)
+
+        # --- 2. Assemble the full input sequence ---
+        input_sequence = torch.zeros(B, S, self.num_players + self.num_special_tokens, self.hidden_dim, device=device)
+        
+        # Apply player tokens or dead token
+        alive_mask = round_data['is_alive_mask'].unsqueeze(-1).expand_as(player_tokens)
+        input_sequence[:, :, :P, :] = torch.where(alive_mask, player_tokens, self.dead_player_token)
+        
+        # Add player slot embeddings
+        slot_ids = torch.arange(P, device=device).view(1, 1, P, 1)
+        input_sequence[:, :, :P, :] += self.player_slot_embeddings(slot_ids)
+
+        # Add special tokens
+        input_sequence[:, :, P, :] = self.game_strategy_token
+        input_sequence[:, :, P + 1, :] = self.scratchspace_token
+
+        # Apply frame masking for MFM training
+        frame_mask = round_data['is_masked_frame_mask'].view(B, S, 1, 1).expand_as(input_sequence)
+        input_sequence = torch.where(frame_mask, self.mask_frame_token, input_sequence)
+
+        # --- 3. Run through Transformer Backbone ---
+        # Reshape for transformer: [S, B, 7, D] -> [S*7, B, D]
+        x = input_sequence.permute(1, 0, 2, 3).reshape(S * (P + self.num_special_tokens), B, self.hidden_dim)
+        
+        rope_cos, rope_sin = self.rotary_embeddings(x)
+        predictions = {"player": [{} for _ in range(P)], "game_strategy": {}}
+        
+        # Player predictions
+        for i in range(P):
+            player_head_inputs = masked_output_tokens[:, i, :]
+            predictions["player"][i] = self.player_prediction_heads[i](player_head_inputs)
+        
+        # Game strategy predictions
+        strategy_head_inputs = masked_output_tokens[:, P, :]
+        predictions["game_strategy"] = self.game_strategy_prediction_heads(strategy_head_inputs)
+
+        return predictions
 
 if __name__ == '__main__':
     # ==================================
@@ -332,3 +468,43 @@ if __name__ == '__main__':
     print(f"Total trainable parameters (ViT unfrozen): {total_params_unfrozen / 1e6:.2f}M")
     
     print("\nStage 2 module built and tested successfully!")
+
+     
+    # ==================================
+    # STAGE 3 SANITY CHECKS
+    # ==================================
+    print("\n--- Running Stage 3 Sanity Checks ---")
+    model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True)
+    
+    # Create a realistic dummy data batch
+    B, S, P = 2, 10, 5 # Batch, Sequence Length, Players
+    dummy_round_data = {
+        'foveal_views': torch.randn(B, S, P, 3, 384, 384),
+        'peripheral_views': torch.randn(B, S, P, 3, 384, 384),
+        'spectrograms': torch.randn(B, S, P, 128, 6),
+        'is_alive_mask': torch.randint(0, 2, (B, S, P), dtype=torch.bool),
+        'is_masked_frame_mask': torch.zeros((B, S), dtype=torch.bool),
+    }
+    # Mask about 15% of the frames
+    dummy_round_data['is_masked_frame_mask'].flatten()[torch.randperm(B*S)[:int(B*S*0.15)]] = True
+    
+    # --- Test Full Forward Pass ---
+    predictions = model(dummy_round_data)
+    print("Full forward pass successful.")
+    
+    # --- Check Output Shapes ---
+    num_masked = dummy_round_data['is_masked_frame_mask'].sum()
+    if num_masked > 0:
+        # Player 0 predictions
+        p0_preds = predictions['player'][0]
+        assert p0_preds['stats'].shape == (num_masked, 3)
+        assert p0_preds['keyboard_logits'].shape == (num_masked, NUM_KEYBOARD_KEYS)
+        print(f"Player 0 stats prediction shape: {p0_preds['stats'].shape}")
+        
+        # Game strategy predictions
+        gs_preds = predictions['game_strategy']
+        assert gs_preds['round_state_logits'].shape == (num_masked, NUM_ROUND_STATE_BITS)
+        assert gs_preds['round_number'].shape == (num_masked, 1)
+        print(f"Game strategy round_state prediction shape: {gs_preds['round_state_logits'].shape}")
+
+    print("\nStage 3 module and full model forward pass built and tested successfully!")
