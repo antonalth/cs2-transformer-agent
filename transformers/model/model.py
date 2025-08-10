@@ -282,8 +282,9 @@ class CS2Transformer(nn.Module):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run sanity checks for the CS2Transformer model.")
     parser.add_argument('--cuda-only', action='store_true', help="Run checks on a CUDA device if available.")
-    # --- CHANGE: Benchmark now defines simulation time ---
     parser.add_argument('--benchmark-seconds', type=int, default=30, help="Number of seconds to simulate for the autoregressive benchmark.")
+    # --- ADDED: Argument for the sliding window size ---
+    parser.add_argument('--max-context-frames', type=int, default=1024, help="Maximum number of frames in the sliding context window.")
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -296,13 +297,15 @@ if __name__ == '__main__':
     model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True).to(device)
     
     # --- Benchmark setup for 30 seconds of gameplay at 32 FPS ---
-    B, P = 1, 5 # Batch size of 1 for generation
-    PROMPT_FRAMES = 10 # Start the model with a 10-frame history
+    B, P = 1, 5
+    # The prompt should not be larger than the max context window
+    PROMPT_FRAMES = min(10, args.max_context_frames)
     FPS = 32
     SIM_SECONDS = args.benchmark_seconds
     STEPS_TO_GENERATE = (SIM_SECONDS * FPS) - PROMPT_FRAMES
     
     print(f"Benchmark parameters: Simulating {SIM_SECONDS}s at {FPS} FPS.")
+    print(f"Max Context Window: {args.max_context_frames} frames")
     print(f"Prompt: {PROMPT_FRAMES} frames, Generating: {STEPS_TO_GENERATE} frames.")
     
     initial_frames_data = {
@@ -312,16 +315,52 @@ if __name__ == '__main__':
         'is_alive_mask': torch.ones((B, PROMPT_FRAMES, P), dtype=torch.bool, device=device),
     }
 
+    # We need to modify the `generate` method to accept the max_context argument
+    # For simplicity in this fix, we'll patch the logic directly in the loop here.
+    
     try:
+        model.eval()
+        history = []
+        for i in range(PROMPT_FRAMES):
+            frame_data = {k: v[:, i] for k, v in initial_frames_data.items()}
+            encoded_frame = model._prepare_input_frame(frame_data)
+            history.append(encoded_frame)
+        history_sequence = torch.stack(history, dim=1)
+
         if args.cuda_only:
             print("Warming up GPU...")
-            model.generate(initial_frames_data, steps=10) # Short warmup
-        
+            with torch.no_grad():
+                _ = model(history_sequence[:, :10]) # Short warmup
+            torch.cuda.synchronize()
+
         print("Starting benchmark...")
-        duration = model.generate(initial_frames_data, steps=STEPS_TO_GENERATE)
-        
-        print(f"\nSuccessfully generated {STEPS_TO_GENERATE} frames in {duration:.4f} seconds.")
-        print(f"Average generation speed: {STEPS_TO_GENERATE / duration:.2f} frames/sec.")
+        t_start = time.perf_counter()
+
+        for step in range(STEPS_TO_GENERATE):
+            with torch.no_grad():
+                next_frame_predictions = model.forward(history_sequence)
+                
+                next_frame_data = {
+                    'foveal_views': torch.randn(B, P, 3, 384, 384, device=device),
+                    'peripheral_views': torch.randn(B, P, 3, 384, 384, device=device),
+                    'spectrograms': torch.randn(B, P, 128, 6, device=device),
+                    'is_alive_mask': torch.randint(0, 2, (B, P), dtype=torch.bool, device=device),
+                }
+                next_encoded_frame = model._prepare_input_frame(next_frame_data).unsqueeze(1)
+                
+                history_sequence = torch.cat([history_sequence, next_encoded_frame], dim=1)
+
+                # --- THE FIX: SLIDING WINDOW ---
+                # If the sequence is too long, discard the oldest frame.
+                if history_sequence.shape[1] > args.max_context_frames:
+                    history_sequence = history_sequence[:, 1:, :, :]
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_end = time.perf_counter()
+
+        print(f"\nSuccessfully generated {STEPS_TO_GENERATE} frames in {t_end - t_start:.4f} seconds.")
+        print(f"Average generation speed: {STEPS_TO_GENERATE / (t_end - t_start):.2f} frames/sec.")
         
     except Exception as e:
         print("\nAn error occurred during the benchmark:")
