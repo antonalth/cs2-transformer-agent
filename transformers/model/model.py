@@ -328,6 +328,10 @@ class CS2Transformer(nn.Module):
         B, S, P, _, _, _ = round_data['foveal_views'].shape
         device = self.game_strategy_token.device
 
+        # --- FIX: Add assertion to fail fast if data shape is incorrect ---
+        assert P == self.num_players, \
+            f"Input data has P={P} players, but model is configured for num_players={self.num_players}."
+
         foveal = round_data['foveal_views'].view(B * S * P, 3, 384, 384)
         peripheral = round_data['peripheral_views'].view(B * S * P, 3, 384, 384)
         audio = round_data['spectrograms'].view(B * S * P, 128, 6)
@@ -335,19 +339,20 @@ class CS2Transformer(nn.Module):
         player_tokens = self.player_encoder(foveal, peripheral, audio)
         player_tokens = player_tokens.view(B, S, P, self.hidden_dim)
 
-        # --- BUG FIX STARTS HERE ---
-        # 1. Create slot embeddings and add them to the player tokens first.
-        slot_ids = torch.arange(P, device=device).view(1, 1, P, 1)
-        slot_embeddings = self.player_slot_embeddings(slot_ids)
-        player_tokens_with_slots = player_tokens + slot_embeddings # Broadcasts to [B, S, P, D]
+        # --- FIX: Cleaner broadcasting for slot embeddings ---
+        # 1. Create slot embeddings with a cleaner shape.
+        slot_ids = torch.arange(P, device=device).view(1, 1, P) # Shape: [1, 1, 5]
+        slot_embeddings = self.player_slot_embeddings(slot_ids)  # Shape: [1, 1, 5, D]
 
-        # 2. Prepare the main sequence container.
+        # 2. Add embeddings to player tokens. This now broadcasts cleanly.
+        player_tokens_with_slots = player_tokens + slot_embeddings
+
+        # 3. Assemble the main sequence container.
         input_sequence = torch.zeros(B, S, self.num_players + self.num_special_tokens, self.hidden_dim, device=device)
-
-        # 3. Use torch.where to select between slotted tokens and the dead token.
+        
+        # 4. Use torch.where to select between slotted tokens and the dead token.
         alive_mask = round_data['is_alive_mask'].unsqueeze(-1).expand_as(player_tokens_with_slots)
         input_sequence[:, :, :P, :] = torch.where(alive_mask, player_tokens_with_slots, self.dead_player_token)
-        # --- BUG FIX ENDS HERE ---
 
         input_sequence[:, :, P, :] = self.game_strategy_token
         input_sequence[:, :, P + 1, :] = self.scratchspace_token
@@ -366,8 +371,7 @@ class CS2Transformer(nn.Module):
 
         masked_output_tokens = output_sequence[round_data['is_masked_frame_mask']]
         
-        if masked_output_tokens.shape[0] == 0:
-            return {}
+        if masked_output_tokens.shape[0] == 0: return {}
 
         predictions = {"player": [{} for _ in range(P)], "game_strategy": {}}
         for i in range(P):
@@ -377,7 +381,6 @@ class CS2Transformer(nn.Module):
         return predictions
 
 if __name__ == '__main__':
-    # --- Add Argument Parser for --cuda-only flag ---
     parser = argparse.ArgumentParser(description="Run sanity checks for the CS2Transformer model.")
     parser.add_argument('--cuda-only', action='store_true', help="Run Stage 3 checks on a CUDA device if available.")
     args = parser.parse_args()
@@ -385,22 +388,18 @@ if __name__ == '__main__':
     device = torch.device("cpu")
     if args.cuda_only:
         if torch.cuda.is_available():
-            device = torch.device("cuda")
-            print("--- Running all checks on CUDA device ---")
+            device = torch.device("cuda"); print("--- Running all checks on CUDA device ---")
         else:
-            print("CUDA not available. Aborting CUDA-only check.")
-            exit()
+            print("CUDA not available. Aborting CUDA-only check."); exit()
     else:
         print("--- Running all checks on CPU device ---")
 
-    # ==================================
-    # STAGE 3 SANITY CHECKS (Now with device placement)
-    # ==================================
     print("\n--- Running Stage 3 Sanity Checks ---")
     model = CS2Transformer(hidden_dim=2048, num_layers=4, num_heads=32, freeze_vit=True).to(device)
     
+    # --- FIX: The Player (P) dimension in test data MUST match the model's internal num_players ---
     B, S, P = 2, 10, 5
-    # Create dummy data directly on the target device
+    
     dummy_round_data = {
         'foveal_views': torch.randn(B, S, P, 3, 384, 384, device=device),
         'peripheral_views': torch.randn(B, S, P, 3, 384, 384, device=device),
@@ -411,7 +410,7 @@ if __name__ == '__main__':
     dummy_round_data['is_masked_frame_mask'].flatten()[torch.randperm(B*S)[:int(B*S*0.15)]] = True
     
     try:
-        with torch.no_grad(): # Use no_grad for inference checks to save memory
+        with torch.no_grad():
             predictions = model(dummy_round_data)
         print("Full forward pass successful.")
         
