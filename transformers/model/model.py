@@ -480,46 +480,75 @@ class PlayerHeads(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         d = cfg.d_model
+        
+        # --- Standard prediction heads ---
         self.stats = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 3))
         self.mouse = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 2))
         self.keyboard = nn.Linear(d, cfg.keyboard_dim)
         self.eco = nn.Linear(d, cfg.eco_dim)
         self.inventory = nn.Linear(d, cfg.inventory_dim)
         self.active_weapon = nn.Linear(d, cfg.weapon_dim)
-        # Simple upsampling stub for 3D heatmap from token
-        vol_feats = 64  # latent channels for deconv stem (tunable)
-        self.pos_seed = nn.Linear(d, vol_feats * 8 * 8 * 8)
+
+        # --- Corrected 3D Heatmap Deconvolutional Head ---
+        # New target shape for the position heatmap
+        self.pos_shape = (8, 64, 64) # (Z, Y, X)
+        
+        vol_feats = 128  # Latent channels for the deconv stem (tunable)
+        
+        # 1. Seed: Project the flat token to a starting 3D volume
+        # The starting volume will have the correct Z dimension already.
+        self.pos_seed = nn.Linear(d, vol_feats * 8 * 8 * 8) 
+        
+        # 2. Deconvolution path: Upsample the Y and X dimensions by 8x (2^3)
+        # We use anisotropic strides (1, 2, 2) to only upsample Y and X.
         self.pos_deconv = nn.Sequential(
-            nn.ConvTranspose3d(vol_feats, vol_feats // 2, 4, stride=2, padding=1),
+            # Input: [B, 128, 8, 8, 8]
+            # Block 1 -> [B, 64, 8, 16, 16]
+            nn.ConvTranspose3d(vol_feats, vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(vol_feats // 2),
             nn.GELU(),
-            nn.ConvTranspose3d(vol_feats // 2, 1, 4, stride=2, padding=1),
+            
+            # Block 2 -> [B, 32, 8, 32, 32]
+            nn.ConvTranspose3d(vol_feats // 2, vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(vol_feats // 4),
+            nn.GELU(),
+
+            # Block 3 -> [B, 16, 8, 64, 64]
+            nn.ConvTranspose3d(vol_feats // 4, vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(vol_feats // 8),
+            nn.GELU(),
         )
-        self.pos_shape = (cfg.pos_z, cfg.pos_y, cfg.pos_x)
+        
+        # 3. Final Projection: Reduce feature channels to a single logit channel
+        self.pos_final_conv = nn.Conv3d(vol_feats // 8, 1, kernel_size=1)
 
     def forward(self, token: torch.Tensor) -> PlayerPredictions:
         # token: [B, d]
         B = token.shape[0]
-        stats = self.stats(token)
-        mouse_delta_deg = self.mouse(token)
-        keyboard_logits = self.keyboard(token)
-        eco_logits = self.eco(token)
-        inventory_logits = self.inventory(token)
-        active_weapon_logits = self.active_weapon(token)
-        # 3D heatmap (coarse → upsample twice → later resize to (64,256,256) if needed)
-        seed = self.pos_seed(token).view(B, 64, 8, 8, 8)
-        vol = self.pos_deconv(seed)  # [B, 1, 32, 32, 32]
-        # For skeleton, pad/resize to target shape lazily
-        pos_heatmap_logits = F.interpolate(vol, size=self.pos_shape, mode="trilinear", align_corners=False).squeeze(1)
-        return {
-            "stats": stats,
-            "pos_heatmap_logits": pos_heatmap_logits,
-            "mouse_delta_deg": mouse_delta_deg,
-            "keyboard_logits": keyboard_logits,
-            "eco_logits": eco_logits,
-            "inventory_logits": inventory_logits,
-            "active_weapon_logits": active_weapon_logits,
-        }
 
+        # --- Generate Heatmap ---
+        # Project token to the initial seed volume [B, vol_feats, 8, 8, 8]
+        seed = self.pos_seed(token).view(B, 128, 8, 8, 8)
+        # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
+        upsampled_vol = self.pos_deconv(seed)
+        # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
+        heatmap_vol = self.pos_final_conv(upsampled_vol)
+        # Remove channel dimension to get final shape [B, 8, 64, 64]
+        pos_heatmap_logits = heatmap_vol.squeeze(1)
+
+        # Sanity check to ensure the output shape is always correct
+        assert pos_heatmap_logits.shape == (B, *self.pos_shape), \
+            f"Shape mismatch! Expected {(B, *self.pos_shape)}, but got {pos_heatmap_logits.shape}"
+
+        return {
+            "stats": self.stats(token),
+            "pos_heatmap_logits": pos_heatmap_logits,
+            "mouse_delta_deg": self.mouse(token),
+            "keyboard_logits": self.keyboard(token),
+            "eco_logits": self.eco(token),
+            "inventory_logits": self.inventory(token),
+            "active_weapon_logits": self.active_weapon(token),
+        }
 
 class StrategyHead(nn.Module):
     def __init__(self, cfg: CS2Config):
