@@ -240,7 +240,7 @@ class CS2Config:
 
     # RoPE / long-context
     rope_base: int = 10000
-    rope_scaling: Optional[Dict[str, Any]]  # e.g.
+    rope_scaling: Optional[Dict[str, Any]] = None  # e.g.
     # {"type": "linear", "factor": 2.0}                   # 2× context
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
 
@@ -292,13 +292,15 @@ class ViTVisualEncoder(nn.Module):
             self._has_hf = False
             ViTModel = None  # type: ignore
 
+        vit_name = getattr(self.cfg, "vit_name")
+
         self.backend = None
         if self._has_timm:
-            self.vit = timm.create_model("vit_large_patch16_384", pretrained=True, num_classes=0)
+            self.vit = timm.create_model(vit_name, pretrained=True, num_classes=0)
             self.backend = "timm"
             self.vit_out_dim = 1024
         elif self._has_hf:
-            self.vit = ViTModel.from_pretrained("google/vit-large-patch16-384")
+            self.vit = ViTModel.from_pretrained(vit_name)
             self.backend = "hf"
             self.vit_out_dim = 1024
         else:
@@ -454,7 +456,7 @@ class RoPEPositionalEncoding(nn.Module):
         self.rot_dim = rot_dim
         # Default scale = 1.0 (no scaling). Expose setter for long-context tuning.
         self.register_buffer("scale", torch.tensor(1.0), persistent=False)
-        self._apply_cfg_scaling(cfg.get("rope_scaling"))
+        self._apply_cfg_scaling(getattr(self.cfg,"rope_scaling"))
 
     def _apply_cfg_scaling(self, scaling: Optional[Dict[str, Any]]) -> None:
         """
@@ -947,12 +949,12 @@ class CS2Transformer(nn.Module):
         """Compute next-frame predictions (t+1) given frames 1..t."""
         # ---- autocast setup ----
         use_amp = (
-            self.cfg.get("amp_autocast", True)
+            self.getattr(self.cfg,"amp_autocast", True)
             and torch.cuda.is_available()
-            and self.cfg.get("compute_dtype", "bf16") != "fp32"
+            and self.getattr(self.cfg,"compute_dtype", "bf16") != "fp32"
         )
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-        amp_dtype = dtype_map[self.cfg.get("compute_dtype", "bf16")]
+        amp_dtype = dtype_map[self.getattr(self.cfg,"compute_dtype", "bf16")]
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
         )
@@ -964,11 +966,11 @@ class CS2Transformer(nn.Module):
             alive = batch["alive_mask"].bool()     # [B, T, 5]
 
             B, T, P = fov.shape[:3]
-            d = self.cfg.get("d_model")
+            d = self.getattr(self.cfg,"d_model")
 
             # Optional consistency check
             if __debug__:
-                assert self.cfg.get("tokens_per_frame") == self.cfg.get("num_players") + 2, \
+                assert self.getattr(self.cfg,"tokens_per_frame") == self.getattr(self.cfg,"num_players") + 2, \
                     "tokens_per_frame must equal num_players + 2 (players + strategy + scratch)"
 
             # ---- encoders ----
@@ -985,7 +987,7 @@ class CS2Transformer(nn.Module):
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)        # [B, T, 7, d]
 
             # ---- flatten time to sequence ----
-            Lpf = self.cfg.get("tokens_per_frame")
+            Lpf = self.getattr(self.cfg,"tokens_per_frame")
             seq = frame_tokens.reshape(B, T * Lpf, d)     # [B, L, d]
 
             attn_mask = None  # handled inside CS2GQAAttention
@@ -995,7 +997,7 @@ class CS2Transformer(nn.Module):
 
             # ---- slice last frame ----
             last = h[:, -Lpf:, :]                         # [B, 7, d]
-            num_players = self.cfg.get("num_players")
+            num_players = self.getattr(self.cfg,"num_players")
             player_tok = last[:, :num_players, :]         # [B, 5, d]
             strat_tok  = last[:, num_players, :]          # [B, d]
             # scratch_tok = last[:, num_players + 1, :]
