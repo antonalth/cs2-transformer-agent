@@ -401,6 +401,7 @@ class PlayerTokenFuser(nn.Module):
     """
     def __init__(self, cfg: CS2Config, player_slot_embed: nn.Embedding, dead_embedding: nn.Parameter):
         super().__init__()
+        self.cfg = cfg
         self.norm = nn.LayerNorm(cfg.d_model)
         self.slot_embed = player_slot_embed
         self.dead_embedding = dead_embedding
@@ -705,10 +706,7 @@ class CS2GQAAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], temporal_pos_ids: torch.Tensor, structural_pos_ids: torch.Tensor) -> torch.Tensor:
         """
-        x:         [B, L, D]
-        attn_mask: Boolean or additive mask. Boolean True = DISALLOW. Additive: large negative = disallow.
-                Shapes supported: [L,L], [B,L,L], [B,1,L,L], [1,1,L,L].
-        pos_ids:   [L] integer positions for RoPE
+        Applies 2D RoPE to query and key tensors.
         """
         B, L, D = x.shape
         Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
@@ -855,35 +853,35 @@ class PlayerHeads(nn.Module):
         # New target shape for the position heatmap
         self.pos_shape = (8, 64, 64) # (Z, Y, X)
         
-        vol_feats = 128  # Latent channels for the deconv stem (tunable)
+        self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
         
         # 1. Seed: Project the flat token to a starting 3D volume
         # The starting volume will have the correct Z dimension already.
         # We start with a small spatial resolution (8x8) that will be upsampled to 64x64.
-        self.pos_seed = nn.Linear(d, vol_feats * 8 * 8 * 8) 
+        self.pos_seed = nn.Linear(d, self.vol_feats * 8 * 8 * 8) 
         
         # 2. Deconvolution path: Upsample the Y and X dimensions by 8x (2^3)
         # We use anisotropic strides (1, 2, 2) to only upsample Y and X.
         self.pos_deconv = nn.Sequential(
             # Input: [B, 128, 8, 8, 8]
             # Block 1 -> [B, 64, 8, 16, 16]
-            nn.ConvTranspose3d(vol_feats, vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(vol_feats // 2),
+            nn.ConvTranspose3d(self.vol_feats, self.vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            _GN3d(self.vol_feats // 2),
             nn.GELU(),
             
             # Block 2 -> [B, 32, 8, 32, 32]
-            nn.ConvTranspose3d(vol_feats // 2, vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(vol_feats // 4),
+            nn.ConvTranspose3d(self.vol_feats // 2, self.vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            _GN3d(self.vol_feats // 4),
             nn.GELU(),
 
             # Block 3 -> [B, 16, 8, 64, 64]
-            nn.ConvTranspose3d(vol_feats // 4, vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(vol_feats // 8),
+            nn.ConvTranspose3d(self.vol_feats // 4, self.vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            _GN3d(self.ol_feats // 8),
             nn.GELU(),
         )
         
         # 3. Final Projection: Reduce feature channels to a single logit channel
-        self.pos_final_conv = nn.Conv3d(vol_feats // 8, 1, kernel_size=1)
+        self.pos_final_conv = nn.Conv3d(self.vol_feats // 8, 1, kernel_size=1)
 
     def forward(self, token: torch.Tensor) -> PlayerPredictions:
         # token: [B, d]
@@ -891,7 +889,7 @@ class PlayerHeads(nn.Module):
 
         # --- Generate Heatmap ---
         # Project token to the initial seed volume [B, 128, 8, 8, 8]
-        seed = self.pos_seed(token).reshape(B, 128, 8, 8, 8)
+        seed = self.pos_seed(token).reshape(B, self.vol_feats, 8, 8, 8)
         # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
         upsampled_vol = self.pos_deconv(seed)
         # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
@@ -919,7 +917,7 @@ class StrategyHead(nn.Module):
         self.enemy_shape = (cfg.pos_z, cfg.pos_y, cfg.pos_x)
         
         # --- Corrected 3D Deconvolutional Head for Enemy Positions ---
-        vol_feats = 128  # Latent channels for the deconv stem (tunable)
+        self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
         
         # 1. Seed: Project the flat token to a starting 3D volume [B, 128, 8, 8, 8]
         self.enemy_seed = nn.Linear(d, vol_feats * 8 * 8 * 8)
@@ -929,23 +927,23 @@ class StrategyHead(nn.Module):
         #    is modeled directly on the working PlayerHeads implementation.
         self.enemy_deconv = nn.Sequential(
             # Input: [B, 128, 8, 8, 8] -> [B, 64, 8, 16, 16]
-            nn.ConvTranspose3d(vol_feats, vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(vol_feats // 2),
+            nn.ConvTranspose3d( self.vol_feats,  self.vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            _GN3d( self.vol_feats // 2),
             nn.GELU(),
             
             # Block 2 -> [B, 32, 8, 32, 32]
-            nn.ConvTranspose3d(vol_feats // 2, vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(vol_feats // 4),
+            nn.ConvTranspose3d( self.vol_feats // 2,  self.vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            _GN3d( self.vol_feats // 4),
             nn.GELU(),
 
             # Block 3 -> [B, 16, 8, 64, 64]
-            nn.ConvTranspose3d(vol_feats // 4, vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(vol_feats // 8),
+            nn.ConvTranspose3d( self.vol_feats // 4,  self.vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            _GN3d( self.vol_feats // 8),
             nn.GELU(),
         )
         
         # 3. Final Projection: Reduce feature channels to a single logit channel
-        self.enemy_final_conv = nn.Conv3d(vol_feats // 8, 1, kernel_size=1)
+        self.enemy_final_conv = nn.Conv3d( self.vol_feats // 8, 1, kernel_size=1)
 
         # --- Other standard prediction heads ---
         self.round_state = nn.Linear(d, cfg.round_state_dim)
