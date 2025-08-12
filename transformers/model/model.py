@@ -403,38 +403,43 @@ class PlayerTokenFuser(nn.Module):
         self.slot_embed = player_slot_embed
         self.dead_embedding = dead_embedding
 
+    # In model.py, inside the PlayerTokenFuser class
+
     def forward(
         self,
         vis: torch.Tensor,   # [B, T, P, d]
         aud: torch.Tensor,   # [B, T, P, d]
         alive_mask: torch.Tensor,  # [B, T, P] bool
     ) -> torch.Tensor:
-            B, T, P, d = vis.shape
-            fused = self.norm(vis + aud)
+        """
+        Fuse visual+audio, apply the DEAD policy, and add player identity.
+        This corrected version is more efficient and readable.
+        """
+        B, T, P, d = vis.shape
 
-            # Add slot embeddings
-            slot_ids = torch.arange(P, device=vis.device).view(1, 1, P)
-            slots = self.slot_embed(slot_ids) # [B, T, P, d] after broadcasting
-            fused = fused + slots
+        # 1. Fuse the sensor data for the "alive" case.
+        fused_alive_token = self.norm(vis + aud)
 
-            # DEAD swap policy
-            dead_mask = ~alive_mask.bool() # [B, T, P]
-            if dead_mask.any():
-                # Create the dead token by explicitly broadcasting the dead_embedding
-                # to the shape of the slot embeddings.
-                dead_token_template = self.dead_embedding.unsqueeze(2).expand_as(slots)
-                
-                # The final dead token is the shared dead embedding plus the unique slot ID
-                dead_tokens = dead_token_template + slots
+        # 2. Prepare the mask for broadcasting. We need a final dimension.
+        # The mask will be True where players are DEAD.
+        dead_mask = ~alive_mask.bool().unsqueeze(-1) # Shape: [B, T, P, 1]
 
-                # Use the mask to select between the fused (alive) token and the dead token.
-                # The mask needs an extra dimension to match the token dimension 'd'.
-                fused = torch.where(
-                    dead_mask.unsqueeze(-1), # Shape: [B, T, P, 1]
-                    dead_tokens,
-                    fused,
-                )
-            return fused # [B, T, P, d]
+        # 3. Select the base token. PyTorch will broadcast self.dead_embedding
+        # to the correct shape where the mask is True. This is highly efficient.
+        base_token = torch.where(
+            dead_mask,
+            self.dead_embedding, # The single [DEAD] embedding
+            fused_alive_token,   # The fused sensor token
+        )
+
+        # 4. Add the unique player slot identity to the selected base token.
+        # This happens regardless of whether the player is alive or dead.
+        slot_ids = torch.arange(P, device=vis.device).view(1, 1, P)
+        slots = self.slot_embed(slot_ids) # Broadcasts to [B, T, P, d]
+        
+        final_token = base_token + slots
+
+        return final_token
 
 
 # -----------------------------------------------------------------------------
@@ -495,19 +500,16 @@ class RoPEPositionalEncoding(nn.Module):
         y = torch.stack([y1, y2], dim=-1).view(B, L, H, rd)
         return torch.cat([y, x_pass], dim=-1)
 
-    # --- PROPOSED CHANGE (2 of 2): Update forward method ---
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # q: [B, L, Hq, Hd], k: [B, L, Hkv, Hd]; positions: [L]
         L = q.shape[1]
         if positions.shape[0] != L:
             raise ValueError(f"Length of positions tensor ({positions.shape[0]}) does not match sequence length ({L}).")
 
-        # Add a check to ensure inputs are valid
-        if positions.shape[0] != L:
-            raise ValueError(f"Length of positions tensor ({positions.shape[0]}) does not match sequence length ({L}).")
-
         rd = self.rot_dim or q.shape[-1]
         
+        # This is the corrected part: `positions` is now used.
         cos, sin = self._build_cos_sin(positions, rd, q.device, q.dtype)
         
         q = self._apply_rotary(q, cos, sin, rd)
@@ -557,60 +559,59 @@ class CS2GQAAttention(nn.Module):
 
     # In model.py, inside the CS2GQAAttention class
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], pos_ids: torch.Tensor) -> torch.Tensor:
-        """
-        x:        [B, L, D]
-        attn_mask: This argument is now expected to be None. Masking decisions are
-                   made internally based on the model config.
-        pos_ids:  [L] integer positions for RoPE
-        """
-        B, L, D = x.shape
-        Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
+    # In model.py, inside the CS2GQAAttention class
 
-        q = self.wq(x).view(B, L, Hq, Hd)
-        k = self.wk(x).view(B, L, Hkv, Hd)
-        v = self.wv(x).view(B, L, Hkv, Hd)
+def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], pos_ids: torch.Tensor) -> torch.Tensor:
+    """
+    x:        [B, L, D]
+    attn_mask: A boolean mask where True values indicate positions that should
+               be MASKED OUT (i.e., not attended to).
+    pos_ids:  [L] integer positions for RoPE
+    """
+    B, L, D = x.shape
+    Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
 
-        q, k = self.rope(q, k, pos_ids)
+    q = self.wq(x).view(B, L, Hq, Hd)
+    k = self.wk(x).view(B, L, Hkv, Hd)
+    v = self.wv(x).view(B, L, Hkv, Hd)
 
-        if Hq % Hkv != 0:
-            raise ValueError(f"n_q_heads ({Hq}) must be divisible by n_kv_heads ({Hkv}) for GQA.")
-        group = Hq // Hkv
-        k = k.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
-        v = v.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
-        
-        q_bLHD = q.contiguous()
-        k_bLHD = k.contiguous()
-        v_bLHD = v.contiguous()
+    q, k = self.rope(q, k, pos_ids)
 
-        # --- PROPOSED CHANGE: Centralized Masking Logic ---
-        # Decide which attention implementation to use.
-        # The fused path (FlashAttention) is fastest but only supports strict
-        # token-level causality. The frame-block causal mask is architecturally
-        # correct but requires manual mask creation and is thus incompatible.
+    if Hq % Hkv != 0:
+        raise ValueError(f"n_q_heads ({Hq}) must be divisible by n_kv_heads ({Hkv}) for GQA.")
+    group = Hq // Hkv
+    k = k.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
+    v = v.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
+    
+    q_bLHD = q.contiguous()
+    k_bLHD = k.contiguous()
+    v_bLHD = v.contiguous()
 
-        # Condition to use the fastest path:
-        can_use_fused_path = (
-            self._use_fa2(x) and
-            self.cfg.use_fused_causal and
-            not self.cfg.use_frame_block_causal_mask and
-            attn_mask is None # Ensure no external mask is passed
+    # --- FIXED MASKING LOGIC ---
+    # Condition to use the fastest path.
+    # CRITICAL CHANGE: The fast path can ONLY be used if no external mask is provided.
+    can_use_fused_path = (
+        self._use_fa2(x) and
+        self.cfg.use_fused_causal and
+        not self.cfg.use_frame_block_causal_mask and
+        attn_mask is None # <--- THIS IS THE KEY FIX
+    )
+
+    if can_use_fused_path:
+        # FAST PATH: Use FlashAttention-2 with its built-in strict causal masking.
+        # This path is now only taken when no mask is passed from the top level.
+        out = self._fa2(
+            q_bLHD, k_bLHD, v_bLHD,
+            dropout_p=self.dropout if self.training else 0.0,
+            causal=True,
+            return_attn_probs=False,
         )
+    else:
+        # SLOW PATH: Manually build or use the provided attention mask.
+        disallow_mask: Optional[torch.Tensor] = attn_mask
 
-        if can_use_fused_path:
-            # FAST PATH: Use FlashAttention-2 with built-in causal masking.
-            out = self._fa2(
-                q_bLHD, k_bLHD, v_bLHD,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=True, #here we accept that we cannot do block wise mask for FA2 speedup (strict causality instead)
-                return_attn_probs=False,
-            )
-        else:
-            # SLOW PATH: Manually build the attention mask.
-            # This path is required for the correct frame-block causal logic
-            # or for running on hardware without FlashAttention support.
-            
-            disallow_mask: torch.Tensor
+        # If no external mask was provided, build one based on the config.
+        if disallow_mask is None:
             if self.cfg.use_frame_block_causal_mask:
                 # Build the architecturally correct frame-block causal mask.
                 G = self.cfg.tokens_per_frame
@@ -618,36 +619,33 @@ class CS2GQAAttention(nn.Module):
                 frame_id = (pos // G)
                 fi_q = frame_id.view(1, 1, L, 1)
                 fi_k = frame_id.view(1, 1, 1, L)
-                # Disallow attending to tokens from strictly future frames.
-                # Allows full attention within a frame and to all past frames.
                 disallow_mask = (fi_k > fi_q)
-            else:
-                # Fallback to a simple, strict token-level causal mask.
-                # This matches the old (incorrect) behavior but is useful for
-                # debugging or if the fused kernel is disabled.
+            elif self.cfg.use_fused_causal:
+                # If we are on this path but fused_causal is True, it means FA2
+                # isn't available. We fall back to a manual strict causal mask.
                 i = torch.arange(L, device=x.device)
                 disallow_mask = (i[None, :] > i[:, None]).view(1, 1, L, L)
+            else:
+                # No masking specified
+                disallow_mask = None
 
-            # If an external mask were ever provided, it would be combined here.
-            if attn_mask is not None:
-                disallow_mask = disallow_mask | attn_mask.to(device=disallow_mask.device)
 
-            q_bHLD = q_bLHD.permute(0, 2, 1, 3).contiguous()
-            k_bHLD = k_bLHD.permute(0, 2, 1, 3).contiguous()
-            v_bHLD = v_bLHD.permute(0, 2, 1, 3).contiguous()
+        q_bHLD = q_bLHD.permute(0, 2, 1, 3).contiguous()
+        k_bHLD = k_bLHD.permute(0, 2, 1, 3).contiguous()
+        v_bHLD = v_bLHD.permute(0, 2, 1, 3).contiguous()
 
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_bHLD, k_bHLD, v_bHLD,
-                attn_mask=disallow_mask, # boolean mask, True = disallow
-                is_causal=False,         # Our mask handles causality explicitly
-                dropout_p=self.dropout if self.training else 0.0,
-            )
-            # Permute back to [B, L, H, Hd]
-            out = out.permute(0, 2, 1, 3).contiguous()
-        # --- END OF CHANGE ---
-
-        out = out.view(B, L, D)
-        return self.wo(out)
+        # The 'is_causal' flag must be False because we provide an explicit mask.
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_bHLD, k_bHLD, v_bHLD,
+            attn_mask=disallow_mask, # boolean mask, True = disallow
+            is_causal=False,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        out = out.permute(0, 2, 1, 3).contiguous()
+    # --- END OF FIX ---
+    
+    out = out.view(B, L, D)
+    return self.wo(out)
 
 
 
