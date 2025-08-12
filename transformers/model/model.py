@@ -513,6 +513,7 @@ class CS2GQAAttention(nn.Module):
         d, hq, hkv = cfg.d_model, cfg.n_q_heads, cfg.n_kv_heads
         assert d % hq == 0, "d_model must be divisible by n_q_heads"
         self.head_dim = d // hq
+        self.dropout = float(getattr(cfg, "attn_dropout", 0.0))
         # Projections
         self.wq = nn.Linear(d, d, bias=False)
         self.wk = nn.Linear(d, hkv * self.head_dim, bias=False)
@@ -566,10 +567,10 @@ class CS2GQAAttention(nn.Module):
         k = k.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
         v = v.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
 
-        # [B, H, L, Hd] for SDPA/FlashAttention
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        q_bLHD = q.contiguous()
+        k_bLHD = k.contiguous()
+        v_bLHD = v.contiguous()
+
 
         # -------------------------
         # Masking / attention path
@@ -581,13 +582,15 @@ class CS2GQAAttention(nn.Module):
         can_use_pure_causal = (attn_mask is None) and (not use_frame_block_mask)
 
         if self._use_fa2(x) and can_use_pure_causal:
-            # Flash / fused path with built-in causal mask.
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                is_causal=True,
+            # FlashAttention-2 path (built-in causal masking). Expects [B, L, H, Hd].
+            # Returns [B, L, H, Hd].
+            out_bLHD = self._fa2(
+                q_bLHD, k_bLHD, v_bLHD,
                 dropout_p=self.dropout if self.training else 0.0,
+                causal=True,
+                return_attn_probs=False,
             )
+            out = out_bLHD  # [B, L, H, Hd]
         else:
             # Build a boolean DISALLOW mask (True = disallow) that broadcasts to [B, H, L, L].
             # Start from either:
@@ -613,15 +616,22 @@ class CS2GQAAttention(nn.Module):
                 # Broadcast OR: disallow if either source disallows
                 disallow = disallow | attn_mask  # result broadcastable to [B,H,L,L]
 
+            q_bHLD = q_bLHD.permute(0, 2, 1, 3).contiguous()
+            k_bHLD = k_bLHD.permute(0, 2, 1, 3).contiguous()
+            v_bHLD = v_bLHD.permute(0, 2, 1, 3).contiguous()
+
             out = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
+                q_bHLD, k_bHLD, v_bHLD,
                 attn_mask=disallow,         # boolean mask, True = disallow
                 is_causal=False,            # IMPORTANT: we encoded causality in the mask
                 dropout_p=self.dropout if self.training else 0.0,
             )
 
-        # Back to [B, L, D]
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, L, D)
+        # Back to [B, L, D] no matter which path we took
+        if out.dim() != 4 or out.shape[:3] != (B, L, Hq):
+            # SDPA branch returns [B, H, L, Hd]
+            out = out.permute(0, 2, 1, 3)
+        out = out.contiguous().view(B, L, D)
         return self.wo(out)
 
 
@@ -809,12 +819,11 @@ class CS2Transformer(nn.Module):
 
     # ------------------------------ helpers ------------------------------- #
     @staticmethod
-    def _build_causal_mask(L: int, device: torch.device) -> torch.Tensor:
-        # Returns boolean mask of shape [1, 1, L, L]: True = allowed
+    def _build_causal_mask(L, device):
         i = torch.arange(L, device=device)
-        mask = (i[:, None] >= i[None, :])
-        return mask.view(1, 1, L, L)
-
+        # True on future positions (upper triangle) = disallow
+        mask = (i[None, :] > i[:, None]).view(1, 1, L, L)
+        return mask
     # ------------------------------- forward ------------------------------ #
     def forward(self, batch: CS2Batch) -> Predictions:
         """Compute next-frame predictions (t+1) given a sequence of frames 1..t.
