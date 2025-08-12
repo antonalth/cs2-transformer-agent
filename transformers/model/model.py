@@ -266,11 +266,10 @@ class ViTVisualEncoder(nn.Module):
         self.cfg = cfg
         self.d_model = cfg.d_model
 
-        # Register normalization buffers (broadcastable)
         self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406]).reshape(1, 1, 1, 3, 1, 1))
         self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 1, 1, 3, 1, 1))
 
-        # Optional backends
+        # Optional backends (unchanged)
         try:
             import timm  # type: ignore
             self._has_timm = True
@@ -286,78 +285,63 @@ class ViTVisualEncoder(nn.Module):
 
         self.backend = None
         if self._has_timm:
-            # Headless model; forward returns [N, 1024]
-            self.vit = timm.create_model(
-                "vit_large_patch16_384", pretrained=True, num_classes=0
-            )
+            self.vit = timm.create_model("vit_large_patch16_384", pretrained=True, num_classes=0)
             self.backend = "timm"
             self.vit_out_dim = 1024
         elif self._has_hf:
-            # HF returns hidden states; we'll grab CLS at index 0
             self.vit = ViTModel.from_pretrained("google/vit-large-patch16-384")
             self.backend = "hf"
             self.vit_out_dim = 1024
         else:
-            raise ImportError(
-                "Neither timm nor transformers is available for ViTVisualEncoder."
-            )
+            raise ImportError("Neither timm nor transformers is available for ViTVisualEncoder.")
 
-        # Project concat(CLS_a, CLS_b) → d_model
         self.proj = nn.Linear(self.vit_out_dim * 2, cfg.d_model)
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [..., 3, H, W] in [0,1]. If input appears in [0,255], scale down.
-        if x.dtype in (torch.uint8, torch.int8, torch.int16):
+        # Accept uint8 (0..255) or float already in [0,1]
+        if not x.is_floating_point():
             x = x.float() / 255.0
-        elif x.max() > 1.5:
-            x = x / 255.0
-        # Move channel dim to match buffers for broadcasting
+        # If callers accidentally pass floats in 0..255, you can add an opt-in flag to rescale.
         return (x - self.img_mean) / self.img_std
 
-    @torch.no_grad()
-    def _forward_one_view_eval(self, x: torch.Tensor) -> torch.Tensor:
-        """Fast path for eval; returns CLS [N, 1024]."""
-        if self.backend == "timm":
-            y = self.vit(x)  # [N, 1024] when num_classes=0
-            return y
-        else:
-            outputs = self.vit(pixel_values=x)
-            return outputs.last_hidden_state[:, 0, :]  # [N, 1024]
+    def _vit_requires_grad(self) -> bool:
+        # True if any ViT parameter requires grad
+        return any(p.requires_grad for p in self.vit.parameters())
 
-    def _forward_one_view_train(self, x: torch.Tensor) -> torch.Tensor:
-        """Train path with grads; returns CLS [N, 1024]."""
+    def _forward_one_view_impl(self, x: torch.Tensor) -> torch.Tensor:
+        """Backend-agnostic single-view forward. Returns CLS [N, 1024]."""
         if self.backend == "timm":
-            y = self.vit(x)
-            return y
+            return self.vit(x)  # [N, 1024] with num_classes=0
         else:
-            outputs = self.vit(pixel_values=x)
-            return outputs.last_hidden_state[:, 0, :]
+            out = self.vit(pixel_values=x)
+            return out.last_hidden_state[:, 0, :]  # [N, 1024]
 
     def _forward_one_view(self, x: torch.Tensor) -> torch.Tensor:
-        return self._forward_one_view_eval(x) if not self.training else self._forward_one_view_train(x)
+        # Freeze-aware grad control
+        need_grad = torch.is_grad_enabled() and self._vit_requires_grad()
+        if need_grad:
+            return self._forward_one_view_impl(x)
+        else:
+            with torch.no_grad():
+                return self._forward_one_view_impl(x)
 
-    def forward(
-        self,
-        foveal: torch.Tensor,        # [B, T, P, 3, 384, 384]
-        peripheral: torch.Tensor,    # [B, T, P, 3, 384, 384]
-    ) -> torch.Tensor:
+    def forward(self, foveal: torch.Tensor, peripheral: torch.Tensor) -> torch.Tensor:
         B, T, P = foveal.shape[:3]
         N = B * T * P
 
-        # normalize to ImageNet stats
+        # Normalize to ImageNet stats (broadcasted)
         foveal = self._normalize(foveal)
         peripheral = self._normalize(peripheral)
 
-        fov = foveal.reshape(N, *foveal.shape[-3:])      # [N, 3, 384, 384]
-        per = peripheral.reshape(N, *peripheral.shape[-3:])
+        # Flatten player-frames
+        fov = foveal.reshape(N, *foveal.shape[-3:])          # [N, 3, 384, 384]
+        per = peripheral.reshape(N, *peripheral.shape[-3:])  # [N, 3, 384, 384]
 
-        # Run both views through shared ViT, take CLS per view
-        cls_a = self._forward_one_view(fov)  # [N, 1024]
-        cls_b = self._forward_one_view(per)  # [N, 1024]
+        # Shared ViT; take CLS token per view
+        cls_a = self._forward_one_view(fov)   # [N, 1024]
+        cls_b = self._forward_one_view(per)   # [N, 1024]
 
-        concat = torch.cat([cls_a, cls_b], dim=-1)    # [N, 2048]
-        vis = self.proj(concat)                       # [N, d_model]
-        vis = vis.reshape(B, T, P, self.d_model)
+        vis = self.proj(torch.cat([cls_a, cls_b], dim=-1)).reshape(B, T, P, self.d_model)
         return vis
 
 
@@ -621,20 +605,21 @@ class CS2GQAAttention(nn.Module):
         """
         x:         [B, L, D]
         attn_mask: Boolean or additive mask. Boolean True = DISALLOW. Additive: large negative = disallow.
-                   Shapes supported: [L,L], [B,L,L], [B,1,L,L], [1,1,L,L].
+                Shapes supported: [L,L], [B,L,L], [B,1,L,L], [1,1,L,L].
         pos_ids:   [L] integer positions for RoPE
         """
         B, L, D = x.shape
         Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
 
+        # Projections
         q = self.wq(x).reshape(B, L, Hq, Hd)
         k = self.wk(x).reshape(B, L, Hkv, Hd)
         v = self.wv(x).reshape(B, L, Hkv, Hd)
 
-        # Apply RoPE to q/k
+        # RoPE on q/k
         q, k = self.rope(q, k, pos_ids)
 
-        # GQA: expand KV to match Q heads
+        # GQA expand KV to match Q heads
         if Hq % Hkv != 0:
             raise ValueError(f"n_q_heads ({Hq}) must be divisible by n_kv_heads ({Hkv}) for GQA.")
         group = Hq // Hkv
@@ -645,7 +630,9 @@ class CS2GQAAttention(nn.Module):
         k_bLHD = k.contiguous()
         v_bLHD = v.contiguous()
 
-        # Fast path can only be used when no external mask is provided.
+        dropout_p = self.dropout if self.training else 0.0
+
+        # Fast path only if no external mask and no frame-block mask required
         can_use_fused_path = (
             self._use_fa2(x, q_bLHD)
             and self.cfg.use_fused_causal
@@ -653,52 +640,55 @@ class CS2GQAAttention(nn.Module):
             and attn_mask is None
         )
 
-        dropout_p = self.dropout if self.training else 0.0
-
         if can_use_fused_path:
-            # FlashAttention-2 expects [B, L, H, Hd]
             try:
-                out = self._fa2_call(q_bLHD, k_bLHD, v_bLHD, dropout_p=dropout_p, causal=True)
+                out = self._fa2_call(
+                    q_bLHD, k_bLHD, v_bLHD,
+                    dropout_p=dropout_p,
+                    causal=True,
+                )
             except Exception:
-                # fall back to SDPA if FA2 errors out at runtime
-                can_use_fused_path = False  # drop to SDPA below
+                can_use_fused_path = False  # fall back to SDPA on any FA2 error
 
         if not can_use_fused_path:
-            # SDPA path with explicit mask
-            disallow_mask = self._prep_attn_mask(attn_mask, L=L, B=B)
-            if disallow_mask is None:
-                if self.cfg.use_frame_block_causal_mask:
-                    # Frame-block causal: tokens can only attend to same-frame past (<=)
-                    G = self.cfg.tokens_per_frame
-                    pos = torch.arange(L, device=x.device)
-                    frame_id = (pos // G)
-                    fi_q = frame_id.view(1, 1, L, 1)
-                    fi_k = frame_id.view(1, 1, 1, L)
-                    disallow_mask = (fi_k > fi_q)  # True = disallow
-                elif self.cfg.use_fused_causal:
-                    # strict causal mask i>j disallowed
-                    i = torch.arange(L, device=x.device)
-                    disallow_mask = (i[None, :] > i[:, None]).view(1, 1, L, L)
-                else:
-                    disallow_mask = None
+            # --- Build/normalize masks and combine ---
+            ext_mask = self._prep_attn_mask(attn_mask, L=L, B=B)  # bool or None
 
-            # SDPA takes [B,H,L,D]
+            built_mask = None
+            if self.cfg.use_frame_block_causal_mask:
+                # Per-frame causal: attend only within frame and to the past (<=)
+                G = self.cfg.tokens_per_frame
+                pos = torch.arange(L, device=x.device)
+                frame_id = (pos // G)
+                fi_q = frame_id.view(1, 1, L, 1)
+                fi_k = frame_id.view(1, 1, 1, L)
+                built_mask = (fi_k > fi_q)  # True = disallow
+            elif self.cfg.use_fused_causal:
+                i = torch.arange(L, device=x.device)
+                built_mask = (i[None, :] > i[:, None]).view(1, 1, L, L)  # True = disallow
+
+            if ext_mask is None:
+                disallow_mask = built_mask
+            elif built_mask is None:
+                disallow_mask = ext_mask
+            else:
+                disallow_mask = (ext_mask.to(x.device) | built_mask)
+
+            # SDPA expects [B,H,L,D]
             q_bHLD = q_bLHD.permute(0, 2, 1, 3).contiguous()
             k_bHLD = k_bLHD.permute(0, 2, 1, 3).contiguous()
             v_bHLD = v_bLHD.permute(0, 2, 1, 3).contiguous()
 
             out = torch.nn.functional.scaled_dot_product_attention(
                 q_bHLD, k_bHLD, v_bHLD,
-                attn_mask=disallow_mask,   # bool, True = disallow
-                is_causal=False,           # we provide explicit mask when needed
+                attn_mask=disallow_mask,  # bool mask, True = disallow; can be None
+                is_causal=False,          # explicit mask handles causality
                 dropout_p=dropout_p,
             )
             out = out.permute(0, 2, 1, 3).contiguous()
 
         out = out.reshape(B, L, D)
         return self.wo(out)
-
-
 
 
 class CS2TransformerEncoderLayer(nn.Module):
