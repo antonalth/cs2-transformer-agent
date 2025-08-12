@@ -222,7 +222,6 @@ class CS2Config:
     # Vision
     vit_name: str = "google/vit-large-patch16-384"
     vit_out_dim: int = 1024
-    use_two_views: bool = True
 
     # Audio
     mel_bins: int = 128
@@ -245,6 +244,10 @@ class CS2Config:
     # {"type": "linear", "factor": 2.0}                   # 2× context
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
 
+def _GN2d(c: int) -> torch.nn.GroupNorm:
+    # pick a divisor of c; 8→4→1 fallback mirrors _GN3d
+    g = 8 if c % 8 == 0 else 4 if c % 4 == 0 else 1
+    return torch.nn.GroupNorm(num_groups=g, num_channels=c)
 
 def _GN3d(c: int) -> torch.nn.GroupNorm:
     # 8 groups is a good default; must divide c
@@ -369,11 +372,11 @@ class AudioCNN(nn.Module):
         super().__init__()
         c1, c2, c3 = cfg.audio_cnn_channels
         self.conv1 = nn.Conv2d(1, c1, 5, padding=2)
-        self.bn1 = nn.BatchNorm2d(c1)
+        self.gn1 = _GN2d(c1)
         self.conv2 = nn.Conv2d(c1, c2, 3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(c2)
+        self.gn2 = _GN2d(c2)
         self.conv3 = nn.Conv2d(c2, c3, 3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm2d(c3)
+        self.gn3 = _GN2d(c3)
         self.pool = nn.AdaptiveAvgPool2d((4, 4))
         self.head = nn.Linear(c3 * 4 * 4, cfg.d_model)
 
@@ -381,9 +384,9 @@ class AudioCNN(nn.Module):
         # mel: [B, T, P, 1, 128, ~6] → pack to [B*T*P, 1, 128, ~6]
         B, T, P = mel.shape[:3]
         x = mel.reshape(B * T * P, 1, mel.shape[-2], mel.shape[-1])
-        x = F.gelu(self.bn1(self.conv1(x)))
-        x = F.gelu(self.bn2(self.conv2(x)))
-        x = F.gelu(self.bn3(self.conv3(x)))
+        x = F.gelu(self.gn1(self.conv1(x)))
+        x = F.gelu(self.gn2(self.conv2(x)))
+        x = F.gelu(self.gn3(self.conv3(x)))
         x = self.pool(x)
         x = torch.flatten(x, 1)
         x = self.head(x)  # [N, d_model]
@@ -413,6 +416,7 @@ class PlayerTokenFuser(nn.Module):
         This corrected version is more efficient and readable by using broadcasting.
         """
         B, T, P, d = vis.shape
+        assert P == self.cfg.num_players, f"P={P} must equal cfg.num_players={self.cfg.num_players}"
 
         # 1. Fuse the sensor data for the "alive" case. This is only computed once.
         fused_alive_token = self.norm(vis + aud)
@@ -607,6 +611,10 @@ class CS2GQAAttention(nn.Module):
     """
     def __init__(self, cfg: CS2Config, rope: RoPEPositionalEncoding):
         super().__init__()
+
+        assert not (cfg.use_fused_causal and cfg.use_frame_block_causal_mask), \
+            "use_fused_causal and use_frame_block_causal_mask are mutually exclusive"
+
         self.cfg = cfg
         self.rope = rope
         d, hq, hkv = cfg.d_model, cfg.n_q_heads, cfg.n_kv_heads
@@ -801,11 +809,13 @@ class CS2TransformerEncoderLayer(nn.Module):
         # --- NEW: Pass both position tensors to the attention module ---
         x = x + self.attn(self.ln1(x), attn_mask, temporal_pos_ids, structural_pos_ids)
         x = x + self.ff(self.ln2(x))
+        return x
 
 
 class CS2Backbone(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
+        self.cfg = cfg
         self.rope = RoPEPositionalEncoding(cfg)
         self.layers = nn.ModuleList([CS2TransformerEncoderLayer(cfg, self.rope) for _ in range(cfg.n_layers)])
 
