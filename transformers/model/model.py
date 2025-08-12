@@ -810,20 +810,13 @@ class CS2Backbone(nn.Module):
         self.layers = nn.ModuleList([CS2TransformerEncoderLayer(cfg, self.rope) for _ in range(cfg.n_layers)])
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        # x: [B, L, d]
         B, L, _ = x.shape
-        
-        # --- NEW: Generate 2D Positional IDs ---
         G = self.cfg.tokens_per_frame
-        T = (L + G - 1) // G # Safely calculate number of frames, even for partial sequences
 
-        # Temporal IDs (frame index): [0, 0, ..., 0, 1, 1, ..., 1, ...]
-        temporal_pos_ids = torch.arange(T, device=x.device).repeat_interleave(G)
-        temporal_pos_ids = temporal_pos_ids[:L] # Trim to exact sequence length
-
-        # Structural IDs (token index within a frame): [0, 1, .. G-1, 0, 1, .. G-1, ...]
-        structural_pos_ids = torch.arange(G, device=x.device).repeat(T)
-        structural_pos_ids = structural_pos_ids[:L] # Trim to exact sequence length
+        # --- NEW: Generate 2D Positional IDs (Robustly) ---
+        pos = torch.arange(L, device=x.device)
+        temporal_pos_ids = pos // G  # Frame index
+        structural_pos_ids = pos % G  # Token index within frame
 
         for layer in self.layers:
             x = layer(x, attn_mask, temporal_pos_ids, structural_pos_ids)
@@ -960,6 +953,8 @@ class StrategyHead(nn.Module):
         heatmap_vol = self.enemy_final_conv(upsampled_vol)
         # Remove channel dimension to get final shape [B, 8, 64, 64]
         enemy_pos_heatmap_logits = heatmap_vol.squeeze(1)
+        assert enemy_pos_heatmap_logits.shape == (B, *self.enemy_shape), \
+            f"Shape mismatch! Expected {(B, *self.enemy_shape)}, but got {enemy_pos_heatmap_logits.shape}"
 
         return {
             "enemy_pos_heatmap_logits": enemy_pos_heatmap_logits,
