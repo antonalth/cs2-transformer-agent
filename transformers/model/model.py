@@ -1,20 +1,152 @@
 """
+====================================================================================================
 A Causal Autoregressive Multi-Modal Transformer for CS2 Gameplay Generation
-model.py — basic structure & scaffolding
+====================================================================================================
 
-This file defines the top-level CS2Transformer and its submodules as stubs with
-clear interfaces, docstrings, and shapes. Fill in TODOs to complete the model.
+This script defines the complete architecture for a high-performance, large-scale generative
+model designed to produce plausible, second-by-second gameplay for a full 5-player team in
+Counter-Strike 2.
 
-Spec highlights implemented here:
-- 7 tokens per frame (5×players + [GAME_STRATEGY] + [SCRATCHSPACE])
-- Shared ViT-Large encoder for foveal & peripheral views (CLS concat → 2048)
-- Audio CNN → 2048, fusion via elementwise add + LayerNorm, slot embeddings
-- DEAD token support
-- Transformer backbone (Pre-LN) with GQA + RoPE + FlashAttention-2 (hooks/stubs)
-- Player heads & strategy head with Appendix B output schema
+----------------------------------------------------------------------------------------------------
+1. HIGH-LEVEL TASK & PARADIGM
+----------------------------------------------------------------------------------------------------
+The model is an AUTOREGRESSIVE 'PLAYER AGENT'. Its fundamental task is to function as a
+generative model: given a history of `t` frames of gameplay, it predicts the actions and state
+for the next frame, `t+1`.
 
-Note: The attention kernel and some internals are left as TODOs so you can
-choose your preferred FlashAttention-2 integration.
+- Causal Paradigm: The model operates under a strict causal constraint, meaning its predictions
+  for any given moment can only be conditioned on past and present information. This is enforced
+  by a causal attention mask within the transformer backbone, making the model suitable for
+  real-time, sequential generation.
+
+- Generative Feedback Loop (Inference): During inference, the model forms a feedback loop with a
+  game simulator.
+  1. The model predicts actions for frame `t+1`.
+  2. These actions are used to update the game simulator.
+  3. The simulator generates the new visual and audio data for frame `t+1`.
+  4. This new frame is encoded, appended to the history, and the process repeats.
+
+----------------------------------------------------------------------------------------------------
+2. CORE ARCHITECTURAL SPECIFICATIONS (THE THREE STAGES)
+----------------------------------------------------------------------------------------------------
+The model is a large-scale transformer with a hidden dimension (d_model) of 2048, ~24 layers,
+and 32 attention heads. It is composed of three main stages:
+  I.   Input Encoding & Token Fusion
+  II.  Transformer Backbone
+  III. Prediction Heads
+
+====================================================================================================
+  I. STAGE 1: INPUT ENCODING & TOKEN FUSION
+====================================================================================================
+For each of the 5 players, a single [1, 2048] token is created per frame by fusing visual and
+audio data streams.
+
+[A] VISUAL STREAM:
+  - Input: Two 384x384 pixel tensors per player:
+    1. Foveal View: A non-scaled, high-resolution crop around the player's crosshair.
+    2. Peripheral View: The full 640x480 game screen, scaled down (with letterboxing).
+  - Encoder: A SINGLE, SHARED-WEIGHT ViT-Large model (`google/vit-large-patch16-384`) processes
+    both views independently.
+  - Fusion: The [CLS] tokens from each view (each `[1, 1024]`) are extracted and concatenated
+    to form a `[1, 2048]` intermediate representation.
+  - Projection: A final linear layer projects this concatenated tensor to the model's native
+    `[1, 2048]` dimension, creating the final visual embedding.
+
+[B] AUDIO STREAM:
+  - Input: A `[128, ~6]` Mel Spectrogram tensor derived from the player's in-game audio.
+  - Encoder: A small 2D CNN (`AudioCNN`) extracts features from the spectrogram.
+  - Projection: A linear layer projects the flattened CNN features to a `[1, 2048]` audio embedding.
+
+[C] TOKEN FUSION:
+  - The final visual and audio embeddings (`[1, 2048]`) are added together element-wise.
+  - A LayerNorm is applied to the sum to create the final, fused PLAYER TOKEN.
+
+====================================================================================================
+  II. STAGE 2: TRANSFORMER BACKBONE
+====================================================================================================
+The backbone processes a sequence of token frames over time.
+
+[A] INPUT SEQUENCE ASSEMBLY (PER FRAME):
+  A sequence of 7 tokens is created for every frame of gameplay:
+  - 5x Player Tokens: One for each player, derived from Stage 1.
+  - 2x Special Tokens:
+    1. `[GAME_STRATEGY]`: A learned token used to aggregate game-wide state and make
+       strategic predictions.
+    2. `[SCRATCHSPACE]`: A learned token for the model to use as intermediate memory.
+
+[B] IDENTITY & STATE HANDLING:
+  - Player Slot Embedding: To maintain player identity across the sequence, a unique, learned
+    `player_slot_embedding` is ADDED to each of the 5 player tokens.
+  - DEAD Token Policy: If a player is dead, their entire visual/audio input is ignored. Instead,
+    their token is replaced by a learned `[DEAD]` embedding, to which their unique
+    `player_slot_embedding` is still added.
+
+[C] TRANSFORMER LAYERS:
+  - A stack of 16-24 custom `CS2TransformerEncoderLayer` modules.
+  - Each layer contains:
+    1. A Causal Self-Attention block (optimized with GQA and FlashAttention-2).
+    2. A Feed-Forward Network (FFN) with a GELU activation.
+  - Pre-Layer Normalization is used throughout for training stability.
+
+====================================================================================================
+  III. STAGE 3: PREDICTION HEADS
+====================================================================================================
+The output tokens from the FINAL TIME STEP of the transformer backbone are used to make
+predictions for the next frame, as specified in Appendix B.
+
+[A] PLAYER PREDICTION HEADS (x5):
+  Each of the 5 player output tokens is fed into a set of dedicated heads to predict:
+  - Stats (Regression): Health, Armor, Money (via an MLP).
+  - Position (Heatmap): A 3D position heatmap `[Z, Y, X]` (via a Deconvolutional Network).
+  - Mouse (Regression): `[delta_x, delta_y]` mouse movement (via an MLP).
+  - Actions (Classification): Logits for Keyboard, Eco, Inventory, and Active Weapon states
+    (via MLPs).
+
+[B] GAME STRATEGY HEAD (x1):
+  The `[GAME_STRATEGY]` output token is used to predict:
+  - Enemy Positions (Heatmap): A 3D heatmap of predicted enemy locations.
+  - Game Phase (Classification): Logits for the round state (e.g., "Bomb Planted").
+  - Round Number (Regression): A single scalar value.
+
+----------------------------------------------------------------------------------------------------
+3. HIGH-PERFORMANCE OPTIMIZATIONS
+----------------------------------------------------------------------------------------------------
+The model is designed for extreme performance and scalability to very long context windows.
+
+- `torch.compile()`: The entire `CS2Transformer` module is intended to be wrapped in
+  `torch.compile(model)` for JIT compilation, kernel fusion, and significant speedups.
+
+- Grouped-Query Attention (GQA): The core attention mechanism uses fewer Key/Value heads than
+  Query heads (e.g., 8 KV heads for 32 Q heads). This dramatically reduces the size of the KV
+  cache, which is the primary bottleneck for fast autoregressive inference.
+
+- FlashAttention-2: Where available, this custom kernel is used to compute attention. It
+  avoids the explicit creation of the `N x N` attention matrix, drastically reducing memory
+  usage and increasing computational speed.
+
+- Rotary Positional Embeddings (RoPE): Positional information is injected via RoPE, which is
+  applied directly to queries and keys. It provides excellent performance on long sequences
+  and strong extrapolation capabilities.
+
+- Mixed Precision & Quantization:
+  - Training: Natively supports `BF16` for faster computation and reduced memory footprint.
+  - Inference/Fine-Tuning: Compatible with advanced quantization (e.g., QLoRA with 4-bit
+    NormalFloat) and FP8 inference on supported hardware for maximum throughput.
+
+----------------------------------------------------------------------------------------------------
+4. TRAINING & FINE-TUNING STRATEGY
+----------------------------------------------------------------------------------------------------
+- Objective: The model is trained on a Next-Frame Prediction task. Given a sequence of `t`
+  ground-truth frames, it is optimized via a COMPOSITE LOSS function to predict the
+  ground-truth data for frame `t+1`.
+
+- ViT Fine-Tuning (Two-Stage):
+  1. Freeze: Initially, the weights of the pre-trained ViT-Large encoder are frozen
+     (`requires_grad=False`). The rest of the model is trained to learn how to interpret
+     its powerful, off-the-shelf features.
+  2. Finetune: After the main model has stabilized, the ViT is unfrozen. The entire model is
+     then trained end-to-end using DIFFERENTIAL LEARNING RATES, where the ViT uses a learning
+     rate 10-100x smaller than the rest of the model to prevent catastrophic forgetting.
 """
 from __future__ import annotations
 
@@ -31,7 +163,7 @@ import torch.nn.functional as F
 
 class PlayerPredictions(TypedDict):
     stats: torch.Tensor                      # [B, 3]
-    pos_heatmap_logits: torch.Tensor         # [B, 64, 256, 256]
+    pos_heatmap_logits: torch.Tensor         # [B, 8, 64, 64]
     mouse_delta_deg: torch.Tensor            # [B, 2]
     keyboard_logits: torch.Tensor            # [B, 31]
     eco_logits: torch.Tensor                 # [B, 384]
@@ -39,7 +171,7 @@ class PlayerPredictions(TypedDict):
     active_weapon_logits: torch.Tensor       # [B, 128]
 
 class GameStrategyPredictions(TypedDict):
-    enemy_pos_heatmap_logits: torch.Tensor   # [B, 64, 256, 256]
+    enemy_pos_heatmap_logits: torch.Tensor   # [B, 8, 64, 64]
     round_state_logits: torch.Tensor         # [B, 5]
     round_number: torch.Tensor               # [B, 1]
 
@@ -96,9 +228,8 @@ class CS2Config:
     round_state_dim: int = 5
 
     # Heatmaps
-    pos_z: int = 64
-    pos_y: int = 256
-    pos_x: int = 256
+    pos_z, pos_y, pos_x = 8, 64, 64
+
 
     # RoPE / long-context
     rope_base: int = 10000
@@ -275,21 +406,32 @@ class PlayerTokenFuser(nn.Module):
         aud: torch.Tensor,   # [B, T, P, d]
         alive_mask: torch.Tensor,  # [B, T, P] bool
     ) -> torch.Tensor:
-        B, T, P, d = vis.shape
-        fused = self.norm(vis + aud)
-        # add slot embeddings
-        slot_ids = torch.arange(P, device=vis.device).view(1, 1, P).expand(B, T, P)
-        slots = self.slot_embed(slot_ids)  # [B, T, P, d]
-        fused = fused + slots
-        # DEAD swap
-        dead = ~alive_mask.bool()
-        if dead.any():
-            fused = torch.where(
-                dead[..., None],
-                self.dead_embedding + slots,
-                fused,
-            )
-        return fused  # [B, T, P, d]
+            B, T, P, d = vis.shape
+            fused = self.norm(vis + aud)
+
+            # Add slot embeddings
+            slot_ids = torch.arange(P, device=vis.device).view(1, 1, P)
+            slots = self.slot_embed(slot_ids) # [B, T, P, d] after broadcasting
+            fused = fused + slots
+
+            # DEAD swap policy
+            dead_mask = ~alive_mask.bool() # [B, T, P]
+            if dead_mask.any():
+                # Create the dead token by explicitly broadcasting the dead_embedding
+                # to the shape of the slot embeddings.
+                dead_token_template = self.dead_embedding.expand_as(slots) # [B, T, P, d]
+                
+                # The final dead token is the shared dead embedding plus the unique slot ID
+                dead_tokens = dead_token_template + slots
+
+                # Use the mask to select between the fused (alive) token and the dead token.
+                # The mask needs an extra dimension to match the token dimension 'd'.
+                fused = torch.where(
+                    dead_mask.unsqueeze(-1), # Shape: [B, T, P, 1]
+                    dead_tokens,
+                    fused,
+                )
+            return fused # [B, T, P, d]
 
 
 # -----------------------------------------------------------------------------
@@ -397,46 +539,91 @@ class CS2GQAAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], pos_ids: torch.Tensor) -> torch.Tensor:
+        """
+        x:        [B, L, D]
+        attn_mask: optional boolean mask broadcastable to [B, H, L, L] with True = DISALLOW.
+                Pass None for pure causal.
+        pos_ids:  [B, L] integer positions for RoPE
+        """
         B, L, D = x.shape
         Hq = self.cfg.n_q_heads
         Hkv = self.cfg.n_kv_heads
         Hd = self.head_dim
-        q = self.wq(x).view(B, L, Hq, Hd)
-        k = self.wk(x).view(B, L, Hkv, Hd)
-        v = self.wv(x).view(B, L, Hkv, Hd)
-        # Apply RoPE
+
+        # Q/K/V projections
+        q = self.wq(x).view(B, L, Hq, Hd)       # [B, L, Hq, Hd]
+        k = self.wk(x).view(B, L, Hkv, Hd)      # [B, L, Hkv, Hd]
+        v = self.wv(x).view(B, L, Hkv, Hd)      # [B, L, Hkv, Hd]
+
+        # RoPE (expects [B, L, H, Hd])
         q, k = self.rope(q, k, pos_ids)
 
-        # Map K/V heads to Q heads by repeating (GQA grouping)
+        # ---- GQA: map K/V heads to Q heads by repeating ----
         if Hq % Hkv != 0:
-            raise ValueError(f"n_q_heads ({Hq}) must be a multiple of n_kv_heads ({Hkv}) for GQA repeat.")
-        repeat = Hq // Hkv
-        k_t = k.repeat_interleave(repeat, dim=2)  # [B, L, Hq, Hd]
-        v_t = v.repeat_interleave(repeat, dim=2)  # [B, L, Hq, Hd]
+            raise ValueError(f"n_q_heads ({Hq}) must be divisible by n_kv_heads ({Hkv}) for GQA.")
+        group = Hq // Hkv
+        # Expand K/V to Hq heads without materializing copies when possible
+        k = k.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
+        v = v.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
 
-        if self._use_fa2(x) and attn_mask is None:
-            # FlashAttention expects [B, L, H, Hd]
-            out = self._fa2(q, k_t, v_t, dropout_p=0.0, causal=True)  # [B, L, Hq, Hd]
-            out = out.view(B, L, Hq, Hd)
-            out = out.permute(0, 1, 2, 3).contiguous().view(B, L, D)
-            return self.wo(out)
+        # [B, H, L, Hd] for SDPA/FlashAttention
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        # -------------------------
+        # Masking / attention path
+        # -------------------------
+        # Fast path: use fused/flash causal attention when:
+        # - we’re on a device/dtype that supports it, and
+        # - we do not need any custom structure beyond pure causality.
+        use_frame_block_mask = getattr(self.cfg, "frame_block_causal", False)  # set True to enable 7-token intra-frame visibility
+        can_use_pure_causal = (attn_mask is None) and (not use_frame_block_mask)
+
+        if self._use_fa2(x) and can_use_pure_causal:
+            # Flash / fused path with built-in causal mask.
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         else:
-            # ... inside CS2GQAAttention.forward else block
-            # Fallback: scaled dot-product with causal mask
-            # Reshape for torch's native attention function [B, H, L, Hd]
-            q = q.permute(0, 2, 1, 3)
-            k_t = k_t.permute(0, 2, 1, 3)
-            v_t = v_t.permute(0, 2, 1, 3)
+            # Build a boolean DISALLOW mask (True = disallow) that broadcasts to [B, H, L, L].
+            # Start from either:
+            #   - frame-aware block-causal (allow all tokens within same frame; block strictly future frames), or
+            #   - plain causal.
+            if use_frame_block_mask:
+                G = self.cfg.tokens_per_frame  # e.g., 7
+                pos = torch.arange(L, device=x.device)
+                frame_id = (pos // G)
+                fi_q = frame_id.view(1, 1, L, 1)  # [1,1,L,1]
+                fi_k = frame_id.view(1, 1, 1, L)  # [1,1,1,L]
+                # Disallow keys from strictly future frames; allow same frame (both directions) and all past frames.
+                disallow = (fi_k > fi_q)  # [1,1,L,L], bool
+            else:
+                # Plain causal: disallow attending to the future (above diagonal)
+                i = torch.arange(L, device=x.device)
+                disallow = (i[None, :] > i[:, None]).view(1, 1, L, L)  # [1,1,L,L], bool
 
-            # Use the built-in, optimized function which handles the causal mask internally.
-            # The 'attn_mask' passed in from the backbone is already a causal mask.
-            # Note: F.scaled_dot_product_attention expects a boolean mask where True means "attend".
-            # The _build_causal_mask function already creates it in this format.
-            # For purely causal attention, you can also just pass is_causal=True.
-            out = F.scaled_dot_product_attention(q, k_t, v_t, attn_mask=attn_mask, is_causal=attn_mask is None)
+            # Combine with any caller-provided disallow mask (must be boolean with True=disallow).
+            if attn_mask is not None:
+                if attn_mask.dtype != torch.bool:
+                    raise ValueError("attn_mask must be a boolean tensor with True=DISALLOW when provided.")
+                # Broadcast OR: disallow if either source disallows
+                disallow = disallow | attn_mask  # result broadcastable to [B,H,L,L]
 
-            out = out.permute(0, 2, 1, 3).contiguous().view(B, L, D)
-            return self.wo(out)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=disallow,         # boolean mask, True = disallow
+                is_causal=False,            # IMPORTANT: we encoded causality in the mask
+                dropout_p=self.dropout if self.training else 0.0,
+            )
+
+        # Back to [B, L, D]
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, L, D)
+        return self.wo(out)
+
 
 
 class CS2TransformerEncoderLayer(nn.Module):
@@ -650,9 +837,9 @@ class CS2Transformer(nn.Module):
         player_tokens = self.player_fuser(vis, aud, alive)   # [B, T, P, d]
 
         # Append special tokens per frame
-        tok_gs = self.token_game_strategy.expand(B, T, -1, -1)  # [B, T, 1, d]
-        tok_sc = self.token_scratch.expand(B, T, -1, -1)        # [B, T, 1, d]
-        frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)  # [B, T, 7, d]
+        tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, -1)  # [B, T, 1, d]
+        tok_sc = self.token_scratch     .unsqueeze(2).expand(B, T, 1, -1)  # [B, T, 1, d]
+        frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)   # [B, T, 7, d]
 
         # Flatten time to sequence and build causal mask
         seq = frame_tokens.view(B, T * self.cfg.tokens_per_frame, d)       # [B, L, d]
