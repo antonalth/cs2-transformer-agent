@@ -182,7 +182,7 @@ class Predictions(TypedDict):
 
 
 # Optional: declare opaque input type if your dataloader provides a struct
-class CS2Batch(TypedDict, total=False):
+class CS2Batch(TypedDict, total=True):
     # Shapes are illustrative; align with your datapipe
     foveal_images: torch.Tensor            # [B, T, 5, 3, 384, 384]
     peripheral_images: torch.Tensor        # [B, T, 5, 3, 384, 384]
@@ -204,7 +204,6 @@ class CS2Config:
     n_q_heads: int = 32
     n_kv_heads: int = 8
     ffn_mult: int = 4
-    dropout: float = 0.0 #unused?
     attn_dropout: float = 0.0
 
     # Sequence
@@ -394,14 +393,15 @@ class AudioCNN(nn.Module):
         return x
     
 class PlayerTokenFuser(nn.Module):
-    """Fuse visual+audio via elementwise add, LayerNorm, add slot identity.
+    """Fuse visual+audio via elementwise add, add slot identity, then LayerNorm.
 
     DEAD handling policy: if dead, replace fused token with
-      dead_embedding + player_slot_embedding.
+      dead_embedding + player_slot_embedding before final norm.
     """
     def __init__(self, cfg: CS2Config, player_slot_embed: nn.Embedding, dead_embedding: nn.Parameter):
         super().__init__()
         self.cfg = cfg
+        # Apply LayerNorm as the final step
         self.norm = nn.LayerNorm(cfg.d_model)
         self.slot_embed = player_slot_embed
         self.dead_embedding = dead_embedding
@@ -413,40 +413,34 @@ class PlayerTokenFuser(nn.Module):
         alive_mask: torch.Tensor,  # [B, T, P] bool
     ) -> torch.Tensor:
         """
-        Fuse visual+audio, apply the DEAD policy, and add player identity.
-        This corrected version is more efficient and readable by using broadcasting.
+        Fuse visual+audio, apply the DEAD policy, add player identity, and finally normalize.
         """
         B, T, P, d = vis.shape
         assert P == self.cfg.num_players, f"P={P} must equal cfg.num_players={self.cfg.num_players}"
 
-        # 1. Fuse the sensor data for the "alive" case. This is only computed once.
-        fused_alive_token = self.norm(vis + aud)
+        # 1. Fuse the sensor data for the "alive" case.
+        fused_alive_token = vis + aud
 
-        # 2. Prepare the mask for broadcasting. We invert the alive_mask to get a
-        #    dead_mask and add a dimension for the feature dimension `d`.
-        # The mask will be True where players are DEAD.
+        # 2. Prepare the mask for broadcasting to select the base token.
         dead_mask = ~alive_mask.bool().unsqueeze(-1) # Shape: [B, T, P, 1]
 
-        # 3. Select the base token using torch.where. This is highly efficient as it
-        #    avoids creating a large intermediate tensor for the dead embedding.
-        #    PyTorch will broadcast self.dead_embedding to the correct shape only
-        #    where the mask is True.
+        # 3. Select the base token (fused sensors or the DEAD embedding)
         base_token = torch.where(
             dead_mask,
-            self.dead_embedding, # The single [1, 1, d] DEAD embedding
-            fused_alive_token,   # The [B, T, P, d] fused sensor token
+            self.dead_embedding,
+            fused_alive_token,
         )
 
-        # 4. Add the unique player slot identity to the selected base token.
-        #    This happens in a single, non-redundant step, regardless of whether
-        #    the player is alive or dead. Broadcasting handles the expansion.
+        # 4. Add the unique player slot identity. This is now done BEFORE normalization.
         slot_ids = torch.arange(P, device=vis.device).reshape(1, 1, P)
-        slots = self.slot_embed(slot_ids) # Broadcasts from [1, 1, P, d] to [B, T, P, d]
+        slots = self.slot_embed(slot_ids)
         
-        final_token = base_token + slots
+        unnormalized_token = base_token + slots
+
+        # 5. Apply LayerNorm as the FINAL step to the fully assembled token.
+        final_token = self.norm(unnormalized_token)
 
         return final_token
-
 # -----------------------------------------------------------------------------
 # 3) Attention core & Transformer layers (stubs for FA2+GQA+RoPE)
 # -----------------------------------------------------------------------------
@@ -876,7 +870,7 @@ class PlayerHeads(nn.Module):
 
             # Block 3 -> [B, 16, 8, 64, 64]
             nn.ConvTranspose3d(self.vol_feats // 4, self.vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(self.ol_feats // 8),
+            _GN3d(self.vol_feats // 8),
             nn.GELU(),
         )
         
@@ -920,7 +914,7 @@ class StrategyHead(nn.Module):
         self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
         
         # 1. Seed: Project the flat token to a starting 3D volume [B, 128, 8, 8, 8]
-        self.enemy_seed = nn.Linear(d, vol_feats * 8 * 8 * 8)
+        self.enemy_seed = nn.Linear(d, self.vol_feats * 8 * 8 * 8)
         
         # 2. Deconvolution path: Upsample Y and X dimensions by 8x (2^3) using
         #    anisotropic strides to preserve the Z dimension. This architecture
