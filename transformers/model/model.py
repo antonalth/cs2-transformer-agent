@@ -210,8 +210,8 @@ class CS2Config:
     # Context (training)
     context_frames: int = 128
 
-    use_fused_causal: bool = True #use FA2
-    use_frame_block_causal_mask: bool = True #cannot be used with FA2 e.g.; use_fused_causal
+    use_fused_causal: bool = True #use FA2, mutually exclusive with use_frame_block_causal_mask
+    use_frame_block_causal_mask: bool = False #cannot be used with FA2 e.g.; use_fused_causal
 
     # Vision
     vit_name: str = "google/vit-large-patch16-384"
@@ -499,7 +499,9 @@ class RoPEPositionalEncoding(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # q: [B, L, Hq, Hd], k: [B, L, Hkv, Hd]; positions: [L]
         L = q.shape[1]
-        
+        if positions.shape[0] != L:
+            raise ValueError(f"Length of positions tensor ({positions.shape[0]}) does not match sequence length ({L}).")
+
         # Add a check to ensure inputs are valid
         if positions.shape[0] != L:
             raise ValueError(f"Length of positions tensor ({positions.shape[0]}) does not match sequence length ({L}).")
