@@ -151,11 +151,12 @@ The model is designed for extreme performance and scalability to very long conte
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, TypedDict, Dict, Optional, Tuple
+from typing import List, TypedDict, Dict, Optional, Tuple, Literal, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 # -----------------------------------------------------------------------------
 # 0) Public types (Appendix B)
@@ -195,6 +196,8 @@ class CS2Batch(TypedDict, total=False):
 
 @dataclass
 class CS2Config:
+    compute_dtype: Literal["fp32", "fp16", "bf16"]  
+    amp_autocast: bool    
     # Model dims
     d_model: int = 2048
     n_layers: int = 24
@@ -235,11 +238,17 @@ class CS2Config:
     # Heatmaps
     pos_z, pos_y, pos_x = 8, 64, 64
 
-
     # RoPE / long-context
     rope_base: int = 10000
-    rope_scaling: Optional[str] = "ntk-yarn"  # placeholder selector
+    rope_scaling: Optional[Dict[str, Any]]  # e.g.
+    # {"type": "linear", "factor": 2.0}                   # 2× context
+    # {"type": "linear_by_len", "orig": 4096, "target": 8192}
 
+
+def _GN3d(c: int) -> torch.nn.GroupNorm:
+    # 8 groups is a good default; must divide c
+    g = 8 if c % 8 == 0 else 4 if c % 4 == 0 else 1
+    return torch.nn.GroupNorm(num_groups=g, num_channels=c)
 
 # -----------------------------------------------------------------------------
 # 2) Submodules — Encoders & Token Fusion
@@ -445,6 +454,31 @@ class RoPEPositionalEncoding(nn.Module):
         self.rot_dim = rot_dim
         # Default scale = 1.0 (no scaling). Expose setter for long-context tuning.
         self.register_buffer("scale", torch.tensor(1.0), persistent=False)
+        self._apply_cfg_scaling(cfg.get("rope_scaling"))
+
+    def _apply_cfg_scaling(self, scaling: Optional[Dict[str, Any]]) -> None:
+        """
+        Supports:
+          - {"type": "linear", "factor": s}          # extend context by s×
+          - {"type": "linear_by_len", "orig": L0, "target": L1}  # extend from L0 to L1
+        Internally we multiply inv_freq by `1/s` to reduce frequencies.
+        """
+        if not scaling:
+            return
+        sc_type = scaling.get("type", "linear")
+        if sc_type == "linear":
+            s = float(scaling.get("factor", 1.0))
+            if s <= 0:
+                raise ValueError("rope_scaling.factor must be > 0")
+            self.set_scale(1.0 / s)  # smaller frequencies
+        elif sc_type == "linear_by_len":
+            L0 = int(scaling["orig"])
+            L1 = int(scaling["target"])
+            if L0 <= 0 or L1 <= 0:
+                raise ValueError("rope_scaling.orig/target must be > 0")
+            self.set_scale(float(L0) / float(L1))  # = 1/s where s = L1/L0
+        else:
+            raise ValueError(f"Unsupported rope_scaling.type: {sc_type}")
 
     def set_scale(self, scale: float) -> None:
         self.scale.fill_(float(scale))
@@ -758,17 +792,17 @@ class PlayerHeads(nn.Module):
             # Input: [B, 128, 8, 8, 8]
             # Block 1 -> [B, 64, 8, 16, 16]
             nn.ConvTranspose3d(vol_feats, vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(vol_feats // 2),
+            _GN3d(vol_feats // 2),
             nn.GELU(),
             
             # Block 2 -> [B, 32, 8, 32, 32]
             nn.ConvTranspose3d(vol_feats // 2, vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(vol_feats // 4),
+            _GN3d(vol_feats // 4),
             nn.GELU(),
 
             # Block 3 -> [B, 16, 8, 64, 64]
             nn.ConvTranspose3d(vol_feats // 4, vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(vol_feats // 8),
+            _GN3d(vol_feats // 8),
             nn.GELU(),
         )
         
@@ -820,17 +854,17 @@ class StrategyHead(nn.Module):
         self.enemy_deconv = nn.Sequential(
             # Input: [B, 128, 8, 8, 8] -> [B, 64, 8, 16, 16]
             nn.ConvTranspose3d(vol_feats, vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(vol_feats // 2),
+            _GN3d(vol_feats // 2),
             nn.GELU(),
             
             # Block 2 -> [B, 32, 8, 32, 32]
             nn.ConvTranspose3d(vol_feats // 2, vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(vol_feats // 4),
+            _GN3d(vol_feats // 4),
             nn.GELU(),
 
             # Block 3 -> [B, 16, 8, 64, 64]
             nn.ConvTranspose3d(vol_feats // 4, vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(vol_feats // 8),
+            _GN3d(vol_feats // 8),
             nn.GELU(),
         )
         
@@ -886,7 +920,7 @@ class CS2Transformer(nn.Module):
         # Backbone
         self.backbone = CS2Backbone(cfg)
         # Heads
-        self.player_heads = nn.ModuleList([PlayerHeads(cfg) for _ in range(cfg.num_players)])
+        self.player_head = PlayerHeads(cfg)
         self.strategy_head = StrategyHead(cfg)
 
     # --------------------------- utility methods --------------------------- #
@@ -896,65 +930,86 @@ class CS2Transformer(nn.Module):
 
     def parameter_groups(self) -> List[Dict[str, object]]:
         vit_params = list(self.visual_encoder.parameters())
-        rest = [p for m in [self.audio_encoder, self.player_fuser, self.backbone, self.player_heads, self.strategy_head]
-                for p in m.parameters()]
+        core_modules = [self.audio_encoder, self.player_fuser, self.backbone, self.player_head, self.strategy_head]
+        rest = [p for m in core_modules for p in m.parameters()]
+        # add standalone parameters/modules
+        rest += [
+            self.token_game_strategy, self.token_scratch, self.dead_embedding,
+            *self.player_slot_embed.parameters(),
+        ]
         return [
             {"params": vit_params, "name": "vit", "lr_scale": 0.1},
             {"params": rest, "name": "core", "lr_scale": 1.0},
         ]
 
-    # In model.py, inside the CS2Transformer class
 
     def forward(self, batch: CS2Batch) -> Predictions:
-        """Compute next-frame predictions (t+1) given a sequence of frames 1..t.
+        """Compute next-frame predictions (t+1) given frames 1..t."""
+        # ---- autocast setup ----
+        use_amp = (
+            self.cfg.get("amp_autocast", True)
+            and torch.cuda.is_available()
+            and self.cfg.get("compute_dtype", "bf16") != "fp32"
+        )
+        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        amp_dtype = dtype_map[self.cfg.get("compute_dtype", "bf16")]
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
+        )
 
-        Expects fields in `batch` matching CS2Batch. Returns Predictions dict.
-        """
-        fov = batch["foveal_images"]         # [B, T, 5, 3, 384, 384]
-        periph = batch["peripheral_images"]  # [B, T, 5, 3, 384, 384]
-        mel = batch["mel_spectrogram"]       # [B, T, 5, 1, 128, ~6]
-        alive = batch["alive_mask"].bool()    # [B, T, 5]
+        with autocast_ctx:
+            fov   = batch["foveal_images"]        # [B, T, 5, 3, 384, 384]
+            periph= batch["peripheral_images"]     # [B, T, 5, 3, 384, 384]
+            mel   = batch["mel_spectrogram"]       # [B, T, 5, 1, 128, ~6]
+            alive = batch["alive_mask"].bool()     # [B, T, 5]
 
-        B, T, P = fov.shape[:3]
-        d = self.cfg.d_model
+            B, T, P = fov.shape[:3]
+            d = self.cfg.get("d_model")
 
-        # Encode modalities
-        vis = self.visual_encoder(fov, periph)   # [B, T, P, d]
-        aud = self.audio_encoder(mel)            # [B, T, P, d]
+            # Optional consistency check
+            if __debug__:
+                assert self.cfg.get("tokens_per_frame") == self.cfg.get("num_players") + 2, \
+                    "tokens_per_frame must equal num_players + 2 (players + strategy + scratch)"
 
-        # Fuse to player tokens (handles DEAD swap and slot id)
-        player_tokens = self.player_fuser(vis, aud, alive)   # [B, T, P, d]
+            # ---- encoders ----
+            vis = self.visual_encoder(fov, periph)   # [B, T, P, d]
+            aud = self.audio_encoder(mel)            # [B, T, P, d]
 
-        # Append special tokens per frame
-        tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, -1)  # [B, T, 1, d]
-        tok_sc = self.token_scratch     .unsqueeze(2).expand(B, T, 1, -1)  # [B, T, 1, d]
-        frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)   # [B, T, 7, d]
+            # ---- fuse to player tokens ----
+            player_tokens = self.player_fuser(vis, aud, alive)  # [B, T, P, d]
 
-        # Flatten time to sequence
-        seq = frame_tokens.reshape(B, T * self.cfg.tokens_per_frame, d)       # [B, L, d]
-        L = seq.shape[1]
+            # ---- special tokens per frame ----
+            # self.token_game_strategy / token_scratch are [d]; make them [1,1,1,d] then expand
+            tok_gs = self.token_game_strategy.view(1, 1, 1, -1).expand(B, T, 1, d)  # [B, T, 1, d]
+            tok_sc = self.token_scratch.view(1, 1, 1, -1).expand(B, T, 1, d)        # [B, T, 1, d]
+            frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)        # [B, T, 7, d]
+
+            # ---- flatten time to sequence ----
+            Lpf = self.cfg.get("tokens_per_frame")
+            seq = frame_tokens.reshape(B, T * Lpf, d)     # [B, L, d]
+
+            attn_mask = None  # handled inside CS2GQAAttention
+
+            # ---- backbone ----
+            h = self.backbone(seq, attn_mask)             # [B, L, d]
+
+            # ---- slice last frame ----
+            last = h[:, -Lpf:, :]                         # [B, 7, d]
+            num_players = self.cfg.get("num_players")
+            player_tok = last[:, :num_players, :]         # [B, 5, d]
+            strat_tok  = last[:, num_players, :]          # [B, d]
+            # scratch_tok = last[:, num_players + 1, :]
+
+            # ---- heads ----
+            player_preds: List[PlayerPredictions] = []
+            for i in range(num_players):
+                token_i = player_tok[:, i, :]             # [B, d]
+                player_preds.append(self.player_head(token_i))
+
+            strategy_preds = self.strategy_head(strat_tok)
+
+            return {"player": player_preds, "game_strategy": strategy_preds} 
         
-        attn_mask = None #handled by CS2GQAAttention
-
-        # Backbone
-        h = self.backbone(seq, attn_mask)  # [B, L, d]
-
-        # Select final frame tokens (last 7 positions)
-        last = h[:, -self.cfg.tokens_per_frame:, :]              # [B, 7, d]
-        player_tok = last[:, :self.cfg.num_players, :]           # [B, 5, d]
-        strat_tok = last[:, self.cfg.num_players, :]             # [B, d]
-        # scratch_tok = last[:, self.cfg.num_players + 1, :]     # optional
-
-        # Heads
-        player_preds: List[PlayerPredictions] = []
-        for i in range(self.cfg.num_players):
-            token_i = player_tok[:, i, :]  # [B, d]
-            player_preds.append(self.player_heads[i](token_i))
-
-        strategy_preds = self.strategy_head(strat_tok)  # GameStrategyPredictions
-
-        return {"player": player_preds, "game_strategy": strategy_preds}
-
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
 #   model = torch.compile(model)  # outside this module
