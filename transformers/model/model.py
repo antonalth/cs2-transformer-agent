@@ -210,6 +210,9 @@ class CS2Config:
     # Context (training)
     context_frames: int = 128
 
+    use_fused_causal: bool = True #use FA2
+    use_frame_block_causal_mask: bool = True
+
     # Vision
     vit_name: str = "google/vit-large-patch16-384"
     vit_out_dim: int = 1024
@@ -437,6 +440,7 @@ class PlayerTokenFuser(nn.Module):
 # -----------------------------------------------------------------------------
 # 3) Attention core & Transformer layers (stubs for FA2+GQA+RoPE)
 # -----------------------------------------------------------------------------
+# In model.py
 
 class RoPEPositionalEncoding(nn.Module):
     """Rotary Positional Embedding (RoPE) with optional NTK-like scaling.
@@ -463,13 +467,20 @@ class RoPEPositionalEncoding(nn.Module):
         inv_freq = inv_freq * self.scale
         return inv_freq  # [half]
 
-    def _build_cos_sin(self, L: int, dim: int, device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    # --- PROPOSED CHANGE (1 of 2): Update helper method ---
+    # Change the signature to accept the positions tensor directly and use it.
+    def _build_cos_sin(
+        self, positions: torch.Tensor, dim: int, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         inv_freq = self._inv_freq(dim, device).to(dtype)
-        t = torch.arange(L, device=device, dtype=dtype).unsqueeze(-1)  # [L,1]
-        freqs = t * inv_freq.unsqueeze(0)                               # [L,half]
+        # Use the passed 'positions' tensor, not a new arange.
+        # Ensure it has the right shape and type for broadcasting.
+        t = positions.to(device=device, dtype=dtype).unsqueeze(-1)      # [L, 1]
+        freqs = t * inv_freq.unsqueeze(0)                                # [L, half]
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)
         return cos, sin
+    # --- END OF CHANGE ---
 
     @staticmethod
     def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rot_dim: int) -> torch.Tensor:
@@ -489,14 +500,24 @@ class RoPEPositionalEncoding(nn.Module):
         y = torch.stack([y1, y2], dim=-1).view(B, L, H, rd)
         return torch.cat([y, x_pass], dim=-1)
 
+    # --- PROPOSED CHANGE (2 of 2): Update forward method ---
     def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # q: [B, L, Hq, Hd], k: [B, L, Hkv, Hd]; positions: [L]
         L = q.shape[1]
+        
+        # Add a check to ensure inputs are valid
+        if positions.shape[0] != L:
+            raise ValueError(f"Length of positions tensor ({positions.shape[0]}) does not match sequence length ({L}).")
+
         rd = self.rot_dim or q.shape[-1]
-        cos, sin = self._build_cos_sin(L, rd, q.device, q.dtype)
+        
+        # Pass the 'positions' tensor to the helper, not the sequence length L.
+        cos, sin = self._build_cos_sin(positions, rd, q.device, q.dtype)
+        
         q = self._apply_rotary(q, cos, sin, rd)
         k = self._apply_rotary(k, cos, sin, rd)
         return q, k
+    # --- END OF CHANGE ---
 
 
 class CS2GQAAttention(nn.Module):
@@ -539,82 +560,82 @@ class CS2GQAAttention(nn.Module):
             and x.dtype in (torch.float16, torch.bfloat16)
         )
 
+    # In model.py, inside the CS2GQAAttention class
+
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], pos_ids: torch.Tensor) -> torch.Tensor:
         """
         x:        [B, L, D]
-        attn_mask: optional boolean mask broadcastable to [B, H, L, L] with True = DISALLOW.
-                Pass None for pure causal.
+        attn_mask: This argument is now expected to be None. Masking decisions are
+                   made internally based on the model config.
         pos_ids:  [B, L] integer positions for RoPE
         """
         B, L, D = x.shape
-        Hq = self.cfg.n_q_heads
-        Hkv = self.cfg.n_kv_heads
-        Hd = self.head_dim
+        Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
 
-        # Q/K/V projections
-        q = self.wq(x).view(B, L, Hq, Hd)       # [B, L, Hq, Hd]
-        k = self.wk(x).view(B, L, Hkv, Hd)      # [B, L, Hkv, Hd]
-        v = self.wv(x).view(B, L, Hkv, Hd)      # [B, L, Hkv, Hd]
+        q = self.wq(x).view(B, L, Hq, Hd)
+        k = self.wk(x).view(B, L, Hkv, Hd)
+        v = self.wv(x).view(B, L, Hkv, Hd)
 
-        # RoPE (expects [B, L, H, Hd])
         q, k = self.rope(q, k, pos_ids)
 
-        # ---- GQA: map K/V heads to Q heads by repeating ----
         if Hq % Hkv != 0:
             raise ValueError(f"n_q_heads ({Hq}) must be divisible by n_kv_heads ({Hkv}) for GQA.")
         group = Hq // Hkv
-        # Expand K/V to Hq heads without materializing copies when possible
         k = k.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
         v = v.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
-
+        
         q_bLHD = q.contiguous()
         k_bLHD = k.contiguous()
         v_bLHD = v.contiguous()
 
+        # --- PROPOSED CHANGE: Centralized Masking Logic ---
+        # Decide which attention implementation to use.
+        # The fused path (FlashAttention) is fastest but only supports strict
+        # token-level causality. The frame-block causal mask is architecturally
+        # correct but requires manual mask creation and is thus incompatible.
 
-        # -------------------------
-        # Masking / attention path
-        # -------------------------
-        # Fast path: use fused/flash causal attention when:
-        # - we’re on a device/dtype that supports it, and
-        # - we do not need any custom structure beyond pure causality.
-        use_frame_block_mask = getattr(self.cfg, "frame_block_causal", False)  # set True to enable 7-token intra-frame visibility
-        can_use_pure_causal = (attn_mask is None) and (not use_frame_block_mask)
+        # Condition to use the fastest path:
+        can_use_fused_path = (
+            self._use_fa2(x) and
+            self.cfg.use_fused_causal and
+            not self.cfg.use_frame_block_causal_mask and
+            attn_mask is None # Ensure no external mask is passed
+        )
 
-        if self._use_fa2(x) and can_use_pure_causal:
-            # FlashAttention-2 path (built-in causal masking). Expects [B, L, H, Hd].
-            # Returns [B, L, H, Hd].
-            out_bLHD = self._fa2(
+        if can_use_fused_path:
+            # FAST PATH: Use FlashAttention-2 with built-in causal masking.
+            out = self._fa2(
                 q_bLHD, k_bLHD, v_bLHD,
                 dropout_p=self.dropout if self.training else 0.0,
                 causal=True,
                 return_attn_probs=False,
             )
-            out = out_bLHD  # [B, L, H, Hd]
         else:
-            # Build a boolean DISALLOW mask (True = disallow) that broadcasts to [B, H, L, L].
-            # Start from either:
-            #   - frame-aware block-causal (allow all tokens within same frame; block strictly future frames), or
-            #   - plain causal.
-            if use_frame_block_mask:
-                G = self.cfg.tokens_per_frame  # e.g., 7
+            # SLOW PATH: Manually build the attention mask.
+            # This path is required for the correct frame-block causal logic
+            # or for running on hardware without FlashAttention support.
+            
+            disallow_mask: torch.Tensor
+            if self.cfg.use_frame_block_causal_mask:
+                # Build the architecturally correct frame-block causal mask.
+                G = self.cfg.tokens_per_frame
                 pos = torch.arange(L, device=x.device)
                 frame_id = (pos // G)
-                fi_q = frame_id.view(1, 1, L, 1)  # [1,1,L,1]
-                fi_k = frame_id.view(1, 1, 1, L)  # [1,1,1,L]
-                # Disallow keys from strictly future frames; allow same frame (both directions) and all past frames.
-                disallow = (fi_k > fi_q)  # [1,1,L,L], bool
+                fi_q = frame_id.view(1, 1, L, 1)
+                fi_k = frame_id.view(1, 1, 1, L)
+                # Disallow attending to tokens from strictly future frames.
+                # Allows full attention within a frame and to all past frames.
+                disallow_mask = (fi_k > fi_q)
             else:
-                # Plain causal: disallow attending to the future (above diagonal)
+                # Fallback to a simple, strict token-level causal mask.
+                # This matches the old (incorrect) behavior but is useful for
+                # debugging or if the fused kernel is disabled.
                 i = torch.arange(L, device=x.device)
-                disallow = (i[None, :] > i[:, None]).view(1, 1, L, L)  # [1,1,L,L], bool
+                disallow_mask = (i[None, :] > i[:, None]).view(1, 1, L, L)
 
-            # Combine with any caller-provided disallow mask (must be boolean with True=disallow).
+            # If an external mask were ever provided, it would be combined here.
             if attn_mask is not None:
-                if attn_mask.dtype != torch.bool:
-                    raise ValueError("attn_mask must be a boolean tensor with True=DISALLOW when provided.")
-                # Broadcast OR: disallow if either source disallows
-                disallow = disallow | attn_mask  # result broadcastable to [B,H,L,L]
+                disallow_mask = disallow_mask | attn_mask.to(device=disallow_mask.device)
 
             q_bHLD = q_bLHD.permute(0, 2, 1, 3).contiguous()
             k_bHLD = k_bLHD.permute(0, 2, 1, 3).contiguous()
@@ -622,13 +643,15 @@ class CS2GQAAttention(nn.Module):
 
             out = torch.nn.functional.scaled_dot_product_attention(
                 q_bHLD, k_bHLD, v_bHLD,
-                attn_mask=disallow,         # boolean mask, True = disallow
-                is_causal=False,            # IMPORTANT: we encoded causality in the mask
+                attn_mask=disallow_mask, # boolean mask, True = disallow
+                is_causal=False,         # Our mask handles causality explicitly
                 dropout_p=self.dropout if self.training else 0.0,
             )
+            # Permute back to [B, L, H, Hd]
+            out = out.permute(0, 2, 1, 3).contiguous()
+        # --- END OF CHANGE ---
 
-        out = out.permute(0, 2, 1, 3)
-        out = out.contiguous().view(B, L, D)
+        out = out.view(B, L, D)
         return self.wo(out)
 
 
@@ -846,14 +869,8 @@ class CS2Transformer(nn.Module):
             {"params": rest, "name": "core", "lr_scale": 1.0},
         ]
 
-    # ------------------------------ helpers ------------------------------- #
-    @staticmethod
-    def _build_causal_mask(L, device):
-        i = torch.arange(L, device=device)
-        # True on future positions (upper triangle) = disallow
-        mask = (i[None, :] > i[:, None]).view(1, 1, L, L)
-        return mask
-    # ------------------------------- forward ------------------------------ #
+    # In model.py, inside the CS2Transformer class
+
     def forward(self, batch: CS2Batch) -> Predictions:
         """Compute next-frame predictions (t+1) given a sequence of frames 1..t.
 
@@ -879,10 +896,11 @@ class CS2Transformer(nn.Module):
         tok_sc = self.token_scratch     .unsqueeze(2).expand(B, T, 1, -1)  # [B, T, 1, d]
         frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)   # [B, T, 7, d]
 
-        # Flatten time to sequence and build causal mask
+        # Flatten time to sequence
         seq = frame_tokens.view(B, T * self.cfg.tokens_per_frame, d)       # [B, L, d]
         L = seq.shape[1]
-        attn_mask = self._build_causal_mask(L, seq.device)                 # [1,1,L,L]
+        
+        attn_mask = None #handled by CS2GQAAttention
 
         # Backbone
         h = self.backbone(seq, attn_mask)  # [B, L, d]
@@ -902,7 +920,6 @@ class CS2Transformer(nn.Module):
         strategy_preds = self.strategy_head(strat_tok)  # GameStrategyPredictions
 
         return {"player": player_preds, "game_strategy": strategy_preds}
-
 
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
