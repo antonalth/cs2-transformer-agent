@@ -210,6 +210,8 @@ class CS2Config:
     # Context (training)
     context_frames: int = 128
 
+    # Once fixed, these can never change during training or inference!
+    # If fused_causal is used, any passed mask is ignored.
     use_fused_causal: bool = True #use FA2, mutually exclusive with use_frame_block_causal_mask
     use_frame_block_causal_mask: bool = False #cannot be used with FA2 e.g.; use_fused_causal
 
@@ -389,8 +391,7 @@ class AudioCNN(nn.Module):
         x = self.head(x)  # [N, d_model]
         x = x.view(B, T, P, -1)
         return x
-
-
+    
 class PlayerTokenFuser(nn.Module):
     """Fuse visual+audio via elementwise add, LayerNorm, add slot identity.
 
@@ -403,8 +404,6 @@ class PlayerTokenFuser(nn.Module):
         self.slot_embed = player_slot_embed
         self.dead_embedding = dead_embedding
 
-    # In model.py, inside the PlayerTokenFuser class
-
     def forward(
         self,
         vis: torch.Tensor,   # [B, T, P, d]
@@ -413,34 +412,37 @@ class PlayerTokenFuser(nn.Module):
     ) -> torch.Tensor:
         """
         Fuse visual+audio, apply the DEAD policy, and add player identity.
-        This corrected version is more efficient and readable.
+        This corrected version is more efficient and readable by using broadcasting.
         """
         B, T, P, d = vis.shape
 
-        # 1. Fuse the sensor data for the "alive" case.
+        # 1. Fuse the sensor data for the "alive" case. This is only computed once.
         fused_alive_token = self.norm(vis + aud)
 
-        # 2. Prepare the mask for broadcasting. We need a final dimension.
+        # 2. Prepare the mask for broadcasting. We invert the alive_mask to get a
+        #    dead_mask and add a dimension for the feature dimension `d`.
         # The mask will be True where players are DEAD.
         dead_mask = ~alive_mask.bool().unsqueeze(-1) # Shape: [B, T, P, 1]
 
-        # 3. Select the base token. PyTorch will broadcast self.dead_embedding
-        # to the correct shape where the mask is True. This is highly efficient.
+        # 3. Select the base token using torch.where. This is highly efficient as it
+        #    avoids creating a large intermediate tensor for the dead embedding.
+        #    PyTorch will broadcast self.dead_embedding to the correct shape only
+        #    where the mask is True.
         base_token = torch.where(
             dead_mask,
-            self.dead_embedding, # The single [DEAD] embedding
-            fused_alive_token,   # The fused sensor token
+            self.dead_embedding, # The single [1, 1, d] DEAD embedding
+            fused_alive_token,   # The [B, T, P, d] fused sensor token
         )
 
         # 4. Add the unique player slot identity to the selected base token.
-        # This happens regardless of whether the player is alive or dead.
+        #    This happens in a single, non-redundant step, regardless of whether
+        #    the player is alive or dead. Broadcasting handles the expansion.
         slot_ids = torch.arange(P, device=vis.device).view(1, 1, P)
-        slots = self.slot_embed(slot_ids) # Broadcasts to [B, T, P, d]
+        slots = self.slot_embed(slot_ids) # Broadcasts from [1, 1, P, d] to [B, T, P, d]
         
         final_token = base_token + slots
 
         return final_token
-
 
 # -----------------------------------------------------------------------------
 # 3) Attention core & Transformer layers (stubs for FA2+GQA+RoPE)
@@ -509,13 +511,13 @@ class RoPEPositionalEncoding(nn.Module):
 
         rd = self.rot_dim or q.shape[-1]
         
-        # This is the corrected part: `positions` is now used.
+        # This function call is now correct because _build_cos_sin will respect the `positions` tensor.
         cos, sin = self._build_cos_sin(positions, rd, q.device, q.dtype)
         
         q = self._apply_rotary(q, cos, sin, rd)
         k = self._apply_rotary(k, cos, sin, rd)
         return q, k
-
+        
 
 class CS2GQAAttention(nn.Module):
     """Grouped-Query Attention with FlashAttention-2.
@@ -707,6 +709,7 @@ class PlayerHeads(nn.Module):
         
         # 1. Seed: Project the flat token to a starting 3D volume
         # The starting volume will have the correct Z dimension already.
+        # We start with a small spatial resolution (8x8) that will be upsampled to 64x64.
         self.pos_seed = nn.Linear(d, vol_feats * 8 * 8 * 8) 
         
         # 2. Deconvolution path: Upsample the Y and X dimensions by 8x (2^3)
@@ -737,7 +740,7 @@ class PlayerHeads(nn.Module):
         B = token.shape[0]
 
         # --- Generate Heatmap ---
-        # Project token to the initial seed volume [B, vol_feats, 8, 8, 8]
+        # Project token to the initial seed volume [B, 128, 8, 8, 8]
         seed = self.pos_seed(token).view(B, 128, 8, 8, 8)
         # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
         upsampled_vol = self.pos_deconv(seed)
@@ -759,7 +762,6 @@ class PlayerHeads(nn.Module):
             "inventory_logits": self.inventory(token),
             "active_weapon_logits": self.active_weapon(token),
         }
-    
 class StrategyHead(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
@@ -817,8 +819,7 @@ class StrategyHead(nn.Module):
             "round_state_logits": self.round_state(token),
             "round_number": self.round_number(token),
         }
-
-
+    
 # -----------------------------------------------------------------------------
 # 5) Top-level model
 # -----------------------------------------------------------------------------
