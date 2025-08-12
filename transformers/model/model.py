@@ -219,7 +219,8 @@ class CS2Config:
     use_frame_block_causal_mask: bool = False #cannot be used with FA2 e.g.; use_fused_causal
 
     # Vision
-    vit_name: str = "google/vit-large-patch16-384"
+    vit_name_hf: str = "google/vit-large-patch16-384"
+    vit_name_timm: str = "vit-large-patch16-384" #preferred if available
     vit_out_dim: int = 1024
 
     # Audio
@@ -295,17 +296,13 @@ class ViTVisualEncoder(nn.Module):
             self._has_hf = False
             ViTModel = None  # type: ignore
 
-        vit_name = getattr(self.cfg, "vit_name")
-
         self.backend = None
         if self._has_timm:
-            #todo fix here (will work for now)
-            timm_name = "vit_large_patch16_384" if vit_name.endswith("vit-large-patch16-384") else vit_name
-            self.vit = timm.create_model(timm_name, pretrained=True, num_classes=0)
+            self.vit = timm.create_model(getattr(self.cfg,"vit_name_timm"), pretrained=True, num_classes=0)
             self.backend = "timm"
             self.vit_out_dim = 1024
         elif self._has_hf:
-            self.vit = ViTModel.from_pretrained(vit_name)
+            self.vit = ViTModel.from_pretrained(getattr(self.cfg,"vit_name_hf"))
             self.backend = "hf"
             self.vit_out_dim = 1024
         else:
