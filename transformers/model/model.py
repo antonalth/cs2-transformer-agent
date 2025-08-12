@@ -419,7 +419,7 @@ class PlayerTokenFuser(nn.Module):
             if dead_mask.any():
                 # Create the dead token by explicitly broadcasting the dead_embedding
                 # to the shape of the slot embeddings.
-                dead_token_template = self.dead_embedding.expand_as(slots) # [B, T, P, d]
+                dead_token_template = self.dead_embedding.unsqueeze(2).expand_as(slots)
                 
                 # The final dead token is the shared dead embedding plus the unique slot ID
                 dead_tokens = dead_token_template + slots
@@ -627,10 +627,7 @@ class CS2GQAAttention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
             )
 
-        # Back to [B, L, D] no matter which path we took
-        if out.dim() != 4 or out.shape[:3] != (B, L, Hq):
-            # SDPA branch returns [B, H, L, Hd]
-            out = out.permute(0, 2, 1, 3)
+        out = out.permute(0, 2, 1, 3)
         out = out.contiguous().view(B, L, D)
         return self.wo(out)
 
@@ -746,27 +743,59 @@ class PlayerHeads(nn.Module):
             "inventory_logits": self.inventory(token),
             "active_weapon_logits": self.active_weapon(token),
         }
-
+    
 class StrategyHead(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         d = cfg.d_model
-        vol_feats = 64
-        self.enemy_seed = nn.Linear(d, vol_feats * 8 * 8 * 8)
-        self.enemy_deconv = nn.Sequential(
-            nn.ConvTranspose3d(vol_feats, vol_feats // 2, 4, stride=2, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose3d(vol_feats // 2, 1, 4, stride=2, padding=1),
-        )
         self.enemy_shape = (cfg.pos_z, cfg.pos_y, cfg.pos_x)
+        
+        # --- Corrected 3D Deconvolutional Head for Enemy Positions ---
+        vol_feats = 128  # Latent channels for the deconv stem (tunable)
+        
+        # 1. Seed: Project the flat token to a starting 3D volume [B, 128, 8, 8, 8]
+        self.enemy_seed = nn.Linear(d, vol_feats * 8 * 8 * 8)
+        
+        # 2. Deconvolution path: Upsample Y and X dimensions by 8x (2^3) using
+        #    anisotropic strides to preserve the Z dimension. This architecture
+        #    is modeled directly on the working PlayerHeads implementation.
+        self.enemy_deconv = nn.Sequential(
+            # Input: [B, 128, 8, 8, 8] -> [B, 64, 8, 16, 16]
+            nn.ConvTranspose3d(vol_feats, vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(vol_feats // 2),
+            nn.GELU(),
+            
+            # Block 2 -> [B, 32, 8, 32, 32]
+            nn.ConvTranspose3d(vol_feats // 2, vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(vol_feats // 4),
+            nn.GELU(),
+
+            # Block 3 -> [B, 16, 8, 64, 64]
+            nn.ConvTranspose3d(vol_feats // 4, vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(vol_feats // 8),
+            nn.GELU(),
+        )
+        
+        # 3. Final Projection: Reduce feature channels to a single logit channel
+        self.enemy_final_conv = nn.Conv3d(vol_feats // 8, 1, kernel_size=1)
+
+        # --- Other standard prediction heads ---
         self.round_state = nn.Linear(d, cfg.round_state_dim)
         self.round_number = nn.Linear(d, 1)
 
     def forward(self, token: torch.Tensor) -> GameStrategyPredictions:
         B = token.shape[0]
-        seed = self.enemy_seed(token).view(B, 64, 8, 8, 8)
-        vol = self.enemy_deconv(seed)  # [B, 1, 32, 32, 32]
-        enemy_pos_heatmap_logits = F.interpolate(vol, size=self.enemy_shape, mode="trilinear", align_corners=False).squeeze(1)
+        
+        # --- Generate Heatmap (Corrected Path) ---
+        # Project token to the initial seed volume -> [B, 128, 8, 8, 8]
+        seed = self.enemy_seed(token).view(B, 128, 8, 8, 8)
+        # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
+        upsampled_vol = self.enemy_deconv(seed)
+        # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
+        heatmap_vol = self.enemy_final_conv(upsampled_vol)
+        # Remove channel dimension to get final shape [B, 8, 64, 64]
+        enemy_pos_heatmap_logits = heatmap_vol.squeeze(1)
+
         return {
             "enemy_pos_heatmap_logits": enemy_pos_heatmap_logits,
             "round_state_logits": self.round_state(token),
