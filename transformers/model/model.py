@@ -196,15 +196,16 @@ class CS2Batch(TypedDict, total=False):
 
 @dataclass
 class CS2Config:
-    compute_dtype: Literal["fp32", "fp16", "bf16"]  
-    amp_autocast: bool    
+    compute_dtype: Literal["fp32", "fp16", "bf16"]  = "bf16"
+    amp_autocast: bool = True
     # Model dims
     d_model: int = 2048
     n_layers: int = 24
     n_q_heads: int = 32
     n_kv_heads: int = 8
     ffn_mult: int = 4
-    dropout: float = 0.0
+    dropout: float = 0.0 #unused?
+    attn_dropout: float = 0.0
 
     # Sequence
     num_players: int = 5
@@ -296,7 +297,9 @@ class ViTVisualEncoder(nn.Module):
 
         self.backend = None
         if self._has_timm:
-            self.vit = timm.create_model(vit_name, pretrained=True, num_classes=0)
+            #todo fix here (will work for now)
+            timm_name = "vit_large_patch16_384" if vit_name.endswith("vit-large-patch16-384") else vit_name
+            self.vit = timm.create_model(timm_name, pretrained=True, num_classes=0)
             self.backend = "timm"
             self.vit_out_dim = 1024
         elif self._has_hf:
@@ -444,19 +447,27 @@ class PlayerTokenFuser(nn.Module):
 # -----------------------------------------------------------------------------
 # In model.py
 
-class RoPEPositionalEncoding(nn.Module):
-    """Rotary Positional Embedding (RoPE) with optional NTK-like scaling.
 
-    Applies sin/cos rotations to the first `rot_dim` dimensions of Q/K per head.
-    Standard usage sets `rot_dim = head_dim`.
+class RoPEPositionalEncoding(nn.Module):
+    """Rotary Positional Embedding (RoPE) with 2D position support and optional scaling.
+
+    This patched version handles two distinct positional axes:
+    1. Temporal Axis: The frame index in a sequence. Context scaling (e.g., NTK)
+       is applied here to extend the context window.
+    2. Structural Axis: The token's position within a frame (e.g., P1, P2, ...).
+       No scaling is applied to this axis.
+
+    It applies sin/cos rotations to designated slices of the Q/K vectors per head.
+    The total rotation dimension (`rot_dim`) is split evenly between the two axes.
     """
     def __init__(self, cfg: CS2Config, rot_dim: Optional[int] = None):
         super().__init__()
+        self.cfg = cfg
         self.base = cfg.rope_base
         self.rot_dim = rot_dim
-        # Default scale = 1.0 (no scaling). Expose setter for long-context tuning.
+        # Default scale = 1.0. This scale is ONLY for the temporal axis.
         self.register_buffer("scale", torch.tensor(1.0), persistent=False)
-        self._apply_cfg_scaling(getattr(self.cfg,"rope_scaling"))
+        self._apply_cfg_scaling(getattr(cfg,"rope_scaling", None))
 
     def _apply_cfg_scaling(self, scaling: Optional[Dict[str, Any]]) -> None:
         """
@@ -464,6 +475,7 @@ class RoPEPositionalEncoding(nn.Module):
           - {"type": "linear", "factor": s}          # extend context by s×
           - {"type": "linear_by_len", "orig": L0, "target": L1}  # extend from L0 to L1
         Internally we multiply inv_freq by `1/s` to reduce frequencies.
+        This scaling is only applied to the temporal axis.
         """
         if not scaling:
             return
@@ -472,32 +484,40 @@ class RoPEPositionalEncoding(nn.Module):
             s = float(scaling.get("factor", 1.0))
             if s <= 0:
                 raise ValueError("rope_scaling.factor must be > 0")
-            self.set_scale(1.0 / s)  # smaller frequencies
+            self.set_scale(1.0 / s)
         elif sc_type == "linear_by_len":
             L0 = int(scaling["orig"])
             L1 = int(scaling["target"])
             if L0 <= 0 or L1 <= 0:
                 raise ValueError("rope_scaling.orig/target must be > 0")
-            self.set_scale(float(L0) / float(L1))  # = 1/s where s = L1/L0
+            self.set_scale(float(L0) / float(L1))
         else:
             raise ValueError(f"Unsupported rope_scaling.type: {sc_type}")
 
     def set_scale(self, scale: float) -> None:
+        """Sets the scaling factor for the temporal axis."""
         self.scale.fill_(float(scale))
 
-    def _inv_freq(self, dim: int, device: torch.device) -> torch.Tensor:
+    def _inv_freq(self, dim: int, device: torch.device, use_scaling: bool) -> torch.Tensor:
+        """Calculates inverse frequencies, with an option to apply temporal scaling."""
         half = dim // 2
         idx = torch.arange(0, half, device=device, dtype=torch.float32)
-        inv = self.base ** (idx / half)  # base^(i/(dim/2))
+        inv = self.base ** (idx / half)
         inv_freq = 1.0 / inv
-        # NTK-like scaling: reduce frequencies to extend context
-        inv_freq = inv_freq * self.scale
-        return inv_freq  # [half]
+        
+        # Apply NTK-like scaling only if specified (i.e., for the temporal axis)
+        if use_scaling:
+            inv_freq = inv_freq * self.scale
+            
+        return inv_freq
 
     def _build_cos_sin(
-        self, positions: torch.Tensor, dim: int, device: torch.device, dtype: torch.dtype
+        self, positions: torch.Tensor, dim: int, device: torch.device, dtype: torch.dtype, use_scaling: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        inv_freq = self._inv_freq(dim, device).to(dtype)
+        """Builds the cosine and sine matrices for a given position tensor."""
+        # Pass the scaling flag down to the frequency calculation
+        inv_freq = self._inv_freq(dim, device, use_scaling=use_scaling).to(dtype)
+        
         t = positions.to(device=device, dtype=dtype).unsqueeze(-1)      # [L, 1]
         freqs = t * inv_freq.unsqueeze(0)                                # [L, half]
         cos = torch.cos(freqs)
@@ -505,39 +525,77 @@ class RoPEPositionalEncoding(nn.Module):
         return cos, sin
 
     @staticmethod
-    def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rot_dim: int) -> torch.Tensor:
-        """x: [B, L, H, Hd]. Apply rotary to first rot_dim dims of Hd."""
-        assert rot_dim % 2 == 0, "RoPE dimension must be even"
-        B, L, H, Hd = x.shape
-        rd = rot_dim
-        x_rot = x[..., :rd]
-        x_pass = x[..., rd:]
-        # pair dims (rd/2, 2)
-        x_pair = x_rot.reshape(B, L, H, rd // 2, 2)
-        cos = cos.reshape(1, L, 1, rd // 2, 1).to(x.dtype)
-        sin = sin.reshape(1, L, 1, rd // 2, 1).to(x.dtype)
+    def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Applies rotary embeddings to the entire input tensor 'x'."""
+        # x: [B, L, H, rot_dim_slice]
+        B, L, H, rd_slice = x.shape
+        assert rd_slice % 2 == 0, "Rotary dimension must be even."
+        
+        x_pair = x.reshape(B, L, H, rd_slice // 2, 2)
+        cos = cos.reshape(1, L, 1, rd_slice // 2, 1).to(x.dtype)
+        sin = sin.reshape(1, L, 1, rd_slice // 2, 1).to(x.dtype)
+        
         x1 = x_pair[..., 0]
         x2 = x_pair[..., 1]
+        
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
-        y = torch.stack([y1, y2], dim=-1).reshape(B, L, H, rd)
-        return torch.cat([y, x_pass], dim=-1)
+        
+        y = torch.stack([y1, y2], dim=-1).reshape(B, L, H, rd_slice)
+        return y
 
+    def forward(self, q: torch.Tensor, k: torch.Tensor, temporal_pos: torch.Tensor, structural_pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Applies 2D RoPE to query and key tensors.
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # q: [B, L, Hq, Hd], k: [B, L, Hkv, Hd]; positions: [L]
+        Args:
+            q: Query tensor of shape [B, L, Hq, Hd].
+            k: Key tensor of shape [B, L, Hkv, Hd].
+            temporal_pos: Integer tensor of temporal positions (frame index), shape [L].
+            structural_pos: Integer tensor of structural positions (token index in frame), shape [L].
+
+        Returns:
+            A tuple of (rotated_q, rotated_k).
+        """
         L = q.shape[1]
-        if positions.shape[0] != L:
-            raise ValueError(f"Length of positions tensor ({positions.shape[0]}) does not match sequence length ({L}).")
+        if temporal_pos.shape[0] != L or structural_pos.shape[0] != L:
+            raise ValueError(f"Length of position tensors must match sequence length {L}.")
 
+        # Determine the total dimension to rotate.
         rd = self.rot_dim or q.shape[-1]
         
-        # This function call is now correct because _build_cos_sin will respect the `positions` tensor.
-        cos, sin = self._build_cos_sin(positions, rd, q.device, q.dtype)
+        # For 2D RoPE, the rotation dimension must be divisible by 4 to be split evenly
+        # into two valid (even) rotation dimensions.
+        if rd % 4 != 0:
+            raise ValueError(f"Rotation dimension ({rd}) must be divisible by 4 for 2D RoPE.")
+
+        # Split the rotation dimension for the two axes.
+        rot_dim_temp = rd // 2
+        rot_dim_struc = rd // 2
+
+        # --- Slice the Tensors ---
+        # First half of the rotatable dimension is for temporal positions.
+        q_t, k_t = q[..., :rot_dim_temp], k[..., :rot_dim_temp]
+        # Second half is for structural positions.
+        q_s, k_s = q[..., rot_dim_temp:rd], k[..., rot_dim_temp:rd]
+        # The remaining part is not rotated.
+        q_pass, k_pass = q[..., rd:], k[..., rd:]
+
+        # --- Temporal Rotation (with scaling) ---
+        cos_t, sin_t = self._build_cos_sin(temporal_pos, rot_dim_temp, q.device, q.dtype, use_scaling=True)
+        q_t_rot = self._apply_rotary(q_t, cos_t, sin_t)
+        k_t_rot = self._apply_rotary(k_t, cos_t, sin_t)
         
-        q = self._apply_rotary(q, cos, sin, rd)
-        k = self._apply_rotary(k, cos, sin, rd)
-        return q, k
+        # --- Structural Rotation (without scaling) ---
+        cos_s, sin_s = self._build_cos_sin(structural_pos, rot_dim_struc, q.device, q.dtype, use_scaling=False)
+        q_s_rot = self._apply_rotary(q_s, cos_s, sin_s)
+        k_s_rot = self._apply_rotary(k_s, cos_s, sin_s)
+        
+        # --- Recombine the tensors ---
+        rotated_q = torch.cat([q_t_rot, q_s_rot, q_pass], dim=-1)
+        rotated_k = torch.cat([k_t_rot, k_s_rot, k_pass], dim=-1)
+
+        return rotated_q, rotated_k
         
 
 class CS2GQAAttention(nn.Module):
@@ -637,7 +695,7 @@ class CS2GQAAttention(nn.Module):
                 causal=causal,
             )
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], pos_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], temporal_pos_ids: torch.Tensor, structural_pos_ids: torch.Tensor) -> torch.Tensor:
         """
         x:         [B, L, D]
         attn_mask: Boolean or additive mask. Boolean True = DISALLOW. Additive: large negative = disallow.
@@ -653,7 +711,7 @@ class CS2GQAAttention(nn.Module):
         v = self.wv(x).reshape(B, L, Hkv, Hd)
 
         # RoPE on q/k
-        q, k = self.rope(q, k, pos_ids)
+        q, k = self.rope(q, k, temporal_pos_ids, structural_pos_ids)
 
         # GQA expand KV to match Q heads
         if Hq % Hkv != 0:
@@ -739,10 +797,10 @@ class CS2TransformerEncoderLayer(nn.Module):
             nn.Linear(cfg.d_model * cfg.ffn_mult, cfg.d_model),
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], pos_ids: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mask, pos_ids)
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], temporal_pos_ids: torch.Tensor, structural_pos_ids: torch.Tensor) -> torch.Tensor:
+        # --- NEW: Pass both position tensors to the attention module ---
+        x = x + self.attn(self.ln1(x), attn_mask, temporal_pos_ids, structural_pos_ids)
         x = x + self.ff(self.ln2(x))
-        return x
 
 
 class CS2Backbone(nn.Module):
@@ -752,11 +810,24 @@ class CS2Backbone(nn.Module):
         self.layers = nn.ModuleList([CS2TransformerEncoderLayer(cfg, self.rope) for _ in range(cfg.n_layers)])
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        # x: [B, L, d]; attn_mask: [1, 1, L, L] boolean where True=allowed
+        # x: [B, L, d]
         B, L, _ = x.shape
-        pos_ids = torch.arange(L, device=x.device)
+        
+        # --- NEW: Generate 2D Positional IDs ---
+        G = self.cfg.tokens_per_frame
+        T = (L + G - 1) // G # Safely calculate number of frames, even for partial sequences
+
+        # Temporal IDs (frame index): [0, 0, ..., 0, 1, 1, ..., 1, ...]
+        temporal_pos_ids = torch.arange(T, device=x.device).repeat_interleave(G)
+        temporal_pos_ids = temporal_pos_ids[:L] # Trim to exact sequence length
+
+        # Structural IDs (token index within a frame): [0, 1, .. G-1, 0, 1, .. G-1, ...]
+        structural_pos_ids = torch.arange(G, device=x.device).repeat(T)
+        structural_pos_ids = structural_pos_ids[:L] # Trim to exact sequence length
+
         for layer in self.layers:
-            x = layer(x, attn_mask, pos_ids)
+            x = layer(x, attn_mask, temporal_pos_ids, structural_pos_ids)
+            
         return x
 
 
@@ -925,6 +996,16 @@ class CS2Transformer(nn.Module):
         self.player_head = PlayerHeads(cfg)
         self.strategy_head = StrategyHead(cfg)
 
+        # ---- autocast setup ----
+        self.use_amp = (
+            getattr(self.cfg,"amp_autocast", True)
+            and torch.cuda.is_available()
+            and getattr(self.cfg,"compute_dtype", "bf16") != "fp32"
+        )
+        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        self.amp_dtype = dtype_map[getattr(self.cfg,"compute_dtype", "bf16")]
+
+
     # --------------------------- utility methods --------------------------- #
     def set_vit_frozen(self, frozen: bool) -> None:
         for p in self.visual_encoder.parameters():
@@ -947,18 +1028,9 @@ class CS2Transformer(nn.Module):
 
     def forward(self, batch: CS2Batch) -> Predictions:
         """Compute next-frame predictions (t+1) given frames 1..t."""
-        # ---- autocast setup ----
-        use_amp = (
-            self.getattr(self.cfg,"amp_autocast", True)
-            and torch.cuda.is_available()
-            and self.getattr(self.cfg,"compute_dtype", "bf16") != "fp32"
-        )
-        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-        amp_dtype = dtype_map[self.getattr(self.cfg,"compute_dtype", "bf16")]
         autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
+            torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )
-
         with autocast_ctx:
             fov   = batch["foveal_images"]        # [B, T, 5, 3, 384, 384]
             periph= batch["peripheral_images"]     # [B, T, 5, 3, 384, 384]
@@ -966,11 +1038,11 @@ class CS2Transformer(nn.Module):
             alive = batch["alive_mask"].bool()     # [B, T, 5]
 
             B, T, P = fov.shape[:3]
-            d = self.getattr(self.cfg,"d_model")
+            d = getattr(self.cfg,"d_model")
 
             # Optional consistency check
             if __debug__:
-                assert self.getattr(self.cfg,"tokens_per_frame") == self.getattr(self.cfg,"num_players") + 2, \
+                assert getattr(self.cfg,"tokens_per_frame") == getattr(self.cfg,"num_players") + 2, \
                     "tokens_per_frame must equal num_players + 2 (players + strategy + scratch)"
 
             # ---- encoders ----
@@ -987,7 +1059,7 @@ class CS2Transformer(nn.Module):
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)        # [B, T, 7, d]
 
             # ---- flatten time to sequence ----
-            Lpf = self.getattr(self.cfg,"tokens_per_frame")
+            Lpf = getattr(self.cfg,"tokens_per_frame")
             seq = frame_tokens.reshape(B, T * Lpf, d)     # [B, L, d]
 
             attn_mask = None  # handled inside CS2GQAAttention
@@ -997,7 +1069,7 @@ class CS2Transformer(nn.Module):
 
             # ---- slice last frame ----
             last = h[:, -Lpf:, :]                         # [B, 7, d]
-            num_players = self.getattr(self.cfg,"num_players")
+            num_players = getattr(self.cfg,"num_players")
             player_tok = last[:, :num_players, :]         # [B, 5, d]
             strat_tok  = last[:, num_players, :]          # [B, d]
             # scratch_tok = last[:, num_players + 1, :]
