@@ -211,7 +211,7 @@ class CS2Config:
     context_frames: int = 128
 
     use_fused_causal: bool = True #use FA2
-    use_frame_block_causal_mask: bool = True
+    use_frame_block_causal_mask: bool = True #cannot be used with FA2 e.g.; use_fused_causal
 
     # Vision
     vit_name: str = "google/vit-large-patch16-384"
@@ -467,20 +467,15 @@ class RoPEPositionalEncoding(nn.Module):
         inv_freq = inv_freq * self.scale
         return inv_freq  # [half]
 
-    # --- PROPOSED CHANGE (1 of 2): Update helper method ---
-    # Change the signature to accept the positions tensor directly and use it.
     def _build_cos_sin(
         self, positions: torch.Tensor, dim: int, device: torch.device, dtype: torch.dtype
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         inv_freq = self._inv_freq(dim, device).to(dtype)
-        # Use the passed 'positions' tensor, not a new arange.
-        # Ensure it has the right shape and type for broadcasting.
         t = positions.to(device=device, dtype=dtype).unsqueeze(-1)      # [L, 1]
         freqs = t * inv_freq.unsqueeze(0)                                # [L, half]
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)
         return cos, sin
-    # --- END OF CHANGE ---
 
     @staticmethod
     def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rot_dim: int) -> torch.Tensor:
@@ -511,13 +506,11 @@ class RoPEPositionalEncoding(nn.Module):
 
         rd = self.rot_dim or q.shape[-1]
         
-        # Pass the 'positions' tensor to the helper, not the sequence length L.
         cos, sin = self._build_cos_sin(positions, rd, q.device, q.dtype)
         
         q = self._apply_rotary(q, cos, sin, rd)
         k = self._apply_rotary(k, cos, sin, rd)
         return q, k
-    # --- END OF CHANGE ---
 
 
 class CS2GQAAttention(nn.Module):
@@ -567,7 +560,7 @@ class CS2GQAAttention(nn.Module):
         x:        [B, L, D]
         attn_mask: This argument is now expected to be None. Masking decisions are
                    made internally based on the model config.
-        pos_ids:  [B, L] integer positions for RoPE
+        pos_ids:  [L] integer positions for RoPE
         """
         B, L, D = x.shape
         Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
@@ -607,7 +600,7 @@ class CS2GQAAttention(nn.Module):
             out = self._fa2(
                 q_bLHD, k_bLHD, v_bLHD,
                 dropout_p=self.dropout if self.training else 0.0,
-                causal=True,
+                causal=True, #here we accept that we cannot do block wise mask for FA2 speedup (strict causality instead)
                 return_attn_probs=False,
             )
         else:
