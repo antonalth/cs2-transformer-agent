@@ -267,28 +267,16 @@ def _get_abs_pos_start(kv_cache_list: Optional[List[Optional[KVCache]]]) -> int:
             return int(c.pos_end)
     return 0
 
-def _update_cache(old: Optional[KVCache],
-                  new_k: torch.Tensor,  # rotated for ABS positions
-                  new_v: torch.Tensor,  # rotated for ABS positions
-                  max_cache_len_tokens: Optional[int]) -> KVCache:
-    if old is None:
-        cat_k, cat_v = new_k, new_v
-        pos_end = new_k.shape[1]  # starts at 0, ends at L_new
-    else:
-        cat_k = torch.cat([old.key, new_k], dim=1)   # [B, L_old+L_new, H_kv, Hd]
-        cat_v = torch.cat([old.value, new_v], dim=1)
-        pos_end = old.pos_end + new_k.shape[1]
-
-    if max_cache_len_tokens is not None and cat_k.shape[1] > max_cache_len_tokens:
-        cat_k = cat_k[:, -max_cache_len_tokens:]
-        cat_v = cat_v[:, -max_cache_len_tokens:]
-        # NOTE: pos_end stays absolute (no change)
-
-    return KVCache(key=cat_k.detach(), value=cat_v.detach(), pos_end=pos_end)
+# --- strengthen cache invariants ---
 
 def _assert_cache_consistency(kv_cache_list: Optional[List[Optional[KVCache]]]) -> None:
     if not kv_cache_list:
         return
+    # Either all or none:
+    has = [c is not None for c in kv_cache_list]
+    if any(has) and not all(has):
+        raise RuntimeError("KV cache must be provided for all layers or none.")
+
     lens = [int(c.key.shape[1]) for c in kv_cache_list if c is not None]
     pos_ends = [int(c.pos_end) for c in kv_cache_list if c is not None]
     if lens:
@@ -298,7 +286,36 @@ def _assert_cache_consistency(kv_cache_list: Optional[List[Optional[KVCache]]]) 
     if pos_ends:
         P0 = pos_ends[0]
         if not all(P == P0 for P in pos_ends):
-            raise RuntimeError(f"Inconsistent absolute positions across layers: {pos_ends}")
+            raise RuntimeError(f"Inconsistent cache pos_end across layers: {pos_ends}")
+
+def _ensure_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if x.device != ref.device or x.dtype != ref.dtype:
+        x = x.to(device=ref.device, dtype=ref.dtype)
+    return x
+
+def _update_cache(old: Optional[KVCache],
+                  new_k: torch.Tensor,
+                  new_v: torch.Tensor,
+                  max_cache_len_tokens: Optional[int]) -> KVCache:
+    if old is not None:
+        new_k = _ensure_like(new_k, old.key)
+        new_v = _ensure_like(new_v, old.value)
+
+    if old is None:
+        cat_k, cat_v = new_k, new_v
+        pos_end = new_k.shape[1]
+    else:
+        cat_k = torch.cat([old.key, new_k], dim=1)
+        cat_v = torch.cat([old.value, new_v], dim=1)
+        pos_end = old.pos_end + new_k.shape[1]
+
+    if max_cache_len_tokens is not None and cat_k.shape[1] > max_cache_len_tokens:
+        cat_k = cat_k[:, -max_cache_len_tokens:]
+        cat_v = cat_v[:, -max_cache_len_tokens:]
+
+    return KVCache(key=cat_k.contiguous().detach(),
+                   value=cat_v.contiguous().detach(),
+                   pos_end=pos_end)
 
 
 def _GN2d(c: int) -> torch.nn.GroupNorm:
@@ -727,6 +744,10 @@ def forward(
 
     inference_mode = not self.training
 
+    if L_new == 0:
+        # nothing to do; return no-op and preserve cache
+        return x[:, :0, :], (kv_cache if inference_mode else None)
+
     # --- ABSOLUTE positions to avoid RoPE drift ---------------------------------
     # For inference, ignore any caller-provided temporal_pos_ids and rebuild them
     # from the cache's absolute position counter.
@@ -811,6 +832,7 @@ def forward(
         fi_q = frame_id.view(L_new, 1)
         sdpa_mask = (fi_k > fi_q)
         sdpa_is_causal = False
+        assert sdpa_mask.shape == (L_new, L_tot), "Unexpected mask shape"
     else:
         # Standard rectangular-causal attention (PyTorch handles L_q != L_k)
         sdpa_is_causal = True
@@ -882,6 +904,10 @@ class CS2Backbone(nn.Module):
         Threads a list of KV caches through the transformer layers and calculates
         correct positional IDs for autoregressive decoding.
         """
+
+        if kv_cache_list is not None and len(kv_cache_list) != len(self.layers):
+            raise RuntimeError(f"Expected {len(self.layers)} caches, got {len(kv_cache_list)}")
+
         B, L_new, _ = x.shape
         G = self.cfg.tokens_per_frame
 
