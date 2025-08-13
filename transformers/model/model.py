@@ -975,12 +975,24 @@ class CS2Transformer(nn.Module):
 
     forward(batch) returns next-step predictions as per Appendix B.
     """
-    def __init__(self, cfg: CS2Config):
+    def __init__(self, cfg: CS2Config, use_dummy_vision: bool = False):
         super().__init__()
         self.cfg = cfg
         d = cfg.d_model
         # Encoders
-        self.visual_encoder = ViTVisualEncoder(cfg)
+        if use_dummy_vision:
+            # Replace the real ViT with a dummy module
+            class DummyVisualEncoder(nn.Module):
+                def __init__(self, d_model):
+                    super().__init__()
+                    self.d_model = d_model
+                def forward(self, foveal, peripheral):
+                    B, T, P = foveal.shape[:3]
+                    # Instantly return a correctly-shaped random tensor
+                    return torch.randn(B, T, P, self.d_model, device=foveal.device, dtype=torch.bfloat16)
+            self.visual_encoder = DummyVisualEncoder(d)
+        else:
+            self.visual_encoder = ViTVisualEncoder(cfg)
         self.audio_encoder = AudioCNN(cfg)
         # Special tokens & embeddings
         self.token_game_strategy = nn.Parameter(torch.randn(1, 1, d) * 0.02)
@@ -1104,6 +1116,7 @@ def main():
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of just a shape test.")
     parser.add_argument("--warmup-steps", type=int, default=5, help="Number of warmup steps for benchmark.")
     parser.add_argument("--bench-steps", type=int, default=20, help="Number of benchmark steps.")
+    parser.add_argument("--dummy-vit", action="store_true",help="Disable ViT to bench main model.")
     args = parser.parse_args()
 
     # --- Setup Device and DType ---
@@ -1131,7 +1144,7 @@ def main():
         context_frames=args.context_frames,
         n_layers=1
     )
-    model = CS2Transformer(cfg).to(device).eval()
+    model = CS2Transformer(cfg, args.dummy_vit).to(device).eval()
 
     if args.freeze_vit:
         model.set_vit_frozen(True)
