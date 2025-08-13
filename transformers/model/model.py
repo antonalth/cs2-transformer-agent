@@ -152,6 +152,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, TypedDict, Dict, Optional, Tuple, Literal, Any
+import time, argparse
 
 import torch
 import torch.nn as nn
@@ -1084,6 +1085,135 @@ class CS2Transformer(nn.Module):
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
 #   model = torch.compile(model)  # outside this module
+
+# -----------------------------------------------------------------------------
+# 6) Test harness and benchmark
+# -----------------------------------------------------------------------------
+
+def main():
+    """A comprehensive testing and benchmarking harness for the CS2Transformer."""
+    parser = argparse.ArgumentParser(description="Test and benchmark the CS2Transformer model.")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size for the test.")
+    parser.add_argument("--context-frames", type=int, default=16, help="Sequence length (time dimension) for the test.")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
+    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="bf16", help="Compute data type.")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile() for the model.")
+    parser.add_argument("--freeze-vit", action="store_true", help="Freeze the ViT encoder weights.")
+    parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of just a shape test.")
+    parser.add_argument("--warmup-steps", type=int, default=5, help="Number of warmup steps for benchmark.")
+    parser.add_argument("--bench-steps", type=int, default=20, help="Number of benchmark steps.")
+    args = parser.parse_args()
+
+    # --- Setup Device and DType ---
+    device = torch.device(args.device)
+    if args.dtype == "bf16" and not (device.type == "cuda" and torch.cuda.is_bf16_supported()):
+        print(f"[WARNING] bf16 not supported on {args.device}. Falling back to fp32.")
+        args.dtype = "fp32"
+    if args.dtype == "fp16" and device.type == "cpu":
+        print(f"[WARNING] fp16 not supported on CPU. Falling back to fp32.")
+        args.dtype = "fp32"
+
+    print("-" * 60)
+    print("Initializing Test Run")
+    print(f"  - Device: {device}")
+    print(f"  - DType: {args.dtype}")
+    print(f"  - Batch Size: {args.batch_size}")
+    print(f"  - Context Frames: {args.context_frames}")
+    print(f"  - torch.compile(): {args.compile}")
+    print("-" * 60)
+
+
+    # --- Instantiate Model ---
+    cfg = CS2Config(
+        compute_dtype=args.dtype,
+        context_frames=args.context_frames,
+    )
+    model = CS2Transformer(cfg).to(device).eval()
+
+    if args.freeze_vit:
+        model.set_vit_frozen(True)
+
+    if args.compile:
+        print("[INFO] Compiling model with torch.compile()... (this may take a moment)")
+        model = torch.compile(model)
+        print("[INFO] Compilation complete.")
+
+    # --- Create Dummy Input Batch ---
+    B, T, P = args.batch_size, cfg.context_frames, cfg.num_players
+    dummy_batch: CS2Batch = {
+        "foveal_images": torch.randint(0, 256, (B, T, P, 3, 384, 384), device=device, dtype=torch.uint8),
+        "peripheral_images": torch.randint(0, 256, (B, T, P, 3, 384, 384), device=device, dtype=torch.uint8),
+        "mel_spectrogram": torch.randn(B, T, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
+        "alive_mask": torch.randint(0, 2, (B, T, P), device=device, dtype=torch.bool),
+    }
+
+    # --- Run Shape Test ---
+    print("\n[PHASE 1] Running Shape Test...")
+    with torch.no_grad():
+        predictions = model(dummy_batch)
+
+    # Player predictions
+    assert isinstance(predictions["player"], list) and len(predictions["player"]) == P, "Player predictions must be a list of length num_players"
+    for i, p_pred in enumerate(predictions["player"]):
+        assert p_pred["stats"].shape == (B, 3), f"Player {i} stats shape is wrong"
+        assert p_pred["pos_heatmap_logits"].shape == (B, cfg.pos_z, cfg.pos_y, cfg.pos_x), f"Player {i} pos_heatmap shape is wrong"
+        assert p_pred["mouse_delta_deg"].shape == (B, 2), f"Player {i} mouse_delta shape is wrong"
+        assert p_pred["keyboard_logits"].shape == (B, cfg.keyboard_dim), f"Player {i} keyboard_logits shape is wrong"
+        assert p_pred["eco_logits"].shape == (B, cfg.eco_dim), f"Player {i} eco_logits shape is wrong"
+        assert p_pred["inventory_logits"].shape == (B, cfg.inventory_dim), f"Player {i} inventory_logits shape is wrong"
+        assert p_pred["active_weapon_logits"].shape == (B, cfg.weapon_dim), f"Player {i} active_weapon_logits shape is wrong"
+    # Strategy predictions
+    strat_pred = predictions["game_strategy"]
+    assert strat_pred["enemy_pos_heatmap_logits"].shape == (B, cfg.pos_z, cfg.pos_y, cfg.pos_x), "Enemy pos_heatmap shape is wrong"
+    assert strat_pred["round_state_logits"].shape == (B, cfg.round_state_dim), "Round state_logits shape is wrong"
+    assert strat_pred["round_number"].shape == (B, 1), "Round number shape is wrong"
+    print("✅ Shape Test Passed!")
+
+    # --- Run Benchmark ---
+    if args.benchmark:
+        print("\n[PHASE 2] Running Benchmark...")
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            start_mem = torch.cuda.max_memory_allocated(device)
+
+        with torch.no_grad():
+            # Warmup
+            print(f"  - Warming up for {args.warmup_steps} iterations...")
+            for _ in range(args.warmup_steps):
+                _ = model(dummy_batch)
+
+            # Benchmark
+            print(f"  - Benchmarking for {args.bench_steps} iterations...")
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+            for _ in range(args.bench_steps):
+                _ = model(dummy_batch)
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            end_time = time.perf_counter()
+
+        # Report results
+        total_time = end_time - start_time
+        avg_time_ms = (total_time / args.bench_steps) * 1000
+        throughput = args.bench_steps / total_time
+
+        print("\n" + "=" * 25 + " BENCHMARK RESULTS " + "=" * 25)
+        print(f"  - Average time per iteration: {avg_time_ms:.2f} ms")
+        print(f"  - Throughput (iterations/sec): {throughput:.2f}")
+        if device.type == "cuda":
+            end_mem = torch.cuda.max_memory_allocated(device)
+            peak_mem_gb = (end_mem - start_mem) / (1024 ** 3)
+            print(f"  - Peak GPU Memory Allocated: {peak_mem_gb:.2f} GB")
+        print("=" * 69)
+
+if __name__ == "__main__":
+    # To run: python model.py --benchmark --compile
+    main()
+
+
 
 __all__ = [
     "CS2Config",
