@@ -997,10 +997,22 @@ class PlayerHeads(nn.Module):
         
         self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
         
-        # 1. Seed: Project the flat token to a starting 3D volume
-        # The starting volume will have the correct Z dimension already.
-        # We start with a small spatial resolution (8x8) that will be upsampled to 64x64.
-        self.pos_seed = nn.Linear(d, self.vol_feats * 8 * 8 * 8) 
+        # 1. New, smaller seed layer. Projects 2048 -> 1024. (~2.1M params)
+        # We will create a tiny 2x2x2 seed volume.
+        self.pos_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
+
+        # 2. Seed Upsampler block. This grows the seed from 2x2x2 to 8x8x8.
+        self.seed_upsampler = nn.Sequential(
+            # Input: [B, 128, 2, 2, 2] -> Output: [B, 128, 4, 4, 4]
+            nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
+            _GN3d(self.vol_feats),
+            nn.GELU(),
+            
+            # Input: [B, 128, 4, 4, 4] -> Output: [B, 128, 8, 8, 8]
+            nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
+            _GN3d(self.vol_feats),
+            nn.GELU(),
+        )
         
         # 2. Deconvolution path: Upsample the Y and X dimensions by 8x (2^3)
         # We use anisotropic strides (1, 2, 2) to only upsample Y and X.
@@ -1029,9 +1041,14 @@ class PlayerHeads(nn.Module):
         # token: [B, d]
         B = token.shape[0]
 
-        # --- Generate Heatmap ---
-        # Project token to the initial seed volume [B, 128, 8, 8, 8]
-        seed = self.pos_seed(token).reshape(B, self.vol_feats, 8, 8, 8)
+        # 1. Project token to the initial small seed vector
+        tiny_seed_vec = self.pos_seed_projector(token)
+        # 2. Reshape into a tiny 3D volume
+        tiny_seed_vol = tiny_seed_vec.reshape(B, self.vol_feats, 2, 2, 2)
+        # 3. Pass through the learned upsampling network to get the final seed
+        seed = self.seed_upsampler(tiny_seed_vol) # Shape: [B, 128, 8, 8, 8]
+        # Sanity check to ensure the output shape of our upsampler is correct
+        assert seed.shape == (B, self.vol_feats, 8, 8, 8)
         # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
         upsampled_vol = self.pos_deconv(seed)
         # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
@@ -1061,8 +1078,15 @@ class StrategyHead(nn.Module):
         # --- Corrected 3D Deconvolutional Head for Enemy Positions ---
         self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
         
-        # 1. Seed: Project the flat token to a starting 3D volume [B, 128, 8, 8, 8]
-        self.enemy_seed = nn.Linear(d, self.vol_feats * 8 * 8 * 8)
+        self.enemy_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
+        self.seed_upsampler = nn.Sequential(
+            nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
+            _GN3d(self.vol_feats),
+            nn.GELU(),
+            nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
+            _GN3d(self.vol_feats),
+            nn.GELU(),
+        )
         
         # 2. Deconvolution path: Upsample Y and X dimensions by 8x (2^3) using
         #    anisotropic strides to preserve the Z dimension. This architecture
@@ -1094,9 +1118,9 @@ class StrategyHead(nn.Module):
     def forward(self, token: torch.Tensor) -> GameStrategyPredictions:
         B = token.shape[0]
         
-        # --- Generate Heatmap (Corrected Path) ---
-        # Project token to the initial seed volume -> [B, 128, 8, 8, 8]
-        seed = self.enemy_seed(token).reshape(B, 128, 8, 8, 8)
+        tiny_seed_vec = self.enemy_seed_projector(token)
+        tiny_seed_vol = tiny_seed_vec.reshape(B, self.vol_feats, 2, 2, 2)
+        seed = self.seed_upsampler(tiny_seed_vol)
         # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
         upsampled_vol = self.enemy_deconv(seed)
         # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
