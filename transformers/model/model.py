@@ -213,6 +213,7 @@ class CS2Config:
     # Context (training)
     context_frames: int = 128
 
+
     # Once fixed, these can never change during training or inference!
     # If fused_causal is used, any passed mask is ignored.
     use_fused_causal: bool = True #use FA2, mutually exclusive with use_frame_block_causal_mask
@@ -240,6 +241,7 @@ class CS2Config:
 
     # RoPE / long-context
     rope_base: int = 10000
+    rope_rot_dim: int = None
     rope_scaling: Optional[Dict[str, Any]] = None  # e.g.
     # {"type": "linear", "factor": 2.0}                   # 2× context
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
@@ -329,7 +331,7 @@ class ViTVisualEncoder(nn.Module):
             out = self.vit(pixel_values=x)
             return out.last_hidden_state[:, 0, :]  # [N, 1024]
 
-    def _forward_one_view(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_one_reshape(self, x: torch.Tensor) -> torch.Tensor:
         # Freeze-aware grad control
         need_grad = torch.is_grad_enabled() and self._vit_requires_grad()
         if need_grad:
@@ -351,8 +353,8 @@ class ViTVisualEncoder(nn.Module):
         per = peripheral.reshape(N, *peripheral.shape[-3:])  # [N, 3, 384, 384]
 
         # Shared ViT; take CLS token per view
-        cls_a = self._forward_one_view(fov)   # [N, 1024]
-        cls_b = self._forward_one_view(per)   # [N, 1024]
+        cls_a = self._forward_one_reshape(fov)   # [N, 1024]
+        cls_b = self._forward_one_reshape(per)   # [N, 1024]
 
         vis = self.proj(torch.cat([cls_a, cls_b], dim=-1)).reshape(B, T, P, self.d_model)
         return vis
@@ -456,11 +458,11 @@ class RoPEPositionalEncoding(nn.Module):
     It applies sin/cos rotations to designated slices of the Q/K vectors per head.
     The total rotation dimension (`rot_dim`) is split evenly between the two axes.
     """
-    def __init__(self, cfg: CS2Config, rot_dim: Optional[int] = None):
+    def __init__(self, cfg: CS2Config):
         super().__init__()
         self.cfg = cfg
         self.base = cfg.rope_base
-        self.rot_dim = rot_dim
+        self.rot_dim = cfg.rope_rot_dim
         # Default scale = 1.0. This scale is ONLY for the temporal axis.
         self.register_buffer("scale", torch.tensor(1.0), persistent=False)
         self._apply_cfg_scaling(getattr(cfg,"rope_scaling", None))
@@ -613,7 +615,7 @@ class CS2GQAAttention(nn.Module):
         assert d % hq == 0, "d_model must be divisible by n_q_heads"
         self.head_dim = d // hq
         # RoPE needs even rotation dim; with full-head RoPE this means even head_dim
-        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
         self.dropout = float(getattr(cfg, "attn_dropout", 0.0))
 
         # Projections
@@ -663,7 +665,7 @@ class CS2GQAAttention(nn.Module):
             m = m <= -1e4  # treat very negative as masked-out
         # Shape normalize
         if m.dim() == 2:          # [L, L] -> [1,1,L,L]
-            m = m.view(1, 1, L, L)
+            m = m.reshape(1, 1, L, L)
         elif m.dim() == 3:        # [B, L, L] -> [B,1,L,L]
             m = m.unsqueeze(1)
         elif m.dim() == 4:
@@ -751,12 +753,12 @@ class CS2GQAAttention(nn.Module):
                 G = self.cfg.tokens_per_frame
                 pos = torch.arange(L, device=x.device)
                 frame_id = (pos // G)
-                fi_q = frame_id.view(1, 1, L, 1)
-                fi_k = frame_id.view(1, 1, 1, L)
+                fi_q = frame_id.reshape(1, 1, L, 1)
+                fi_k = frame_id.reshape(1, 1, 1, L)
                 built_mask = (fi_k > fi_q)  # True = disallow
             elif self.cfg.use_fused_causal:
                 i = torch.arange(L, device=x.device)
-                built_mask = (i[None, :] > i[:, None]).view(1, 1, L, L)  # True = disallow
+                built_mask = (i[None, :] > i[:, None]).reshape(1, 1, L, L)  # True = disallow
 
             if ext_mask is None:
                 disallow_mask = built_mask
@@ -1014,6 +1016,7 @@ class CS2Transformer(nn.Module):
             self.token_game_strategy, self.token_scratch, self.dead_embedding,
             *self.player_slot_embed.parameters(),
         ]
+        #todo make sure optimizer uses lr_scale
         return [
             {"params": vit_params, "name": "vit", "lr_scale": 0.1},
             {"params": rest, "name": "core", "lr_scale": 1.0},
@@ -1048,8 +1051,8 @@ class CS2Transformer(nn.Module):
 
             # ---- special tokens per frame ----
             # self.token_game_strategy / token_scratch are [d]; make them [1,1,1,d] then expand
-            tok_gs = self.token_game_strategy.view(1, 1, 1, -1).expand(B, T, 1, d)  # [B, T, 1, d]
-            tok_sc = self.token_scratch.view(1, 1, 1, -1).expand(B, T, 1, d)        # [B, T, 1, d]
+            tok_gs = self.token_game_strategy.reshape(1, 1, 1, -1).expand(B, T, 1, d)  # [B, T, 1, d]
+            tok_sc = self.token_scratch.reshape(1, 1, 1, -1).expand(B, T, 1, d)        # [B, T, 1, d]
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)        # [B, T, 7, d]
 
             # ---- flatten time to sequence ----
