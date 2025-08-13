@@ -7,29 +7,24 @@ services:
     volumes:
       - ./:/workspace
       - pip-cache:/root/.cache/pip
-    stdin_open: true   # keeps STDIN open (so you get an interactive prompt)
+    stdin_open: true   # keep STDIN open
     tty: true          # allocate a TTY
-    ipc: host          # recommended for PyTorch dataloaders
-    shm_size: "16gb"   # optional: increase shared memory (adjust as needed)
+    ipc: host
+    shm_size: "16gb"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
-    # If you're on modern Docker Compose, this requests GPUs from the NVIDIA driver.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: ["gpu"]
+    # Compose v2+ with NVIDIA Container Toolkit supports this:
+    gpus: all
+    # Run setup, then hand you an interactive shell
+    entrypoint: ["/bin/bash", "-lc"]
     command: >
-      bash -lc "
-        python -m pip install --upgrade pip setuptools wheel &&
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi &&
-        echo -e '\n✅ Environment ready. You are now inside the NGC PyTorch container.' &&
-        exec bash
-      "
+      "python -m pip install --upgrade pip setuptools wheel &&
+       if [ -f requirements.txt ]; then pip install -r requirements.txt; fi &&
+       echo '✅ Environment ready. Type exit to leave.' &&
+       exec bash"
 
 volumes:
   pip-cache:
