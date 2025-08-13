@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   dev:
     image: nvcr.io/nvidia/pytorch:25.06-py3
@@ -7,8 +5,16 @@ services:
     volumes:
       - ./:/workspace
       - pip-cache:/root/.cache/pip
-    stdin_open: true   # keep STDIN open
-    tty: true          # allocate a TTY
+
+      # 🔽 persist model caches on the host
+      - ./cache/hf:/workspace/.cache/huggingface
+      - ./cache/torch:/workspace/.cache/torch
+      - ./cache/datasets:/workspace/.cache/huggingface/datasets
+      # (optional) keep your HF auth files outside the repo:
+      # - ~/.huggingface:/root/.huggingface:ro
+
+    stdin_open: true
+    tty: true
     ipc: host
     shm_size: "16gb"
     environment:
@@ -16,14 +22,20 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
-    # Compose v2+ with NVIDIA Container Toolkit supports this:
+
+      # 🔽 tell libs where to cache
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface/transformers
+      - HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface/hub
+      - HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets
+      - TORCH_HOME=/workspace/.cache/torch  # used by timm & torch.hub
+
     gpus: all
-    # Run setup, then hand you an interactive shell
     entrypoint: ["/bin/bash", "-lc"]
     command: >
       "python -m pip install --upgrade pip setuptools wheel &&
        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi &&
-       echo '✅ Environment ready. Type exit to leave.' &&
+       echo '✅ Environment ready. Caches are mounted.' &&
        exec bash"
 
 volumes:
