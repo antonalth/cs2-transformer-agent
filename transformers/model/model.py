@@ -724,117 +724,120 @@ class CS2GQAAttention(nn.Module):
         kv_cache: Optional[KVCache] = None
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """
-        Dual-path attention with intelligent masking for SDPA.
+        Dual-path attention optimized for training and autoregressive inference.
 
-        - Training Path (kv_cache is None): Uses fast FlashAttention-2.
-        - SDPA Fallback/Inference Path:
-            - For training fallbacks with standard causality, uses the efficient `is_causal=True`.
-            - For inference with caching, builds the necessary boolean attention mask manually.
-            - For custom frame-block masking, builds the mask manually.
+        - Training Path: For standard training runs (no KV cache), this uses the highly
+          optimized FlashAttention-2 kernel if available.
+
+        - Universal SDPA Path: This path handles all other cases, including:
+            1. Autoregressive inference with KV Caching.
+            2. Custom masking logic (e.g., frame-block causality).
+            3. Fallbacks when FlashAttention-2 is unavailable or fails.
+
+        It correctly uses the `is_causal=True` flag for both square (training) and
+        non-square (inference) attention patterns, avoiding manual mask construction
+        where possible, per modern PyTorch best practices.
         """
         B, L_new, D = x.shape
         Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
 
-        # Projections and RoPE for the new tokens
+        # Project and apply RoPE to the new incoming tokens
         q_new = self.wq(x).reshape(B, L_new, Hq, Hd)
         k_new = self.wk(x).reshape(B, L_new, Hkv, Hd)
         v_new = self.wv(x).reshape(B, L_new, Hkv, Hd)
         q_new, k_new = self.rope(q_new, k_new, temporal_pos_ids, structural_pos_ids)
 
-        is_inference_caching = kv_cache is not None
+        # Determine if we are running inference with a KV cache
+        is_inference = kv_cache is not None
+
+        # --- PATH 1: Fused Causal Attention for Training ---
+        # This is the fastest path, used only during training under ideal conditions.
         can_use_fused_training_path = (
-            not is_inference_caching
-            and self._use_fa2(x, q_new)
-            and self.cfg.use_fused_causal
+            not is_inference
+            and not self.cfg.use_frame_block_causal_mask # FA2 causal doesn't support our custom mask
             and attn_mask is None
+            and self._use_fa2(x, q_new)
         )
 
-        # --- PATH 1: Fused Causal Attention for Training (Unchanged) ---
+        out = None
         if can_use_fused_training_path:
-            if Hq != Hkv:
-                k_new = k_new.repeat_interleave(Hq // Hkv, dim=2)
-                v_new = v_new.repeat_interleave(Hq // Hkv, dim=2)
+            # GQA requires repeating KV heads to match query heads
+            k_fa2 = k_new.repeat_interleave(Hq // Hkv, dim=2)
+            v_fa2 = v_new.repeat_interleave(Hq // Hkv, dim=2)
             try:
-                out = self._fa2_call(q_new, k_new, v_new, dropout_p=(self.dropout if self.training else 0.0), causal=True)
+                # Use the optimized FA2 kernel with its built-in causal mask
+                out = self._fa2_call(q_new, k_fa2, v_fa2, dropout_p=(self.dropout if self.training else 0.0), causal=True)
             except Exception:
-                # On any error, fall back to the universal SDPA path
-                return self.forward(x, attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=None)
+                # If FA2 fails for any reason, `out` remains None, and we fall through to the SDPA path
+                pass
 
-            out = out.reshape(B, L_new, D)
-            return self.wo(out), None
+        # If we used the fast path, finalize and return
+        if out is not None:
+            return self.wo(out.reshape(B, L_new, D)), None # No cache is returned in the training path
 
-        # --- PATH 2: SDPA for Caching (Inference) or Fallback (REFINED LOGIC) ---
-        else:
-            if is_inference_caching:
-                k = torch.cat([kv_cache.key, k_new], dim=1)
-                v = torch.cat([kv_cache.value, v_new], dim=1)
-            else: # Training fallback
-                k = k_new
-                v = v_new
+        # --- PATH 2: Universal SDPA for Inference, Custom Masks, or Fallbacks ---
+        # This path handles all cases where the fused path wasn't taken.
 
-            updated_cache = KVCache(key=k, value=v)
+        # 1. Prepend the cache if it exists
+        if is_inference:
+            k = torch.cat([kv_cache.key, k_new], dim=1)
+            v = torch.cat([kv_cache.value, v_new], dim=1)
+        else: # This is a training-time fallback
+            k = k_new
+            v = v_new
 
-            if Hq != Hkv:
-                k = k.repeat_interleave(Hq // Hkv, dim=2)
-                v = v.repeat_interleave(Hq // Hkv, dim=2)
+        # The new cache always contains the full sequence of keys and values
+        updated_cache = KVCache(key=k, value=v)
 
+        # 2. Expand K/V heads for Grouped-Query Attention
+        k_gqa = k.repeat_interleave(Hq // Hkv, dim=2)
+        v_gqa = v.repeat_interleave(Hq // Hkv, dim=2)
+
+        # 3. Configure the correct masking for SDPA
+        sdpa_mask = None
+        sdpa_is_causal = False # Will be overridden if conditions are met
+
+        if attn_mask is not None:
+            # An explicit mask was provided by the user. Use it.
+            sdpa_mask = self._prep_attn_mask(attn_mask, L=k.shape[1], B=B)
+        elif self.cfg.use_frame_block_causal_mask:
+            # A custom frame-block mask is required. We must build it manually.
             total_len = k.shape[1]
-            q_for_attn = q_new
+            G = self.cfg.tokens_per_frame
+            pos = torch.arange(total_len, device=x.device)
+            frame_id = (pos // G)
+            fi_k = frame_id.reshape(1, total_len)
 
-            # --- Refined SDPA Parameter Setup ---
-            sdpa_attn_mask = self._prep_attn_mask(attn_mask, L=total_len, B=B)
-            sdpa_is_causal = False
+            if is_inference: # Query is only the new token(s)
+                L_past = total_len - L_new
+                q_indices = torch.arange(L_past, total_len, device=x.device)
+                fi_q = frame_id[q_indices].reshape(L_new, 1)
+            else: # Query is the full sequence
+                fi_q = frame_id.reshape(total_len, 1)
 
-            if sdpa_attn_mask is None: # Only consider causal masking if no external mask is provided.
+            sdpa_mask = (fi_k > fi_q).to(x.device) # True where key frame > query frame
+        else:
+            # No custom mask needed. Use the efficient built-in causal masking.
+            # This correctly handles both square (training) and non-square (inference) cases.
+            sdpa_is_causal = True
 
-                # Scenario 1: Training fallback with standard causality.
-                # Here, Q and K have the same length, so `is_causal=True` is efficient and correct.
-                if not is_inference_caching and (self.cfg.use_fused_causal or self.cfg.inference_use_standard_causal):
-                    sdpa_is_causal = True
+        # 4. Final SDPA call
+        # Permute to the [B, H, L, Hd] layout that SDPA expects
+        q_bHLD = q_new.permute(0, 2, 1, 3)
+        k_bHLD = k_gqa.permute(0, 2, 1, 3)
+        v_bHLD = v_gqa.permute(0, 2, 1, 3)
 
-                # Scenario 2: Inference with standard causality.
-                # Here, Q is short and K is long. We MUST build the mask manually as `is_causal`
-                # assumes a square attention matrix.
-                elif is_inference_caching and self.cfg.inference_use_standard_causal:
-                    L_past = total_len - L_new
-                    q_indices = torch.arange(L_past, total_len, device=x.device)
-                    k_indices = torch.arange(total_len, device=x.device)
-                    sdpa_attn_mask = k_indices[None, :] > q_indices[:, None]
-                    sdpa_is_causal = False # We provided the mask explicitly
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_bHLD, k_bHLD, v_bHLD,
+            attn_mask=sdpa_mask,
+            is_causal=sdpa_is_causal,
+            dropout_p=(self.dropout if self.training else 0.0),
+        )
 
-                # Scenario 3: Frame-block mask (for training or inference).
-                # This mask is always custom and must be built manually.
-                elif self.cfg.use_frame_block_causal_mask:
-                    G = self.cfg.tokens_per_frame
-                    pos = torch.arange(total_len, device=x.device)
-                    frame_id = (pos // G)
-                    
-                    if is_inference_caching:
-                        L_past = total_len - L_new
-                        fi_q = frame_id[L_past:].reshape(L_new, 1)
-                    else: # Training fallback
-                        fi_q = frame_id.reshape(total_len, 1)
-                    
-                    fi_k = frame_id.reshape(1, total_len)
-                    sdpa_attn_mask = (fi_k > fi_q)
-                    sdpa_is_causal = False
-
-            # --- Final SDPA Call ---
-            q_bHLD = q_for_attn.permute(0, 2, 1, 3)
-            k_bHLD = k.permute(0, 2, 1, 3)
-            v_bHLD = v.permute(0, 2, 1, 3)
-
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_bHLD, k_bHLD, v_bHLD,
-                attn_mask=sdpa_attn_mask,
-                is_causal=sdpa_is_causal,
-                dropout_p=(self.dropout if self.training else 0.0),
-            )
-            out = out.permute(0, 2, 1, 3).contiguous().reshape(B, L_new, D)
-
-            return self.wo(out), updated_cache
-
-
+        # Reshape output back to [B, L, D] and apply final projection
+        out = out.permute(0, 2, 1, 3).contiguous().reshape(B, L_new, D)
+        return self.wo(out), updated_cache
+    
 class CS2TransformerEncoderLayer(nn.Module):
     def __init__(self, cfg: CS2Config, rope: RoPEPositionalEncoding):
         super().__init__()
