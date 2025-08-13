@@ -729,132 +729,133 @@ class CS2GQAAttention(nn.Module):
             return m
 
         raise ValueError(f"Unsupported attn_mask dims: {m.dim()}")
-def forward(
-    self,
-    x: torch.Tensor,
-    attn_mask: Optional[torch.Tensor],
-    temporal_pos_ids: torch.Tensor,
-    structural_pos_ids: torch.Tensor,
-    kv_cache: Optional[KVCache] = None
-) -> Tuple[torch.Tensor, Optional[KVCache]]:
-    B, L_new, D = x.shape
-    Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
-    assert Hq % Hkv == 0, "n_q_heads must be a multiple of n_kv_heads for GQA"
-    gqa_factor = Hq // Hkv
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        temporal_pos_ids: torch.Tensor,
+        structural_pos_ids: torch.Tensor,
+        kv_cache: Optional[KVCache] = None
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        B, L_new, D = x.shape
+        Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
+        assert Hq % Hkv == 0, "n_q_heads must be a multiple of n_kv_heads for GQA"
+        gqa_factor = Hq // Hkv
 
-    inference_mode = not self.training
+        inference_mode = not self.training
 
-    if L_new == 0:
-        # nothing to do; return no-op and preserve cache
-        return x[:, :0, :], (kv_cache if inference_mode else None)
+        if L_new == 0:
+            # nothing to do; return no-op and preserve cache
+            return x[:, :0, :], (kv_cache if inference_mode else None)
 
-    # --- ABSOLUTE positions to avoid RoPE drift ---------------------------------
-    # For inference, ignore any caller-provided temporal_pos_ids and rebuild them
-    # from the cache's absolute position counter.
-    if inference_mode:
-        abs_pos_start = kv_cache.pos_end if kv_cache is not None else 0
-        temporal_pos_ids = torch.arange(
-            abs_pos_start, abs_pos_start + L_new, device=x.device
-        )
-    # ---------------------------------------------------------------------------
+        # --- ABSOLUTE positions to avoid RoPE drift ---------------------------------
+        # For inference, ignore any caller-provided temporal_pos_ids and rebuild them
+        # from the cache's absolute position counter.
+        if inference_mode:
+            abs_pos_start = kv_cache.pos_end if kv_cache is not None else 0
+            temporal_pos_ids = torch.arange(
+                abs_pos_start, abs_pos_start + L_new, device=x.device
+            )
+        # ---------------------------------------------------------------------------
 
-    # Projections for NEW tokens
-    q_new = self.wq(x).reshape(B, L_new, Hq, Hd)
-    k_new = self.wk(x).reshape(B, L_new, Hkv, Hd)
-    v_new = self.wv(x).reshape(B, L_new, Hkv, Hd)
+        # Projections for NEW tokens
+        q_new = self.wq(x).reshape(B, L_new, Hq, Hd)
+        k_new = self.wk(x).reshape(B, L_new, Hkv, Hd)
+        v_new = self.wv(x).reshape(B, L_new, Hkv, Hd)
 
-    # Apply RoPE to NEW tokens using ABS positions
-    q_new, k_new = self.rope(q_new, k_new, temporal_pos_ids, structural_pos_ids)
+        # Apply RoPE to NEW tokens using ABS positions
+        q_new, k_new = self.rope(q_new, k_new, temporal_pos_ids, structural_pos_ids)
 
-    # --- Update cache with NEW (already-rotated) K/V ----------------------------
-    maxL = self.cfg.max_cache_len_tokens if (inference_mode and hasattr(self.cfg, "max_cache_len_tokens")) else None
-    new_cache = _update_cache(kv_cache, k_new, v_new, maxL) if inference_mode else None
+        # --- Update cache with NEW (already-rotated) K/V ----------------------------
+        maxL = self.cfg.max_cache_len_tokens if (inference_mode and hasattr(self.cfg, "max_cache_len_tokens")) else None
+        new_cache = _update_cache(kv_cache, k_new, v_new, maxL) if inference_mode else None
 
-    # Build full K/V for attention (cache already contains new chunk)
-    if inference_mode:
-        k_full = new_cache.key    # [B, L_tot, H_kv, Hd]
-        v_full = new_cache.value  # [B, L_tot, H_kv, Hd]
-    else:
-        # Training path: no cache concat
-        k_full, v_full = k_new, v_new
-    # ---------------------------------------------------------------------------
+        # Build full K/V for attention (cache already contains new chunk)
+        if inference_mode:
+            k_full = new_cache.key    # [B, L_tot, H_kv, Hd]
+            v_full = new_cache.value  # [B, L_tot, H_kv, Hd]
+        else:
+            # Training path: no cache concat
+            k_full, v_full = k_new, v_new
+        # ---------------------------------------------------------------------------
 
-    # GQA expansion for SDPA path
-    # (Repeat K/V heads to match Q heads if needed)
-    if gqa_factor != 1:
-        k_gqa = k_full.repeat_interleave(gqa_factor, dim=2)  # [B, L_tot, Hq, Hd]
-        v_gqa = v_full.repeat_interleave(gqa_factor, dim=2)
-    else:
-        k_gqa, v_gqa = k_full, v_full
+        # GQA expansion for SDPA path
+        # (Repeat K/V heads to match Q heads if needed)
+        if gqa_factor != 1:
+            k_gqa = k_full.repeat_interleave(gqa_factor, dim=2)  # [B, L_tot, Hq, Hd]
+            v_gqa = v_full.repeat_interleave(gqa_factor, dim=2)
+        else:
+            k_gqa, v_gqa = k_full, v_full
 
-    # --- Mask selection ---------------------------------------------------------
-    sdpa_mask = None
-    sdpa_is_causal = False
-    L_tot = k_full.shape[1]
-
-    if attn_mask is not None:
-        # NOTE: _prep_attn_mask should preserve bool dtype if provided one.
-        sdpa_mask = self._prep_attn_mask(
-            attn_mask, B=B, H=Hq, L_q=L_new, L_k=L_tot, device=x.device, dtype=q_new.dtype
-        )
-
-    elif inference_mode and not getattr(self.cfg, "inference_use_standard_causal", True):
-        # --- BEGIN PATCH: absolute frame-block mask robust to cache truncation ---
-        G = self.cfg.tokens_per_frame
-        # Absolute end position (exclusive) after appending this chunk
-        abs_end = new_cache.pos_end
-        abs_start = abs_end - L_tot  # absolute index of k_full[:, 0, :]
-
-        # Absolute frame IDs for keys
-        pos_k = torch.arange(L_tot, device=x.device)
-        frame_id_k = (abs_start + pos_k) // G  # [L_tot]
-
-        # Frame IDs for the new query positions (the tail segment of k_full)
-        L_past = L_tot - L_new
-        q_idx = torch.arange(L_past, L_tot, device=x.device)
-        frame_id_q = frame_id_k[q_idx]  # [L_new]
-
-        # Bool SDPA mask: True = masked (keys from future frames)
-        fi_k = frame_id_k.view(1, L_tot)      # [1, L_tot]
-        fi_q = frame_id_q.view(L_new, 1)      # [L_new, 1]
-        sdpa_mask = (fi_k > fi_q)             # [L_new, L_tot], broadcast over [B, H]
-
-        # With an explicit mask, do not also mark is_causal
+        # --- Mask selection ---------------------------------------------------------
+        sdpa_mask = None
         sdpa_is_causal = False
-        # --- END PATCH ---
+        L_tot = k_full.shape[1]
 
-    elif (not inference_mode) and getattr(self.cfg, "training_use_frame_block_causal", False):
-        # Training: opt-in frame-block causal when no external mask is provided
-        G = self.cfg.tokens_per_frame
-        pos = torch.arange(L_new, device=x.device)           # training is square: L_q == L_k == L_new
-        frame_id = (pos // G)
-        fi_k = frame_id.view(1, L_new)
-        fi_q = frame_id.view(L_new, 1)
-        sdpa_mask = (fi_k > fi_q)
-        sdpa_is_causal = False
-        assert sdpa_mask.shape == (L_new, L_tot), "Unexpected mask shape"
-    else:
-        # Standard rectangular-causal attention (PyTorch handles L_q != L_k)
-        sdpa_is_causal = True
-    # ---------------------------------------------------------------------------
+        if attn_mask is not None:
+            # NOTE: _prep_attn_mask should preserve bool dtype if provided one.
+            sdpa_mask = self._prep_attn_mask(
+                attn_mask, B=B, H=Hq, L_q=L_new, L_k=L_tot, device=x.device, dtype=q_new.dtype
+            )
 
-    # --- SDPA -------------------------------------------------------------------
-    q_bHLD = q_new.permute(0, 2, 1, 3)  # [B, Hq, L_new, Hd]
-    k_bHLD = k_gqa.permute(0, 2, 1, 3)  # [B, Hq, L_tot, Hd]
-    v_bHLD = v_gqa.permute(0, 2, 1, 3)  # [B, Hq, L_tot, Hd]
+        elif inference_mode and not getattr(self.cfg, "inference_use_standard_causal", True):
+            # --- BEGIN PATCH: absolute frame-block mask robust to cache truncation ---
+            G = self.cfg.tokens_per_frame
+            # Absolute end position (exclusive) after appending this chunk
+            abs_end = new_cache.pos_end
+            abs_start = abs_end - L_tot  # absolute index of k_full[:, 0, :]
 
-    out = F.scaled_dot_product_attention(
-        q_bHLD, k_bHLD, v_bHLD,
-        attn_mask=sdpa_mask,
-        is_causal=sdpa_is_causal,
-        dropout_p=(self.dropout if self.training else 0.0),
-    )
-    out = out.permute(0, 2, 1, 3).contiguous().reshape(B, L_new, D)
-    out = self.wo(out)
-    # ---------------------------------------------------------------------------
+            # Absolute frame IDs for keys
+            pos_k = torch.arange(L_tot, device=x.device)
+            frame_id_k = (abs_start + pos_k) // G  # [L_tot]
 
-    # Return updated cache only in inference
-    return out, (new_cache if inference_mode else None)
+            # Frame IDs for the new query positions (the tail segment of k_full)
+            L_past = L_tot - L_new
+            q_idx = torch.arange(L_past, L_tot, device=x.device)
+            frame_id_q = frame_id_k[q_idx]  # [L_new]
+
+            # Bool SDPA mask: True = masked (keys from future frames)
+            fi_k = frame_id_k.view(1, L_tot)      # [1, L_tot]
+            fi_q = frame_id_q.view(L_new, 1)      # [L_new, 1]
+            sdpa_mask = (fi_k > fi_q)             # [L_new, L_tot], broadcast over [B, H]
+
+            # With an explicit mask, do not also mark is_causal
+            sdpa_is_causal = False
+            # --- END PATCH ---
+
+        elif (not inference_mode) and getattr(self.cfg, "training_use_frame_block_causal", False):
+            # Training: opt-in frame-block causal when no external mask is provided
+            G = self.cfg.tokens_per_frame
+            pos = torch.arange(L_new, device=x.device)           # training is square: L_q == L_k == L_new
+            frame_id = (pos // G)
+            fi_k = frame_id.view(1, L_new)
+            fi_q = frame_id.view(L_new, 1)
+            sdpa_mask = (fi_k > fi_q)
+            sdpa_is_causal = False
+            assert sdpa_mask.shape == (L_new, L_tot), "Unexpected mask shape"
+        else:
+            # Standard rectangular-causal attention (PyTorch handles L_q != L_k)
+            sdpa_is_causal = True
+        # ---------------------------------------------------------------------------
+
+        # --- SDPA -------------------------------------------------------------------
+        q_bHLD = q_new.permute(0, 2, 1, 3)  # [B, Hq, L_new, Hd]
+        k_bHLD = k_gqa.permute(0, 2, 1, 3)  # [B, Hq, L_tot, Hd]
+        v_bHLD = v_gqa.permute(0, 2, 1, 3)  # [B, Hq, L_tot, Hd]
+
+        out = F.scaled_dot_product_attention(
+            q_bHLD, k_bHLD, v_bHLD,
+            attn_mask=sdpa_mask,
+            is_causal=sdpa_is_causal,
+            dropout_p=(self.dropout if self.training else 0.0),
+        )
+        out = out.permute(0, 2, 1, 3).contiguous().reshape(B, L_new, D)
+        out = self.wo(out)
+        # ---------------------------------------------------------------------------
+
+        # Return updated cache only in inference
+        return out, (new_cache if inference_mode else None)
 
     
 class CS2TransformerEncoderLayer(nn.Module):
