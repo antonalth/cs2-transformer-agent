@@ -214,6 +214,8 @@ class CS2Config:
     # Context (training)
     context_frames: int = 128
 
+    max_cache_len_tokens: int = None
+
 
     # --- Masking Behavior ---
     # use_fused_causal: For TRAINING. Uses FlashAttention's internal causal mask. Fastest.
@@ -258,9 +260,51 @@ class CS2Config:
 
 @dataclass
 class KVCache:
-    """Holds the Key and Value cache for a single transformer layer."""
-    key: torch.Tensor      # Shape: [B, L_past, H_kv, D_h]
-    value: torch.Tensor    # Shape: [B, L_past, H_kv, D_h]
+    key: torch.Tensor    # [B, L, H_kv, Hd]
+    value: torch.Tensor  # [B, L, H_kv, Hd]
+    pos_end: int         # absolute position *after* last cached token
+
+def _get_abs_pos_start(kv_cache_list: Optional[List[Optional[KVCache]]]) -> int:
+    if not kv_cache_list:
+        return 0
+    for c in kv_cache_list:
+        if c is not None:
+            return int(c.pos_end)
+    return 0
+
+def _update_cache(old: Optional[KVCache],
+                  new_k: torch.Tensor,  # rotated for ABS positions
+                  new_v: torch.Tensor,  # rotated for ABS positions
+                  max_cache_len_tokens: Optional[int]) -> KVCache:
+    if old is None:
+        cat_k, cat_v = new_k, new_v
+        pos_end = new_k.shape[1]  # starts at 0, ends at L_new
+    else:
+        cat_k = torch.cat([old.key, new_k], dim=1)   # [B, L_old+L_new, H_kv, Hd]
+        cat_v = torch.cat([old.value, new_v], dim=1)
+        pos_end = old.pos_end + new_k.shape[1]
+
+    if max_cache_len_tokens is not None and cat_k.shape[1] > max_cache_len_tokens:
+        cat_k = cat_k[:, -max_cache_len_tokens:]
+        cat_v = cat_v[:, -max_cache_len_tokens:]
+        # NOTE: pos_end stays absolute (no change)
+
+    return KVCache(key=cat_k.detach(), value=cat_v.detach(), pos_end=pos_end)
+
+def _assert_cache_consistency(kv_cache_list: Optional[List[Optional[KVCache]]]) -> None:
+    if not kv_cache_list:
+        return
+    lens = [int(c.key.shape[1]) for c in kv_cache_list if c is not None]
+    pos_ends = [int(c.pos_end) for c in kv_cache_list if c is not None]
+    if lens:
+        L0 = lens[0]
+        if not all(L == L0 for L in lens):
+            raise RuntimeError(f"Inconsistent cache window lengths across layers: {lens}")
+    if pos_ends:
+        P0 = pos_ends[0]
+        if not all(P == P0 for P in pos_ends):
+            raise RuntimeError(f"Inconsistent absolute positions across layers: {pos_ends}")
+
 
 def _GN2d(c: int) -> torch.nn.GroupNorm:
     # pick a divisor of c; 8→4→1 fallback mirrors _GN3d
@@ -745,109 +789,75 @@ class CS2GQAAttention(nn.Module):
         """
         B, L_new, D = x.shape
         Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
+        assert Hq % Hkv == 0, "n_q_heads must be a multiple of n_kv_heads for GQA"
+        gqa_factor = Hq // Hkv
 
-        # Project and apply RoPE to the new incoming tokens
         q_new = self.wq(x).reshape(B, L_new, Hq, Hd)
         k_new = self.wk(x).reshape(B, L_new, Hkv, Hd)
         v_new = self.wv(x).reshape(B, L_new, Hkv, Hd)
         q_new, k_new = self.rope(q_new, k_new, temporal_pos_ids, structural_pos_ids)
 
-        # Determine if we are running inference with a KV cache
-        is_inference = kv_cache is not None
+        # Treat eval mode as inference; bootstrap cache if needed
+        inference_mode = not self.training
 
-        # --- PATH 1: Fused Causal Attention for Training ---
-        # This is the fastest path, used only during training under ideal conditions.
-        can_use_fused_training_path = (
-            self.training  # Only use FA2 path during training
-            and not is_inference
-            and not self.cfg.use_frame_block_causal_mask # FA2 causal doesn't support our custom mask
-            and attn_mask is None
-            and self._use_fa2(x, q_new)
-        )
-
-        out = None
-        if can_use_fused_training_path:
-            # GQA requires repeating KV heads to match query heads
-            k_fa2 = k_new.repeat_interleave(Hq // Hkv, dim=2)
-            v_fa2 = v_new.repeat_interleave(Hq // Hkv, dim=2)
-            try:
-                # Use the optimized FA2 kernel with its built-in causal mask
-                out = self._fa2_call(q_new, k_fa2, v_fa2, dropout_p=(self.dropout if self.training else 0.0), causal=True)
-            except Exception:
-                # If FA2 fails for any reason, `out` remains None, and we fall through to the SDPA path
-                pass
-
-        # If we used the fast path, finalize and return
-        if out is not None:
-            return self.wo(out.reshape(B, L_new, D)), None # No cache is returned in the training path
-
-        # --- PATH 2: Universal SDPA for Inference, Custom Masks, or Fallbacks ---
-        # This path handles all cases where the fused path wasn't taken.
-
-        # 1. Prepend the cache if it exists
-        if is_inference:
-            k = torch.cat([kv_cache.key, k_new], dim=1)
-            v = torch.cat([kv_cache.value, v_new], dim=1)
-        else: # This is a training-time fallback
+        if kv_cache is not None:
+            # (optional) align device/dtype first
+            k_prev = kv_cache.key
+            v_prev = kv_cache.value
+            if k_prev.device != k_new.device or k_prev.dtype != k_new.dtype:
+                k_prev = k_prev.to(device=k_new.device, dtype=k_new.dtype)
+                v_prev = v_prev.to(device=v_new.device, dtype=v_new.dtype)
+            k = torch.cat([k_prev, k_new], dim=1)
+            v = torch.cat([v_prev, v_new], dim=1)
+        else:
             k = k_new
             v = v_new
 
-        # FIX: Only create a cache for inference, and always detach the tensors.
-        updated_cache: Optional[KVCache]
-        if is_inference:
-            # For inference, create the cache and detach tensors from the graph.
-            updated_cache = KVCache(key=k.detach(), value=v.detach())
-        else:
-            # For training fallbacks, no cache is needed.
-            updated_cache = None
+        # Sliding window (optional)
+        if inference_mode and getattr(self.cfg, "max_cache_len_tokens", None):
+            maxL = self.cfg.max_cache_len_tokens
+            k = k[:, -maxL:, :, :]
+            v = v[:, -maxL:, :, :]
 
-        # 2. Expand K/V heads for Grouped-Query Attention
-        k_gqa = k.repeat_interleave(Hq // Hkv, dim=2)
-        v_gqa = v.repeat_interleave(Hq // Hkv, dim=2)
+        # GQA expansion for SDPA
+        k_gqa = k.repeat_interleave(gqa_factor, dim=2)
+        v_gqa = v.repeat_interleave(gqa_factor, dim=2)
 
-        # 3. Configure the correct masking for SDPA
+        # Mask selection
         sdpa_mask = None
-        sdpa_is_causal = False # Will be overridden if conditions are met
-
+        sdpa_is_causal = False
         if attn_mask is not None:
-            # An explicit mask was provided by the user. Use it.
             sdpa_mask = self._prep_attn_mask(attn_mask, L=k.shape[1], B=B, device=x.device)
-        elif self.cfg.use_frame_block_causal_mask:
-            # A custom frame-block mask is required. We must build it manually.
+        elif inference_mode and not self.cfg.inference_use_standard_causal:
+            # frame-block causal
             total_len = k.shape[1]
             G = self.cfg.tokens_per_frame
             pos = torch.arange(total_len, device=x.device)
-            frame_id = (pos // G)
+            frame_id = pos // G
             fi_k = frame_id.reshape(1, total_len)
-
-            if is_inference: # Query is only the new token(s)
-                L_past = total_len - L_new
-                q_indices = torch.arange(L_past, total_len, device=x.device)
-                fi_q = frame_id[q_indices].reshape(L_new, 1)
-            else: # Query is the full sequence
-                fi_q = frame_id.reshape(total_len, 1)
-
-            sdpa_mask = (fi_k > fi_q).to(x.device) # True where key frame > query frame
+            L_past = total_len - L_new
+            q_idx = torch.arange(L_past, total_len, device=x.device)
+            fi_q = frame_id[q_idx].reshape(L_new, 1)
+            sdpa_mask = (fi_k > fi_q)
         else:
-            # No custom mask needed. Use the efficient built-in causal masking.
-            # This correctly handles both square (training) and non-square (inference) cases.
             sdpa_is_causal = True
 
-        # 4. Final SDPA call
-        # Permute to the [B, H, L, Hd] layout that SDPA expects
+        # SDPA call
         q_bHLD = q_new.permute(0, 2, 1, 3)
         k_bHLD = k_gqa.permute(0, 2, 1, 3)
         v_bHLD = v_gqa.permute(0, 2, 1, 3)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
+        out = F.scaled_dot_product_attention(
             q_bHLD, k_bHLD, v_bHLD,
-            attn_mask=sdpa_mask,
-            is_causal=sdpa_is_causal,
+            attn_mask=sdpa_mask, is_causal=sdpa_is_causal,
             dropout_p=(self.dropout if self.training else 0.0),
         )
-
-        # Reshape output back to [B, L, D] and apply final projection
         out = out.permute(0, 2, 1, 3).contiguous().reshape(B, L_new, D)
+
+        # Always return a cache in inference
+        updated_cache = None
+        if inference_mode:
+            updated_cache = KVCache(key=k.detach(), value=v.detach())
+
         return self.wo(out), updated_cache
     
 class CS2TransformerEncoderLayer(nn.Module):
@@ -903,8 +913,13 @@ class CS2Backbone(nn.Module):
         # --- CRITICAL: Calculate Positional IDs with offset for caching ---
         # The starting position is 0 if there's no cache, otherwise it's the
         # length of the sequence already in the cache.
-        past_len = kv_cache_list[0].key.shape[1] if kv_cache_list is not None and kv_cache_list[0] is not None else 0
-        pos = torch.arange(past_len, past_len + L_new, device=x.device)
+
+        #todo check okay
+        _assert_cache_consistency(kv_cache_list)
+        abs_pos_start = _get_abs_pos_start(kv_cache_list)  # int
+        L_new = x.size(1)  # or the variable you already use for new-token length
+        pos = torch.arange(abs_pos_start, abs_pos_start + L_new, device=x.device)  # [L_new]
+        # use `pos` for rotating the *new* q/k only (do not re-rotate cached states)
 
         temporal_pos_ids = pos // G    # Frame index
         structural_pos_ids = pos % G  # Token index within a frame
@@ -1274,6 +1289,7 @@ def main():
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile() for the model.")
     parser.add_argument("--freeze-vit", action="store_true", help="Freeze the ViT encoder weights.")
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of just a shape test.")
+    parser.add_argument("--autoregressive", type=int, metavar="N_FRAMES", help="Run autoregressive KV-cached benchmark for N frames.")
     parser.add_argument("--warmup-steps", type=int, default=5, help="Number of warmup steps for benchmark.")
     parser.add_argument("--bench-steps", type=int, default=20, help="Number of benchmark steps.")
     parser.add_argument("--dummy-vit", action="store_true",help="Disable ViT to bench main model.")
@@ -1296,6 +1312,7 @@ def main():
     print(f"  - Batch Size: {args.batch_size}")
     print(f"  - Context Frames: {args.context_frames}")
     print(f"  - torch.compile(): {args.compile}")
+    print(f"  - Autoregressive benchmark: {'Yes (' + str(args.autoregressive) + ' frames)' if args.autoregressive else 'No'}")
     print("-" * 60)
 
 
@@ -1346,9 +1363,9 @@ def main():
     assert strat_pred["round_number"].shape == (B, 1), "Round number shape is wrong"
     print("✅ Shape Test Passed!")
 
-    # --- Run Benchmark ---
+    # --- Run Standard Benchmark ---
     if args.benchmark:
-        print("\n[PHASE 2] Running Benchmark...")
+        print("\n[PHASE 2] Running Standard Benchmark...")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
             start_mem = torch.cuda.max_memory_allocated(device)
@@ -1386,8 +1403,65 @@ def main():
             print(f"  - Peak GPU Memory Allocated: {peak_mem_gb:.2f} GB")
         print("=" * 69)
 
+    # --- Run Autoregressive Benchmark ---
+    if args.autoregressive:
+        print("\n[PHASE 3] Running Autoregressive (KV-Cached) Benchmark...")
+        num_frames = args.autoregressive
+        model.eval() # Ensure model is in eval mode
+
+        # Create a dummy batch for a single frame (T=1)
+        single_frame_batch: CS2Batch = {
+            "foveal_images": torch.randint(0, 256, (B, 1, P, 3, 384, 384), device=device, dtype=torch.uint8),
+            "peripheral_images": torch.randint(0, 256, (B, 1, P, 3, 384, 384), device=device, dtype=torch.uint8),
+            "mel_spectrogram": torch.randn(B, 1, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
+            "alive_mask": torch.randint(0, 2, (B, 1, P), device=device, dtype=torch.bool),
+        }
+
+        # Warmup
+        print(f"  - Warming up for {args.warmup_steps} autoregressive steps...")
+        with torch.no_grad():
+            kv_cache = [None] * cfg.n_layers
+            for _ in range(args.warmup_steps):
+                _, kv_cache = model.autoregressive_step(single_frame_batch, kv_cache)
+
+        # Benchmark
+        print(f"  - Benchmarking for {num_frames} autoregressive steps...")
+        kv_cache = [None] * cfg.n_layers
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            start_mem = torch.cuda.max_memory_allocated(device)
+            torch.cuda.synchronize()
+        
+        start_time = time.perf_counter()
+
+        with torch.no_grad():
+            for _ in range(num_frames):
+                _, kv_cache = model.autoregressive_step(single_frame_batch, kv_cache)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
+
+        # Report results
+        total_time = end_time - start_time
+        avg_time_ms = (total_time / num_frames) * 1000
+        throughput_fps = num_frames / total_time
+
+        print("\n" + "=" * 20 + " AUTOREGRESSIVE BENCHMARK RESULTS " + "=" * 20)
+        print(f"  - Total frames generated: {num_frames}")
+        print(f"  - Average time per frame: {avg_time_ms:.2f} ms")
+        print(f"  - Throughput (Frames/Sec): {throughput_fps:.2f} FPS")
+        if device.type == "cuda":
+            end_mem = torch.cuda.max_memory_allocated(device)
+            # The cache is now the dominant memory user
+            peak_mem_gb = (end_mem) / (1024 ** 3)
+            print(f"  - Peak GPU Memory Allocated (incl. cache): {peak_mem_gb:.2f} GB")
+        print("=" * 69)
+
+
 if __name__ == "__main__":
-    # To run: python model.py --benchmark --compile
+    # To run standard benchmark: python model.py --benchmark --compile
+    # To run autoregressive benchmark: python model.py --autoregressive 100 --compile
     main()
 
 
