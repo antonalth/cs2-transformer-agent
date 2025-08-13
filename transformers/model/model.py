@@ -1117,6 +1117,7 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=5, help="Number of warmup steps for benchmark.")
     parser.add_argument("--bench-steps", type=int, default=20, help="Number of benchmark steps.")
     parser.add_argument("--dummy-vit", action="store_true",help="Disable ViT to bench main model.")
+    parser.add_argument("--num-layers", type=int, default=24, help="Set number of main tf layers.")
     args = parser.parse_args()
 
     # --- Setup Device and DType ---
@@ -1142,7 +1143,7 @@ def main():
     cfg = CS2Config(
         compute_dtype=args.dtype,
         context_frames=args.context_frames,
-        n_layers=1
+        n_layers=args.num_layers
     )
     model = CS2Transformer(cfg, args.dummy_vit).to(device).eval()
 
