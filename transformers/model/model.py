@@ -630,6 +630,8 @@ class CS2GQAAttention(nn.Module):
         self.rope = rope
         d, hq, hkv = cfg.d_model, cfg.n_q_heads, cfg.n_kv_heads
         assert d % hq == 0, "d_model must be divisible by n_q_heads"
+        # FIX: Assert n_q_heads is divisible by n_kv_heads for GQA
+        assert hq % hkv == 0, "n_q_heads must be divisible by n_kv_heads for GQA"
         self.head_dim = d // hq
         # RoPE needs even rotation dim; with full-head RoPE this means even head_dim
         assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
@@ -667,33 +669,37 @@ class CS2GQAAttention(nn.Module):
                 return False
         return True
 
-    def _prep_attn_mask(self, attn_mask: Optional[torch.Tensor], L: int, B: int) -> Optional[torch.Tensor]:
-        """
-        Normalize attention masks for PyTorch SDPA:
-          - Boolean mask: True = DISALLOW (masked-out), False = allow.
-          - Float mask: additive; large negative (e.g., <= -1e4) = disallow, 0 = allow.
-        Supports shapes: [L,L], [B,L,L], [B,1,L,L], [1,1,L,L].
-        Returns bool mask broadcastable to [B, H, L, L] (we pass H explicitly in SDPA).
-        """
-        if attn_mask is None:
-            return None
-        m = attn_mask
-        if m.dtype != torch.bool:
-            m = m <= -1e4  # treat very negative as masked-out
-        # Shape normalize
-        if m.dim() == 2:          # [L, L] -> [1,1,L,L]
-            m = m.reshape(1, 1, L, L)
-        elif m.dim() == 3:        # [B, L, L] -> [B,1,L,L]
-            m = m.unsqueeze(1)
-        elif m.dim() == 4:
-            # assume already [B or 1, H or 1, L, L]
-            pass
-        else:
-            raise ValueError(f"Unsupported attn_mask dims: {m.shape}")
-        # ensure batch dimension is either 1 or B
-        if m.shape[0] not in (1, B):
-            raise ValueError(f"attn_mask batch dim {m.shape[0]} incompatible with B={B}")
-        return m.to(torch.bool)
+    def _prep_attn_mask(self, attn_mask: Optional[torch.Tensor], L: int, B: int, device: torch.device) -> Optional[torch.Tensor]:
+            """
+            Normalize attention masks for PyTorch SDPA:
+            - Boolean mask: True = DISALLOW (masked-out), False = allow.
+            - Float mask: additive; large negative (e.g., <= -1e4) = disallow, 0 = allow.
+            Supports shapes: [L,L], [B,L,L], [B,1,L,L], [1,1,L,L].
+            Returns bool mask broadcastable to [B, H, L, L] on the correct device.
+            """
+            if attn_mask is None:
+                return None
+            m = attn_mask
+            if m.dtype != torch.bool:
+                m = m <= -1e4  # treat very negative as masked-out
+            
+            # FIX: Ensure mask is on the same device as the input tensors
+            m = m.to(device)
+
+            # Shape normalize
+            if m.dim() == 2:          # [L, L] -> [1,1,L,L]
+                m = m.reshape(1, 1, L, L)
+            elif m.dim() == 3:        # [B, L, L] -> [B,1,L,L]
+                m = m.unsqueeze(1)
+            elif m.dim() == 4:
+                # assume already [B or 1, H or 1, L, L]
+                pass
+            else:
+                raise ValueError(f"Unsupported attn_mask dims: {m.shape}")
+            # ensure batch dimension is either 1 or B
+            if m.shape[0] not in (1, B):
+                raise ValueError(f"attn_mask batch dim {m.shape[0]} incompatible with B={B}")
+            return m.to(torch.bool)
 
     def _fa2_call(self, q, k, v, dropout_p: float, causal: bool):
         """Handle FA2 signature drift gracefully; return tensor or raise to trigger fallback."""
@@ -713,7 +719,6 @@ class CS2GQAAttention(nn.Module):
                 softmax_scale=None,
                 causal=causal,
             )
-
 
     def forward(
         self,
@@ -753,7 +758,8 @@ class CS2GQAAttention(nn.Module):
         # --- PATH 1: Fused Causal Attention for Training ---
         # This is the fastest path, used only during training under ideal conditions.
         can_use_fused_training_path = (
-            not is_inference
+            self.training  # Only use FA2 path during training
+            and not is_inference
             and not self.cfg.use_frame_block_causal_mask # FA2 causal doesn't support our custom mask
             and attn_mask is None
             and self._use_fa2(x, q_new)
@@ -786,8 +792,14 @@ class CS2GQAAttention(nn.Module):
             k = k_new
             v = v_new
 
-        # The new cache always contains the full sequence of keys and values
-        updated_cache = KVCache(key=k, value=v)
+        # FIX: Only create a cache for inference, and always detach the tensors.
+        updated_cache: Optional[KVCache]
+        if is_inference:
+            # For inference, create the cache and detach tensors from the graph.
+            updated_cache = KVCache(key=k.detach(), value=v.detach())
+        else:
+            # For training fallbacks, no cache is needed.
+            updated_cache = None
 
         # 2. Expand K/V heads for Grouped-Query Attention
         k_gqa = k.repeat_interleave(Hq // Hkv, dim=2)
@@ -799,7 +811,7 @@ class CS2GQAAttention(nn.Module):
 
         if attn_mask is not None:
             # An explicit mask was provided by the user. Use it.
-            sdpa_mask = self._prep_attn_mask(attn_mask, L=k.shape[1], B=B)
+            sdpa_mask = self._prep_attn_mask(attn_mask, L=k.shape[1], B=B, device=x.device)
         elif self.cfg.use_frame_block_causal_mask:
             # A custom frame-block mask is required. We must build it manually.
             total_len = k.shape[1]
@@ -857,7 +869,7 @@ class CS2TransformerEncoderLayer(nn.Module):
         temporal_pos_ids: torch.Tensor,
         structural_pos_ids: torch.Tensor,
         kv_cache: Optional[KVCache] = None
-    ) -> Tuple[torch.Tensor, KVCache]:
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """
         Now accepts and returns a KV cache.
         """
@@ -880,7 +892,7 @@ class CS2Backbone(nn.Module):
 
     def forward(
         self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], kv_cache_list: Optional[List[KVCache]] = None
-    ) -> Tuple[torch.Tensor, List[KVCache]]:
+    ) -> Tuple[torch.Tensor, List[Optional[KVCache]]]:
         """
         Threads a list of KV caches through the transformer layers and calculates
         correct positional IDs for autoregressive decoding.
@@ -1182,7 +1194,7 @@ class CS2Transformer(nn.Module):
         self,
         single_frame_batch: CS2Batch,
         past_kv_cache: Optional[List[KVCache]] = None
-    ) -> Tuple[Predictions, List[KVCache]]:
+    ) -> Tuple[Predictions, List[Optional[KVCache]]]:
         """
         Processes a SINGLE frame of data for efficient autoregressive inference.
         
@@ -1205,44 +1217,45 @@ class CS2Transformer(nn.Module):
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )
-        with autocast_ctx:
-            # --- Encoders and Token Fusion (for a single frame) ---
-            fov = single_frame_batch["foveal_images"]
-            periph = single_frame_batch["peripheral_images"]
-            mel = single_frame_batch["mel_spectrogram"]
-            alive = single_frame_batch["alive_mask"].bool()
-            
-            B, T, P = fov.shape[:3] # T is 1
-            d = self.cfg.d_model
+        with torch.inference_mode():
+            with autocast_ctx:
+                # --- Encoders and Token Fusion (for a single frame) ---
+                fov = single_frame_batch["foveal_images"]
+                periph = single_frame_batch["peripheral_images"]
+                mel = single_frame_batch["mel_spectrogram"]
+                alive = single_frame_batch["alive_mask"].bool()
+                
+                B, T, P = fov.shape[:3] # T is 1
+                d = self.cfg.d_model
 
-            vis = self.visual_encoder(fov, periph)
-            aud = self.audio_encoder(mel)
-            player_tokens = self.player_fuser(vis, aud, alive)
+                vis = self.visual_encoder(fov, periph)
+                aud = self.audio_encoder(mel)
+                player_tokens = self.player_fuser(vis, aud, alive)
 
-            tok_gs = self.token_game_strategy.expand(B, T, 1, d)
-            tok_sc = self.token_scratch.expand(B, T, 1, d)
-            frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
+                tok_gs = self.token_game_strategy.expand(B, T, 1, d)
+                tok_sc = self.token_scratch.expand(B, T, 1, d)
+                frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
 
-            # --- Prepare sequence of new tokens (L will be 7) ---
-            seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
+                # --- Prepare sequence of new tokens (L will be 7) ---
+                seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
 
-            # --- Backbone call with cache ---
-            # Pass the new tokens and the cache from the previous step
-            h, updated_kv_cache = self.backbone(seq, attn_mask=None, kv_cache_list=past_kv_cache)
+                # --- Backbone call with cache ---
+                # Pass the new tokens and the cache from the previous step
+                h, updated_kv_cache = self.backbone(seq, attn_mask=None, kv_cache_list=past_kv_cache)
 
-            # --- Prediction Heads ---
-            # `h` contains the output for only the new tokens
-            last = h
-            num_players = self.cfg.num_players
-            player_tok = last[:, :num_players, :]
-            strat_tok  = last[:, num_players, :]
+                # --- Prediction Heads ---
+                # `h` contains the output for only the new tokens
+                last = h
+                num_players = self.cfg.num_players
+                player_tok = last[:, :num_players, :]
+                strat_tok  = last[:, num_players, :]
 
-            player_preds: List[PlayerPredictions] = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
-            strategy_preds = self.strategy_head(strat_tok)
+                player_preds: List[PlayerPredictions] = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
+                strategy_preds = self.strategy_head(strat_tok)
 
-            predictions = {"player": player_preds, "game_strategy": strategy_preds}
-            
-            return predictions, updated_kv_cache  
+                predictions = {"player": player_preds, "game_strategy": strategy_preds}
+                
+                return predictions, updated_kv_cache  
         
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
