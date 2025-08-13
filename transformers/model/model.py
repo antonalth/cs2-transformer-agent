@@ -531,9 +531,10 @@ class RoPEPositionalEncoding(nn.Module):
         assert rd_slice % 2 == 0, "Rotary dimension must be even."
         
         x_pair = x.reshape(B, L, H, rd_slice // 2, 2)
-        cos = cos.reshape(1, L, 1, rd_slice // 2, 1).to(x.dtype)
-        sin = sin.reshape(1, L, 1, rd_slice // 2, 1).to(x.dtype)
-        
+        half_dim = rd_slice // 2
+        cos = cos.reshape(1, L, 1, half_dim).to(x.dtype)
+        sin = sin.reshape(1, L, 1, half_dim).to(x.dtype)
+
         x1 = x_pair[..., 0]
         x2 = x_pair[..., 1]
         
