@@ -718,8 +718,9 @@ class CS2GQAAttention(nn.Module):
         if Hq % Hkv != 0:
             raise ValueError(f"n_q_heads ({Hq}) must be divisible by n_kv_heads ({Hkv}) for GQA.")
         group = Hq // Hkv
-        k = k.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
-        v = v.unsqueeze(2).expand(B, L, Hkv, group, Hd).reshape(B, L, Hq, Hd)
+        if group > 1: 
+            k = k.repeat_interleave(group, dim=2)
+            v = v.repeat_interleave(group, dim=2)
 
         q_bLHD = q.contiguous()
         k_bLHD = k.contiguous()
