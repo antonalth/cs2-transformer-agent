@@ -705,7 +705,7 @@ class CS2GQAAttention(nn.Module):
         if attn_mask is None:
             return None
 
-        m = attn_mask.to(device=device, dtype=dtype)
+        m = attn_mask.to(device=device)
         if m.dtype == torch.bool:
                 pass  # keep bool, SDPA will treat True as masked
         else:
@@ -754,9 +754,9 @@ class CS2GQAAttention(nn.Module):
         # from the cache's absolute position counter.
         if inference_mode:
             abs_pos_start = kv_cache.pos_end if kv_cache is not None else 0
-            temporal_pos_ids = torch.arange(
-                abs_pos_start, abs_pos_start + L_new, device=x.device
-            )
+            abs_pos = torch.arange(abs_pos_start, abs_pos_start + L_new, device=x.device)
+            temporal_pos_ids   = abs_pos // self.cfg.tokens_per_frame
+            structural_pos_ids = abs_pos %  self.cfg.tokens_per_frame
         # ---------------------------------------------------------------------------
 
         # Projections for NEW tokens
@@ -1315,6 +1315,7 @@ def main():
     print(f"  - Context Frames: {args.context_frames}")
     print(f"  - torch.compile(): {args.compile}")
     print(f"  - Autoregressive benchmark: {'Yes (' + str(args.autoregressive) + ' frames)' if args.autoregressive else 'No'}")
+    print(f"  - Dummy Vit: {args.dummy_vit}")
     print("-" * 60)
 
 
