@@ -1338,7 +1338,7 @@ def main():
     cfg = CS2Config(
         compute_dtype=args.dtype,
         context_frames=args.context_frames,
-        n_layers=args.num_layers
+        n_layers=args.num_layers,
     )
     print_dataclass(cfg)
     model = CS2Transformer(cfg, args.dummy_vit).to(device).eval()
