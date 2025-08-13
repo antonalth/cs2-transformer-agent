@@ -535,7 +535,7 @@ class PlayerTokenFuser(nn.Module):
 
         # 4) Add player slot identity (no per-forward arange; use pre-registered buffer).
         #    slot_ids_buf is [1,1,P] (long); slot_embed returns [1,1,P,d] and broadcasts.
-        slots = self.slot_embed(self.slot_ids_buf)  # [1, 1, P, d]
+        slots = self.slot_embed(self.slot_ids_buf.to(vis.device))  # [1, 1, P, d]
         unnormalized = base_token + slots           # [B, T, P, d]
 
         # 5) Final LayerNorm.
