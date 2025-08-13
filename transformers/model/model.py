@@ -846,7 +846,7 @@ class CS2TransformerEncoderLayer(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.d_model * cfg.ffn_mult, cfg.d_model),
         )
-        
+
     def forward(
         self,
         x: torch.Tensor,
@@ -875,20 +875,37 @@ class CS2Backbone(nn.Module):
         self.rope = RoPEPositionalEncoding(cfg)
         self.layers = nn.ModuleList([CS2TransformerEncoderLayer(cfg, self.rope) for _ in range(cfg.n_layers)])
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        B, L, _ = x.shape
+    def forward(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], kv_cache_list: Optional[List[KVCache]] = None
+    ) -> Tuple[torch.Tensor, List[KVCache]]:
+        """
+        Threads a list of KV caches through the transformer layers and calculates
+        correct positional IDs for autoregressive decoding.
+        """
+        B, L_new, _ = x.shape
         G = self.cfg.tokens_per_frame
 
-        # --- NEW: Generate 2D Positional IDs (Robustly) ---
-        pos = torch.arange(L, device=x.device)
-        temporal_pos_ids = pos // G  # Frame index
-        structural_pos_ids = pos % G  # Token index within frame
+        # --- CRITICAL: Calculate Positional IDs with offset for caching ---
+        # The starting position is 0 if there's no cache, otherwise it's the
+        # length of the sequence already in the cache.
+        past_len = kv_cache_list[0].key.shape[1] if kv_cache_list is not None and kv_cache_list[0] is not None else 0
+        pos = torch.arange(past_len, past_len + L_new, device=x.device)
 
-        for layer in self.layers:
-            x = layer(x, attn_mask, temporal_pos_ids, structural_pos_ids)
+        temporal_pos_ids = pos // G    # Frame index
+        structural_pos_ids = pos % G  # Token index within a frame
+
+        new_kv_cache_list = []
+        for i, layer in enumerate(self.layers):
+            # Get the cache for the current layer, or None if it's the first run
+            layer_cache = kv_cache_list[i] if kv_cache_list is not None else None
             
-        return x
-
+            # Pass the cache and get the updated one back
+            x, new_layer_cache = layer(
+                x, attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=layer_cache
+            )
+            new_kv_cache_list.append(new_layer_cache)
+            
+        return x, new_kv_cache_list
 
 # -----------------------------------------------------------------------------
 # 4) Heads
@@ -1139,7 +1156,7 @@ class CS2Transformer(nn.Module):
             attn_mask = None  # handled inside CS2GQAAttention
 
             # ---- backbone ----
-            h = self.backbone(seq, attn_mask)             # [B, L, d]
+            h, _ = self.backbone(seq, attn_mask, kv_cache_list=None)
 
             # ---- slice last frame ----
             last = h[:, -Lpf:, :]                         # [B, 7, d]
@@ -1158,6 +1175,72 @@ class CS2Transformer(nn.Module):
 
             return {"player": player_preds, "game_strategy": strategy_preds} 
         
+    def autoregressive_step(
+        self,
+        single_frame_batch: CS2Batch,
+        past_kv_cache: Optional[List[KVCache]] = None
+    ) -> Tuple[Predictions, List[KVCache]]:
+        """
+        Processes a SINGLE frame of data for efficient autoregressive inference.
+        
+        Args:
+            single_frame_batch: A batch dict containing data for ONE time step (T=1).
+            past_kv_cache: The list of KV caches from the previous generation step.
+                           Should be None for the very first frame.
+
+        Returns:
+            A tuple containing:
+            - predictions: The dictionary of predictions for the next frame.
+            - updated_kv_cache: The list of updated KV caches for the next step.
+        """
+        # This method assumes evaluation mode and no gradients
+        assert not self.training, "autoregressive_step should be called in eval mode"
+        
+        # Ensure the input batch is for a single time step
+        assert single_frame_batch["foveal_images"].shape[1] == 1, "Input for autoregressive_step must have T=1"
+
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
+        )
+        with autocast_ctx:
+            # --- Encoders and Token Fusion (for a single frame) ---
+            fov = single_frame_batch["foveal_images"]
+            periph = single_frame_batch["peripheral_images"]
+            mel = single_frame_batch["mel_spectrogram"]
+            alive = single_frame_batch["alive_mask"].bool()
+            
+            B, T, P = fov.shape[:3] # T is 1
+            d = self.cfg.d_model
+
+            vis = self.visual_encoder(fov, periph)
+            aud = self.audio_encoder(mel)
+            player_tokens = self.player_fuser(vis, aud, alive)
+
+            tok_gs = self.token_game_strategy.expand(B, T, 1, d)
+            tok_sc = self.token_scratch.expand(B, T, 1, d)
+            frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
+
+            # --- Prepare sequence of new tokens (L will be 7) ---
+            seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
+
+            # --- Backbone call with cache ---
+            # Pass the new tokens and the cache from the previous step
+            h, updated_kv_cache = self.backbone(seq, attn_mask=None, kv_cache_list=past_kv_cache)
+
+            # --- Prediction Heads ---
+            # `h` contains the output for only the new tokens
+            last = h
+            num_players = self.cfg.num_players
+            player_tok = last[:, :num_players, :]
+            strat_tok  = last[:, num_players, :]
+
+            player_preds: List[PlayerPredictions] = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
+            strategy_preds = self.strategy_head(strat_tok)
+
+            predictions = {"player": player_preds, "game_strategy": strategy_preds}
+            
+            return predictions, updated_kv_cache  
+        
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
 #   model = torch.compile(model)  # outside this module
@@ -1165,7 +1248,6 @@ class CS2Transformer(nn.Module):
 # -----------------------------------------------------------------------------
 # 6) Test harness and benchmark
 # -----------------------------------------------------------------------------
-
 def main():
     """A comprehensive testing and benchmarking harness for the CS2Transformer."""
     parser = argparse.ArgumentParser(description="Test and benchmark the CS2Transformer model.")
