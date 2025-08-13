@@ -19,7 +19,7 @@ PYTHON_VERSION = "3.12"
 
 # 3. PYTORCH INSTALLATION COMMAND for CUDA 12.x
 # This command is cross-platform and works for Linux with CUDA 12.1
-PYTORCH_COMMAND = "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128"
+PYTORCH_COMMAND = "pip3 install torch==2.8 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128"
 
 # --- ACTION REQUIRED for TENSORRT ---
 # 4. TENSORRT WHEEL FILE CONFIGURATION FOR LINUX
