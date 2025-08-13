@@ -39,6 +39,7 @@ TENSORRT_WHEEL_PATH = "/home/unknown/TensorRT-10.10.0.31/python/tensorrt-10.10.0
 OTHER_PIP_PACKAGES = [
     "lmdb",
     "msgpack",
+    "timm",
     "flash-attn",
     "transformers",
     "onnx",
