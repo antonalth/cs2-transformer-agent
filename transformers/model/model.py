@@ -228,7 +228,7 @@ class CS2Config:
 
     # Vision
     vit_name_hf: str = "google/vit-large-patch16-384"
-    vit_name_timm: str = "vit-large-patch16_384" #preferred if available
+    vit_name_timm: str = "vit_large_patch16_384" #preferred if available
     vit_out_dim: int = 1024
 
     # Audio
