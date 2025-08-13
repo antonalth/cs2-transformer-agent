@@ -758,6 +758,12 @@ class CS2GQAAttention(nn.Module):
         assert Hq % Hkv == 0, "n_q_heads must be a multiple of n_kv_heads for GQA"
         gqa_factor = Hq // Hkv
 
+        if self.training and kv_cache is not None:
+            raise RuntimeError("KV cache must be None during training.")
+
+        if kv_cache is not None and kv_cache.key.device != x.device:
+            raise RuntimeError("KV cache/device mismatch between steps.")
+        
         inference_mode = not self.training
 
         if L_new == 0:
@@ -915,7 +921,7 @@ class CS2Backbone(nn.Module):
 
     def forward(
         self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], kv_cache_list: Optional[List[KVCache]] = None
-    ) -> Tuple[torch.Tensor, List[Optional[KVCache]]]:
+    ) -> Tuple[torch.Tensor, Optional[List[Optional[KVCache]]]]:
         """
         Threads a list of KV caches through the transformer layers and calculates
         correct positional IDs for autoregressive decoding.
