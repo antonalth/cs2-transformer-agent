@@ -150,7 +150,7 @@ The model is designed for extreme performance and scalability to very long conte
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import List, TypedDict, Dict, Optional, Tuple, Literal, Any
 import time, argparse
 
@@ -258,6 +258,21 @@ class KVCache:
     key: torch.Tensor    # [B, L, H_kv, Hd]
     value: torch.Tensor  # [B, L, H_kv, Hd]
     pos_end: int         # absolute position *after* last cached token
+
+def print_dataclass(dc: Any, indent: int = 0):
+    """Recursively print a dataclass and its attributes."""
+    if not is_dataclass(dc):
+        raise TypeError(f"{type(dc)} is not a dataclass instance")
+
+    pad = " " * indent
+    print(f"{pad}{type(dc).__name__}:")
+    for f in fields(dc):
+        value = getattr(dc, f.name)
+        if is_dataclass(value):
+            print(f"{pad}  {f.name}:")
+            print_dataclass(value, indent + 4)
+        else:
+            print(f"{pad}  {f.name} = {value}")
 
 def _get_abs_pos_start(kv_cache_list: Optional[List[Optional[KVCache]]]) -> int:
     if not kv_cache_list:
@@ -1325,6 +1340,7 @@ def main():
         context_frames=args.context_frames,
         n_layers=args.num_layers
     )
+    print_dataclass(cfg)
     model = CS2Transformer(cfg, args.dummy_vit).to(device).eval()
 
     if args.freeze_vit:
