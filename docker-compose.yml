@@ -6,12 +6,10 @@ services:
       - ./:/workspace
       - pip-cache:/root/.cache/pip
 
-      # 🔽 persist model caches on the host
+      # Unified cache for Hugging Face
       - ./cache/hf:/workspace/.cache/huggingface
+      # Torch / timm / torch.hub cache
       - ./cache/torch:/workspace/.cache/torch
-      - ./cache/datasets:/workspace/.cache/huggingface/datasets
-      # (optional) keep your HF auth files outside the repo:
-      # - ~/.huggingface:/root/.huggingface:ro
 
     stdin_open: true
     tty: true
@@ -23,19 +21,19 @@ services:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
 
-      # 🔽 tell libs where to cache
+      # Hugging Face unified home
       - HF_HOME=/workspace/.cache/huggingface
-      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface/transformers
-      - HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface/hub
+      # Optional: separate datasets cache (otherwise goes into HF_HOME)
       - HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets
-      - TORCH_HOME=/workspace/.cache/torch  # used by timm & torch.hub
+      # Torch hub cache (used by timm & torch.hub)
+      - TORCH_HOME=/workspace/.cache/torch
 
     gpus: all
     entrypoint: ["/bin/bash", "-lc"]
     command: >
       "python -m pip install --upgrade pip setuptools wheel &&
        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi &&
-       echo '✅ Environment ready. Caches are mounted.' &&
+       echo '✅ Environment ready. Caches are mounted at HF_HOME and TORCH_HOME.' &&
        exec bash"
 
 volumes:
