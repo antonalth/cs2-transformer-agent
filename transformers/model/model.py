@@ -1129,6 +1129,7 @@ def main():
     cfg = CS2Config(
         compute_dtype=args.dtype,
         context_frames=args.context_frames,
+        n_layers=1
     )
     model = CS2Transformer(cfg).to(device).eval()
 
