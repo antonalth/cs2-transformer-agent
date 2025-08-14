@@ -507,7 +507,7 @@ class PlayerTokenFuser(nn.Module):
 
         # 4) CREATE slot_ids ON THE FLY on the correct device.
         # This is the key change. We use `vis.device` which is guaranteed to be correct.
-        slot_ids = torch.arange(self.cfg.num_players, device=vis.device).view(1, 1, -1)
+        slot_ids = torch.arange(self.cfg.num_players, device=vis.device, dtype=torch.int32).view(1, 1, -1)
         slots = self.slot_embed(slot_ids)
 
         # 5) Add player slot identity
