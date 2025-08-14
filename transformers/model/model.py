@@ -151,9 +151,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import nullcontext
 
-import timm
-from timm.data import resolve_model_data_config
-
 torch.backends.cuda.enable_flash_sdp(True)
 #torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(False)
@@ -353,6 +350,15 @@ class ViTVisualEncoder(nn.Module):
     - Output: A visual embedding per player-frame, [B, T, P, d_model].
     """
     def __init__(self, cfg):
+        try:
+            import timm
+            from timm.data import resolve_model_data_config
+        except Exception as e:
+            raise RuntimeError(
+                "The ViTVisualEncoder requires 'timm'. Install it or pass --dummy-vit.\n"
+                f"Original import error: {e}"
+            )
+
         super().__init__()
         self.cfg = cfg
         self.d_model = int(cfg.d_model)
@@ -507,7 +513,7 @@ class PlayerTokenFuser(nn.Module):
 
         # 4) CREATE slot_ids ON THE FLY on the correct device.
         # This is the key change. We use `vis.device` which is guaranteed to be correct.
-        slot_ids = torch.arange(self.cfg.num_players, device=vis.device, dtype=torch.int32).view(1, 1, -1)
+        slot_ids = torch.arange(self.cfg.num_players, device=vis.device, dtype=torch.long).view(1, 1, -1)
         slots = self.slot_embed(slot_ids)
 
         # 5) Add player slot identity
@@ -929,7 +935,7 @@ class CS2Backbone(nn.Module):
         _assert_cache_consistency(kv_cache_list)
         abs_pos_start = _get_abs_pos_start(kv_cache_list)  # int
         L_new = x.size(1)  # or the variable you already use for new-token length
-        pos = torch.arange(abs_pos_start, abs_pos_start + L_new, device=x.device, dtype=torch.int32)  # [L_new]
+        pos = torch.arange(abs_pos_start, abs_pos_start + L_new, device=x.device)  # int64 by default
         # use `pos` for rotating the *new* q/k only (do not re-rotate cached states)
 
         temporal_pos_ids = pos // G    # Frame index
@@ -1311,6 +1317,11 @@ def main():
     parser.add_argument("--dummy-vit", action="store_true", help="Disable ViT to bench main model.")
     parser.add_argument("--num-layers", type=int, default=24, help="Set number of main tf layers.")
     args = parser.parse_args()
+
+    if args.compile and args.tensorrt and args.dtype == "bf16":
+        print("[WARNING] bfloat16 not fully supported by TensorRT; forcing fp16 for TRT backend.")
+        args.dtype = "fp16"
+
 
     # --- Setup Device and DType ---
     device = torch.device(args.device)
