@@ -1,8 +1,9 @@
 transformers
 lmdb
 msgpack
-timm
 flash-attn
 matplotlib
 opencv-python
+numpy<2.0
 tqdm
+timm
