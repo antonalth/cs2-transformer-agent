@@ -1288,11 +1288,6 @@ class CS2Transformer(nn.Module):
 #   model = CS2Transformer(CS2Config())
 #   model = torch.compile(model)  # outside this module
 
-def build_model():
-    # TODO: put your real init here (cfg, checkpoint load, etc.)
-    m = CS2Transformer(CS2Config())
-    m.eval().to("cuda")
-    return m
 
 # -----------------------------------------------------------------------------
 # 6) Test harness and benchmark
