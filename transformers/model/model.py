@@ -155,7 +155,7 @@ import timm
 from timm.data import resolve_model_data_config
 
 torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
+#torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(False)
 
 # -----------------------------------------------------------------------------
