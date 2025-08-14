@@ -210,7 +210,7 @@ class CS2Config:
     tokens_per_frame: int = 7  # 5 players + 2 special
 
     # Context (training)
-    context_frames: int = 128
+    context_frames: int = 1
 
     max_cache_len_tokens: int = None
     
@@ -1287,6 +1287,12 @@ class CS2Transformer(nn.Module):
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
 #   model = torch.compile(model)  # outside this module
+
+def build_model():
+    # TODO: put your real init here (cfg, checkpoint load, etc.)
+    m = CS2Transformer(CS2Config())
+    m.eval().to("cuda")
+    return m
 
 # -----------------------------------------------------------------------------
 # 6) Test harness and benchmark
