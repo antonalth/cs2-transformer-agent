@@ -466,16 +466,13 @@ class PlayerTokenFuser(nn.Module):
         self,
         cfg: CS2Config,
         player_slot_embed: nn.Embedding,
-        dead_embedding: nn.Parameter,       # expected shape: [1, 1, 1, d]
-        slot_ids_buf: torch.Tensor,         # registered in CS2Transformer: [1, 1, P] (long)
+        dead_embedding: nn.Parameter,
     ):
         super().__init__()
         self.cfg = cfg
         self.norm = nn.LayerNorm(cfg.d_model)
         self.slot_embed = player_slot_embed
         self.dead_embedding = dead_embedding
-        # Keep a reference to the buffer owned by the parent module (no need to re-register here).
-        self.slot_ids_buf = slot_ids_buf
 
     @torch.no_grad()
     def _assert_shapes(self, vis: torch.Tensor):
@@ -489,36 +486,35 @@ class PlayerTokenFuser(nn.Module):
             f"slot_ids_buf must be [1,1,{P}] but is {tuple(self.slot_ids_buf.shape)}"
 
     def forward(
-        self,
-        vis: torch.Tensor,              # [B, T, P, d]
-        aud: torch.Tensor,              # [B, T, P, d]
-        alive_mask: torch.Tensor,       # [B, T, P] bool
+    self,
+    vis: torch.Tensor,
+    aud: torch.Tensor,
+    alive_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Fuse visual+audio, apply the DEAD policy, add player identity, and finally normalize.
         """
         B, T, P, d = vis.shape
-        # Optional safety checks (fast, no grad)
-        # self._assert_shapes(vis)
 
         # 1) Fuse sensors for alive tokens.
-        fused_alive_token = vis + aud  # [B, T, P, d]
+        fused_alive_token = vis + aud
 
         # 2) Build broadcastable dead mask.
-        dead_mask = ~alive_mask.bool().unsqueeze(-1)  # [B, T, P, 1]
+        dead_mask = ~alive_mask.bool().unsqueeze(-1)
 
         # 3) Choose base token: dead -> learned dead token, else fused sensors.
-        #    dead_embedding is [1,1,1,d] and will broadcast to [B,T,P,d].
-        base_token = torch.where(dead_mask, self.dead_embedding, fused_alive_token)  # [B, T, P, d]
+        base_token = torch.where(dead_mask, self.dead_embedding, fused_alive_token)
 
-        # 4) Add player slot identity (no per-forward arange; use pre-registered buffer).
-        #    slot_ids_buf is [1,1,P] (long); slot_embed returns [1,1,P,d] and broadcasts.
-        slots = self.slot_embed(self.slot_ids_buf)
-        unnormalized = base_token + slots           # [B, T, P, d]
+        # 4) CREATE slot_ids ON THE FLY on the correct device.
+        # This is the key change. We use `vis.device` which is guaranteed to be correct.
+        slot_ids = torch.arange(self.cfg.num_players, device=vis.device).view(1, 1, -1)
+        slots = self.slot_embed(slot_ids)
 
-        # 5) Final LayerNorm.
+        # 5) Add player slot identity
+        unnormalized = base_token + slots
+
+        # 6) Final LayerNorm.
         return self.norm(unnormalized)
-
 # -----------------------------------------------------------------------------
 # 3) Attention core & Transformer layers (stubs for FA2+GQA+RoPE)
 # -----------------------------------------------------------------------------
@@ -1147,12 +1143,12 @@ class CS2Transformer(nn.Module):
         self.dead_embedding = nn.Parameter(torch.randn(1, 1, 1, d) * 0.02)
         self.player_slot_embed = nn.Embedding(cfg.num_players, d)
         # Fuser
-        self.register_buffer("slot_ids_buf", torch.arange(cfg.num_players).view(1,1,-1), persistent=True)
+        #self.register_buffer("slot_ids_buf", torch.arange(cfg.num_players).view(1,1,-1), persistent=True)
         self.player_fuser = PlayerTokenFuser(
             cfg,
             player_slot_embed=self.player_slot_embed,
             dead_embedding=self.dead_embedding,
-            slot_ids_buf=self.slot_ids_buf,
+            #slot_ids_buf=self.slot_ids_buf,
         )
         # Backbone
         self.backbone = CS2Backbone(cfg)
