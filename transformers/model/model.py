@@ -955,7 +955,7 @@ class CS2Backbone(nn.Module):
         _assert_cache_consistency(kv_cache_list)
         abs_pos_start = _get_abs_pos_start(kv_cache_list)  # int
         L_new = x.size(1)  # or the variable you already use for new-token length
-        pos = torch.arange(abs_pos_start, abs_pos_start + L_new, device=x.device)  # [L_new]
+        pos = torch.arange(abs_pos_start, abs_pos_start + L_new, device=x.device, dtype=torch.int32)  # [L_new]
         # use `pos` for rotating the *new* q/k only (do not re-rotate cached states)
 
         temporal_pos_ids = pos // G    # Frame index
