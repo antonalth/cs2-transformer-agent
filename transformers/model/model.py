@@ -42,10 +42,10 @@ For each of the 5 players, a single [1, 2048] token is created per frame by fusi
 audio data streams.
 
 [A] VISUAL STREAM:
-  - Input: Two 384x384 pixel tensors per player:
+  - Input: Two 224x224 pixel tensors per player:
     1. Foveal View: A non-scaled, high-resolution crop around the player's crosshair.
     2. Peripheral View: The full 640x480 game screen, scaled down (with letterboxing).
-  - Encoder: A SINGLE, SHARED-WEIGHT ViT-Large model (`google/vit-large-patch16-384`) processes
+  - Encoder: A SINGLE, SHARED-WEIGHT ViT-Large model (`google/vit-large-patch16-224`) processes
     both views independently.
   - Fusion: The [CLS] tokens from each view (each `[1, 1024]`) are extracted and concatenated
     to form a `[1, 2048]` intermediate representation.
@@ -172,7 +172,7 @@ class PlayerPredictions(TypedDict):
     pos_heatmap_logits: torch.Tensor         # [B, 8, 64, 64]
     mouse_delta_deg: torch.Tensor            # [B, 2]
     keyboard_logits: torch.Tensor            # [B, 31]
-    eco_logits: torch.Tensor                 # [B, 384]
+    eco_logits: torch.Tensor                 # [B, 224]
     inventory_logits: torch.Tensor           # [B, 128]
     active_weapon_logits: torch.Tensor       # [B, 128]
 
@@ -189,8 +189,8 @@ class Predictions(TypedDict):
 # Optional: declare opaque input type if your dataloader provides a struct
 class CS2Batch(TypedDict, total=True):
     # Shapes are illustrative; align with your datapipe
-    foveal_images: torch.Tensor            # [B, T, 5, 3, 384, 384]
-    peripheral_images: torch.Tensor        # [B, T, 5, 3, 384, 384]
+    foveal_images: torch.Tensor            # [B, T, 5, 3, 224, 224]
+    peripheral_images: torch.Tensor        # [B, T, 5, 3, 224, 224]
     mel_spectrogram: torch.Tensor          # [B, T, 5, 1, 128, ~6]
     alive_mask: torch.Tensor               # [B, T, 5] bool
 
@@ -228,7 +228,7 @@ class CS2Config:
 
     # Vision
     vit_name_hf: str = None
-    vit_name_timm: str = "vit_base_patch16_224.augreg2_in21k" #preferred if available
+    vit_name_timm: str = "vit_base_patch16_clip_224.openai" #preferred if available
     vit_channels_last: bool = True
 
     # Audio
@@ -238,7 +238,7 @@ class CS2Config:
 
     # Heads
     keyboard_dim: int = 31
-    eco_dim: int = 384
+    eco_dim: int = 224
     inventory_dim: int = 128
     weapon_dim: int = 128
     round_state_dim: int = 5
@@ -1256,8 +1256,8 @@ class CS2Transformer(nn.Module):
             torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )
         with autocast_ctx:
-            fov   = batch["foveal_images"]        # [B, T, 5, 3, 384, 384]
-            periph= batch["peripheral_images"]     # [B, T, 5, 3, 384, 384]
+            fov   = batch["foveal_images"]        # [B, T, 5, 3, 224, 224]
+            periph= batch["peripheral_images"]     # [B, T, 5, 3, 224, 224]
             mel   = batch["mel_spectrogram"]       # [B, T, 5, 1, 128, ~6]
             alive = batch["alive_mask"].bool()     # [B, T, 5]
 
