@@ -1379,7 +1379,7 @@ def main():
                 # Set the precision for the TensorRT engine
                 "enabled_precisions": {precision},
                 # Workspace for fastest kernels (1GB default)
-                "workspace_size": 1 << 30,
+                "workspace_size": 5 << 30,
                 # Avoid issues with unsupported dtypes
                 "truncate_long_and_double": True,
             }
