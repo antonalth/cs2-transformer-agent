@@ -371,8 +371,8 @@ class ViTVisualEncoder(nn.Module):
         data_config = resolve_model_data_config(self.vit)
         mean = torch.tensor(data_config['mean']).view(1, 3, 1, 1)
         std = torch.tensor(data_config['std']).view(1, 3, 1, 1)
-        self.register_buffer("img_mean", mean, persistent=False)
-        self.register_buffer("img_std", std, persistent=False)
+        self.register_buffer("img_mean", mean, persistent=True)
+        self.register_buffer("img_std", std, persistent=True)
         self.target_size = data_config['input_size'][1:] # (H, W) e.g., (448, 448)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -543,7 +543,7 @@ class RoPEPositionalEncoding(nn.Module):
         self.base = cfg.rope_base
         self.rot_dim = cfg.rope_rot_dim
         # Default scale = 1.0. This scale is ONLY for the temporal axis.
-        self.register_buffer("scale", torch.tensor(1.0), persistent=False)
+        self.register_buffer("scale", torch.tensor(1.0), persistent=True)
         self._apply_cfg_scaling(getattr(cfg,"rope_scaling", None))
 
     def _apply_cfg_scaling(self, scaling: Optional[Dict[str, Any]]) -> None:
@@ -1147,7 +1147,7 @@ class CS2Transformer(nn.Module):
         self.dead_embedding = nn.Parameter(torch.randn(1, 1, 1, d) * 0.02)
         self.player_slot_embed = nn.Embedding(cfg.num_players, d)
         # Fuser
-        self.register_buffer("slot_ids_buf", torch.arange(cfg.num_players).view(1,1,-1), persistent=False)
+        self.register_buffer("slot_ids_buf", torch.arange(cfg.num_players).view(1,1,-1), persistent=True)
         self.player_fuser = PlayerTokenFuser(
             cfg,
             player_slot_embed=self.player_slot_embed,
