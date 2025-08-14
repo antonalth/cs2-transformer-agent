@@ -16,3 +16,4 @@ gemini.md
 *.png
 /scripts/node_modules
 /scripts/broker/node_modules
+/cache/**/ */

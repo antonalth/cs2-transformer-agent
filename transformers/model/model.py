@@ -1354,6 +1354,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
     parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="bf16", help="Compute data type.")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile() for the model.")
+    parser.add_argument("--tensorrt", action="store_true", help="Use torch_tensorrt backend when --compile is enabled.")
     parser.add_argument("--freeze-vit", action="store_true", help="Freeze the ViT encoder weights.")
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of just a shape test.")
     parser.add_argument("--autoregressive", type=int, metavar="N_FRAMES", help="Run autoregressive KV-cached benchmark for N frames.")
@@ -1378,7 +1379,11 @@ def main():
     print(f"  - DType: {args.dtype}")
     print(f"  - Batch Size: {args.batch_size}")
     print(f"  - Context Frames: {args.context_frames}")
-    print(f"  - torch.compile(): {args.compile}")
+    if args.compile:
+        backend = "torch_tensorrt" if args.tensorrt else "default torch.compile"
+        print(f"  - torch.compile(): True (backend: {backend})")
+    else:
+        print(f"  - torch.compile(): False")
     print(f"  - Autoregressive benchmark: {'Yes (' + str(args.autoregressive) + ' frames)' if args.autoregressive else 'No'}")
     print(f"  - Dummy Vit: {args.dummy_vit}")
     print("-" * 60)
@@ -1391,14 +1396,48 @@ def main():
         n_layers=args.num_layers,
     )
     print_dataclass(cfg)
+    # Put model in eval mode before any compilation
     model = CS2Transformer(cfg, args.dummy_vit).to(device).eval()
 
     if args.freeze_vit:
         model.set_vit_frozen(True)
 
     if args.compile:
-        print("[INFO] Compiling model with torch.compile()... (this may take a moment)")
-        model = torch.compile(model)
+        if args.tensorrt:
+            # --- Compile with torch_tensorrt backend ---
+            try:
+                import torch_tensorrt
+            except ImportError:
+                print("\n[ERROR] torch_tensorrt is not installed.")
+                print("Please install it to use the --tensorrt flag, e.g., `pip install torch-tensorrt`")
+                exit(1)
+            
+            print("[INFO] Compiling model with torch_tensorrt backend... (this may take a long time)")
+            
+            dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+            precision = dtype_map[args.dtype]
+
+            model = torch.compile(
+                model,
+                backend="torch_tensorrt",
+                options={
+                    # Set the precision for the TensorRT engine. For RTX 30-series,
+                    # fp16 is the best choice for performance.
+                    "enabled_precisions": {precision},
+                    
+                    # A workspace is a chunk of GPU memory that TensorRT uses as
+                    # scratch space to find the fastest kernels. 1GB is a good default.
+                    "workspace_size": 1 << 30,
+                    
+                    # Helps avoid issues with dtypes TensorRT may not handle natively
+                    "truncate_long_and_double": True,
+                }
+            )
+        else:
+            # --- Compile with default torch.compile backend ---
+            print("[INFO] Compiling model with default torch.compile() backend... (this may take a moment)")
+            model = torch.compile(model)
+        
         print("[INFO] Compilation complete.")
 
     # --- Create Dummy Input Batch ---
@@ -1407,11 +1446,12 @@ def main():
         "foveal_images": torch.randint(0, 256, (B, T, P, 3, 384, 384), device=device, dtype=torch.uint8),
         "peripheral_images": torch.randint(0, 256, (B, T, P, 3, 384, 384), device=device, dtype=torch.uint8),
         "mel_spectrogram": torch.randn(B, T, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
-        "alive_mask": torch.randint(0, 2, (B, T, P), device=device, dtype=torch.bool),
+        "alive_mask": torch.ones(B, T, P, device=device, dtype=torch.bool), #worstcase
     }
 
     # --- Run Shape Test ---
-    print("\n[PHASE 1] Running Shape Test...")
+    # NOTE: The first run after compilation will be slow as the engine is built and kernels are tuned.
+    print("\n[PHASE 1] Running Shape Test & Initial Compilation...")
     with torch.no_grad():
         predictions = model(dummy_batch)
 
@@ -1476,7 +1516,8 @@ def main():
     if args.autoregressive:
         print("\n[PHASE 3] Running Autoregressive (KV-Cached) Benchmark...")
         num_frames = args.autoregressive
-        model.eval() # Ensure model is in eval mode
+        # Ensure model is in eval mode, though it already is
+        model.eval()
 
         # Create a dummy batch for a single frame (T=1)
         single_frame_batch: CS2Batch = {
@@ -1489,9 +1530,19 @@ def main():
         # Warmup
         print(f"  - Warming up for {args.warmup_steps} autoregressive steps...")
         with torch.no_grad():
-            kv_cache = [None] * cfg.n_layers
-            for _ in range(args.warmup_steps):
-                _, kv_cache = model.autoregressive_step(single_frame_batch, kv_cache)
+            # NOTE: Compiling stateful models like autoregressive_step with TRT
+            # is complex and may fail if dynamic shapes are not handled correctly
+            # by the backend. This benchmark is a stress test.
+            try:
+                kv_cache = [None] * cfg.n_layers
+                for _ in range(args.warmup_steps):
+                    _, kv_cache = model.autoregressive_step(single_frame_batch, kv_cache)
+            except Exception as e:
+                print("\n[ERROR] Autoregressive warmup failed. This can happen with compiled stateful models.")
+                print("The torch_tensorrt backend may not have been able to handle the dynamic KV cache.")
+                print(f"Error details: {e}")
+                return
+
 
         # Benchmark
         print(f"  - Benchmarking for {num_frames} autoregressive steps...")
@@ -1526,7 +1577,6 @@ def main():
             peak_mem_gb = (end_mem) / (1024 ** 3)
             print(f"  - Peak GPU Memory Allocated (incl. cache): {peak_mem_gb:.2f} GB")
         print("=" * 69)
-
 
 if __name__ == "__main__":
     # To run standard benchmark: python model.py --benchmark --compile
