@@ -359,7 +359,7 @@ class ViTVisualEncoder(nn.Module):
         self.use_channels_last = bool(getattr(cfg, "vit_channels_last", True))
         self.use_letterboxing = bool(getattr(cfg, "use_letterboxing", True))
 
-        model_name = getattr(cfg, "vit_name_timm", "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k")
+        model_name = getattr(cfg, "vit_name_timm", "vit_base_patch14_dinov2.lvd142m")
         try:
             self.vit = timm.create_model(model_name, pretrained=True, num_classes=0)
             self.vit_hidden = self.vit.num_features
@@ -1400,7 +1400,7 @@ def main():
     B, T, P = args.batch_size, cfg.context_frames, cfg.num_players
     # Using 480x640 as the representative input size
     dummy_batch: CS2Batch = {
-        "images": torch.randint(0, 256, (B, T, P, 3, 480, 640), device=device, dtype=torch.uint8),
+        "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
         "mel_spectrogram": torch.randn(B, T, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
         "alive_mask": torch.ones(B, T, P, device=device, dtype=torch.float32),
     }
@@ -1474,7 +1474,7 @@ def main():
         model.eval()
 
         single_frame_batch: CS2Batch = {
-            "images": torch.randint(0, 256, (B, T, P, 3, 480, 640), device=device, dtype=torch.uint8),
+            "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
             "mel_spectrogram": torch.randn(B, 1, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
             "alive_mask": torch.randint(0, 2, (B, 1, P), device=device, dtype=torch.bool),
         }
