@@ -14,17 +14,16 @@ The model is an AUTOREGRESSIVE 'PLAYER AGENT'. Its fundamental task is to functi
 generative model: given a history of `t` frames of gameplay, it predicts the actions and state
 for the next frame, `t+1`.
 
-- Causal Paradigm: The model operates under a strict causal constraint, meaning its predictions
-  for any given moment can only be conditioned on past and present information. This is enforced
+- Causal Paradigm: The model operates under a strict causal constraint. Its predictions
+  for any given moment can only be conditioned on past information. This is enforced
   by a causal attention mask within the transformer backbone, making the model suitable for
   real-time, sequential generation.
 
-- Generative Feedback Loop (Inference): During inference, the model forms a feedback loop with a
-  game simulator.
+- Generative Feedback Loop (Inference): During inference, the model forms a feedback loop.
   1. The model predicts actions for frame `t+1`.
-  2. These actions are used to update the game simulator.
-  3. The simulator generates the new visual and audio data for frame `t+1`.
-  4. This new frame is encoded, appended to the history, and the process repeats.
+  2. These actions are used to update an external game simulator.
+  3. The simulator provides the new visual and audio data for frame `t+1`.
+  4. This new frame is encoded, appended to the history cache, and the process repeats.
 
 ----------------------------------------------------------------------------------------------------
 2. CORE ARCHITECTURAL SPECIFICATIONS (THE THREE STAGES)
@@ -42,15 +41,13 @@ For each of the 5 players, a single [1, 2048] token is created per frame by fusi
 audio data streams.
 
 [A] VISUAL STREAM:
-  - Input: Two 224x224 pixel tensors per player:
-    1. Foveal View: A non-scaled, high-resolution crop around the player's crosshair.
-    2. Peripheral View: The full 640x480 game screen, scaled down (with letterboxing).
-  - Encoder: A SINGLE, SHARED-WEIGHT ViT-Large model (`google/vit-large-patch16-224`) processes
-    both views independently.
-  - Fusion: The [CLS] tokens from each view (each `[1, 1024]`) are extracted and concatenated
-    to form a `[1, 2048]` intermediate representation.
-  - Projection: A final linear layer projects this concatenated tensor to the model's native
-    `[1, 2048]` dimension, creating the final visual embedding.
+  - Input: A SINGLE game screen tensor per player (e.g., 480x640 resolution).
+  - Preprocessing: The input image undergoes aspect-ratio-preserving resizing (letterboxing)
+    to match the native input size of the vision encoder (e.g., 448x448).
+  - Encoder: A SINGLE, SHARED-WEIGHT Vision Transformer (ViT) model, specifically
+    `eva02_large_patch14_448.mim_m38m_ft_in22k_in1k` from `timm`, processes the image.
+  - Projection: A final linear layer projects the ViT's output feature vector to the model's
+    native `[1, 2048]` dimension, creating the final visual embedding.
 
 [B] AUDIO STREAM:
   - Input: A `[128, ~6]` Mel Spectrogram tensor derived from the player's in-game audio.
@@ -75,14 +72,14 @@ The backbone processes a sequence of token frames over time.
     2. `[SCRATCHSPACE]`: A learned token for the model to use as intermediate memory.
 
 [B] IDENTITY & STATE HANDLING:
-  - Player Slot Embedding: To maintain player identity across the sequence, a unique, learned
-    `player_slot_embedding` is ADDED to each of the 5 player tokens.
-  - DEAD Token Policy: If a player is dead, their entire visual/audio input is ignored. Instead,
+  - Player Slot Embedding: To maintain player identity, a unique, learned `player_slot_embedding`
+    is ADDED to each of the 5 player tokens.
+  - DEAD Token Policy: If a player is dead, their visual/audio input is ignored. Instead,
     their token is replaced by a learned `[DEAD]` embedding, to which their unique
     `player_slot_embedding` is still added.
 
 [C] TRANSFORMER LAYERS:
-  - A stack of 16-24 custom `CS2TransformerEncoderLayer` modules.
+  - A stack of ~24 custom `CS2TransformerEncoderLayer` modules.
   - Each layer contains:
     1. A Causal Self-Attention block (optimized with GQA and FlashAttention-2).
     2. A Feed-Forward Network (FFN) with a GELU activation.
@@ -92,15 +89,14 @@ The backbone processes a sequence of token frames over time.
   III. STAGE 3: PREDICTION HEADS
 ====================================================================================================
 The output tokens from the FINAL TIME STEP of the transformer backbone are used to make
-predictions for the next frame, as specified in Appendix B.
+predictions for the next frame.
 
 [A] PLAYER PREDICTION HEADS (x5):
-  Each of the 5 player output tokens is fed into a set of dedicated heads to predict:
-  - Stats (Regression): Health, Armor, Money (via an MLP).
-  - Position (Heatmap): A 3D position heatmap `[Z, Y, X]` (via a Deconvolutional Network).
-  - Mouse (Regression): `[delta_x, delta_y]` mouse movement (via an MLP).
-  - Actions (Classification): Logits for Keyboard, Eco, Inventory, and Active Weapon states
-    (via MLPs).
+  Each of the 5 player output tokens is fed into dedicated heads to predict:
+  - Stats (Regression): Health, Armor, Money.
+  - Position (Heatmap): A 3D position heatmap `[Z, Y, X]` via a Deconvolutional Network.
+  - Mouse (Regression): `[delta_x, delta_y]` mouse movement.
+  - Actions (Classification): Logits for Keyboard, Eco, Inventory, and Active Weapon states.
 
 [B] GAME STRATEGY HEAD (x1):
   The `[GAME_STRATEGY]` output token is used to predict:
@@ -111,42 +107,38 @@ predictions for the next frame, as specified in Appendix B.
 ----------------------------------------------------------------------------------------------------
 3. HIGH-PERFORMANCE OPTIMIZATIONS
 ----------------------------------------------------------------------------------------------------
-The model is designed for extreme performance and scalability to very long context windows.
+The model is designed for extreme performance and scalability to long context windows.
 
-- `torch.compile()`: The entire `CS2Transformer` module is intended to be wrapped in
-  `torch.compile(model)` for JIT compilation, kernel fusion, and significant speedups.
+- `torch.compile()`: The entire `CS2Transformer` module is JIT-compiled for kernel fusion
+  and significant speedups.
 
-- Grouped-Query Attention (GQA): The core attention mechanism uses fewer Key/Value heads than
-  Query heads (e.g., 8 KV heads for 32 Q heads). This dramatically reduces the size of the KV
-  cache, which is the primary bottleneck for fast autoregressive inference.
+- Grouped-Query Attention (GQA): Reduces the size of the KV cache—the primary bottleneck
+  for fast autoregressive inference—by using fewer Key/Value heads than Query heads.
 
-- FlashAttention-2: Where available, this custom kernel is used to compute attention. It
-  avoids the explicit creation of the `N x N` attention matrix, drastically reducing memory
-  usage and increasing computational speed.
+- FlashAttention-2: A custom kernel that computes attention without materializing the large
+  `N x N` attention matrix, drastically reducing memory usage and increasing speed.
 
-- Rotary Positional Embeddings (RoPE): Positional information is injected via RoPE, which is
-  applied directly to queries and keys. It provides excellent performance on long sequences
-  and strong extrapolation capabilities.
+- 2D Rotary Positional Embeddings (RoPE): Positional information is injected by rotating
+  queries and keys. This implementation uniquely handles two axes: a `temporal` axis
+  (frame index) and a `structural` axis (token index within a frame), providing excellent
+  performance on long, structured sequences.
 
-- Mixed Precision & Quantization:
-  - Training: Natively supports `BF16` for faster computation and reduced memory footprint.
-  - Inference/Fine-Tuning: Compatible with advanced quantization (e.g., QLoRA with 4-bit
-    NormalFloat) and FP8 inference on supported hardware for maximum throughput.
+- Mixed Precision & Quantization: Natively supports `BF16` for training and is compatible
+  with advanced quantization (e.g., QLoRA) and FP8 inference for maximum throughput.
 
 ----------------------------------------------------------------------------------------------------
 4. TRAINING & FINE-TUNING STRATEGY
 ----------------------------------------------------------------------------------------------------
-- Objective: The model is trained on a Next-Frame Prediction task. Given a sequence of `t`
-  ground-truth frames, it is optimized via a COMPOSITE LOSS function to predict the
-  ground-truth data for frame `t+1`.
+- Objective: The model is trained on a Next-Frame Prediction task using a composite loss
+  function to predict the ground-truth data for frame `t+1` given frames `1...t`.
 
 - ViT Fine-Tuning (Two-Stage):
-  1. Freeze: Initially, the weights of the pre-trained ViT-Large encoder are frozen
-     (`requires_grad=False`). The rest of the model is trained to learn how to interpret
-     its powerful, off-the-shelf features.
+  1. Freeze: Initially, the weights of the single pre-trained ViT encoder are frozen
+     (`requires_grad=False`). The rest of the model learns to interpret its powerful,
+     off-the-shelf features.
   2. Finetune: After the main model has stabilized, the ViT is unfrozen. The entire model is
-     then trained end-to-end using DIFFERENTIAL LEARNING RATES, where the ViT uses a learning
-     rate 10-100x smaller than the rest of the model to prevent catastrophic forgetting.
+     then trained end-to-end using DIFFERENTIAL LEARNING RATES, where the ViT uses a
+     learning rate 10-100x smaller than the rest of the model to prevent catastrophic forgetting.
 """
 from __future__ import annotations
 
@@ -229,7 +221,7 @@ class CS2Config:
     training_use_frame_block_causal: bool = False #like above but reverse
 
     # Vision
-    vit_name_timm: str = "eva02_base_patch14_448.mim_in22k_ft_in22k_in1k" #preferred if available
+    vit_name_timm: str = "vit_base_patch14_dinov2.lvd142m" #preferred if available
     vit_channels_last: bool = True
 
     # Audio
