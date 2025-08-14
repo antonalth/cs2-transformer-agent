@@ -229,7 +229,7 @@ class CS2Config:
     training_use_frame_block_causal: bool = False #like above but reverse
 
     # Vision
-    vit_name_timm: str = "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k" #preferred if available
+    vit_name_timm: str = "eva02_base_patch14_448.mim_m38m_ft_in22k_in1k" #preferred if available
     vit_channels_last: bool = True
 
     # Audio
@@ -401,7 +401,7 @@ class ViTVisualEncoder(nn.Module):
 
             # 2. Resize the image
             x = F.interpolate(
-                x, size=(new_h, new_w), mode='bilinear', align_corners=False
+                x, size=(new_h, new_w), mode='bilinear', align_corners=False, antialias=True
             )
 
             # 3. Normalize the resized image
