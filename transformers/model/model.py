@@ -159,6 +159,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import nullcontext
 
+import timm
+from timm.data import resolve_model_data_config
+
 torch.backends.cuda.enable_flash_sdp(True)
 #torch.backends.cuda.enable_mem_efficient_sdp(False)
 #torch.backends.cuda.enable_math_sdp(False)
@@ -226,7 +229,7 @@ class CS2Config:
     training_use_frame_block_causal: bool = False #like above but reverse
 
     # Vision
-    vit_name_timm: str = "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k.openai" #preferred if available
+    vit_name_timm: str = "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k" #preferred if available
     vit_channels_last: bool = True
 
     # Audio
@@ -344,25 +347,17 @@ def _GN3d(c: int) -> torch.nn.GroupNorm:
 # -----------------------------------------------------------------------------
 # 2) Submodules — Encoders & Token Fusion
 # -----------------------------------------------------------------------------
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
 
-import timm
-from timm.data import resolve_model_data_config
 
 class ViTVisualEncoder(nn.Module):
-    """Single-Image ViT encoder using timm, with dynamic padding.
+    """Single-Image ViT encoder using timm, with SOTA letterboxing.
 
-    This version replaces the dual-view (foveal/peripheral) system. It
-    accepts a single image per player-frame, dynamically pads it to be
-    divisible by the ViT's patch size, normalizes it using model-specific
-    stats, and extracts a feature embedding.
+    This version implements aspect-ratio-preserving resizing with the correct
+    preprocessing order: Resize -> Normalize -> Pad. This ensures that padded
+    regions are neutral (zero) after normalization.
 
-    - Model: Defaults to EVA02-L/14, configurable via `vit_name_timm`.
-    - Preprocessing: Handles padding and normalization internally.
-    - Input: A single image tensor, e.g., [B, T, P, 3, 480, 640].
+    - Preprocessing: Handles letterboxing, resizing, and normalization.
+    - Input: A single image tensor, e.g., [B, T, P, 3, H, W].
     - Output: A visual embedding per player-frame, [B, T, P, d_model].
     """
     def __init__(self, cfg):
@@ -370,93 +365,72 @@ class ViTVisualEncoder(nn.Module):
         self.cfg = cfg
         self.d_model = int(cfg.d_model)
         self.use_channels_last = bool(getattr(cfg, "vit_channels_last", True))
+        self.use_letterboxing = bool(getattr(cfg, "use_letterboxing", True))
 
-        # --- MODIFIED: Backbone Initialization (timm only) ---
-        # Default to the specified EVA02 model
         model_name = getattr(cfg, "vit_name_timm", "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k")
         try:
-            # num_classes=0 returns the pooled embedding before the final head
             self.vit = timm.create_model(model_name, pretrained=True, num_classes=0)
             self.vit_hidden = self.vit.num_features
-            # Get patch size for padding calculation
-            self.patch_size = self.vit.patch_embed.patch_size[0]
         except Exception as e:
             raise RuntimeError(f"Failed to initialize timm model '{model_name}': {e}")
 
-        # --- MODIFIED: Projection Layer for single view ---
-        # Projects the ViT's embedding to the main model's dimension.
         self.proj = nn.Linear(self.vit_hidden, self.d_model)
 
-        # --- MODIFIED: Normalization Buffers from timm config ---
-        # Resolve model-specific mean/std instead of hard-coding ImageNet stats
         data_config = resolve_model_data_config(self.vit)
         mean = torch.tensor(data_config['mean']).view(1, 3, 1, 1)
         std = torch.tensor(data_config['std']).view(1, 3, 1, 1)
         self.register_buffer("img_mean", mean, persistent=False)
         self.register_buffer("img_std", std, persistent=False)
-
-    def _pad_to_patch_multiples(self, x: torch.Tensor) -> torch.Tensor:
-        """Pads height and width to be multiples of the ViT patch size."""
-        B, C, H, W = x.shape
-        ph, pw = self.patch_size, self.patch_size
-
-        # Calculate target dimensions
-        H_new = (H + ph - 1) // ph * ph
-        W_new = (W + pw - 1) // pw * pw
-
-        # Calculate padding amounts
-        pad_h = H_new - H
-        pad_w = W_new - W
-
-        if pad_h > 0 or pad_w > 0:
-            # (pad_left, pad_right, pad_top, pad_bottom)
-            return F.pad(x, (0, pad_w, 0, pad_h))
-        return x
+        self.target_size = data_config['input_size'][1:] # (H, W) e.g., (448, 448)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Encodes a single image view and projects it to a fused embedding.
-
-        Args:
-            images: Tensor of shape [B, T, P, 3, H, W] (e.g., 480x640).
-
-        Returns:
-            A visual embedding of shape [B, T, P, d_model].
-        """
         B, T, P, C, H, W = images.shape
         N = B * T * P
-
-        # Reshape for batch processing
         x = images.reshape(N, C, H, W)
 
-        # --- Preprocessing ---
-        # 1. Convert to float [0, 1] if input is uint8
         if not x.is_floating_point():
             x = x.float() / 255.0
 
-        # 2. Pad height and width to be divisible by patch size
-        x = self._pad_to_patch_multiples(x)
+        # --- Preprocessing with CORRECT order: Resize -> Normalize -> Pad ---
+        if self.use_letterboxing:
+            target_h, target_w = self.target_size
+            
+            # 1. Calculate resize ratio and new dimensions
+            ratio = min(target_h / H, target_w / W)
+            new_h, new_w = int(H * ratio), int(W * ratio)
 
-        # 3. Normalize with model-specific stats
-        x = (x - self.img_mean) / self.img_std
+            # 2. Resize the image
+            x = F.interpolate(
+                x, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
 
-        # 4. Set memory format for performance
+            # 3. Normalize the resized image
+            x = (x - self.img_mean) / self.img_std
+            
+            # 4. Calculate and apply padding
+            pad_h = target_h - new_h
+            pad_w = target_w - new_w
+            padding = (pad_w // 2, pad_w - (pad_w // 2), pad_h // 2, pad_h - (pad_h // 2))
+            
+            # Pad with 0, which is the neutral value for a normalized image (representing the mean)
+            x = F.pad(x, padding, "constant", 0)
+        else:
+            # Fallback to simple (distorting) resize if letterboxing is disabled
+            if x.shape[-2:] != self.target_size:
+                x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+            x = (x - self.img_mean) / self.img_std
+
         if self.use_channels_last:
             x = x.to(memory_format=torch.channels_last)
 
         # --- Backbone and Projection ---
-        # Conditionally disable gradients for the ViT if it's frozen.
         need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in self.vit.parameters())
         ctx = nullcontext() if need_grad else torch.no_grad()
 
         with ctx:
-            # Get pooled embedding from ViT: [N, vit_hidden]
             embedding = self.vit(x)
 
-        # Project to the final model dimension: [N, d_model]
         vis = self.proj(embedding)
-
-        # Reshape back to the original batch structure
         return vis.reshape(B, T, P, self.d_model)
 
 class AudioCNN(nn.Module):
