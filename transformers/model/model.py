@@ -1487,8 +1487,8 @@ def main():
     # --- Create Dummy Input Batch ---
     B, T, P = args.batch_size, cfg.context_frames, cfg.num_players
     dummy_batch: CS2Batch = {
-        "foveal_images": torch.randint(0, 256, (B, T, P, 3, 384, 384), device=device, dtype=torch.uint8),
-        "peripheral_images": torch.randint(0, 256, (B, T, P, 3, 384, 384), device=device, dtype=torch.uint8),
+        "foveal_images": torch.randint(0, 256, (B, T, P, 3, 224, 224), device=device, dtype=torch.uint8),
+        "peripheral_images": torch.randint(0, 256, (B, T, P, 3, 224, 224), device=device, dtype=torch.uint8),
         "mel_spectrogram": torch.randn(B, T, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
         "alive_mask": torch.ones(B, T, P, device=device, dtype=torch.float32),
     }
