@@ -393,7 +393,7 @@ class ViTVisualEncoder(nn.Module):
 
             # 2. Resize the image
             x = F.interpolate(
-                x, size=(new_h, new_w), mode='bilinear', align_corners=False, antialias=False
+                x, size=(new_h, new_w), mode='bilinear', align_corners=False, antialias=True
             )
 
             # 3. Normalize the resized image

@@ -25,6 +25,29 @@ from typing import Tuple, Optional
 
 import torch
 
+# ==== ONNX export workarounds ====
+import torch.nn.functional as F
+from contextlib import contextmanager
+
+@contextmanager
+def _disable_interpolate_antialias_during_export():
+    """
+    Monkeypatch F.interpolate to force antialias=False during ONNX export.
+    Avoids unsupported op: aten::_upsample_bilinear2d_aa.
+    """
+    _orig = F.interpolate
+    def _patched(input, size=None, scale_factor=None, mode="nearest", align_corners=None,
+                 recompute_scale_factor=None, antialias=False):
+        # Force antialias off for ONNX
+        return _orig(input, size=size, scale_factor=scale_factor, mode=mode,
+                     align_corners=align_corners, recompute_scale_factor=recompute_scale_factor,
+                     antialias=False)
+    F.interpolate = _patched
+    try:
+        yield
+    finally:
+        F.interpolate = _orig
+
 # Optional deps (handled gracefully)
 try:
     import onnx
@@ -38,6 +61,46 @@ try:
 except Exception:  # pragma: no cover
     trt = None
 
+
+
+# ==== AdaptiveAvgPool2d → ReduceMean for ONNX export ====
+@contextmanager
+def _patch_adaptive_avg_pool2d_for_export():
+    """
+    Replaces F.adaptive_avg_pool2d(x, (1,1)) with x.mean((-2,-1), keepdim=True)
+    during ONNX export to avoid 'input size not accessible' errors.
+    Also patches nn.AdaptiveAvgPool2d.forward accordingly.
+    """
+    import torch.nn.functional as F
+    import torch.nn as nn
+
+    _orig_F = F.adaptive_avg_pool2d
+    def _f_patched(input, output_size):
+        # Only safe/meaningful replacement for 1x1 global pooling
+        if output_size == 1 or output_size == (1, 1) or output_size == [1, 1]:
+            return input.mean(dim=(-2, -1), keepdim=True)
+        # Fall back to original for other sizes
+        return _orig_F(input, output_size)
+
+    F.adaptive_avg_pool2d = _f_patched
+
+    # Patch module.forward
+    _orig_mod_forward = None
+    if hasattr(nn, "AdaptiveAvgPool2d"):
+        _orig_mod_forward = nn.AdaptiveAvgPool2d.forward
+        def _mod_forward(self, input):
+            if self.output_size == 1 or self.output_size == (1,1) or self.output_size == [1,1]:
+                return input.mean(dim=(-2, -1), keepdim=True)
+            return _orig_F(input, self.output_size)
+        nn.AdaptiveAvgPool2d.forward = _mod_forward
+
+    try:
+        yield
+    finally:
+        F.adaptive_avg_pool2d = _orig_F
+        if _orig_mod_forward is not None:
+            import torch.nn as nn
+            nn.AdaptiveAvgPool2d.forward = _orig_mod_forward
 
 # ------------------------------
 # Shim that flattens outputs
@@ -142,7 +205,9 @@ def export_to_onnx(core_model: torch.nn.Module, onnx_path: str, shp: Shapes, dty
         "strategy_flat": {0: "B"},
     }
 
-    torch.onnx.export(
+    _ctx = _disable_interpolate_antialias_during_export()
+    with _ctx, _patch_adaptive_avg_pool2d_for_export():
+        torch.onnx.export(
         shim, (images, mel, alive), onnx_path,
         input_names=["images", "mel_spectrogram", "alive_mask"],
         output_names=["players_flat", "strategy_flat"],
@@ -155,6 +220,46 @@ def export_to_onnx(core_model: torch.nn.Module, onnx_path: str, shp: Shapes, dty
     if onnx is not None:
         mdl = onnx.load(onnx_path)
         onnx.checker.check_model(mdl)
+
+# ==== AdaptiveAvgPool2d → ReduceMean for ONNX export ====
+@contextmanager
+def _patch_adaptive_avg_pool2d_for_export():
+    """
+    Replaces F.adaptive_avg_pool2d(x, (1,1)) with x.mean((-2,-1), keepdim=True)
+    during ONNX export to avoid 'input size not accessible' errors.
+    Also patches nn.AdaptiveAvgPool2d.forward accordingly.
+    """
+    import torch.nn.functional as F
+    import torch.nn as nn
+
+    _orig_F = F.adaptive_avg_pool2d
+    def _f_patched(input, output_size):
+        # Only safe/meaningful replacement for 1x1 global pooling
+        if output_size == 1 or output_size == (1, 1) or output_size == [1, 1]:
+            return input.mean(dim=(-2, -1), keepdim=True)
+        # Fall back to original for other sizes
+        return _orig_F(input, output_size)
+
+    F.adaptive_avg_pool2d = _f_patched
+
+    # Patch module.forward
+    _orig_mod_forward = None
+    if hasattr(nn, "AdaptiveAvgPool2d"):
+        _orig_mod_forward = nn.AdaptiveAvgPool2d.forward
+        def _mod_forward(self, input):
+            if self.output_size == 1 or self.output_size == (1,1) or self.output_size == [1,1]:
+                return input.mean(dim=(-2, -1), keepdim=True)
+            return _orig_F(input, self.output_size)
+        nn.AdaptiveAvgPool2d.forward = _mod_forward
+
+    try:
+        yield
+    finally:
+        F.adaptive_avg_pool2d = _orig_F
+        if _orig_mod_forward is not None:
+            import torch.nn as nn
+            nn.AdaptiveAvgPool2d.forward = _orig_mod_forward
+
 
 
 def build_trt_engine(onnx_path: str, engine_path: str, precision: str = "fp16", workspace_gb: int = 8):
