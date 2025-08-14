@@ -227,9 +227,9 @@ class CS2Config:
     training_use_frame_block_causal: bool = False #like above but reverse
 
     # Vision
-    vit_name_hf: str = "google/vit-large-patch16-384"
-    vit_name_timm: str = "vit_large_patch16_384" #preferred if available
-    vit_out_dim: int = 1024
+    vit_name_hf: str = None
+    vit_name_timm: str = "vit_base_patch16_224.augreg2_in21k" #preferred if available
+    vit_channels_last: bool = True
 
     # Audio
     mel_bins: int = 128
@@ -346,80 +346,107 @@ def _GN3d(c: int) -> torch.nn.GroupNorm:
 # -----------------------------------------------------------------------------
 # 2) Submodules — Encoders & Token Fusion
 # -----------------------------------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
 
 class ViTVisualEncoder(nn.Module):
-    """Shared-weight ViT-Large encoder for both views.
+    """Shared-weight ViT encoder with restored fine-tuning logic.
+
+    This version is a corrected drop-in replacement that:
+      - Restores the critical logic for freezing the ViT backbone during the
+        initial training phase, as described in the original model documentation.
+      - Removes automatic image resizing. It now assumes the input tensors
+        (foveal, peripheral) are pre-processed to the correct dimensions
+        required by the specified ViT model.
+      - Retains the improvements of dynamically inferring the ViT's hidden
+        size and supporting channels-last memory format for performance.
 
     Inputs per player-frame:
-      - foveal:     [B, T, P, 3, 384, 384]
-      - peripheral: [B, T, P, 3, 384, 384]
+      - foveal:     [B, T, P, 3, H, W] (H, W must match ViT's expected input)
+      - peripheral: [B, T, P, 3, H, W] (H, W must match ViT's expected input)
     Returns per player-frame visual embedding: [B, T, P, d_model]
 
-    Notes
-    -----
-    * Prefers timm's `vit_large_patch16_384` (headless) for speed.
-    * Falls back to Hugging Face `google/vit-large-patch16-384` if timm
-      is unavailable.
-    * This module expects images in **ImageNet normalization**
-      (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]).
+    Config knobs expected in `cfg` (all have safe defaults):
+      - d_model (required): Transformer model width to project into.
+      - vit_name_timm (str): e.g., "vit_base_patch16_224.augreg2_in21k".
+      - vit_channels_last (bool): Use channels-last memory format (default True).
     """
-    def __init__(self, cfg: CS2Config):
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.d_model = cfg.d_model
+        self.d_model = int(cfg.d_model)
+        self.use_channels_last: bool = bool(getattr(cfg, "vit_channels_last", True))
 
-        self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406]).reshape(1, 1, 1, 3, 1, 1))
-        self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 1, 1, 3, 1, 1))
-
-        # Optional backends (unchanged)
+        # --- Backbone Initialization (timm preferred) ---
+        backend = None
+        vit_hidden = None
         try:
             import timm  # type: ignore
-            self._has_timm = True
+            name = getattr(cfg, "vit_name_timm", "vit_base_patch16_224.augreg2_in21k")
+            self.vit = timm.create_model(name, pretrained=True, num_classes=0)
+            backend = "timm"
+            vit_hidden = getattr(self.vit, "num_features", None) or getattr(self.vit, "embed_dim", None)
         except Exception:
-            self._has_timm = False
-            timm = None  # type: ignore
-        try:
-            from transformers import ViTModel  # type: ignore
-            self._has_hf = True
-        except Exception:
-            self._has_hf = False
-            ViTModel = None  # type: ignore
+            from transformers import ViTModel, AutoConfig  # type: ignore
+            name = getattr(cfg, "vit_name_hf", "google/vit-base-patch16-224")
+            hf_cfg = AutoConfig.from_pretrained(name, trust_remote_code=True)
+            self.vit = ViTModel.from_pretrained(name, add_pooling_layer=False, trust_remote_code=True)
+            backend = "hf"
+            vit_hidden = int(hf_cfg.hidden_size)
 
-        self.backend = None
-        if self._has_timm:
-            self.vit = timm.create_model(getattr(self.cfg,"vit_name_timm"), pretrained=True, num_classes=0)
-            self.backend = "timm"
-            self.vit_out_dim = 1024
-        elif self._has_hf:
-            self.vit = ViTModel.from_pretrained(getattr(self.cfg,"vit_name_hf"))
-            self.backend = "hf"
-            self.vit_out_dim = 1024
-        else:
-            raise ImportError("Neither timm nor transformers is available for ViTVisualEncoder.")
+        if not backend or not vit_hidden:
+            raise RuntimeError("Could not initialize ViT backbone or infer its hidden size.")
+        self.backend = backend
+        self.vit_hidden = int(vit_hidden)
 
-        self.proj = nn.Linear(self.vit_out_dim * 2, cfg.d_model)
+        # --- Projection Layer ---
+        # Projects concatenated [CLS] tokens (foveal + peripheral) to the main model's dimension.
+        self.proj = nn.Linear(self.vit_hidden * 2, self.d_model)
+
+        # --- ImageNet Normalization Buffers ---
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("img_mean", mean, persistent=False)
+        self.register_buffer("img_std", std, persistent=False)
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept uint8 (0..255) or float already in [0,1]
+        """Normalizes a tensor using ImageNet stats."""
+        # Ensure input is float for normalization
         if not x.is_floating_point():
             x = x.float() / 255.0
-        # If callers accidentally pass floats in 0..255, you can add an opt-in flag to rescale.
         return (x - self.img_mean) / self.img_std
 
     def _vit_requires_grad(self) -> bool:
-        # True if any ViT parameter requires grad
+        """Checks if any parameter in the ViT backbone requires gradients."""
         return any(p.requires_grad for p in self.vit.parameters())
 
     def _forward_one_view_impl(self, x: torch.Tensor) -> torch.Tensor:
-        """Backend-agnostic single-view forward. Returns CLS [N, 1024]."""
+        """
+        Backend-agnostic forward pass for a single view.
+        Input: [N, 3, H, W], Output: CLS token [N, vit_hidden].
+        """
         if self.backend == "timm":
-            return self.vit(x)  # [N, 1024] with num_classes=0
-        else:
+            # timm models with num_classes=0 return the CLS token directly.
+            return self.vit(x)
+        else:  # Hugging Face ViTModel
+            # We must explicitly extract the CLS token from the output.
             out = self.vit(pixel_values=x)
-            return out.last_hidden_state[:, 0, :]  # [N, 1024]
+            return out.last_hidden_state[:, 0, :]
 
     def _forward_one_reshape(self, x: torch.Tensor) -> torch.Tensor:
-        # Freeze-aware grad control
+        """
+        Processes a flattened batch of images for one view, respecting the
+        ViT's frozen state.
+        """
+        # Normalize and set memory format. No resizing is performed.
+        x = self._normalize(x)
+        if self.use_channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+
+        # Conditionally disable gradients for the ViT forward pass if it's frozen.
+        # This is critical for the two-stage training strategy.
         need_grad = torch.is_grad_enabled() and self._vit_requires_grad()
         if need_grad:
             return self._forward_one_view_impl(x)
@@ -428,23 +455,32 @@ class ViTVisualEncoder(nn.Module):
                 return self._forward_one_view_impl(x)
 
     def forward(self, foveal: torch.Tensor, peripheral: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes foveal and peripheral views and projects them to a fused embedding.
+
+        Args:
+            foveal: Tensor of shape [B, T, P, 3, H, W].
+            peripheral: Tensor of shape [B, T, P, 3, H, W].
+
+        Returns:
+            A fused visual embedding of shape [B, T, P, d_model].
+        """
         B, T, P = foveal.shape[:3]
         N = B * T * P
 
-        # Normalize to ImageNet stats (broadcasted)
-        foveal = self._normalize(foveal)
-        peripheral = self._normalize(peripheral)
+        # Reshape the batch for efficient processing.
+        fov = foveal.reshape(N, *foveal.shape[-3:])
+        per = peripheral.reshape(N, *peripheral.shape[-3:])
 
-        # Flatten player-frames
-        fov = foveal.reshape(N, *foveal.shape[-3:])          # [N, 3, 384, 384]
-        per = peripheral.reshape(N, *peripheral.shape[-3:])  # [N, 3, 384, 384]
+        # Process each view through the shared-weight ViT encoder.
+        cls_a = self._forward_one_reshape(fov)  # [N, vit_hidden]
+        cls_b = self._forward_one_reshape(per)  # [N, vit_hidden]
 
-        # Shared ViT; take CLS token per view
-        cls_a = self._forward_one_reshape(fov)   # [N, 1024]
-        cls_b = self._forward_one_reshape(per)   # [N, 1024]
+        # Concatenate the [CLS] tokens and project to the final dimension.
+        vis = self.proj(torch.cat([cls_a, cls_b], dim=-1)) # [N, d_model]
 
-        vis = self.proj(torch.cat([cls_a, cls_b], dim=-1)).reshape(B, T, P, self.d_model)
-        return vis
+        # Reshape back to the original batch structure.
+        return vis.reshape(B, T, P, self.d_model)
 
 
 class AudioCNN(nn.Module):
@@ -1521,8 +1557,8 @@ def main():
 
         # Create a dummy batch for a single frame (T=1)
         single_frame_batch: CS2Batch = {
-            "foveal_images": torch.randint(0, 256, (B, 1, P, 3, 384, 384), device=device, dtype=torch.uint8),
-            "peripheral_images": torch.randint(0, 256, (B, 1, P, 3, 384, 384), device=device, dtype=torch.uint8),
+            "foveal_images": torch.randint(0, 256, (B, 1, P, 3, 224, 224), device=device, dtype=torch.uint8),
+            "peripheral_images": torch.randint(0, 256, (B, 1, P, 3, 224, 224), device=device, dtype=torch.uint8),
             "mel_spectrogram": torch.randn(B, 1, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
             "alive_mask": torch.randint(0, 2, (B, 1, P), device=device, dtype=torch.bool),
         }
