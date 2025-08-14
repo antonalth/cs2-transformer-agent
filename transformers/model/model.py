@@ -1347,6 +1347,9 @@ def main():
     if args.freeze_vit:
         model.set_vit_frozen(True)
 
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    precision = dtype_map[args.dtype]
+
     if args.compile:
         if args.tensorrt:
             # --- Compile with torch_tensorrt backend ---
@@ -1367,9 +1370,6 @@ def main():
                 exit(1)
 
             print("[INFO] Compiling model with torch_tensorrt backend... (this may take a long time)")
-
-            dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-            precision = dtype_map[args.dtype]
 
             trt_options = {
                 # Set the precision for the TensorRT engine
