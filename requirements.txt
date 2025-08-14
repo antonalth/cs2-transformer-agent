@@ -1,1 +1,8 @@
 transformers
+lmdb
+msgpack
+timm
+flash-attn
+matplotlib
+opencv-python
+tqdm
