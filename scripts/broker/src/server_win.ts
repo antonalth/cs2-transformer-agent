@@ -136,43 +136,51 @@ function createHttpApiServer() {
 
 			// Now the command is simple, as we're already in the right directory.
 			const listPidsCmdString = `Start.exe /box:${sandboxName} /listpids`;
-
-			try {
-				// Execute the first command to get the PIDs.
+        try {
+				// --- Step 1: Get all PIDs running inside the specific sandbox. (First external call) ---
 				const { stdout: pidsOutput } = await execFilePromise('cmd.exe', ['/c', listPidsCmdString], execOptions);
-				
-				const pids = pidsOutput.match(/\d+/g) || [];
+				const sandboxedPids = new Set(pidsOutput.match(/\d+/g) || []);
+
+				if (sandboxedPids.size === 0) {
+					// No processes in the sandbox, so it can't be running.
+					res.writeHead(200, { 'Content-Type': 'application/json' });
+					res.end('false');
+					return;
+				}
+
+				// --- Step 2: Get all running processes on the system. (Second and final external call) ---
+				// We use the native 'tasklist' command, which is very fast.
+				// '/fo csv' formats the output as CSV. '/nh' removes the header row.
+				const { stdout: tasklistOutput } = await execFilePromise('tasklist', ['/fo', 'csv', '/nh']);
 
 				let isRunning = false;
-				for (const pid of pids) {
-					// FIX: Use PowerShell for a reliable way to get the process name from a PID.
-					// This avoids all the quoting issues with cmd.exe and tasklist.
-					const checkPidCmd = 'powershell.exe';
-					const checkPidArgs = ['-Command', `(Get-Process -Id ${pid}).MainModule.ModuleName`];
-					const { stdout: processNameOutput } = await execFilePromise(checkPidCmd, checkPidArgs);
+				const targetProcessName = processName.toLowerCase();
 
-					// The output is now clean (e.g., "cs2.exe"). We can do a direct, case-insensitive comparison.
-					if (processNameOutput.trim().toLowerCase() === processName.toLowerCase()) {
+				// --- Step 3: Parse the tasklist output and check for a match in memory. ---
+				// This is extremely fast as it doesn't involve any more external calls.
+				const runningProcesses = tasklistOutput.trim().split('\n');
+				for (const processLine of runningProcesses) {
+					// tasklist CSV format is: "Image Name","PID","Session Name",...
+					// We only need the first two values.
+					const parts = processLine.split('","');
+					if (parts.length < 2) continue;
+
+					const currentProcessName = parts[0].substring(1).toLowerCase(); // Remove leading quote
+					const currentPid = parts[1];
+					
+					// If the process name matches AND its PID is in our sandbox set, we have a winner.
+					if (currentProcessName === targetProcessName && sandboxedPids.has(currentPid)) {
 						isRunning = true;
-						break; 
+						break; // Found it, no need to check further.
 					}
 				}
 
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify(isRunning));
+
 			} catch (error) {
-				// We still expect errors if a PID disappears between listing and checking.
-				// We can log it for debugging but it's not a critical failure.
-				// Critical failures (like sandbox not found) will also be caught here.
-				if (
-					typeof error === 'object' &&
-					error !== null &&
-					'stderr' in error &&
-					typeof (error as { stderr?: string }).stderr === 'string' &&
-					!(error as { stderr: string }).stderr.includes('No process with process ID')
-				) {
-					console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
-				}
+				console.error(`[HTTP API /running] Error checking process for client ${clientId}:`, error);
+				// If something went wrong (e.g., sandbox doesn't exist), report 'false'.
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end('false');
 			}
