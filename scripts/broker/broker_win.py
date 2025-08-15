@@ -8,4 +8,4 @@ os.chdir("broker")
 subprocess.run(["npm", "install"], shell=True, check=True)
 
 # Step 2: Run the server with tsx
-subprocess.run(["npx", "tsx", r"src\server.ts"], shell=True, check=True)
+subprocess.run(["npx", "tsx", r"src\server_win.ts"], shell=True, check=True)
