@@ -337,22 +337,17 @@ def _GN3d(c: int) -> torch.nn.GroupNorm:
 # 2) Submodules — Encoders & Token Fusion
 # -----------------------------------------------------------------------------
 
-
 class ViTVisualEncoder(nn.Module):
-    """Single-Image ViT encoder using timm, with SOTA letterboxing.
+    """
+    Single-Image ViT encoder that assumes *externally* pre-processed input.
 
-    This version implements aspect-ratio-preserving resizing with the correct
-    preprocessing order: Resize -> Normalize -> Pad. This ensures that padded
-    regions are neutral (zero) after normalization.
-
-    - Preprocessing: Handles letterboxing, resizing, and normalization.
-    - Input: A single image tensor, e.g., [B, T, P, 3, H, W].
-    - Output: A visual embedding per player-frame, [B, T, P, d_model].
+    - Expects input already resized/letterboxed/padded and normalized for the chosen ViT.
+    - Input:  [B, T, P, 3, H, W]  (float tensor; normalized; correct HxW for the ViT)
+    - Output: [B, T, P, d_model]
     """
     def __init__(self, cfg):
         try:
             import timm
-            from timm.data import resolve_model_data_config
         except Exception as e:
             raise RuntimeError(
                 "The ViTVisualEncoder requires 'timm'. Install it or pass --dummy-vit.\n"
@@ -363,73 +358,50 @@ class ViTVisualEncoder(nn.Module):
         self.cfg = cfg
         self.d_model = int(cfg.d_model)
         self.use_channels_last = bool(getattr(cfg, "vit_channels_last", True))
-        self.use_letterboxing = bool(getattr(cfg, "use_letterboxing", True))
 
         model_name = getattr(cfg, "vit_name_timm", "vit_base_patch14_dinov2.lvd142m")
         try:
+            # num_classes=0 -> feature extractor returning (N, num_features)
             self.vit = timm.create_model(model_name, pretrained=True, num_classes=0)
             self.vit_hidden = self.vit.num_features
         except Exception as e:
             raise RuntimeError(f"Failed to initialize timm model '{model_name}': {e}")
 
+        # Optionally freeze the backbone if configured
+        freeze_vit = bool(getattr(cfg, "vit_frozen", False))
+        if freeze_vit:
+            for p in self.vit.parameters():
+                p.requires_grad = False
+            # Disable dropout, etc., if we’re not training the backbone
+            self.vit.eval()
+
         self.proj = nn.Linear(self.vit_hidden, self.d_model)
 
-        data_config = resolve_model_data_config(self.vit)
-        mean = torch.tensor(data_config['mean']).view(1, 3, 1, 1)
-        std = torch.tensor(data_config['std']).view(1, 3, 1, 1)
-        self.register_buffer("img_mean", mean, persistent=True)
-        self.register_buffer("img_std", std, persistent=True)
-        self.target_size = data_config['input_size'][1:] # (H, W) e.g., (448, 448)
-
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # Expect [B, T, P, C, H, W] with C==3, already normalized & sized correctly.
+        if images.dim() != 6:
+            raise ValueError(f"Expected 6D tensor [B,T,P,C,H,W], got {images.shape}")
         B, T, P, C, H, W = images.shape
+        if C != 3:
+            raise ValueError(f"Expected 3 channels, got {C}")
+
         N = B * T * P
         x = images.reshape(N, C, H, W)
 
-        if not x.is_floating_point():
-            x = x.float() / 255.0
-
-        # --- Preprocessing with CORRECT order: Resize -> Normalize -> Pad ---
-        if self.use_letterboxing:
-            target_h, target_w = self.target_size
-            
-            # 1. Calculate resize ratio and new dimensions
-            ratio = min(target_h / H, target_w / W)
-            new_h, new_w = int(H * ratio), int(W * ratio)
-
-            # 2. Resize the image
-            x = F.interpolate(
-                x, size=(new_h, new_w), mode='bilinear', align_corners=False, antialias=True
-            )
-
-            # 3. Normalize the resized image
-            x = (x - self.img_mean) / self.img_std
-            
-            # 4. Calculate and apply padding
-            pad_h = target_h - new_h
-            pad_w = target_w - new_w
-            padding = (pad_w // 2, pad_w - (pad_w // 2), pad_h // 2, pad_h - (pad_h // 2))
-            
-            # Pad with 0, which is the neutral value for a normalized image (representing the mean)
-            x = F.pad(x, padding, "constant", 0)
-        else:
-            # Fallback to simple (distorting) resize if letterboxing is disabled
-            if x.shape[-2:] != self.target_size:
-                x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
-            x = (x - self.img_mean) / self.img_std
-
+        # No resizing/letterboxing/normalization here—done upstream in train.py.
         if self.use_channels_last:
+            # keep device and dtype; only change memory format
             x = x.to(memory_format=torch.channels_last)
 
-        # --- Backbone and Projection ---
+        # Run backbone (optionally without grad if it’s frozen)
         need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in self.vit.parameters())
         ctx = nullcontext() if need_grad else torch.no_grad()
-
         with ctx:
-            embedding = self.vit(x)
+            feats = self.vit(x)          # (N, vit_hidden)
 
-        vis = self.proj(embedding)
-        return vis.reshape(B, T, P, self.d_model)
+        vis = self.proj(feats)           # (N, d_model)
+        return vis.view(B, T, P, self.d_model)
+
 
 class AudioCNN(nn.Module):
     """Small 2D-CNN over Mel-spectrograms → [B, T, P, d_model].
@@ -1456,7 +1428,7 @@ def main():
     B, T, P = args.batch_size, cfg.context_frames, cfg.num_players
     # Using 480x640 as the representative input size
     dummy_batch: CS2Batch = {
-        "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
+        "images": torch.randn(B, T, P, 3, 518, 518, device=device, dtype=precision),
         "mel_spectrogram": torch.randn(B, T, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
         "alive_mask": torch.ones(B, T, P, device=device, dtype=torch.float32),
     }
@@ -1530,7 +1502,7 @@ def main():
         model.eval()
 
         single_frame_batch: CS2Batch = {
-            "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
+            "images": torch.randn(B, T, P, 3, 518, 518, device=device, dtype=precision),
             "mel_spectrogram": torch.randn(B, 1, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
             "alive_mask": torch.randint(0, 2, (B, 1, P), device=device, dtype=torch.bool),
         }

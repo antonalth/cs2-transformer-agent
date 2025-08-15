@@ -16,7 +16,7 @@ import argparse
 import random
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List, Any, Sequence
 
 # Third-party libraries
 import lmdb
@@ -46,12 +46,17 @@ class DataConfig:
     lmdb_root_path: str
     manifest_path: str
     num_workers: int = 8
+    # TODO: These should be part of the config file
+    map_extents: Dict = field(default_factory=lambda: {
+        "x": (-2000.0, 3000.0), "y": (-3500.0, 2500.0), "z": (-500.0, 500.0)
+    })
 
 @dataclass
 class TrainConfig:
     context_frames: int = 512
     steps_per_epoch: int = 10000
     batch_size: int = 4
+    model_name: str = "vit_base_patch14_dinov2.lvd142m"
 
 def load_config_from_yaml(path: str) -> tuple[DataConfig, TrainConfig]:
     with open(path, 'r') as f:
@@ -127,6 +132,55 @@ class DatasetIndexer:
 # 4. DATA TRANSFORMATION HELPERS
 # ===================================================================
 
+# --- TIMM-aware Image Preprocessing Functions ---
+
+def _resolve_timm_config(model_name: str):
+    """Creates a dummy TIMM model to resolve its preprocessing config."""
+    try:
+        import timm
+        from timm.data import resolve_model_data_config
+    except ImportError:
+        raise ImportError("Please install timm to use the ViT model: `pip install timm`")
+    
+    m = timm.create_model(model_name, pretrained=True, num_classes=0)
+    cfg = resolve_model_data_config(m)
+    H, W = cfg["input_size"][1], cfg["input_size"][2]
+    interp = cfg.get("interpolation", "bicubic")
+    mean = torch.tensor(cfg.get("mean", (0.485, 0.456, 0.406)), dtype=torch.float32)
+    std  = torch.tensor(cfg.get("std",  (0.229, 0.224, 0.225)), dtype=torch.float32)
+    print(f"[TIMM Config Resolver] Model: {model_name} -> Input: {H}x{W}, Interp: {interp}")
+    return (H, W), interp, mean, std
+
+def _cv2_interpolation(interp_name: str) -> int:
+    """Maps TIMM interpolation string to an OpenCV enum."""
+    interp_name = (interp_name or "").lower()
+    if "bicubic" in interp_name: return cv2.INTER_CUBIC
+    if "lanczos" in interp_name: return cv2.INTER_LANCZOS4
+    if "nearest" in interp_name: return cv2.INTER_NEAREST
+    return cv2.INTER_LINEAR
+
+def _letterbox_resize_pad_opencv(img_np: np.ndarray, target_hw: Tuple[int, int], interp: str, pad_value_rgb_01: Sequence[float]) -> torch.Tensor:
+    """Performs a pure OpenCV/NumPy letterbox resize and pad."""
+    assert img_np.ndim == 3 and img_np.shape[2] == 3, "Input must be a HWC RGB numpy array"
+    Ht, Wt = target_hw
+    h, w, c = img_np.shape
+    scale = min(Wt / w, Ht / h)
+    new_w, new_h = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    if (new_w, new_h) != (w, h):
+        img_np = cv2.resize(img_np, (new_w, new_h), interpolation=_cv2_interpolation(interp))
+    pad_value_uint8 = (np.array(pad_value_rgb_01, dtype=np.float32) * 255.0).astype(np.uint8)
+    canvas = np.full((Ht, Wt, c), pad_value_uint8, dtype=np.uint8)
+    top, left = (Ht - new_h) // 2, (Wt - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w, :] = img_np
+    return torch.from_numpy(canvas).permute(2, 0, 1).float().div(255.0)
+
+def _normalize_inplace(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
+    """Normalizes a CHW tensor in-place."""
+    x.sub_(mean[:, None, None]).div_(std[:, None, None])
+    return x
+
+# --- Core Data Transformation Helpers ---
+
 def find_nth_set_bit_pos(n: int, j: int) -> int:
     """Finds the bit position of the j-th 'on' bit in integer n."""
     count = 0
@@ -135,7 +189,9 @@ def find_nth_set_bit_pos(n: int, j: int) -> int:
             if count == j:
                 return i
             count += 1
-    return -1 # Should not happen if data is well-formed
+    return -1
+
+# ... (Bitmask and heatmap helpers will be added in later steps)
 
 # ===================================================================
 # 5. PYTORCH DATASET & DATALOADER
@@ -152,83 +208,60 @@ class LMDBStreamerDataset(IterableDataset):
         self.train_cfg = train_cfg
         self.chunk_size_frames = self.train_cfg.context_frames + 1
         self.envs = {}
+        
+        # Resolve the TIMM config once. This is inherited by worker processes.
+        self.target_hw, self.interp, self.mean, self.std = _resolve_timm_config(self.train_cfg.model_name)
 
     def _get_env(self, lmdb_path):
         if lmdb_path not in self.envs:
             self.envs[lmdb_path] = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
         return self.envs[lmdb_path]
         
-    def _process_chunk(self, raw_chunk_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _process_chunk(self, raw_chunk_data: List[Dict[str, Any]], round_info: dict) -> Dict[str, Any]:
         """Transforms a chunk of raw data from LMDB into processed tensors."""
-        
-        # --- Initialize lists to hold per-frame input tensors ---
         all_frame_images, all_frame_mels, all_alive_masks = [], [], []
 
-        # --- Process Input Frames (0 to T-1) ---
         for frame_data in raw_chunk_data[:self.train_cfg.context_frames]:
             game_state = frame_data['game_state'][0]
             player_data_list = frame_data['player_data']
             
-            # Padded tensors for this frame
-            padded_images = torch.zeros(NUM_PLAYERS, 3, 480, 640, dtype=torch.uint8)
-            padded_mels = torch.zeros(NUM_PLAYERS, 1, 128, 6, dtype=torch.float32) # Assuming default mel shape
+            padded_images = torch.zeros(NUM_PLAYERS, 3, *self.target_hw, dtype=torch.float32)
+            padded_mels = torch.zeros(NUM_PLAYERS, 1, 128, 8, dtype=torch.float32) # Assuming fixed mel shape
             
             team_alive_mask = game_state['team_alive']
             alive_mask = torch.tensor([(team_alive_mask >> i) & 1 for i in range(NUM_PLAYERS)], dtype=torch.bool)
             
-            # Use the alive mask to correctly place player data in padded tensors
             for i, p_data_tuple in enumerate(player_data_list):
                 slot_index = find_nth_set_bit_pos(team_alive_mask, i)
                 if slot_index == -1: continue
 
-                # Unpack player data
                 p_info, jpeg_bytes, mel_spec = p_data_tuple
                 
-                # Image processing
+                # --- OpenCV-Optimized Preprocessing Pipeline ---
                 img_bgr = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                padded_images[slot_index] = torch.from_numpy(img_rgb).permute(2, 0, 1)
+                img_rgb_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                img_tensor_01 = _letterbox_resize_pad_opencv(img_rgb_np, self.target_hw, self.interp, self.mean.tolist())
+                img_tensor_norm = _normalize_inplace(img_tensor_01, self.mean, self.std)
+                padded_images[slot_index] = img_tensor_norm
 
-                # Mel spectrogram processing
                 if mel_spec is not None:
-                    # TODO: Handle variable time dimension of mel spectrograms if necessary
-                    padded_mels[slot_index] = torch.from_numpy(mel_spec).unsqueeze(0)
+                    # TODO: Implement proper mel spectrogram padding/truncating
+                    pass
 
             all_frame_images.append(padded_images)
             all_frame_mels.append(padded_mels)
             all_alive_masks.append(alive_mask)
 
-        # --- Process Target Frame (the last frame) ---
+        # TODO: Implement full target transformation logic
         target_frame_data = raw_chunk_data[-1]
-        gs_target = target_frame_data['game_state'][0]
-        pd_target_list = target_frame_data['player_data']
         
-        # TODO: Implement full target transformation logic (heatmaps, multi-hot bitmasks)
-        # For now, we create placeholder tensors
-        
-        # Game-level targets
-        target_enemy_pos = torch.from_numpy(gs_target['enemy_pos'])
-        
-        # Player-level targets
-        padded_target_health = torch.zeros(NUM_PLAYERS, dtype=torch.uint8)
-        team_alive_target = gs_target['team_alive']
-        for i, p_data_tuple in enumerate(pd_target_list):
-            slot_index = find_nth_set_bit_pos(team_alive_target, i)
-            if slot_index == -1: continue
-            padded_target_health[slot_index] = p_data_tuple[0]['health']
-            
-        # --- Final Assembly ---
         inputs = {
-            "images": torch.stack(all_frame_images, dim=0),      # Shape: [T, 5, 3, H, W]
-            "mel_spectrograms": torch.stack(all_frame_mels, dim=0), # Shape: [T, 5, 1, M, T_mel]
-            "alive_mask": torch.stack(all_alive_masks, dim=0),   # Shape: [T, 5]
+            "images": torch.stack(all_frame_images, dim=0),
+            "mel_spectrograms": torch.stack(all_frame_mels, dim=0),
+            "alive_mask": torch.stack(all_alive_masks, dim=0),
         }
         
-        targets = {
-            "enemy_pos": target_enemy_pos,
-            "player_health": padded_target_health,
-            # ... other target tensors will be added here
-        }
+        targets = { "placeholder": torch.tensor(0) } # Placeholder for now
 
         return {"inputs": inputs, "targets": targets}
 
@@ -268,32 +301,30 @@ class LMDBStreamerDataset(IterableDataset):
                         unpacked_data = msgpack.unpackb(value_bytes, raw=False, object_hook=mpnp.decode)
                         raw_chunk_data.append(unpacked_data)
                     else:
-                        raw_chunk_data.append(None) # Should be handled
-
-            # Filter out None chunks which can happen at round boundaries
+                        raw_chunk_data.append(None)
+            
             if any(item is None for item in raw_chunk_data):
                 continue
             
-            yield self._process_chunk(raw_chunk_data)
-
+            yield self._process_chunk(raw_chunk_data, round_info)
 
 # ===================================================================
-# 6. SCRIPT ENTRYPOINT (for testing Tier 1)
+# 6. SCRIPT ENTRYPOINT
 # ===================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test the Tier 1 Data Pipeline for the CS2Transformer.")
     
-    # Create a dummy yaml file for testing
     dummy_config_path = "dummy_config.yaml"
     with open(dummy_config_path, 'w') as f:
         f.write("data:\n")
-        f.write("  lmdb_root_path: '/path/to/your/lmdbs' # <-- IMPORTANT: EDIT THIS PATH\n")
+        f.write("  lmdb_root_path: '/path/to/your/lmdbs' # <-- EDIT THIS PATH\n")
         f.write("  manifest_path: '/path/to/your/lmdbs/split_manifest.json' # <-- AND THIS PATH\n")
         f.write("  num_workers: 2\n")
         f.write("\ntrain:\n")
         f.write("  context_frames: 128\n")
         f.write("  steps_per_epoch: 100\n")
         f.write("  batch_size: 2\n")
+        f.write("  model_name: 'vit_base_patch14_dinov2.lvd142m'\n")
     
     parser.add_argument("--config", type=str, default=dummy_config_path, help="Path to the YAML configuration file.")
     args = parser.parse_args()
@@ -323,6 +354,8 @@ if __name__ == "__main__":
     except (FileNotFoundError, ValueError, KeyError) as e:
         print(f"\nAn error occurred during the test:\n{e}")
         print("\nPlease ensure paths in your config file ('dummy_config.yaml') are correct.")
+    except ImportError as e:
+        print(f"\nAn import error occurred: {e}")
     finally:
         if os.path.exists(dummy_config_path):
             os.remove(dummy_config_path)
