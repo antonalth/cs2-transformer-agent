@@ -13,20 +13,53 @@ and checkpointing for the project.
 import os
 import json
 import argparse
+import random
 from pathlib import Path
+from dataclasses import dataclass, field
 
 # Third-party libraries
 import lmdb
+import yaml
+import cv2
+import numpy as np
+import msgpack
+import msgpack_numpy as mpnp
 from tqdm import tqdm
 
-# (We will add more imports like torch, wandb, etc. in future steps)
+# PyTorch imports
+import torch
+import torch.distributed as dist
+from torch.utils.data import IterableDataset, DataLoader
 
+# (We will add more imports like model, wandb, etc. in future steps)
 
 # ===================================================================
-# 2. CONFIGURATION DATACLASSES
+# 2. CONSTANTS & CONFIGURATION
 # ===================================================================
-# (To be added in the next step)
 
+# This is a fundamental property of the dataset created by injection_mold.py
+TICKS_PER_FRAME = 2
+
+@dataclass
+class DataConfig:
+    lmdb_root_path: str
+    manifest_path: str
+    num_workers: int = 8
+
+@dataclass
+class TrainConfig:
+    context_frames: int = 512  # 16 seconds
+    steps_per_epoch: int = 10000
+    batch_size: int = 4
+    # (More training params like learning_rate will be added later)
+
+def load_config_from_yaml(path: str) -> tuple[DataConfig, TrainConfig]:
+    """Loads configuration from a YAML file."""
+    with open(path, 'r') as f:
+        cfg_dict = yaml.safe_load(f)
+    data_cfg = DataConfig(**cfg_dict['data'])
+    train_cfg = TrainConfig(**cfg_dict['train'])
+    return data_cfg, train_cfg
 
 # ===================================================================
 # 3. DATASET INDEXING & VALIDATION
@@ -170,45 +203,201 @@ class DatasetIndexer:
         return round_pool
 
 # ===================================================================
-# 4. SCRIPT ENTRYPOINT (for testing the indexer)
+# 4. PYTORCH DATASET & DATALOADER
+# ===================================================================
+
+class LMDBStreamerDataset(IterableDataset):
+    """
+    A PyTorch IterableDataset for streaming data from a collection of LMDBs.
+    This dataset is designed for large-scale, distributed training.
+    """
+    def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig):
+        super().__init__()
+        self.pool = sampling_pool
+        self.data_cfg = data_cfg
+        self.train_cfg = train_cfg
+        self.chunk_size_frames = self.train_cfg.context_frames + 1
+        
+        # In-worker cache for LMDB environments to avoid re-opening files
+        self.envs = {}
+
+    def _get_env(self, lmdb_path):
+        """Opens and caches LMDB environments on a per-worker basis."""
+        if lmdb_path not in self.envs:
+            self.envs[lmdb_path] = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
+        return self.envs[lmdb_path]
+
+    def _process_chunk(self, raw_chunk_data: list, round_info: dict) -> dict:
+        """
+        Transforms a chunk of raw data from LMDB into processed tensors.
+        
+        TODO: This is where the core data transformation logic will live.
+        - Padding of player data to a fixed size of 5.
+        - Transformation of bitmasks to multi-hot tensors.
+        - Transformation of coordinates to heatmaps.
+        """
+        # For now, let's implement the essential parts: deserialization and image decoding.
+        
+        images = []
+        for frame_data in raw_chunk_data:
+            # frame_data is a tuple: (player_info_bytes, jpeg_bytes, mel_spectrogram_bytes)
+            # The model expects a list of 5 player images per frame.
+            
+            # TODO: Implement full 5-player padding logic.
+            # For now, we just process the first available player for simplicity.
+            if frame_data and frame_data[0]:
+                jpeg_bytes = frame_data[0][1] # Get the first player's jpeg
+                img_bgr = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                images.append(img_rgb)
+            else:
+                 # Append a dummy black frame if no players are alive
+                images.append(np.zeros((480, 640, 3), dtype=np.uint8))
+
+        # Stack into a single numpy array and convert to tensor
+        images_tensor = torch.from_numpy(np.stack(images, axis=0)).permute(0, 3, 1, 2) # T, C, H, W
+        
+        # The final output will be a dictionary of tensors
+        return {"images": images_tensor}
+        
+
+    def __iter__(self):
+        # Handle DDP sharding
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            # Single-process data loading
+            worker_id = 0
+            num_workers = 1
+            worker_pool = self.pool
+        else:
+            # Multi-process data loading
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            # Each worker gets a unique, non-overlapping shard of the data
+            worker_pool = self.pool[worker_id::num_workers]
+
+        # Set a unique random seed for each worker to ensure different data streams
+        random.seed(random.randint(0, 2**32-1) + worker_id)
+
+        # Infinite loop to continuously stream data
+        while True:
+            # 1. Randomly select a round-perspective from this worker's pool
+            round_info = random.choice(worker_pool)
+            start_tick, end_tick = round_info['start_tick'], round_info['end_tick']
+            
+            # Calculate total number of frames available in this round
+            total_frames = (end_tick - start_tick) // TICKS_PER_FRAME
+            if total_frames < self.chunk_size_frames:
+                continue # Skip this round, it's too short for a full chunk
+
+            # --- Two-Stage Uniform Sampling (by Frame Index) ---
+            # Stage 1: Uniformly sample a TARGET frame index
+            target_frame_idx = random.randint(0, total_frames - 1)
+
+            # Stage 2: Uniformly sample a valid CHUNK START that contains the target
+            max_start_frame_idx = total_frames - self.chunk_size_frames
+            
+            possible_start_min = max(0, target_frame_idx - self.chunk_size_frames + 1)
+            possible_start_max = min(max_start_frame_idx, target_frame_idx)
+            
+            start_frame_idx = random.randint(possible_start_min, possible_start_max)
+            
+            # --- Read the chunk from LMDB ---
+            raw_chunk_data = []
+            env = self._get_env(round_info['lmdb_path'])
+            with env.begin(write=False) as txn:
+                for i in range(self.chunk_size_frames):
+                    current_frame_idx = start_frame_idx + i
+                    current_tick = start_tick + (current_frame_idx * TICKS_PER_FRAME)
+                    
+                    key = (f"{round_info['demo_name']}_round_{round_info['round_num']:03d}_"
+                           f"team_{round_info['team']}_tick_{current_tick:08d}").encode('utf-8')
+                    
+                    value_bytes = txn.get(key)
+                    if value_bytes:
+                        # Deserialization happens later in _process_chunk
+                        # The value is a msgpack'd dict {"game_state": ..., "player_data": [...]}
+                        # player_data is a list of tuples: [(pi_dtype, jpg_bytes, mel_spec), ...]
+                        unpacked_data = msgpack.unpackb(value_bytes, raw=False, object_hook=mpnp.decode)
+                        raw_chunk_data.append(unpacked_data.get('player_data'))
+                    else:
+                        # Append None if a key is missing, though this shouldn't happen
+                        raw_chunk_data.append(None)
+
+            # Process the raw data into tensors and yield
+            yield self._process_chunk(raw_chunk_data, round_info)
+
+
+# ===================================================================
+# 5. SCRIPT ENTRYPOINT (for testing Tier 1)
 # ===================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Test the DatasetIndexer component of the training script."
+        description="Test the Tier 1 Data Pipeline for the CS2Transformer."
     )
+    # Create a dummy yaml file for testing
+    with open('dummy_config.yaml', 'w') as f:
+        f.write("data:\n")
+        f.write("  lmdb_root_path: '/path/to/your/lmdbs'\n")
+        f.write("  manifest_path: '/path/to/your/lmdbs/split_manifest.json'\n")
+        f.write("  num_workers: 2\n")
+        f.write("\n")
+        f.write("train:\n")
+        f.write("  context_frames: 128\n")
+        f.write("  steps_per_epoch: 100\n")
+        f.write("  batch_size: 2\n")
+    
     parser.add_argument(
-        "--lmdbpath",
-        required=True,
+        "--config",
         type=str,
-        help="Path to the root directory containing the LMDB folders."
+        default="dummy_config.yaml",
+        help="Path to the YAML configuration file."
     )
-    parser.add_argument(
-        "--manifest_path",
-        type=str,
-        default=None,
-        help="Path to the split_manifest.json file. If not provided, defaults to <lmdbpath>/split_manifest.json"
-    )
-
     args = parser.parse_args()
-
-    manifest_path = args.manifest_path
-    if manifest_path is None:
-        manifest_path = os.path.join(args.lmdbpath, "split_manifest.json")
+    
+    print(f"Loading configuration from: {args.config}")
+    data_cfg, train_cfg = load_config_from_yaml(args.config)
+    
+    print("\nNOTE: Replace paths in 'dummy_config.yaml' with your actual dataset paths to run this test.")
 
     try:
+        # 1. Instantiate the Indexer
         indexer = DatasetIndexer(
-            lmdb_root_path=args.lmdbpath,
-            manifest_path=manifest_path
+            lmdb_root_path=data_cfg.lmdb_root_path,
+            manifest_path=data_cfg.manifest_path
         )
-        
-        print("\n--- Example items from the generated sampling pools ---")
-        if indexer.train_pool:
-            print("\nFirst 3 training round-perspectives found:")
-            print(json.dumps(indexer.train_pool[:3], indent=2))
-        
-        if indexer.val_pool:
-            print("\nFirst 3 validation round-perspectives found:")
-            print(json.dumps(indexer.val_pool[:3], indent=2))
+
+        # 2. Instantiate the Dataset
+        dataset = LMDBStreamerDataset(
+            sampling_pool=indexer.train_pool,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg
+        )
+
+        # 3. Instantiate the DataLoader
+        dataloader = DataLoader(
+            dataset,
+            batch_size=train_cfg.batch_size,
+            num_workers=data_cfg.num_workers
+        )
+
+        # 4. Fetch one batch to test the entire pipeline
+        print("\nAttempting to fetch one batch from the dataloader...")
+        first_batch = next(iter(dataloader))
+        print("Successfully fetched one batch!")
+
+        # 5. Print the shapes of the tensors in the batch
+        print("\n--- Batch Content ---")
+        for key, value in first_batch.items():
+            if isinstance(value, torch.Tensor):
+                print(f"  - Key: '{key}', Shape: {value.shape}, DType: {value.dtype}")
+        print("---------------------\n")
+        print("Tier 1 Data Pipeline test successful!")
 
     except (FileNotFoundError, ValueError, KeyError) as e:
-        print(f"\nAn error occurred during indexing:\n{e}")
+        print(f"\nAn error occurred during the test:\n{e}")
+        print("\nPlease ensure paths in your config file are correct and the dataset is valid.")
+    finally:
+        # Clean up the dummy config file
+        if os.path.exists("dummy_config.yaml"):
+            os.remove("dummy_config.yaml")
