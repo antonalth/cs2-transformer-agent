@@ -1197,27 +1197,50 @@ class CS2Transformer(nn.Module):
             torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )
         with autocast_ctx:
-            # --- MODIFIED: Use the single 'images' tensor from the batch ---
             images = batch["images"]               # [B, T, 5, 3, H, W]
             mel    = batch["mel_spectrogram"]      # [B, T, 5, 1, 128, ~6]
             alive  = batch["alive_mask"].bool()    # [B, T, 5]
 
-            B, T, P = images.shape[:3]
-            d = getattr(self.cfg,"d_model")
+            dev = images.device
+            mel   = mel.to(dev, non_blocking=True)
+            alive = alive.to(dev, non_blocking=True)
+
+            B, T, P, C, H, W = images.shape
+            d = self.cfg.d_model
 
             if __debug__:
-                assert getattr(self.cfg,"tokens_per_frame") == getattr(self.cfg,"num_players") + 2
+                assert self.cfg.tokens_per_frame == self.cfg.num_players + 2
 
-            # --- MODIFIED: Call visual encoder with a single tensor ---
-            vis = self.visual_encoder(images)        # [B, T, P, d]
-            aud = self.audio_encoder(mel)            # [B, T, P, d]
+            param_dtype = next(self.parameters()).dtype
+            target_dtype = self.amp_dtype if self.use_amp else param_dtype
+
+            vis = torch.zeros(B, T, P, d, device=dev, dtype=target_dtype)
+
+            # Only run ViT for alive slots
+            if alive.any().item():
+                alive_images = images[alive]  # [num_alive, C, H, W] – non-contiguous view!
+                num_alive = alive_images.shape[0]
+
+                # Give encoder its expected 6D shape; use reshape to handle non-contiguity safely.
+                packed_vis_out = self.visual_encoder(
+                    alive_images.reshape(num_alive, 1, 1, C, H, W)
+                )  # [num_alive, 1, 1, d]
+
+                # Match dtype before assignment
+                packed_vis_out = packed_vis_out.squeeze(1).squeeze(1).to(target_dtype)  # [num_alive, d]
+                vis[alive] = packed_vis_out
+            # --- END OPTIMIZATION ---
+
+            # Audio encoding is cheap; run for everyone.
+            aud = self.audio_encoder(mel).to(target_dtype)  # [B, T, P, d]
 
             # ---- fuse to player tokens ----
             player_tokens = self.player_fuser(vis, aud, alive)
+            # ... rest of the method
 
             # ---- special tokens per frame ----
-            tok_gs = self.token_game_strategy.reshape(1, 1, 1, -1).expand(B, T, 1, d)
-            tok_sc = self.token_scratch.reshape(1, 1, 1, -1).expand(B, T, 1, d)
+            tok_gs = self.token_game_strategy.reshape(1, 1, 1, -1).expand(B, T, 1, d).to(target_dtype)
+            tok_sc = self.token_scratch.reshape(1, 1, 1, -1).expand(B, T, 1, d).to(target_dtype)
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
 
             # ---- flatten time to sequence ----
@@ -1261,16 +1284,37 @@ class CS2Transformer(nn.Module):
                 mel = single_frame_batch["mel_spectrogram"]
                 alive = single_frame_batch["alive_mask"].bool()
 
-                B, T, P = images.shape[:3] # T is 1
+                dev = images.device
+                mel   = mel.to(dev, non_blocking=True)
+                alive = alive.to(dev, non_blocking=True)
+
+                B, T, P = images.shape[:3]  # T==1
+                C, H, W = images.shape[-3:]
                 d = self.cfg.d_model
 
-                # --- MODIFIED: Call visual encoder with a single tensor ---
-                vis = self.visual_encoder(images)
-                aud = self.audio_encoder(mel)
+                param_dtype = next(self.parameters()).dtype
+                target_dtype = self.amp_dtype if self.use_amp else param_dtype
+
+                vis = torch.zeros(B, T, P, d, device=dev, dtype=target_dtype)
+                if alive.any().item():
+                    alive_images = images[alive]  # [num_alive, 3, H, W] (non-contiguous)
+                    num_alive = alive_images.shape[0]
+
+                    # Re-wrap to the encoder’s expected 6D input
+                    packed_vis_out = self.visual_encoder(
+                        alive_images.reshape(num_alive, 1, 1, C, H, W)
+                    )  # [num_alive, 1, 1, d]
+
+                    vis[alive] = packed_vis_out.squeeze(1).squeeze(1).to(target_dtype)  # [num_alive, d]
+
+                # Audio: cheap enough to run for all
+                aud = self.audio_encoder(mel).to(target_dtype)  # [B, 1, P, d]
+
+                # Fuse
                 player_tokens = self.player_fuser(vis, aud, alive)
 
-                tok_gs = self.token_game_strategy.expand(B, T, 1, d)
-                tok_sc = self.token_scratch.expand(B, T, 1, d)
+                tok_gs = self.token_game_strategy.expand(B, T, 1, d).to(target_dtype)
+                tok_sc = self.token_scratch.expand(B, T, 1, d).to(target_dtype)
                 frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
 
                 seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
