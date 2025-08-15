@@ -1201,9 +1201,11 @@ class CS2Transformer(nn.Module):
             mel    = batch["mel_spectrogram"]      # [B, T, 5, 1, 128, ~6]
             alive  = batch["alive_mask"].bool()    # [B, T, 5]
 
-            dev = images.device
-            mel   = mel.to(dev, non_blocking=True)
-            alive = alive.to(dev, non_blocking=True)
+            dev = next(self.parameters()).device
+            images = images.to(dev, non_blocking=True)
+            mel    = mel.to(dev,    non_blocking=True)
+            alive  = alive.to(dev,  non_blocking=True)
+
 
             B, T, P, C, H, W = images.shape
             d = self.cfg.d_model
@@ -1217,7 +1219,7 @@ class CS2Transformer(nn.Module):
             vis = torch.zeros(B, T, P, d, device=dev, dtype=target_dtype)
 
             # Only run ViT for alive slots
-            if alive.any().item():
+            if torch.count_nonzero(alive):
                 alive_images = images[alive]  # [num_alive, C, H, W] – non-contiguous view!
                 num_alive = alive_images.shape[0]
 
@@ -1284,9 +1286,11 @@ class CS2Transformer(nn.Module):
                 mel = single_frame_batch["mel_spectrogram"]
                 alive = single_frame_batch["alive_mask"].bool()
 
-                dev = images.device
-                mel   = mel.to(dev, non_blocking=True)
-                alive = alive.to(dev, non_blocking=True)
+                
+                dev = next(self.parameters()).device
+                images = images.to(dev, non_blocking=True)
+                mel    = mel.to(dev,    non_blocking=True)
+                alive  = alive.to(dev,  non_blocking=True)
 
                 B, T, P = images.shape[:3]  # T==1
                 C, H, W = images.shape[-3:]
@@ -1296,7 +1300,7 @@ class CS2Transformer(nn.Module):
                 target_dtype = self.amp_dtype if self.use_amp else param_dtype
 
                 vis = torch.zeros(B, T, P, d, device=dev, dtype=target_dtype)
-                if alive.any().item():
+                if torch.count_nonzero(alive):
                     alive_images = images[alive]  # [num_alive, 3, H, W] (non-contiguous)
                     num_alive = alive_images.shape[0]
 
