@@ -129,32 +129,40 @@ class DatasetIndexer:
                 
                 info_data = json.loads(info_bytes.decode('utf-8'))
                 
-                # Create a cursor for efficient key existence checks
                 cursor = txn.cursor()
 
                 for round_entry in info_data.get("rounds", []):
                     round_num, start_tick, end_tick = round_entry
                     
-                    # For each round, check for both 'T' and 'CT' perspectives
                     for team in ['T', 'CT']:
-                        # To validate existence, we check if the key for the first tick exists.
-                        # This is a reliable and fast way to confirm data is present.
                         test_key = f"{demo_name}_round_{round_num:03d}_team_{team}_tick_{start_tick:08d}".encode('utf-8')
                         
-                        # cursor.set_key() is faster than txn.get() as it doesn't retrieve the value
                         if cursor.set_key(test_key):
-                            # This perspective exists, add it to the pool
+                            # ==============================================================
+                            # IMPORTANT NOTE ON TICK STRUCTURE (from injection_mold.py)
+                            # --------------------------------------------------------------
+                            # The data is sampled at 32 FPS from a 64 tick-rate game,
+                            # meaning TICKS_PER_FRAME = 2.
+                            #
+                            # This means that valid tick keys in the LMDB step by 2.
+                            # For example, if start_tick is 100, the valid keys for this
+                            # round-perspective will be 100, 102, 104, 106, etc., up to
+                            # the end_tick.
+                            #
+                            # The DataLoader/sampler implementation MUST account for this.
+                            # It cannot simply pick a random integer between start_tick
+                            # and end_tick; it must pick from the valid, stepped range.
+                            # ==============================================================
                             round_metadata = {
                                 "lmdb_path": str(demo_path),
                                 "demo_name": demo_name,
                                 "round_num": round_num,
-                                "team": team,  # <-- The crucial new field
+                                "team": team,
                                 "start_tick": start_tick,
                                 "end_tick": end_tick
                             }
                             round_pool.append(round_metadata)
                         else:
-                            # This perspective is missing, which can happen. Log a warning.
                             print(f"\n[Warning] Missing perspective 'team={team}' for round {round_num} in demo '{demo_name}'. Skipping.")
             
             env.close()
