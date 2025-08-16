@@ -369,7 +369,7 @@ class LMDBStreamerDataset(IterableDataset):
         }
 
         images = inputs["images"]            # [T,5,3,H,W], float32
-        mel    = inputs["mel"]               # [T,5,1,128,8], float32
+        mel    = inputs["mel_spectrogram"]               # [T,5,1,128,8], float32
         alive  = inputs["alive_mask"]        # [T,5], bool
 
         T = images.shape[0]
