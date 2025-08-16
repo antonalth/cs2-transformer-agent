@@ -1,8 +1,10 @@
 transformers
 lmdb
-msgpack
+--no-binary=msgpack msgpack
+msgpack-numpy
 flash-attn
 matplotlib
+librosa
 opencv-python
 numpy<2.0
 tqdm

@@ -243,120 +243,6 @@ def _coords_to_heatmap(coords: np.ndarray, dims: Tuple[int, int, int], extents: 
 # In class LMDBStreamerDataset:
 # ===================================================================
 
-def _process_chunk(self, raw_chunk_data: List[Dict[str, Any]], round_info: dict) -> Dict[str, Any]:
-    """Transforms a chunk of raw data from LMDB into processed tensors for model input and targets."""
-    
-    all_frame_images, all_frame_mels, all_alive_masks = [], [], []
-
-    # --- Process Input Frames (0 to T-1) ---
-    for frame_data in raw_chunk_data[:self.train_cfg.context_frames]:
-        game_state = frame_data['game_state'][0]
-        player_data_list = frame_data['player_data']
-        
-        padded_images = torch.zeros(NUM_PLAYERS, 3, *self.target_hw, dtype=torch.float32)
-        padded_mels = torch.zeros(NUM_PLAYERS, 1, 128, MEL_SPEC_TIME_FRAMES, dtype=torch.float32)
-        
-        team_alive_mask = game_state['team_alive']
-        alive_mask = torch.tensor([(team_alive_mask >> i) & 1 for i in range(NUM_PLAYERS)], dtype=torch.bool)
-        
-        for i, p_data_tuple in enumerate(player_data_list):
-            slot_index = find_nth_set_bit_pos(team_alive_mask, i)
-            if slot_index == -1: continue
-
-            _, jpeg_bytes, mel_spec = p_data_tuple
-            
-            img_bgr = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            img_rgb_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            img_tensor_01 = _letterbox_resize_pad_opencv(img_rgb_np, self.target_hw, self.interp, self.mean.tolist())
-            img_tensor_norm = _normalize_inplace(img_tensor_01, self.mean, self.std)
-            padded_images[slot_index] = img_tensor_norm
-
-            if mel_spec is not None:
-                mel_tensor = torch.from_numpy(mel_spec).unsqueeze(0)
-                if mel_tensor.shape[-1] > MEL_SPEC_TIME_FRAMES:
-                    padded_mels[slot_index] = mel_tensor[:, :, :, :MEL_SPEC_TIME_FRAMES]
-                else:
-                    pad_width = MEL_SPEC_TIME_FRAMES - mel_tensor.shape[-1]
-                    padded_mels[slot_index] = torch.nn.functional.pad(mel_tensor, (0, pad_width), 'constant', -80.0)
-
-        all_frame_images.append(padded_images)
-        all_frame_mels.append(padded_mels)
-        all_alive_masks.append(alive_mask)
-
-    # --- Process Target Frame (the last frame) ---
-    target_frame_data = raw_chunk_data[-1]
-    gs_target = target_frame_data['game_state'][0]
-    pd_target_list = target_frame_data['player_data']
-    team_alive_target = gs_target['team_alive']
-
-    padded_stats = torch.zeros(NUM_PLAYERS, 3, dtype=torch.float32)
-    padded_pos_heatmaps = torch.zeros(NUM_PLAYERS, *HEATMAP_DIMS, dtype=torch.float32)
-    padded_mouse = torch.zeros(NUM_PLAYERS, 2, dtype=torch.float32)
-    padded_keyboard = torch.zeros(NUM_PLAYERS, KEYBOARD_DIM, dtype=torch.float32)
-    padded_eco = torch.zeros(NUM_PLAYERS, ECO_DIM, dtype=torch.float32)
-    padded_inventory = torch.zeros(NUM_PLAYERS, INVENTORY_DIM, dtype=torch.float32)
-    padded_active_weapon = torch.zeros(NUM_PLAYERS, WEAPON_DIM, dtype=torch.float32)
-
-    for i, p_data_tuple in enumerate(pd_target_list):
-        slot_index = find_nth_set_bit_pos(team_alive_target, i)
-        if slot_index == -1: continue
-        p_info, _, _ = p_data_tuple
-        padded_stats[slot_index] = torch.tensor([p_info['health'], p_info['armor'], p_info['money']], dtype=torch.float32)
-        padded_pos_heatmaps[slot_index] = _coords_to_heatmap(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
-        padded_mouse[slot_index] = torch.from_numpy(p_info['mouse'])
-        padded_keyboard[slot_index] = _bitmask_to_multihot(p_info['keyboard_bitmask'], KEYBOARD_DIM)
-        padded_eco[slot_index] = _bitmask_array_to_multihot(p_info['eco_bitmask'], ECO_DIM)
-        padded_inventory[slot_index] = _bitmask_array_to_multihot(p_info['inventory_bitmask'], INVENTORY_DIM)
-        padded_active_weapon[slot_index] = _bitmask_array_to_multihot(p_info['active_weapon_bitmask'], WEAPON_DIM)
-
-    # --- Final Assembly ---
-    inputs = {
-        "images": torch.stack(all_frame_images, dim=0),
-        "mel_spectrogram": torch.stack(all_frame_mels, dim=0),
-        "alive_mask": torch.stack(all_alive_masks, dim=0),
-    }
-    
-    targets = {
-        "player_stats": padded_stats,
-        "player_pos_heatmaps": padded_pos_heatmaps,
-        "player_mouse": padded_mouse,
-        "player_keyboard": padded_keyboard,
-        "player_eco": padded_eco,
-        "player_inventory": padded_inventory,
-        "player_active_weapon": padded_active_weapon,
-        "enemy_pos_heatmap": _coords_to_heatmap(gs_target['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents),
-        "round_state": _bitmask_to_multihot(gs_target['round_state'], ROUND_STATE_DIM),
-        "round_number": torch.tensor([round_info['round_num']], dtype=torch.float32),
-    }
-    
-    images = inputs["images"]            # [T,5,3,H,W], float32
-    mel    = inputs["mel"]               # [T,5,1,128,8], float32
-    alive  = inputs["alive_mask"]        # [T,5], bool
-
-    T = images.shape[0]
-
-    # Inputs
-    assert images.dtype == torch.float32 and images.ndim == 5, "images must be [T,5,3,H,W] float32"
-    assert mel.dtype == torch.float32 and mel.ndim == 5, "mel must be [T,5,1,128,8] float32"
-    assert alive.dtype == torch.bool and alive.shape == (T, 5), "alive_mask must be [T,5] bool"
-
-    # Targets
-    assert targets["player_keyboard"].shape == (5, KEYBOARD_DIM)
-    assert targets["player_pos_heatmaps"].shape == (5, *HEATMAP_DIMS)
-    assert targets["enemy_pos_heatmap"].shape == HEATMAP_DIMS
-    assert targets["round_state"].shape == (ROUND_STATE_DIM,)
-
-    # Value ranges (avoid truthiness of tensors)
-    imin = images.amin().item()
-    imax = images.amax().item()
-    assert imin > -5 and imax < 5, f"Image normalization likely wrong: range [{imin:.3f},{imax:.3f}]"
-
-    pk = targets["player_keyboard"]
-    assert pk.dtype == torch.float32, "player_keyboard should be float32 multi-hot"
-    assert (pk >= 0).all().item() and (pk <= 1).all().item(), "player_keyboard must be in [0,1]"
-
-    return {"inputs": inputs, "targets": targets}
-
 
 # ===================================================================
 # 5. PYTORCH DATASET & DATALOADER
@@ -381,17 +267,19 @@ class LMDBStreamerDataset(IterableDataset):
         if lmdb_path not in self.envs:
             self.envs[lmdb_path] = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
         return self.envs[lmdb_path]
-        
+    
     def _process_chunk(self, raw_chunk_data: List[Dict[str, Any]], round_info: dict) -> Dict[str, Any]:
-        """Transforms a chunk of raw data from LMDB into processed tensors."""
+        """Transforms a chunk of raw data from LMDB into processed tensors for model input and targets."""
+        
         all_frame_images, all_frame_mels, all_alive_masks = [], [], []
 
+        # --- Process Input Frames (0 to T-1) ---
         for frame_data in raw_chunk_data[:self.train_cfg.context_frames]:
             game_state = frame_data['game_state'][0]
             player_data_list = frame_data['player_data']
             
             padded_images = torch.zeros(NUM_PLAYERS, 3, *self.target_hw, dtype=torch.float32)
-            padded_mels = torch.zeros(NUM_PLAYERS, 1, 128, 8, dtype=torch.float32) # Assuming fixed mel shape
+            padded_mels = torch.zeros(NUM_PLAYERS, 1, 128, MEL_SPEC_TIME_FRAMES, dtype=torch.float32)
             
             team_alive_mask = game_state['team_alive']
             alive_mask = torch.tensor([(team_alive_mask >> i) & 1 for i in range(NUM_PLAYERS)], dtype=torch.bool)
@@ -400,9 +288,8 @@ class LMDBStreamerDataset(IterableDataset):
                 slot_index = find_nth_set_bit_pos(team_alive_mask, i)
                 if slot_index == -1: continue
 
-                p_info, jpeg_bytes, mel_spec = p_data_tuple
+                _, jpeg_bytes, mel_spec = p_data_tuple
                 
-                # --- OpenCV-Optimized Preprocessing Pipeline ---
                 img_bgr = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                 img_rgb_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 img_tensor_01 = _letterbox_resize_pad_opencv(img_rgb_np, self.target_hw, self.interp, self.mean.tolist())
@@ -410,23 +297,88 @@ class LMDBStreamerDataset(IterableDataset):
                 padded_images[slot_index] = img_tensor_norm
 
                 if mel_spec is not None:
-                    # TODO: Implement proper mel spectrogram padding/truncating
-                    pass
+                    mel_tensor = torch.from_numpy(mel_spec).unsqueeze(0)
+                    if mel_tensor.shape[-1] > MEL_SPEC_TIME_FRAMES:
+                        padded_mels[slot_index] = mel_tensor[:, :, :, :MEL_SPEC_TIME_FRAMES]
+                    else:
+                        pad_width = MEL_SPEC_TIME_FRAMES - mel_tensor.shape[-1]
+                        padded_mels[slot_index] = torch.nn.functional.pad(mel_tensor, (0, pad_width), 'constant', -80.0)
 
             all_frame_images.append(padded_images)
             all_frame_mels.append(padded_mels)
             all_alive_masks.append(alive_mask)
 
-        # TODO: Implement full target transformation logic
+        # --- Process Target Frame (the last frame) ---
         target_frame_data = raw_chunk_data[-1]
-        
+        gs_target = target_frame_data['game_state'][0]
+        pd_target_list = target_frame_data['player_data']
+        team_alive_target = gs_target['team_alive']
+
+        padded_stats = torch.zeros(NUM_PLAYERS, 3, dtype=torch.float32)
+        padded_pos_heatmaps = torch.zeros(NUM_PLAYERS, *HEATMAP_DIMS, dtype=torch.float32)
+        padded_mouse = torch.zeros(NUM_PLAYERS, 2, dtype=torch.float32)
+        padded_keyboard = torch.zeros(NUM_PLAYERS, KEYBOARD_DIM, dtype=torch.float32)
+        padded_eco = torch.zeros(NUM_PLAYERS, ECO_DIM, dtype=torch.float32)
+        padded_inventory = torch.zeros(NUM_PLAYERS, INVENTORY_DIM, dtype=torch.float32)
+        padded_active_weapon = torch.zeros(NUM_PLAYERS, WEAPON_DIM, dtype=torch.float32)
+
+        for i, p_data_tuple in enumerate(pd_target_list):
+            slot_index = find_nth_set_bit_pos(team_alive_target, i)
+            if slot_index == -1: continue
+            p_info, _, _ = p_data_tuple
+            padded_stats[slot_index] = torch.tensor([p_info['health'], p_info['armor'], p_info['money']], dtype=torch.float32)
+            padded_pos_heatmaps[slot_index] = _coords_to_heatmap(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
+            padded_mouse[slot_index] = torch.from_numpy(p_info['mouse'])
+            padded_keyboard[slot_index] = _bitmask_to_multihot(p_info['keyboard_bitmask'], KEYBOARD_DIM)
+            padded_eco[slot_index] = _bitmask_array_to_multihot(p_info['eco_bitmask'], ECO_DIM)
+            padded_inventory[slot_index] = _bitmask_array_to_multihot(p_info['inventory_bitmask'], INVENTORY_DIM)
+            padded_active_weapon[slot_index] = _bitmask_array_to_multihot(p_info['active_weapon_bitmask'], WEAPON_DIM)
+
+        # --- Final Assembly ---
         inputs = {
             "images": torch.stack(all_frame_images, dim=0),
-            "mel_spectrograms": torch.stack(all_frame_mels, dim=0),
+            "mel_spectrogram": torch.stack(all_frame_mels, dim=0),
             "alive_mask": torch.stack(all_alive_masks, dim=0),
         }
         
-        targets = { "placeholder": torch.tensor(0) } # Placeholder for now
+        targets = {
+            "player_stats": padded_stats,
+            "player_pos_heatmaps": padded_pos_heatmaps,
+            "player_mouse": padded_mouse,
+            "player_keyboard": padded_keyboard,
+            "player_eco": padded_eco,
+            "player_inventory": padded_inventory,
+            "player_active_weapon": padded_active_weapon,
+            "enemy_pos_heatmap": _coords_to_heatmap(gs_target['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents),
+            "round_state": _bitmask_to_multihot(gs_target['round_state'], ROUND_STATE_DIM),
+            "round_number": torch.tensor([round_info['round_num']], dtype=torch.float32),
+        }
+
+        images = inputs["images"]            # [T,5,3,H,W], float32
+        mel    = inputs["mel"]               # [T,5,1,128,8], float32
+        alive  = inputs["alive_mask"]        # [T,5], bool
+
+        T = images.shape[0]
+
+        # Inputs
+        assert images.dtype == torch.float32 and images.ndim == 5, "images must be [T,5,3,H,W] float32"
+        assert mel.dtype == torch.float32 and mel.ndim == 5, "mel must be [T,5,1,128,8] float32"
+        assert alive.dtype == torch.bool and alive.shape == (T, 5), "alive_mask must be [T,5] bool"
+
+        # Targets
+        assert targets["player_keyboard"].shape == (5, KEYBOARD_DIM)
+        assert targets["player_pos_heatmaps"].shape == (5, *HEATMAP_DIMS)
+        assert targets["enemy_pos_heatmap"].shape == HEATMAP_DIMS
+        assert targets["round_state"].shape == (ROUND_STATE_DIM,)
+
+        # Value ranges (avoid truthiness of tensors)
+        imin = images.amin().item()
+        imax = images.amax().item()
+        assert imin > -5 and imax < 5, f"Image normalization likely wrong: range [{imin:.3f},{imax:.3f}]"
+
+        pk = targets["player_keyboard"]
+        assert pk.dtype == torch.float32, "player_keyboard should be float32 multi-hot"
+        assert (pk >= 0).all().item() and (pk <= 1).all().item(), "player_keyboard must be in [0,1]"
 
         return {"inputs": inputs, "targets": targets}
 
@@ -482,8 +434,8 @@ if __name__ == "__main__":
     dummy_config_path = "dummy_config.yaml"
     with open(dummy_config_path, 'w') as f:
         f.write("data:\n")
-        f.write("  lmdb_root_path: '/path/to/your/lmdbs' # <-- EDIT THIS PATH\n")
-        f.write("  manifest_path: '/path/to/your/lmdbs/split_manifest.json' # <-- AND THIS PATH\n")
+        f.write("  lmdb_root_path: 'data/lmdb' # <-- EDIT THIS PATH\n")
+        f.write("  manifest_path: 'data/lmdb/split_manifest.json' # <-- AND THIS PATH\n")
         f.write("  num_workers: 2\n")
         f.write("\ntrain:\n")
         f.write("  context_frames: 128\n")

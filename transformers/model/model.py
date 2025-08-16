@@ -44,8 +44,7 @@ audio data streams.
   - Input: A SINGLE game screen tensor per player (e.g., 480x640 resolution).
   - Preprocessing: The input image undergoes aspect-ratio-preserving resizing (letterboxing)
     to match the native input size of the vision encoder (e.g., 448x448).
-  - Encoder: A SINGLE, SHARED-WEIGHT Vision Transformer (ViT) model, specifically
-    `eva02_large_patch14_448.mim_m38m_ft_in22k_in1k` from `timm`, processes the image.
+  - Encoder: A SINGLE, SHARED-WEIGHT Vision Transformer (ViT) model, processes the image.
   - Projection: A final linear layer projects the ViT's output feature vector to the model's
     native `[1, 2048]` dimension, creating the final visual embedding.
 
