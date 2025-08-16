@@ -97,6 +97,7 @@ class DatasetIndexer:
                 return json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"FATAL: Error decoding JSON from manifest file: {self.manifest_path}\n{e}")
+    # In class DatasetIndexer:
     def _index_demos(self, demo_names: list, set_name: str) -> list:
         round_pool = []
         if not demo_names:
@@ -107,21 +108,31 @@ class DatasetIndexer:
             demo_path = self.lmdb_root / demo_name
             if not demo_path.is_dir():
                 raise FileNotFoundError(f"FATAL: Manifest lists demo '{demo_name}' for the '{set_name}' set, but it was not found at the expected path: {demo_path}")
+            
+            # --- FIX STARTS HERE ---
+            # Use the full demo_name for the path, but create a base name for the keys.
+            demo_name_base = demo_name.removesuffix('.lmdb')
+            # --- FIX ENDS HERE ---
+
             env = lmdb.open(str(demo_path), readonly=True, lock=False, readahead=False, meminit=False)
             with env.begin(write=False) as txn:
-                info_key = f"{demo_name}_INFO".encode('utf-8')
+                # Use the base name to construct the key
+                info_key = f"{demo_name_base}_INFO".encode('utf-8')
                 info_bytes = txn.get(info_key)
                 if info_bytes is None:
                     env.close()
+                    # Use the corrected key in the error message for clarity
                     raise KeyError(f"FATAL: Could not find metadata key '{info_key.decode()}' in the LMDB for demo '{demo_name}'. The LMDB may be corrupt or incomplete.")
+                
                 info_data = json.loads(info_bytes.decode('utf-8'))
                 cursor = txn.cursor()
                 for round_entry in info_data.get("rounds", []):
                     round_num, start_tick, end_tick = round_entry
                     for team in ['T', 'CT']:
-                        test_key = f"{demo_name}_round_{round_num:03d}_team_{team}_tick_{start_tick:08d}".encode('utf-8')
+                        # Use the base name here as well
+                        test_key = f"{demo_name_base}_round_{round_num:03d}_team_{team}_tick_{start_tick:08d}".encode('utf-8')
                         if cursor.set_key(test_key):
-                            round_metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
+                            round_metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name_base, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
                             round_pool.append(round_metadata)
                         else:
                             print(f"\n[Warning] Missing perspective 'team={team}' for round {round_num} in demo '{demo_name}'. Skipping.")
