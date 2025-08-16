@@ -313,7 +313,6 @@ class DALIDataFeeder:
         }
         
         return (all_jpegs, cpu_passthrough_data)
-
 class CS2Pipeline(Pipeline):
     """
     NVIDIA DALI Pipeline for processing CS2 data.
@@ -338,10 +337,10 @@ class CS2Pipeline(Pipeline):
         self.source = fn.external_source(
             source=self.feeder,
             num_outputs=2,
-            # --- FIX IS HERE ---
-            # The layout argument expects strings. Use "" for data with no layout.
             layout=["", ""],
-            dtype=[types.UINT8, types.DALIDataType.ANY_DATA],
+            # --- FIX IS HERE ---
+            # Use DALIDataType.CPU for passthrough data in modern DALI versions
+            dtype=[types.UINT8, types.DALIDataType.CPU],
             batch=False,
             parallel=True
         )
@@ -367,7 +366,7 @@ class CS2Pipeline(Pipeline):
         )
 
         return (normalized_images, cpu_data)
-
+    
 def collate_and_process_cpu_data(batch: list, data_cfg: DataConfig, train_cfg: TrainConfig) -> dict:
     """
     This function is executed on the CPU after DALI has processed the images.
