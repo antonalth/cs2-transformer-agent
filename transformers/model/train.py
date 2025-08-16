@@ -129,13 +129,20 @@ class DatasetIndexer:
                 for round_entry in info_data.get("rounds", []):
                     round_num, start_tick, end_tick = round_entry
                     for team in ['T', 'CT']:
-                        # Use the base name here as well
-                        test_key = f"{demo_name_base}_round_{round_num:03d}_team_{team}_tick_{start_tick:08d}".encode('utf-8')
-                        if cursor.set_key(test_key):
-                            round_metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name_base, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
-                            round_pool.append(round_metadata)
+                        # This is more robust if the start_tick isn't perfectly aligned with TICKS_PER_FRAME.
+                        prefix = f"{demo_name_base}_round_{round_num:03d}_team_{team}_".encode('utf-8')
+                        
+                        # Move cursor to the first key >= prefix
+                        if cursor.set_range(prefix):
+                            # Check if the key we found actually belongs to this perspective
+                            if cursor.key().startswith(prefix):
+                                round_metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name_base, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
+                                round_pool.append(round_metadata)
+                            else:
+                                # To make the error message more specific as you requested:
+                                print(f"\n[Warning] Could not find any data for perspective 'team={team}' in round {round_num} of demo '{demo_name}'. Skipping.")
                         else:
-                            print(f"\n[Warning] Missing perspective 'team={team}' for round {round_num} in demo '{demo_name}'. Skipping.")
+                            print(f"\n[Warning] Could not find any data for perspective 'team={team}' in round {round_num} of demo '{demo_name}'. Skipping.")
             env.close()
         return round_pool
 
@@ -336,7 +343,10 @@ class LMDBStreamerDataset(IterableDataset):
         for i, p_data_tuple in enumerate(pd_target_list):
             slot_index = find_nth_set_bit_pos(team_alive_target, i)
             if slot_index == -1: continue
-            p_info, _, _ = p_data_tuple
+            # p_info is an array of shape (1,), so we access the first element
+            # to get the actual data structure.
+            p_struct, _, _ = p_data_tuple
+            p_info = p_struct[0]
             padded_stats[slot_index] = torch.tensor([p_info['health'], p_info['armor'], p_info['money']], dtype=torch.float32)
             padded_pos_heatmaps[slot_index] = _coords_to_heatmap(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
             padded_mouse[slot_index] = torch.from_numpy(p_info['mouse'])
