@@ -327,14 +327,23 @@ class CS2Pipeline(Pipeline):
         self.mean_01 = torch.tensor(mean).view(1, 1, 3).tolist()
         self.std_01 = torch.tensor(std).view(1, 1, 3).tolist()
 
-        interp_map = {"bicubic": types.INTERP_CUBIC, "lanczos": types.INTERP_LANCZOS3, "nearest": types.INTERP_NN}
+        interp_map = {
+            "bicubic": types.INTERP_CUBIC,
+            "lanczos": types.INTERP_LANCZOS3,
+            "nearest": types.INTERP_NN
+        }
         self.interp_type = interp_map.get(interp_str.lower(), types.INTERP_LINEAR)
 
+        # Define the external source operator that consumes data from our feeder
         self.source = fn.external_source(
-            source=self.feeder, num_outputs=2,
-            layout=[types.Layout("..."), types.Layout("")],
+            source=self.feeder,
+            num_outputs=2,
+            # --- FIX IS HERE ---
+            # The layout argument expects strings. Use "" for data with no layout.
+            layout=["", ""],
             dtype=[types.UINT8, types.DALIDataType.ANY_DATA],
-            batch=False, parallel=True
+            batch=False,
+            parallel=True
         )
 
     def define_graph(self):
