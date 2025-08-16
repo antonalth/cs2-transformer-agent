@@ -129,20 +129,13 @@ class DatasetIndexer:
                 for round_entry in info_data.get("rounds", []):
                     round_num, start_tick, end_tick = round_entry
                     for team in ['T', 'CT']:
-                        # This is more robust if the start_tick isn't perfectly aligned with TICKS_PER_FRAME.
-                        prefix = f"{demo_name_base}_round_{round_num:03d}_team_{team}_".encode('utf-8')
-                        
-                        # Move cursor to the first key >= prefix
-                        if cursor.set_range(prefix):
-                            # Check if the key we found actually belongs to this perspective
-                            if cursor.key().startswith(prefix):
-                                round_metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name_base, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
-                                round_pool.append(round_metadata)
-                            else:
-                                # To make the error message more specific as you requested:
-                                print(f"\n[Warning] Could not find any data for perspective 'team={team}' in round {round_num} of demo '{demo_name}'. Skipping.")
+                        # Use the base name here as well
+                        test_key = f"{demo_name_base}_round_{round_num:03d}_team_{team}_tick_{start_tick:08d}".encode('utf-8')
+                        if cursor.set_key(test_key):
+                            round_metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name_base, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
+                            round_pool.append(round_metadata)
                         else:
-                            print(f"\n[Warning] Could not find any data for perspective 'team={team}' in round {round_num} of demo '{demo_name}'. Skipping.")
+                            print(f"\n[Warning] Missing perspective 'team={team}' for round {round_num} in demo '{demo_name}'. Skipping.")
             env.close()
         return round_pool
 
