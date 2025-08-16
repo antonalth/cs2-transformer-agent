@@ -308,7 +308,7 @@ class LMDBStreamerDataset(IterableDataset):
                 padded_images[slot_index] = img_tensor_norm
 
                 if mel_spec is not None:
-                    mel_tensor = torch.from_numpy(mel_spec).unsqueeze(0)
+                    mel_tensor = torch.from_numpy(mel_spec.copy()).unsqueeze(0)
                     if mel_tensor.shape[-1] > MEL_SPEC_TIME_FRAMES:
                         padded_mels[slot_index] = mel_tensor[:, :, :, :MEL_SPEC_TIME_FRAMES]
                     else:
