@@ -376,9 +376,14 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
     images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
     # _FIX: `fill_value` must be a scalar float. Changed from mean255 to 0.0.
-    images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
-                      min_canvas_size=(target_h, target_w),
-                      fill_value=0.0)
+    images = fn.paste(
+        images,
+        ratio=1.0,
+        paste_pos_x=0.5,
+        paste_pos_y=0.5,
+        min_canvas_size=[int(target_h), int(target_w)],  # list, not tuple
+        fill_value=0.0
+    )
     images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
                                       mean=mean255, std=std255)
     
