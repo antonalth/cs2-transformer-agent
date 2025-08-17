@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.0 (Optimized NVIDIA DALI Integration)
+VERSION: 4.1 (Fixed DALI Implementation)
 """
 
 # ===================================================================
@@ -197,22 +197,26 @@ class DALIExternalSource:
 
     def __next__(self):
         batch_jpegs, batch_mels, batch_alive, batch_stats, batch_pos, batch_mouse, batch_kbd, batch_enemy, batch_state = [],[],[],[],[],[],[],[],[]
-
+        
+        rep = self.train_cfg.context_frames * NUM_PLAYERS
+        
         for _ in range(self.batch_size):
             jpegs, mels, alive, stats, pos, mouse, kbd, enemy, state = self.get_single_sample()
-            batch_jpegs.extend(jpegs) # Flatten JPEGs for one large batch
-            batch_mels.append(mels)
-            batch_alive.append(alive)
-            batch_stats.append(stats)
-            batch_pos.append(pos)
-            batch_mouse.append(mouse)
-            batch_kbd.append(kbd)
-            batch_enemy.append(enemy)
-            batch_state.append(state)
             
-        return (batch_jpegs, np.stack(batch_mels), np.stack(batch_alive), np.stack(batch_stats), 
-                np.stack(batch_pos), np.stack(batch_mouse), np.stack(batch_kbd), 
-                np.stack(batch_enemy), np.stack(batch_state))
+            batch_jpegs.extend(jpegs) # Flatten JPEGs for one large batch
+            batch_mels.extend(list(mels))
+            
+            # Replicate chunk-level arrays T*P times so batch size matches images
+            batch_alive.extend([alive] * rep)
+            batch_stats.extend([stats] * rep)
+            batch_pos.extend([pos] * rep)
+            batch_mouse.extend([mouse] * rep)
+            batch_kbd.extend([kbd] * rep)
+            batch_enemy.extend([enemy] * rep)
+            batch_state.extend([state] * rep)
+
+        return (batch_jpegs, batch_mels, batch_alive, batch_stats, batch_pos,
+                batch_mouse, batch_kbd, batch_enemy, batch_state)
 
     def get_single_sample(self):
         """Fetches and processes one chunk of data for DALI."""
@@ -249,7 +253,7 @@ class DALIExternalSource:
         if hasattr(self, "_cached_dummy_jpeg"): return self._cached_dummy_jpeg
         rgb = (self.mean.numpy() * 255.0).round().astype(np.uint8)
         img = np.full((1, 1, 3), rgb, dtype=np.uint8)
-        ok, enc = cv2.imencode(".jpg", cv.cvtColor(img, cv2.COLOR_RGB2BGR))
+        ok, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         assert ok, "Failed to encode dummy JPEG"
         self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
         return self._cached_dummy_jpeg
@@ -260,6 +264,7 @@ class DALIExternalSource:
         dummy_jpeg = self._get_dummy_mean_jpeg()
         all_jpegs, all_mels, all_alive_masks = [], [], []
 
+        # This loop creates T_ctx * NUM_PLAYERS images and mels
         for frame_data in raw_chunk_data[:T_ctx]:
             gs, pd_list = frame_data['game_state'][0], frame_data['player_data']
             alive_mask = gs['team_alive']
@@ -275,9 +280,9 @@ class DALIExternalSource:
                     slot_to_jpeg[slot] = np.frombuffer(jpeg_bytes, dtype=np.uint8)
                     if mel_spec is not None:
                         mel = torch.from_numpy(mel_spec.copy()).unsqueeze(0)
-                        mel = torch.nn.functional.pad(mel, (0, max(0, MEL_SPEC_TIME_FRAMES - mel.shape[-1])), 'constant', -80.0)[:,:,:,:MEL_SPEC_TIME_FRAMES]
+                        mel = torch.nn.functional.pad(mel, (0, max(0, MEL_SPEC_TIME_FRAMES - mel.shape[-1])), 'constant', -80.0)[:,:,:MEL_SPEC_TIME_FRAMES]
                         slot_to_mel[slot] = mel.numpy()
-
+            
             for s_idx in range(NUM_PLAYERS):
                 all_jpegs.append(slot_to_jpeg[s_idx])
                 all_mels.append(slot_to_mel[s_idx])
@@ -294,13 +299,21 @@ class DALIExternalSource:
                 hm[np.clip(iz,0,Z-1), np.clip(iy,0,Y-1), np.clip(ix,0,X-1)] = 1.0
             return hm
 
-        stats, pos_hm, mouse, keyboard = (np.zeros((NUM_PLAYERS, d), dtype=np.float32) for d in [3, HEATMAP_DIMS, 2, KEYBOARD_DIM])
+        # Corrected allocation
+        stats    = np.zeros((NUM_PLAYERS, 3), dtype=np.float32)
+        pos_hm   = np.zeros((NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
+        mouse    = np.zeros((NUM_PLAYERS, 2), dtype=np.float32)
+        keyboard = np.zeros((NUM_PLAYERS, KEYBOARD_DIM), dtype=np.float32)
+        
         for i, p_tuple in enumerate(pd_target_list):
             slot = find_nth_set_bit_pos(gs_target['team_alive'], i)
             if slot != -1:
                 p_info = p_tuple[0][0]
-                stats[slot], pos_hm[slot], mouse[slot], keyboard[slot] = ([p_info['health'],p_info['armor'],p_info['money']], _coords_to_heatmap_np(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents), p_info['mouse'], _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM))
-
+                stats[slot] = [p_info['health'], p_info['armor'], p_info['money']]
+                pos_hm[slot] = _coords_to_heatmap_np(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
+                mouse[slot] = p_info['mouse']
+                keyboard[slot] = _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM)
+        
         return (all_jpegs, np.stack(all_mels), np.stack(all_alive_masks), stats, pos_hm,
                 mouse, keyboard, _coords_to_heatmap_np(gs_target['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents),
                 _bitmask_to_multihot_np(gs_target['round_state'], ROUND_STATE_DIM))
@@ -317,13 +330,18 @@ def create_dali_pipeline(external_source_iterator, data_cfg, train_cfg):
     jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_iterator,
         num_outputs=9,
-        batch=False, # We are feeding full batches from the source
+        batch=True, # Correct: Must be True for an iterable source in parallel mode
         parallel=True,
-        prefetch_queue_depth=data_cfg.dali_prefetch
+        prefetch_queue_depth=data_cfg.dali_prefetch,
+        # Provide dtype and ndim hints for each output for robustness
+        dtype=[types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
+               types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT],
+        ndim=[1, 3, 2, 2, 4, 2, 2, 3, 1]
     )
     
     # Process the batch of images on the GPU
-    images = fn.decoders.image(jpegs.gpu(), device="mixed", output_type=types.RGB)
+    # Correct: Pass CPU jpegs to "mixed" device decoder
+    images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
     images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
                       min_canvas_size=max(target_h, target_w),
@@ -363,10 +381,13 @@ if __name__ == "__main__":
         
         data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, train_cfg.batch_size)
         
+        # Correct: The pipeline's batch_size must be the total number of samples processed per iteration
+        effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
+        
         pipeline = create_dali_pipeline(
             external_source_iterator=data_iterator,
             data_cfg=data_cfg, train_cfg=train_cfg,
-            batch_size=train_cfg.batch_size,
+            batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id
         )
@@ -380,30 +401,49 @@ if __name__ == "__main__":
         print("Successfully fetched one batch!")
 
         B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
+        # The image tensor comes out "flat"
         _, C, H, W = first_batch_from_dali["images"].shape
         
+        # Correctly reshape per-frame/player tensors
+        images_tensor = first_batch_from_dali["images"].view(B, T, P, C, H, W)
+        mels_tensor = first_batch_from_dali["mel"].view(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
+        
+        # Correctly "un-flatten" the replicated metadata by taking the first of each T*P group
+        def unflatten_tensor(tensor, per_player=False, has_time=False):
+            original_dims = tensor.shape[1:]
+            if has_time: # alive_mask
+                return tensor.view(B, T * P, T, P)[:, 0]
+            if per_player: # stats, pos_hm, mouse, kbd
+                return tensor.view(B, T * P, P, *original_dims[1:])[:, 0]
+            else: # enemy_hm, state
+                return tensor.view(B, T * P, *original_dims)[:, 0]
+
         batch_for_inspection = {
             "inputs": {
-                "images": first_batch_from_dali["images"].view(B, T, P, C, H, W),
-                "mel_spectrogram": first_batch_from_dali["mel"].view(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES),
-                "alive_mask": first_batch_from_dali["alive"].view(B, T, P)
+                "images": images_tensor,
+                "mel_spectrogram": mels_tensor,
+                "alive_mask": unflatten_tensor(first_batch_from_dali["alive"], has_time=True)
             },
-            "targets": { k: first_batch_from_dali[v] for k, v in [
-                ("player_stats", "stats"), ("player_pos_heatmaps", "pos_hm"), ("player_mouse", "mouse"),
-                ("player_keyboard", "kbd"), ("enemy_pos_heatmap", "enemy_hm"), ("round_state", "state")]
+            "targets": {
+                "player_stats": unflatten_tensor(first_batch_from_dali["stats"], per_player=True),
+                "player_pos_heatmaps": unflatten_tensor(first_batch_from_dali["pos_hm"], per_player=True),
+                "player_mouse": unflatten_tensor(first_batch_from_dali["mouse"], per_player=True),
+                "player_keyboard": unflatten_tensor(first_batch_from_dali["kbd"], per_player=True),
+                "enemy_pos_heatmap": unflatten_tensor(first_batch_from_dali["enemy_hm"]),
+                "round_state": unflatten_tensor(first_batch_from_dali["state"])
             }
         }
         
         print(f"DALI is ENABLED. Image tensor device: '{batch_for_inspection['inputs']['images'].device}'. All tensors should be on this device.")
         
-        print("\n--- Batch Content ---")
+        print("\n--- Batch Content (Reshaped) ---")
         for key, value in batch_for_inspection.items():
             print(f"\nTop-level key: '{key}'")
             if isinstance(value, dict):
                 for sub_key, sub_value in value.items():
                     if isinstance(sub_value, torch.Tensor):
                         print(f"  - Sub-key: '{sub_key}', Shape: {sub_value.shape}, DType: {sub_value.dtype}, Device: {sub_value.device}")
-        print("---------------------\n")
+        print("--------------------------------\n")
         print("Data Pipeline test successful!")
 
     except Exception as e:
