@@ -258,7 +258,7 @@ class DALIExternalSource:
         if hasattr(self, "_cached_dummy_jpeg"): return self._cached_dummy_jpeg
         rgb = (self.mean.numpy() * 255.0).round().astype(np.uint8)
         img = np.full((1, 1, 3), rgb, dtype=np.uint8)
-        ok, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB_BGR))
+        ok, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         assert ok, "Failed to encode dummy JPEG"
         self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
         return self._cached_dummy_jpeg
