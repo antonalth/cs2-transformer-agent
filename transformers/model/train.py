@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.2 (Polished DALI Implementation)
+VERSION: 4.3 (Fixed DALI Multiprocessing)
 """
 
 # ===================================================================
@@ -182,14 +182,13 @@ def find_nth_set_bit_pos(n: int, j: int) -> int:
 # ===================================================================
 class DALIExternalSource:
     """Callable data source for DALI's external_source operator."""
-    def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig, batch_size: int):
+    def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig, batch_size: int, mean_rgb: torch.Tensor):
         self.pool = sampling_pool
         self.data_cfg = data_cfg
         self.train_cfg = train_cfg
         self.batch_size = batch_size
         self.chunk_size_frames = self.train_cfg.context_frames + 1
-        
-        _, _, self.mean, _ = _resolve_timm_config(self.train_cfg.model_name)
+        self.mean = mean_rgb
         self.envs = {}
         
     def __iter__(self):
@@ -299,7 +298,6 @@ class DALIExternalSource:
                 hm[np.clip(iz,0,Z-1), np.clip(iy,0,Y-1), np.clip(ix,0,X-1)] = 1.0
             return hm
 
-        # Corrected allocation
         stats    = np.zeros((NUM_PLAYERS, 3), dtype=np.float32)
         pos_hm   = np.zeros((NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
         mouse    = np.zeros((NUM_PLAYERS, 2), dtype=np.float32)
@@ -325,7 +323,6 @@ def create_dali_pipeline(external_source_iterator, dali_prefetch, target_hw, int
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
-    # Define a single external source for all data from Python
     jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_iterator,
         num_outputs=9,
@@ -337,7 +334,6 @@ def create_dali_pipeline(external_source_iterator, dali_prefetch, target_hw, int
         ndim=[1, 3, 2, 2, 4, 2, 2, 3, 1]
     )
     
-    # Process the batch of images on the GPU
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
     images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
@@ -370,16 +366,16 @@ if __name__ == "__main__":
     try:
         if data_cfg.use_dali and not DALI_AVAILABLE: raise ImportError("use_dali=True but NVIDIA DALI is not installed.")
         if data_cfg.use_dali and not torch.cuda.is_available(): raise RuntimeError("use_dali=True requires a CUDA-enabled PyTorch and DALI.")
-
+        
+        # This must happen before any CUDA context is created
+        target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
+        
         indexer = DatasetIndexer(lmdb_root_path=data_cfg.lmdb_root_path, manifest_path=data_cfg.manifest_path)
         
         print("\n--- Using NVIDIA DALI Data Pipeline ---")
         device_id = torch.cuda.current_device()
         
-        # Resolve model-specific configuration once, outside the pipeline definition
-        target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
-        
-        data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, train_cfg.batch_size)
+        data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, train_cfg.batch_size, mean_rgb=mean)
         
         effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
         
@@ -393,8 +389,9 @@ if __name__ == "__main__":
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id,
-            # Add py_num_workers to actually enable parallel python execution
-            py_num_workers=data_cfg.num_workers
+            py_num_workers=data_cfg.num_workers,
+            # CRITICAL FIX: Use 'spawn' to avoid forking a process with an initialized CUDA context.
+            py_start_method='spawn'
         )
         
         output_map = ["images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
@@ -408,7 +405,6 @@ if __name__ == "__main__":
         B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
         _, C, H, W = first_batch_from_dali["images"].shape
         
-        # Correctly reshape per-frame/player tensors
         images_tensor = first_batch_from_dali["images"].view(B, T, P, C, H, W)
         mels_tensor = first_batch_from_dali["mel"].view(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
         
