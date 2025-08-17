@@ -141,9 +141,7 @@ class DatasetIndexer:
 # ===================================================================
 HEATMAP_DIMS = (8, 64, 64)
 KEYBOARD_DIM = 31
-ECO_DIM = 224
-INVENTORY_DIM = 128
-WEAPON_DIM = 128
+# _NICE-TO-HAVE: Removed unused constants
 ROUND_STATE_DIM = 5
 MEL_SPEC_TIME_FRAMES = 8
 
@@ -193,7 +191,8 @@ class DALIExternalSource:
         self.data_cfg = data_cfg
         self.train_cfg = train_cfg
         self.mean = mean_rgb
-        self.chunk_size_frames = self.train_cfg.context_frames + 1
+        # _FIX #2: Read exactly T frames, not T+1
+        self.chunk_size_frames = self.train_cfg.context_frames
         
         self.envs = {}
         self.current_chunk_data = None
@@ -202,8 +201,10 @@ class DALIExternalSource:
         
         self.chunk_count = 0
         self.current_chunk_id = -1
-    
-    # PATCH: Replaced __call__ and _process_chunk
+        
+        # _NICE-TO-HAVE: Per-worker RNG for determinism
+        self._rng = random.Random()
+
     def __call__(self, sample_info: "SampleInfo"):
         if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
             self._load_and_process_new_chunk(sample_info)
@@ -232,19 +233,25 @@ class DALIExternalSource:
         return (chunk_id, sample_id, jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
 
     def _load_and_process_new_chunk(self, sample_info: "SampleInfo"):
+        # _NICE-TO-HAVE: Per-worker seeding for reproducible sampling
         worker_id = getattr(sample_info, "worker_id", 0)
+        if not hasattr(self, "_seeded"):
+            base_seed = int(os.getenv("DL_SEED", "1337"))
+            self._rng.seed((base_seed ^ (worker_id + 1) << 16) & 0xFFFFFFFF)
+            self._seeded = True
+            
         self.current_chunk_id = np.int64((worker_id << 32) | self.chunk_count)
         self.chunk_count += 1
         
         while True:
-            round_info = random.choice(self.pool)
+            round_info = self._rng.choice(self.pool)
             start_tick, end_tick = round_info['start_tick'], round_info['end_tick']
             total_frames = (end_tick - start_tick) // TICKS_PER_FRAME
             if total_frames < self.chunk_size_frames: continue
 
-            target_frame_idx = random.randint(0, total_frames - 1)
+            # _FIX #2: Simplified start frame selection
             max_start_frame_idx = total_frames - self.chunk_size_frames
-            start_frame_idx = random.randint(max(0, target_frame_idx - self.chunk_size_frames + 1), min(max_start_frame_idx, target_frame_idx))
+            start_frame_idx = self._rng.randint(0, max_start_frame_idx)
             
             raw_chunk_data = []
             env = self._get_env(round_info['lmdb_path'])
@@ -286,8 +293,9 @@ class DALIExternalSource:
         all_jpegs, all_mels = [], []
         all_alive, all_stats, all_pos, all_mouse, all_kbd = [], [], [], [], []
         enemy_seq, state_seq = [], []
-
-        for i, frame_data in enumerate(raw_chunk_data[:T_ctx]):
+        
+        # _FIX #2: Loop over T frames, not T+1
+        for i, frame_data in enumerate(raw_chunk_data):
             gs = frame_data['game_state'][0]
             pd_list = frame_data['player_data']
             mask_int = gs['team_alive']
@@ -363,7 +371,6 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
-    # PATCH: Updated external_source ndim signature for new per-sample shapes
     chunk_id, sample_id, jpegs, mels, alive, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_callable,
         num_outputs=11,
@@ -382,8 +389,13 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
                                       mean=mean255, std=std255)
     
+    # _NICE-TO-HAVE: Cast heatmaps on CPU before moving to GPU to save bandwidth
+    pos_hm = fn.cast(pos_hm, dtype=types.FLOAT16)
+    enemy_hm = fn.cast(enemy_hm, dtype=types.FLOAT16)
+
+    # _FIX #1: Keep chunk_id and sample_id on the CPU for sorting
     return (
-        chunk_id.gpu(), sample_id.gpu(), images, mels.gpu(),
+        chunk_id, sample_id, images, mels.gpu(),
         alive,
         stats,
         pos_hm.gpu(),
@@ -459,18 +471,27 @@ if __name__ == "__main__":
         print("Successfully fetched one batch!")
 
         print("Sorting batch to restore sequential order...")
-        chunk_id_tensor = first_batch_from_dali["chunk_id"]
-        sample_id_tensor = first_batch_from_dali["sample_id"]
+        # _FIX #1: Perform sorting on CPU and create separate indices for CPU/GPU tensors
+        # to prevent a device mismatch error when indexing.
+        chunk_id_cpu = first_batch_from_dali["chunk_id"].cpu()
+        sample_id_cpu = first_batch_from_dali["sample_id"].cpu()
         
-        _, idx1 = torch.sort(sample_id_tensor, stable=True)
-        chunk_sorted = chunk_id_tensor[idx1]
+        _, idx1 = torch.sort(sample_id_cpu, stable=True)
+        chunk_sorted = chunk_id_cpu[idx1]
         _, idx2 = torch.sort(chunk_sorted, stable=True)
-        sorted_indices = idx1[idx2]
         
-        sorted_batch = {key: tensor[sorted_indices] for key, tensor in first_batch_from_dali.items()}
+        sorted_idx_cpu = idx1[idx2]
+        sorted_idx_gpu = sorted_idx_cpu.cuda(device_id)
+        
+        sorted_batch = {}
+        for k, v in first_batch_from_dali.items():
+            if v.is_cuda:
+                sorted_batch[k] = v.index_select(0, sorted_idx_gpu)
+            else:
+                sorted_batch[k] = v.index_select(0, sorted_idx_cpu)
+                
         print("Batch sorted successfully.")
 
-        # PATCH: Replaced unflattening logic with direct reshapes
         B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
 
         C, H, W = sorted_batch["images"].shape[1:]
@@ -478,6 +499,7 @@ if __name__ == "__main__":
         mels_tensor   = sorted_batch["mel"].reshape(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
         alive_tensor  = sorted_batch["alive"].reshape(B, T, P)
         stats_tensor  = sorted_batch["stats"].reshape(B, T, P, 3)
+        # Note: DALI output for heatmaps is now float16, as requested.
         pos_hm_tensor = sorted_batch["pos_hm"].reshape(B, T, P, *HEATMAP_DIMS)
         mouse_tensor  = sorted_batch["mouse"].reshape(B, T, P, 2)
         kbd_tensor    = sorted_batch["kbd"].reshape(B, T, P, KEYBOARD_DIM)
@@ -518,4 +540,4 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         if os.path.exists(dummy_config_path):
-            os.remove(dummy_config_path)
+            os.remove(dummy_config_path)```
