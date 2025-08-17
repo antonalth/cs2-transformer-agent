@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.3 (Fixed DALI Multiprocessing)
+VERSION: 4.4 (Fixed DALI Multiprocessing and CUDA Initialization)
 """
 
 # ===================================================================
@@ -182,11 +182,10 @@ def find_nth_set_bit_pos(n: int, j: int) -> int:
 # ===================================================================
 class DALIExternalSource:
     """
-    Callable, stateful iterator for DALI's external_source operator.
-    Designed to be used with `parallel=True`, where DALI creates one
-    instance of this class for each `py_num_workers`. Each instance
-    maintains its own state (which chunk it's reading) to provide a
-    continuous stream of single items (image + metadata).
+    Callable, stateful source for DALI's external_source operator.
+    By implementing `__call__` instead of `__iter__`, DALI can create
+    independent instances of this class in each worker process,
+    allowing for true multiprocessing.
     """
     def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig, mean_rgb: torch.Tensor):
         self.pool = sampling_pool
@@ -195,16 +194,14 @@ class DALIExternalSource:
         self.mean = mean_rgb
         self.chunk_size_frames = self.train_cfg.context_frames + 1
         
-        # State for each worker's iterator instance
+        # State for each worker's callable instance
         self.envs = {}
         self.current_chunk_data = None
         self.current_idx_in_chunk = 0
         self.items_in_chunk = self.train_cfg.context_frames * NUM_PLAYERS
 
-    def __iter__(self):
-        return self
-
-    def __next__(self):
+    def __call__(self):
+        """Called by DALI for each sample. Returns one sample's data."""
         if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
             self._load_and_process_new_chunk()
             self.current_idx_in_chunk = 0
@@ -225,7 +222,7 @@ class DALIExternalSource:
         return (jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
 
     def _load_and_process_new_chunk(self):
-        """Fetches and processes one chunk of data, caching it for the iterator."""
+        """Fetches and processes one chunk of data, caching it for the instance."""
         while True:
             round_info = random.choice(self.pool)
             start_tick, end_tick = round_info['start_tick'], round_info['end_tick']
@@ -327,15 +324,14 @@ class DALIExternalSource:
         }
 
 @pipeline_def
-def create_dali_pipeline(external_source_iterator, target_hw, interp_str, mean, std):
+def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, std):
     """Defines the DALI processing graph."""
     target_h, target_w = target_hw
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
-    # FIX: Switched to per-sample (`batch=False`) parallel (`parallel=True`) external source
     jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
-        source=external_source_iterator,
+        source=external_source_callable,
         num_outputs=9,
         batch=False,
         parallel=True,
@@ -381,16 +377,16 @@ if __name__ == "__main__":
         # This CPU-only setup can happen before any CUDA context is created
         target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
         indexer = DatasetIndexer(lmdb_root_path=data_cfg.lmdb_root_path, manifest_path=data_cfg.manifest_path)
-        data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, mean_rgb=mean)
+        dali_source_callable = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, mean_rgb=mean)
         
         print("\n--- Using NVIDIA DALI Data Pipeline ---")
         
         # The total number of individual images DALI will process in a batch
         effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
         
-        # FIX: Defer CUDA device query until just before pipeline creation
-        # and pass spawn method to pipeline constructor to prevent forking errors.
-        device_id = torch.cuda.current_device()
+        # FIX: Determine device_id from environment variables without calling torch.cuda.*
+        # This prevents initializing the CUDA context in the parent process before workers are spawned.
+        device_id = int(os.getenv("LOCAL_RANK", os.getenv("RANK", "0")))
         
         pipeline = create_dali_pipeline(
             # DALI's pipeline arguments
@@ -399,18 +395,19 @@ if __name__ == "__main__":
             device_id=device_id,
             prefetch_queue_depth=data_cfg.dali_prefetch,
             py_num_workers=data_cfg.num_workers,
-            py_start_method='spawn', # CRITICAL FIX: Avoids forking a process with an initialized CUDA context.
+            py_start_method='spawn', # CRITICAL: Avoids forking a process with an initialized CUDA context.
             # Custom arguments for our decorated function
-            external_source_iterator=data_iterator,
+            external_source_callable=dali_source_callable,
             target_hw=target_hw,
             interp_str=interp_str,
             mean=mean,
             std=std
         )
         
-        # FIX: Explicitly build the pipeline. This is when the worker processes are spawned.
         pipeline.build()
-        print("DALI pipeline built successfully. Python workers started via 'spawn'.")
+        # FIX: Now that workers are spawned, it is safe to interact with CUDA.
+        torch.cuda.set_device(device_id)
+        print(f"DALI pipeline built successfully for device {device_id}. Python workers started via 'spawn'.")
 
         output_map = ["images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
         
