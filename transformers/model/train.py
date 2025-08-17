@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.1 (Fixed DALI Implementation)
+VERSION: 4.2 (Polished DALI Implementation)
 """
 
 # ===================================================================
@@ -319,9 +319,8 @@ class DALIExternalSource:
                 _bitmask_to_multihot_np(gs_target['round_state'], ROUND_STATE_DIM))
 
 @pipeline_def
-def create_dali_pipeline(external_source_iterator, data_cfg, train_cfg):
+def create_dali_pipeline(external_source_iterator, dali_prefetch, target_hw, interp_str, mean, std):
     """Defines the DALI processing graph."""
-    target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
     target_h, target_w = target_hw
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
@@ -330,17 +329,15 @@ def create_dali_pipeline(external_source_iterator, data_cfg, train_cfg):
     jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_iterator,
         num_outputs=9,
-        batch=True, # Correct: Must be True for an iterable source in parallel mode
+        batch=True,
         parallel=True,
-        prefetch_queue_depth=data_cfg.dali_prefetch,
-        # Provide dtype and ndim hints for each output for robustness
+        prefetch_queue_depth=dali_prefetch,
         dtype=[types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
                types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT],
         ndim=[1, 3, 2, 2, 4, 2, 2, 3, 1]
     )
     
     # Process the batch of images on the GPU
-    # Correct: Pass CPU jpegs to "mixed" device decoder
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
     images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
@@ -379,17 +376,25 @@ if __name__ == "__main__":
         print("\n--- Using NVIDIA DALI Data Pipeline ---")
         device_id = torch.cuda.current_device()
         
+        # Resolve model-specific configuration once, outside the pipeline definition
+        target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
+        
         data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, train_cfg.batch_size)
         
-        # Correct: The pipeline's batch_size must be the total number of samples processed per iteration
         effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
         
         pipeline = create_dali_pipeline(
             external_source_iterator=data_iterator,
-            data_cfg=data_cfg, train_cfg=train_cfg,
+            dali_prefetch=data_cfg.dali_prefetch,
+            target_hw=target_hw,
+            interp_str=interp_str,
+            mean=mean,
+            std=std,
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
-            device_id=device_id
+            device_id=device_id,
+            # Add py_num_workers to actually enable parallel python execution
+            py_num_workers=data_cfg.num_workers
         )
         
         output_map = ["images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
@@ -401,14 +406,12 @@ if __name__ == "__main__":
         print("Successfully fetched one batch!")
 
         B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
-        # The image tensor comes out "flat"
         _, C, H, W = first_batch_from_dali["images"].shape
         
         # Correctly reshape per-frame/player tensors
         images_tensor = first_batch_from_dali["images"].view(B, T, P, C, H, W)
         mels_tensor = first_batch_from_dali["mel"].view(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
         
-        # Correctly "un-flatten" the replicated metadata by taking the first of each T*P group
         def unflatten_tensor(tensor, per_player=False, has_time=False):
             original_dims = tensor.shape[1:]
             if has_time: # alive_mask
