@@ -355,7 +355,6 @@ class DALIExternalSource:
         self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
         return self._cached_dummy_jpeg
 
-# _FIX: Renamed `seed` to `pipeline_seed` to avoid shadowing warning
 @pipeline_def
 def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, std, pipeline_seed=1337):
     """Defines the DALI processing graph."""
@@ -374,11 +373,14 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     )
     
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
-    images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
-    # _FIX: `fill_value` must be a scalar float. Changed from mean255 to 0.0.
+    
+    # FIX: DALI operators like resize and paste strictly expect a list `[H, W]` for size arguments, not a tuple.
+    # Passing a tuple was causing the `TypeError: float() argument must be a string or a real number, not 'tuple'`
+    images = fn.resize(images, size=[target_h, target_w], mode="not_larger", interp_type=interp_dali)
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
-                      min_canvas_size=(target_h, target_w),
+                      min_canvas_size=[target_h, target_w],
                       fill_value=0.0)
+    
     images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
                                       mean=mean255, std=std255)
     
@@ -438,11 +440,10 @@ if __name__ == "__main__":
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id,
-            seed=1337, # This is the main pipeline seed
+            seed=1337,
             prefetch_queue_depth=data_cfg.dali_prefetch,
             py_num_workers=data_cfg.num_workers,
             py_start_method='spawn',
-            # _FIX: Pass the seed to the renamed argument
             external_source_callable=dali_source_callable,
             target_hw=target_hw,
             interp_str=interp_str,
