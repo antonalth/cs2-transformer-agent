@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.4 (Fixed DALI Multiprocessing and CUDA Initialization)
+VERSION: 4.5 (Fixed DALI Parallel Data Loading Race Condition)
 """
 
 # ===================================================================
@@ -200,11 +200,16 @@ class DALIExternalSource:
         self.current_chunk_data = None
         self.current_idx_in_chunk = 0
         self.items_in_chunk = self.train_cfg.context_frames * NUM_PLAYERS
+        
+        # FIX: Add per-worker state for generating unique chunk IDs
+        self.chunk_count = 0
+        self.current_chunk_id = -1
             
     def __call__(self, sample_info: "SampleInfo"):
         """Called by DALI for each sample. Returns one sample's data."""
         if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
-            self._load_and_process_new_chunk()
+            # FIX: Pass sample_info to generate a unique ID when loading a new chunk
+            self._load_and_process_new_chunk(sample_info)
             self.current_idx_in_chunk = 0
 
         # Retrieve the data for the current flat index
@@ -219,11 +224,23 @@ class DALIExternalSource:
         enemy = self.current_chunk_data['enemy_hm']
         state = self.current_chunk_data['state']
 
-        self.current_idx_in_chunk += 1
-        return (jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
+        # FIX: Create sorting keys.
+        # `chunk_id` groups all T*P samples together.
+        # `sample_id` orders samples within that group.
+        chunk_id = self.current_chunk_id
+        sample_id = np.int32(self.current_idx_in_chunk)
 
-    def _load_and_process_new_chunk(self):
+        self.current_idx_in_chunk += 1
+        return (chunk_id, sample_id, jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
+
+    def _load_and_process_new_chunk(self, sample_info: "SampleInfo"):
         """Fetches and processes one chunk of data, caching it for the instance."""
+        
+        # FIX: Generate a unique ID for this chunk that is consistent across all its samples.
+        # This ID is unique across all workers and all chunks.
+        self.current_chunk_id = np.int64( (sample_info.worker_id << 32) | self.chunk_count )
+        self.chunk_count += 1
+        
         while True:
             round_info = random.choice(self.pool)
             start_tick, end_tick = round_info['start_tick'], round_info['end_tick']
@@ -331,15 +348,16 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
-    jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
+    # FIX: Add chunk_id and sample_id to handle parallel loading correctly.
+    chunk_id, sample_id, jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_callable,
-        num_outputs=9,
+        num_outputs=11, # Increased from 9 to 11
         batch=False,
         parallel=True,
-        dtype=[types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
+        dtype=[types.INT64, types.INT32, types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
                types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT],
         # Dims for a single item, not a batch
-        ndim=[1, 3, 2, 2, 4, 2, 2, 3, 1]
+        ndim=[0, 0, 1, 3, 2, 2, 4, 2, 2, 3, 1]
     )
     
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
@@ -347,10 +365,11 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
                       min_canvas_size=max(target_h, target_w),
                       fill_value=mean255)
-    images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW", #red to fp16 for training
+    images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
                                       mean=mean255, std=std255)
     
-    return images, mels.gpu(), alive_mask.gpu(), stats.gpu(), pos_hm.gpu(), mouse.gpu(), kbd.gpu(), enemy_hm.gpu(), state.gpu()
+    # FIX: Pass the sorting keys through the pipeline to the final output.
+    return chunk_id.gpu(), sample_id.gpu(), images, mels.gpu(), alive_mask.gpu(), stats.gpu(), pos_hm.gpu(), mouse.gpu(), kbd.gpu(), enemy_hm.gpu(), state.gpu()
 
 
 # ===================================================================
@@ -375,29 +394,22 @@ if __name__ == "__main__":
         if data_cfg.use_dali and not DALI_AVAILABLE: raise ImportError("use_dali=True but NVIDIA DALI is not installed.")
         if data_cfg.use_dali and not torch.cuda.is_available(): raise RuntimeError("use_dali=True requires a CUDA-enabled PyTorch and DALI.")
         
-        # This CPU-only setup can happen before any CUDA context is created
         target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
         indexer = DatasetIndexer(lmdb_root_path=data_cfg.lmdb_root_path, manifest_path=data_cfg.manifest_path)
         dali_source_callable = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, mean_rgb=mean)
         
         print("\n--- Using NVIDIA DALI Data Pipeline ---")
         
-        # The total number of individual images DALI will process in a batch
         effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
-        
-        # FIX: Determine device_id from environment variables without calling torch.cuda.*
-        # This prevents initializing the CUDA context in the parent process before workers are spawned.
         device_id = int(os.getenv("LOCAL_RANK", os.getenv("RANK", "0")))
         
         pipeline = create_dali_pipeline(
-            # DALI's pipeline arguments
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id,
             prefetch_queue_depth=data_cfg.dali_prefetch,
             py_num_workers=data_cfg.num_workers,
-            py_start_method='spawn', # CRITICAL: Avoids forking a process with an initialized CUDA context.
-            # Custom arguments for our decorated function
+            py_start_method='spawn',
             external_source_callable=dali_source_callable,
             target_hw=target_hw,
             interp_str=interp_str,
@@ -406,11 +418,11 @@ if __name__ == "__main__":
         )
         
         pipeline.build()
-        # FIX: Now that workers are spawned, it is safe to interact with CUDA.
         torch.cuda.set_device(device_id)
         print(f"DALI pipeline built successfully for device {device_id}. Python workers started via 'spawn'.")
 
-        output_map = ["images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
+        # FIX: Add the new sorting keys to the output map.
+        output_map = ["chunk_id", "sample_id", "images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
         
         dali_loader = DALIGenericIterator([pipeline], output_map, reader_name=None, auto_reset=True, last_batch_padded=True)
         
@@ -418,34 +430,49 @@ if __name__ == "__main__":
         first_batch_from_dali = next(iter(dali_loader))[0]
         print("Successfully fetched one batch!")
 
-        B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
-        _, C, H, W = first_batch_from_dali["images"].shape
+        # FIX: Sort the entire batch using the keys to restore sequential order before reshaping.
+        print("Sorting batch to restore sequential order...")
+        chunk_id_tensor = first_batch_from_dali["chunk_id"]
+        sample_id_tensor = first_batch_from_dali["sample_id"]
         
-        images_tensor = first_batch_from_dali["images"].view(B, T, P, C, H, W)
-        mels_tensor = first_batch_from_dali["mel"].view(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
+        # lexsort sorts by the last key first, so we order it as [inner_key, outer_key]
+        sorted_indices = torch.lexsort([sample_id_tensor, chunk_id_tensor])
         
-        def unflatten_tensor(tensor, per_player=False, has_time=False):
-            original_dims = tensor.shape[1:]
-            if has_time: # alive_mask
-                return tensor.view(B, T * P, T, P)[:, 0]
-            if per_player: # stats, pos_hm, mouse, kbd
-                return tensor.view(B, T * P, P, *original_dims[1:])[:, 0]
-            else: # enemy_hm, state
-                return tensor.view(B, T * P, *original_dims)[:, 0]
+        sorted_batch = {key: tensor[sorted_indices] for key, tensor in first_batch_from_dali.items()}
+        print("Batch sorted successfully.")
 
+        B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
+        
+        # Use the new 'sorted_batch' dictionary for all subsequent operations.
+        images_tensor = sorted_batch["images"].view(B, T, P, *sorted_batch["images"].shape[1:])
+        mels_tensor = sorted_batch["mel"].view(B, T, P, *sorted_batch["mel"].shape[1:])
+        
+        # Correctly unflatten target tensors. Targets are constant per-chunk, so we take the first
+        # sample of each chunk after sorting and reshaping.
+        def unflatten_target_tensor(tensor, per_player=True):
+            # Reshape to [B, T*P, ...], then select the first element of the T*P dimension.
+            if per_player:
+                # Original shape [B*T*P, P, ...] -> [B, T*P, P, ...] -> [B, P, ...]
+                reshaped = tensor.view(B, T * P, P, *tensor.shape[2:])
+                return reshaped[:, 0]
+            else:
+                # Original shape [B*T*P, ...] -> [B, T*P, ...] -> [B, ...]
+                reshaped = tensor.view(B, T * P, *tensor.shape[1:])
+                return reshaped[:, 0]
+        
         batch_for_inspection = {
             "inputs": {
                 "images": images_tensor,
                 "mel_spectrogram": mels_tensor,
-                "alive_mask": unflatten_tensor(first_batch_from_dali["alive"], has_time=True)
+                "alive_mask": sorted_batch["alive"].view(B, T, P)
             },
             "targets": {
-                "player_stats": unflatten_tensor(first_batch_from_dali["stats"], per_player=True),
-                "player_pos_heatmaps": unflatten_tensor(first_batch_from_dali["pos_hm"], per_player=True),
-                "player_mouse": unflatten_tensor(first_batch_from_dali["mouse"], per_player=True),
-                "player_keyboard": unflatten_tensor(first_batch_from_dali["kbd"], per_player=True),
-                "enemy_pos_heatmap": unflatten_tensor(first_batch_from_dali["enemy_hm"]),
-                "round_state": unflatten_tensor(first_batch_from_dali["state"])
+                "player_stats": unflatten_target_tensor(sorted_batch["stats"], per_player=True),
+                "player_pos_heatmaps": unflatten_target_tensor(sorted_batch["pos_hm"], per_player=True),
+                "player_mouse": unflatten_target_tensor(sorted_batch["mouse"], per_player=True),
+                "player_keyboard": unflatten_target_tensor(sorted_batch["kbd"], per_player=True),
+                "enemy_pos_heatmap": unflatten_target_tensor(sorted_batch["enemy_hm"], per_player=False),
+                "round_state": unflatten_target_tensor(sorted_batch["state"], per_player=False)
             }
         }
         
