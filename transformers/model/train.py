@@ -379,8 +379,8 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     images = fn.paste(
         images,
         ratio=1.0,
-        paste_pos_x=0.5,
-        paste_pos_y=0.5,
+        paste_x=0.5,
+        paste_y=0.5,
         min_canvas_size=[int(target_h), int(target_w)],  # list, not tuple
         fill_value=0.0
     )
