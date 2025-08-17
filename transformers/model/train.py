@@ -141,7 +141,6 @@ class DatasetIndexer:
 # ===================================================================
 HEATMAP_DIMS = (8, 64, 64)
 KEYBOARD_DIM = 31
-# _NICE-TO-HAVE: Removed unused constants
 ROUND_STATE_DIM = 5
 MEL_SPEC_TIME_FRAMES = 8
 
@@ -191,7 +190,6 @@ class DALIExternalSource:
         self.data_cfg = data_cfg
         self.train_cfg = train_cfg
         self.mean = mean_rgb
-        # _FIX #2: Read exactly T frames, not T+1
         self.chunk_size_frames = self.train_cfg.context_frames
         
         self.envs = {}
@@ -202,7 +200,6 @@ class DALIExternalSource:
         self.chunk_count = 0
         self.current_chunk_id = -1
         
-        # _NICE-TO-HAVE: Per-worker RNG for determinism
         self._rng = random.Random()
 
     def __call__(self, sample_info: "SampleInfo"):
@@ -210,21 +207,19 @@ class DALIExternalSource:
             self._load_and_process_new_chunk(sample_info)
             self.current_idx_in_chunk = 0
 
-        idx = self.current_idx_in_chunk  # 0 .. (T*P-1)
+        idx = self.current_idx_in_chunk
         t = idx // NUM_PLAYERS
 
-        # Per-sample, per-player outputs:
         jpeg  = self.current_chunk_data['jpegs'][idx]
-        mel   = self.current_chunk_data['mels'][idx]        # (1, 128, M)
-        alive = self.current_chunk_data['alive'][idx]       # scalar bool
-        stats = self.current_chunk_data['stats'][idx]       # (3,)
-        pos   = self.current_chunk_data['pos_hm'][idx]      # (8, 64, 64)
-        mouse = self.current_chunk_data['mouse'][idx]       # (2,)
-        kbd   = self.current_chunk_data['kbd'][idx]         # (31,)
+        mel   = self.current_chunk_data['mels'][idx]
+        alive = self.current_chunk_data['alive'][idx]
+        stats = self.current_chunk_data['stats'][idx]
+        pos   = self.current_chunk_data['pos_hm'][idx]
+        mouse = self.current_chunk_data['mouse'][idx]
+        kbd   = self.current_chunk_data['kbd'][idx]
 
-        # Per-frame (duplicated across P samples in frame t):
-        enemy = self.current_chunk_data['enemy_hm_seq'][t]  # (8, 64, 64)
-        state = self.current_chunk_data['state_seq'][t]     # (5,)
+        enemy = self.current_chunk_data['enemy_hm_seq'][t]
+        state = self.current_chunk_data['state_seq'][t]
 
         chunk_id = self.current_chunk_id
         sample_id = np.int32(idx)
@@ -233,7 +228,6 @@ class DALIExternalSource:
         return (chunk_id, sample_id, jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
 
     def _load_and_process_new_chunk(self, sample_info: "SampleInfo"):
-        # _NICE-TO-HAVE: Per-worker seeding for reproducible sampling
         worker_id = getattr(sample_info, "worker_id", 0)
         if not hasattr(self, "_seeded"):
             base_seed = int(os.getenv("DL_SEED", "1337"))
@@ -249,7 +243,6 @@ class DALIExternalSource:
             total_frames = (end_tick - start_tick) // TICKS_PER_FRAME
             if total_frames < self.chunk_size_frames: continue
 
-            # _FIX #2: Simplified start frame selection
             max_start_frame_idx = total_frames - self.chunk_size_frames
             start_frame_idx = self._rng.randint(0, max_start_frame_idx)
             
@@ -269,7 +262,6 @@ class DALIExternalSource:
             return
 
     def _process_chunk(self, raw_chunk_data, round_info) -> dict:
-        T_ctx = self.train_cfg.context_frames
         dummy_jpeg = self._get_dummy_mean_jpeg()
 
         def _bitmask_to_multihot_np(m, nc): 
@@ -294,7 +286,6 @@ class DALIExternalSource:
         all_alive, all_stats, all_pos, all_mouse, all_kbd = [], [], [], [], []
         enemy_seq, state_seq = [], []
         
-        # _FIX #2: Loop over T frames, not T+1
         for i, frame_data in enumerate(raw_chunk_data):
             gs = frame_data['game_state'][0]
             pd_list = frame_data['player_data']
@@ -364,8 +355,9 @@ class DALIExternalSource:
         self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
         return self._cached_dummy_jpeg
 
+# _FIX: Renamed `seed` to `pipeline_seed` to avoid shadowing warning
 @pipeline_def
-def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, std, seed=1337):
+def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, std, pipeline_seed=1337):
     """Defines the DALI processing graph."""
     target_h, target_w = target_hw
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
@@ -383,17 +375,16 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
     images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
+    # _FIX: `fill_value` must be a scalar float. Changed from mean255 to 0.0.
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
                       min_canvas_size=(target_h, target_w),
-                      fill_value=mean255)
+                      fill_value=0.0)
     images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
                                       mean=mean255, std=std255)
     
-    # _NICE-TO-HAVE: Cast heatmaps on CPU before moving to GPU to save bandwidth
     pos_hm = fn.cast(pos_hm, dtype=types.FLOAT16)
     enemy_hm = fn.cast(enemy_hm, dtype=types.FLOAT16)
 
-    # _FIX #1: Keep chunk_id and sample_id on the CPU for sorting
     return (
         chunk_id, sample_id, images, mels.gpu(),
         alive,
@@ -447,15 +438,17 @@ if __name__ == "__main__":
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id,
-            seed=int(os.getenv("DL_SEED", "1337")),
+            seed=1337, # This is the main pipeline seed
             prefetch_queue_depth=data_cfg.dali_prefetch,
             py_num_workers=data_cfg.num_workers,
             py_start_method='spawn',
+            # _FIX: Pass the seed to the renamed argument
             external_source_callable=dali_source_callable,
             target_hw=target_hw,
             interp_str=interp_str,
             mean=mean,
-            std=std
+            std=std,
+            pipeline_seed=int(os.getenv("DL_SEED", "1337"))
         )
         
         pipeline.build()
@@ -471,8 +464,6 @@ if __name__ == "__main__":
         print("Successfully fetched one batch!")
 
         print("Sorting batch to restore sequential order...")
-        # _FIX #1: Perform sorting on CPU and create separate indices for CPU/GPU tensors
-        # to prevent a device mismatch error when indexing.
         chunk_id_cpu = first_batch_from_dali["chunk_id"].cpu()
         sample_id_cpu = first_batch_from_dali["sample_id"].cpu()
         
@@ -499,7 +490,6 @@ if __name__ == "__main__":
         mels_tensor   = sorted_batch["mel"].reshape(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
         alive_tensor  = sorted_batch["alive"].reshape(B, T, P)
         stats_tensor  = sorted_batch["stats"].reshape(B, T, P, 3)
-        # Note: DALI output for heatmaps is now float16, as requested.
         pos_hm_tensor = sorted_batch["pos_hm"].reshape(B, T, P, *HEATMAP_DIMS)
         mouse_tensor  = sorted_batch["mouse"].reshape(B, T, P, 2)
         kbd_tensor    = sorted_batch["kbd"].reshape(B, T, P, KEYBOARD_DIM)
