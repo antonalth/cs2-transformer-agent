@@ -347,7 +347,7 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
                       min_canvas_size=max(target_h, target_w),
                       fill_value=mean255)
-    images = fn.crop_mirror_normalize(images, dtype=types.FLOAT, output_layout="CHW",
+    images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW", #red to fp16 for training
                                       mean=mean255, std=std255)
     
     return images, mels.gpu(), alive_mask.gpu(), stats.gpu(), pos_hm.gpu(), mouse.gpu(), kbd.gpu(), enemy_hm.gpu(), state.gpu()
