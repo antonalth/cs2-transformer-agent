@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.6 (Audited: Patched DDP, DALI args, Seeding, Sorting, and Reshaping)
+VERSION: 4.8 (Refactor: Emit per-sample, per-player labels from DALI source)
 """
 
 # ===================================================================
@@ -195,7 +195,6 @@ class DALIExternalSource:
         self.mean = mean_rgb
         self.chunk_size_frames = self.train_cfg.context_frames + 1
         
-        # State for each worker's callable instance
         self.envs = {}
         self.current_chunk_data = None
         self.current_idx_in_chunk = 0
@@ -203,34 +202,38 @@ class DALIExternalSource:
         
         self.chunk_count = 0
         self.current_chunk_id = -1
-            
+    
+    # PATCH: Replaced __call__ and _process_chunk
     def __call__(self, sample_info: "SampleInfo"):
-        """Called by DALI for each sample. Returns one sample's data."""
         if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
             self._load_and_process_new_chunk(sample_info)
             self.current_idx_in_chunk = 0
 
-        jpeg = self.current_chunk_data['jpegs'][self.current_idx_in_chunk]
-        mel = self.current_chunk_data['mels'][self.current_idx_in_chunk]
-        alive = self.current_chunk_data['alive']
-        stats = self.current_chunk_data['stats']
-        pos = self.current_chunk_data['pos_hm']
-        mouse = self.current_chunk_data['mouse']
-        kbd = self.current_chunk_data['kbd']
-        enemy = self.current_chunk_data['enemy_hm']
-        state = self.current_chunk_data['state']
+        idx = self.current_idx_in_chunk  # 0 .. (T*P-1)
+        t = idx // NUM_PLAYERS
+
+        # Per-sample, per-player outputs:
+        jpeg  = self.current_chunk_data['jpegs'][idx]
+        mel   = self.current_chunk_data['mels'][idx]        # (1, 128, M)
+        alive = self.current_chunk_data['alive'][idx]       # scalar bool
+        stats = self.current_chunk_data['stats'][idx]       # (3,)
+        pos   = self.current_chunk_data['pos_hm'][idx]      # (8, 64, 64)
+        mouse = self.current_chunk_data['mouse'][idx]       # (2,)
+        kbd   = self.current_chunk_data['kbd'][idx]         # (31,)
+
+        # Per-frame (duplicated across P samples in frame t):
+        enemy = self.current_chunk_data['enemy_hm_seq'][t]  # (8, 64, 64)
+        state = self.current_chunk_data['state_seq'][t]     # (5,)
 
         chunk_id = self.current_chunk_id
-        sample_id = np.int32(self.current_idx_in_chunk)
+        sample_id = np.int32(idx)
 
         self.current_idx_in_chunk += 1
         return (chunk_id, sample_id, jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
 
     def _load_and_process_new_chunk(self, sample_info: "SampleInfo"):
-        """Fetches and processes one chunk of data, caching it for the instance."""
-        
-        worker_id = getattr(sample_info, "worker_id", 0) # future-proof
-        self.current_chunk_id = np.int64( (worker_id << 32) | self.chunk_count )
+        worker_id = getattr(sample_info, "worker_id", 0)
+        self.current_chunk_id = np.int64((worker_id << 32) | self.chunk_count)
         self.chunk_count += 1
         
         while True:
@@ -258,6 +261,87 @@ class DALIExternalSource:
             self.current_chunk_data = self._process_chunk(raw_chunk_data, round_info)
             return
 
+    def _process_chunk(self, raw_chunk_data, round_info) -> dict:
+        T_ctx = self.train_cfg.context_frames
+        dummy_jpeg = self._get_dummy_mean_jpeg()
+
+        def _bitmask_to_multihot_np(m, nc): 
+            return np.array([(m >> i) & 1 for i in range(nc)], dtype=np.float32)
+
+        def _coords_to_heatmap_np(coords, dims, ext):
+            Z, Y, X = dims
+            hm = np.zeros(dims, dtype=np.float32)
+            if coords is None or (isinstance(coords, np.ndarray) and coords.size == 0):
+                return hm
+            coords = np.atleast_2d(coords)
+            for x, y, z in coords:
+                if not np.all(np.isfinite([x, y, z])): 
+                    continue
+                ix = int(((x - ext['x'][0]) / (ext['x'][1] - ext['x'][0])) * (X - 1))
+                iy = int(((y - ext['y'][0]) / (ext['y'][1] - ext['y'][0])) * (Y - 1))
+                iz = int(((z - ext['z'][0]) / (ext['z'][1] - ext['z'][0])) * (Z - 1))
+                hm[np.clip(iz, 0, Z-1), np.clip(iy, 0, Y-1), np.clip(ix, 0, X-1)] = 1.0
+            return hm
+
+        all_jpegs, all_mels = [], []
+        all_alive, all_stats, all_pos, all_mouse, all_kbd = [], [], [], [], []
+        enemy_seq, state_seq = [], []
+
+        for i, frame_data in enumerate(raw_chunk_data[:T_ctx]):
+            gs = frame_data['game_state'][0]
+            pd_list = frame_data['player_data']
+            mask_int = gs['team_alive']
+
+            slot_to_jpeg = {s: dummy_jpeg for s in range(NUM_PLAYERS)}
+            slot_to_mel = {s: np.full((1, 128, MEL_SPEC_TIME_FRAMES), -80.0, dtype=np.float32) for s in range(NUM_PLAYERS)}
+            slot_alive = np.zeros(NUM_PLAYERS, dtype=np.bool_)
+            slot_stats = np.zeros((NUM_PLAYERS, 3), dtype=np.float32)
+            slot_pos   = np.zeros((NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
+            slot_mouse = np.zeros((NUM_PLAYERS, 2), dtype=np.float32)
+            slot_kbd   = np.zeros((NUM_PLAYERS, KEYBOARD_DIM), dtype=np.float32)
+
+            for p_idx, p_tuple in enumerate(pd_list):
+                slot = find_nth_set_bit_pos(mask_int, p_idx)
+                if slot == -1: continue
+                
+                p_info, jpeg_bytes, mel_spec = p_tuple[0][0], p_tuple[1], p_tuple[2]
+
+                slot_alive[slot] = True
+                slot_to_jpeg[slot] = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                if mel_spec is not None:
+                    mel = torch.from_numpy(mel_spec.copy()).unsqueeze(0)
+                    mel = torch.nn.functional.pad(mel, (0, max(0, MEL_SPEC_TIME_FRAMES - mel.shape[-1])), 'constant', -80.0)[:, :, :MEL_SPEC_TIME_FRAMES]
+                    slot_to_mel[slot] = mel.numpy()
+
+                slot_stats[slot] = [p_info['health'], p_info['armor'], p_info['money']]
+                slot_pos[slot]   = _coords_to_heatmap_np(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
+                slot_mouse[slot] = p_info['mouse']
+                slot_kbd[slot]   = _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM)
+
+            for s in range(NUM_PLAYERS):
+                all_jpegs.append(slot_to_jpeg[s])
+                all_mels.append(slot_to_mel[s])
+                all_alive.append(slot_alive[s])
+                all_stats.append(slot_stats[s])
+                all_pos.append(slot_pos[s])
+                all_mouse.append(slot_mouse[s])
+                all_kbd.append(slot_kbd[s])
+
+            enemy_seq.append(_coords_to_heatmap_np(gs['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents))
+            state_seq.append(_bitmask_to_multihot_np(gs['round_state'], ROUND_STATE_DIM))
+
+        return {
+            "jpegs": all_jpegs,
+            "mels": np.stack(all_mels),
+            "alive": np.asarray(all_alive, dtype=np.bool_),
+            "stats": np.asarray(all_stats, dtype=np.float32),
+            "pos_hm": np.asarray(all_pos, dtype=np.float32),
+            "mouse": np.asarray(all_mouse, dtype=np.float32),
+            "kbd":   np.asarray(all_kbd, dtype=np.float32),
+            "enemy_hm_seq": np.asarray(enemy_seq, dtype=np.float32),
+            "state_seq":    np.asarray(state_seq, dtype=np.float32),
+        }
+
     def _get_env(self, lmdb_path):
         if lmdb_path not in self.envs:
             self.envs[lmdb_path] = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
@@ -271,76 +355,6 @@ class DALIExternalSource:
         assert ok, "Failed to encode dummy JPEG"
         self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
         return self._cached_dummy_jpeg
-    
-    def _process_chunk(self, raw_chunk_data, round_info) -> dict:
-        """Prepares all data for one chunk as numpy arrays to be cached."""
-        T_ctx = self.train_cfg.context_frames
-        dummy_jpeg = self._get_dummy_mean_jpeg()
-        all_jpegs, all_mels = [], []
-        
-        # Since alive_mask is identical for all samples in a chunk, we process it once
-        alive_masks_list = []
-        for frame_data in raw_chunk_data[:T_ctx]:
-            gs = frame_data['game_state'][0]
-            alive_mask = gs['team_alive']
-            alive_masks_list.append(np.array([(alive_mask >> i) & 1 for i in range(NUM_PLAYERS)], dtype=np.bool_))
-        
-        # This [T, P] grid is duplicated for every sample in the chunk
-        alive_mask_chunk_grid = np.stack(alive_masks_list)
-
-        for i, frame_data in enumerate(raw_chunk_data[:T_ctx]):
-            pd_list = frame_data['player_data']
-            alive_mask_for_frame = alive_masks_list[i].astype(np.uint8).tobytes() # Need a way to map this
-            
-            slot_to_jpeg = {s: dummy_jpeg for s in range(NUM_PLAYERS)}
-            slot_to_mel = {s: np.full((1, 128, MEL_SPEC_TIME_FRAMES), -80.0, dtype=np.float32) for s in range(NUM_PLAYERS)}
-
-            for p_idx, p_tuple in enumerate(pd_list):
-                slot = find_nth_set_bit_pos(int.from_bytes(alive_mask_for_frame, 'little'), p_idx)
-                if slot != -1:
-                    _, jpeg_bytes, mel_spec = p_tuple
-                    slot_to_jpeg[slot] = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-                    if mel_spec is not None:
-                        mel = torch.from_numpy(mel_spec.copy()).unsqueeze(0)
-                        mel = torch.nn.functional.pad(mel, (0, max(0, MEL_SPEC_TIME_FRAMES - mel.shape[-1])), 'constant', -80.0)[:,:,:MEL_SPEC_TIME_FRAMES]
-                        slot_to_mel[slot] = mel.numpy()
-            
-            for s_idx in range(NUM_PLAYERS):
-                all_jpegs.append(slot_to_jpeg[s_idx])
-                all_mels.append(slot_to_mel[s_idx])
-
-        gs_target, pd_target_list = raw_chunk_data[-1]['game_state'][0], raw_chunk_data[-1]['player_data']
-        def _bitmask_to_multihot_np(m, nc): return np.array([(m >> i) & 1 for i in range(nc)], dtype=np.float32)
-        def _coords_to_heatmap_np(coords, dims, ext):
-            Z,Y,X = dims; hm = np.zeros(dims, dtype=np.float32)
-            if coords is None or coords.size == 0: return hm
-            coords = np.atleast_2d(coords)
-            for x,y,z in coords:
-                if not np.all(np.isfinite([x,y,z])): continue
-                ix, iy, iz = int(((x-ext['x'][0])/(ext['x'][1]-ext['x'][0]))*(X-1)), int(((y-ext['y'][0])/(ext['y'][1]-ext['y'][0]))*(Y-1)), int(((z-ext['z'][0])/(ext['z'][1]-ext['z'][0]))*(Z-1))
-                hm[np.clip(iz,0,Z-1), np.clip(iy,0,Y-1), np.clip(ix,0,X-1)] = 1.0
-            return hm
-
-        stats    = np.zeros((NUM_PLAYERS, 3), dtype=np.float32)
-        pos_hm   = np.zeros((NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
-        mouse    = np.zeros((NUM_PLAYERS, 2), dtype=np.float32)
-        keyboard = np.zeros((NUM_PLAYERS, KEYBOARD_DIM), dtype=np.float32)
-        
-        for i, p_tuple in enumerate(pd_target_list):
-            slot = find_nth_set_bit_pos(gs_target['team_alive'], i)
-            if slot != -1:
-                p_info = p_tuple[0][0]
-                stats[slot] = [p_info['health'], p_info['armor'], p_info['money']]
-                pos_hm[slot] = _coords_to_heatmap_np(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
-                mouse[slot] = p_info['mouse']
-                keyboard[slot] = _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM)
-        
-        return {
-            "jpegs": all_jpegs, "mels": np.stack(all_mels), "alive": alive_mask_chunk_grid,
-            "stats": stats, "pos_hm": pos_hm, "mouse": mouse, "kbd": keyboard,
-            "enemy_hm": _coords_to_heatmap_np(gs_target['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents),
-            "state": _bitmask_to_multihot_np(gs_target['round_state'], ROUND_STATE_DIM)
-        }
 
 @pipeline_def
 def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, std, seed=1337):
@@ -349,30 +363,35 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
-    chunk_id, sample_id, jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
+    # PATCH: Updated external_source ndim signature for new per-sample shapes
+    chunk_id, sample_id, jpegs, mels, alive, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_callable,
         num_outputs=11,
         batch=False,
         parallel=True,
         dtype=[types.INT64, types.INT32, types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
                types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT],
-        # Dims for a single item, not a batch. alive_mask is [T, P]
-        ndim=[0, 0, 1, 3, 2, 2, 4, 2, 2, 3, 1]
+        ndim=[0, 0, 1, 3, 0, 1, 3, 1, 1, 3, 1]
     )
     
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
     images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
-    # PATCH: Use a tuple for min_canvas_size
     images = fn.paste(images, ratio=1.0, paste_x=0.5, paste_y=0.5,
                       min_canvas_size=(target_h, target_w),
                       fill_value=mean255)
     images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
                                       mean=mean255, std=std255)
     
-    # PATCH: Keep small metadata on CPU for performance.
-    return (chunk_id.gpu(), sample_id.gpu(), images, mels.gpu(),
-            alive_mask, stats, pos_hm.gpu(), mouse, kbd, enemy_hm.gpu(), state)
-
+    return (
+        chunk_id.gpu(), sample_id.gpu(), images, mels.gpu(),
+        alive,
+        stats,
+        pos_hm.gpu(),
+        mouse,
+        kbd,
+        enemy_hm.gpu(),
+        state
+    )
 
 # ===================================================================
 # 6. SCRIPT ENTRYPOINT
@@ -404,7 +423,6 @@ if __name__ == "__main__":
         
         effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
         
-        # PATCH: Robust device selection for DDP
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         num_gpus = torch.cuda.device_count()
         if num_gpus == 0:
@@ -413,7 +431,6 @@ if __name__ == "__main__":
             raise RuntimeError(f"LOCAL_RANK={local_rank} but only {num_gpus} GPU(s) visible.")
         device_id = local_rank
 
-        # PATCH: Add seed for reproducibility
         pipeline = create_dali_pipeline(
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
@@ -445,7 +462,6 @@ if __name__ == "__main__":
         chunk_id_tensor = first_batch_from_dali["chunk_id"]
         sample_id_tensor = first_batch_from_dali["sample_id"]
         
-        # PATCH: Use a GPU-native, two-pass stable sort instead of non-existent lexsort
         _, idx1 = torch.sort(sample_id_tensor, stable=True)
         chunk_sorted = chunk_id_tensor[idx1]
         _, idx2 = torch.sort(chunk_sorted, stable=True)
@@ -454,35 +470,33 @@ if __name__ == "__main__":
         sorted_batch = {key: tensor[sorted_indices] for key, tensor in first_batch_from_dali.items()}
         print("Batch sorted successfully.")
 
+        # PATCH: Replaced unflattening logic with direct reshapes
         B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
-        
-        images_tensor = sorted_batch["images"].reshape(B, T, P, *sorted_batch["images"].shape[1:])
-        mels_tensor = sorted_batch["mel"].reshape(B, T, P, *sorted_batch["mel"].shape[1:])
-        
-        def unflatten_target_tensor(tensor, per_player=True):
-            if per_player:
-                reshaped = tensor.reshape(B, T * P, P, *tensor.shape[2:])
-                return reshaped[:, 0]
-            else:
-                reshaped = tensor.reshape(B, T * P, *tensor.shape[1:])
-                return reshaped[:, 0]
 
-        # PATCH: Correctly unflatten the alive_mask, which is duplicated per-chunk
-        alive_seq = sorted_batch["alive"].reshape(B, T * P, T, P)[:, 0]
+        C, H, W = sorted_batch["images"].shape[1:]
+        images_tensor = sorted_batch["images"].reshape(B, T, P, C, H, W)
+        mels_tensor   = sorted_batch["mel"].reshape(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
+        alive_tensor  = sorted_batch["alive"].reshape(B, T, P)
+        stats_tensor  = sorted_batch["stats"].reshape(B, T, P, 3)
+        pos_hm_tensor = sorted_batch["pos_hm"].reshape(B, T, P, *HEATMAP_DIMS)
+        mouse_tensor  = sorted_batch["mouse"].reshape(B, T, P, 2)
+        kbd_tensor    = sorted_batch["kbd"].reshape(B, T, P, KEYBOARD_DIM)
+        enemy_tensor  = sorted_batch["enemy_hm"].reshape(B, T, P, *HEATMAP_DIMS)
+        state_tensor  = sorted_batch["state"].reshape(B, T, P, ROUND_STATE_DIM)
 
         batch_for_inspection = {
             "inputs": {
                 "images": images_tensor,
                 "mel_spectrogram": mels_tensor,
-                "alive_mask": alive_seq
+                "alive_mask": alive_tensor
             },
             "targets": {
-                "player_stats": unflatten_target_tensor(sorted_batch["stats"], per_player=True),
-                "player_pos_heatmaps": unflatten_target_tensor(sorted_batch["pos_hm"], per_player=True),
-                "player_mouse": unflatten_target_tensor(sorted_batch["mouse"], per_player=True),
-                "player_keyboard": unflatten_target_tensor(sorted_batch["kbd"], per_player=True),
-                "enemy_pos_heatmap": unflatten_target_tensor(sorted_batch["enemy_hm"], per_player=False),
-                "round_state": unflatten_target_tensor(sorted_batch["state"], per_player=False)
+                "player_stats": stats_tensor,
+                "player_pos_heatmaps": pos_hm_tensor,
+                "player_mouse": mouse_tensor,
+                "player_keyboard": kbd_tensor,
+                "enemy_pos_heatmap": enemy_tensor,
+                "round_state": state_tensor
             }
         }
         
