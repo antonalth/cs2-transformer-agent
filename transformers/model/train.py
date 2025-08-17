@@ -540,4 +540,4 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         if os.path.exists(dummy_config_path):
-            os.remove(dummy_config_path)```
+            os.remove(dummy_config_path)
