@@ -181,44 +181,51 @@ def find_nth_set_bit_pos(n: int, j: int) -> int:
 # 5. DALI PIPELINE & DATA SOURCE
 # ===================================================================
 class DALIExternalSource:
-    """Callable data source for DALI's external_source operator."""
-    def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig, batch_size: int, mean_rgb: torch.Tensor):
+    """
+    Callable, stateful iterator for DALI's external_source operator.
+    Designed to be used with `parallel=True`, where DALI creates one
+    instance of this class for each `py_num_workers`. Each instance
+    maintains its own state (which chunk it's reading) to provide a
+    continuous stream of single items (image + metadata).
+    """
+    def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig, mean_rgb: torch.Tensor):
         self.pool = sampling_pool
         self.data_cfg = data_cfg
         self.train_cfg = train_cfg
-        self.batch_size = batch_size
-        self.chunk_size_frames = self.train_cfg.context_frames + 1
         self.mean = mean_rgb
-        self.envs = {}
+        self.chunk_size_frames = self.train_cfg.context_frames + 1
         
+        # State for each worker's iterator instance
+        self.envs = {}
+        self.current_chunk_data = None
+        self.current_idx_in_chunk = 0
+        self.items_in_chunk = self.train_cfg.context_frames * NUM_PLAYERS
+
     def __iter__(self):
         return self
 
     def __next__(self):
-        batch_jpegs, batch_mels, batch_alive, batch_stats, batch_pos, batch_mouse, batch_kbd, batch_enemy, batch_state = [],[],[],[],[],[],[],[],[]
-        
-        rep = self.train_cfg.context_frames * NUM_PLAYERS
-        
-        for _ in range(self.batch_size):
-            jpegs, mels, alive, stats, pos, mouse, kbd, enemy, state = self.get_single_sample()
-            
-            batch_jpegs.extend(jpegs) # Flatten JPEGs for one large batch
-            batch_mels.extend(list(mels))
-            
-            # Replicate chunk-level arrays T*P times so batch size matches images
-            batch_alive.extend([alive] * rep)
-            batch_stats.extend([stats] * rep)
-            batch_pos.extend([pos] * rep)
-            batch_mouse.extend([mouse] * rep)
-            batch_kbd.extend([kbd] * rep)
-            batch_enemy.extend([enemy] * rep)
-            batch_state.extend([state] * rep)
+        if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
+            self._load_and_process_new_chunk()
+            self.current_idx_in_chunk = 0
 
-        return (batch_jpegs, batch_mels, batch_alive, batch_stats, batch_pos,
-                batch_mouse, batch_kbd, batch_enemy, batch_state)
+        # Retrieve the data for the current flat index
+        jpeg = self.current_chunk_data['jpegs'][self.current_idx_in_chunk]
+        mel = self.current_chunk_data['mels'][self.current_idx_in_chunk]
+        # Metadata is identical for all items in the chunk
+        alive = self.current_chunk_data['alive']
+        stats = self.current_chunk_data['stats']
+        pos = self.current_chunk_data['pos_hm']
+        mouse = self.current_chunk_data['mouse']
+        kbd = self.current_chunk_data['kbd']
+        enemy = self.current_chunk_data['enemy_hm']
+        state = self.current_chunk_data['state']
 
-    def get_single_sample(self):
-        """Fetches and processes one chunk of data for DALI."""
+        self.current_idx_in_chunk += 1
+        return (jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
+
+    def _load_and_process_new_chunk(self):
+        """Fetches and processes one chunk of data, caching it for the iterator."""
         while True:
             round_info = random.choice(self.pool)
             start_tick, end_tick = round_info['start_tick'], round_info['end_tick']
@@ -241,7 +248,8 @@ class DALIExternalSource:
             
             if any(item is None for item in raw_chunk_data): continue
             
-            return self._process_chunk_for_dali(raw_chunk_data, round_info)
+            self.current_chunk_data = self._process_chunk(raw_chunk_data, round_info)
+            return
 
     def _get_env(self, lmdb_path):
         if lmdb_path not in self.envs:
@@ -252,18 +260,17 @@ class DALIExternalSource:
         if hasattr(self, "_cached_dummy_jpeg"): return self._cached_dummy_jpeg
         rgb = (self.mean.numpy() * 255.0).round().astype(np.uint8)
         img = np.full((1, 1, 3), rgb, dtype=np.uint8)
-        ok, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        ok, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB_BGR))
         assert ok, "Failed to encode dummy JPEG"
         self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
         return self._cached_dummy_jpeg
     
-    def _process_chunk_for_dali(self, raw_chunk_data, round_info):
-        """Prepares all data for one chunk as numpy arrays to be fed into DALI."""
+    def _process_chunk(self, raw_chunk_data, round_info) -> dict:
+        """Prepares all data for one chunk as numpy arrays to be cached."""
         T_ctx = self.train_cfg.context_frames
         dummy_jpeg = self._get_dummy_mean_jpeg()
         all_jpegs, all_mels, all_alive_masks = [], [], []
 
-        # This loop creates T_ctx * NUM_PLAYERS images and mels
         for frame_data in raw_chunk_data[:T_ctx]:
             gs, pd_list = frame_data['game_state'][0], frame_data['player_data']
             alive_mask = gs['team_alive']
@@ -312,25 +319,29 @@ class DALIExternalSource:
                 mouse[slot] = p_info['mouse']
                 keyboard[slot] = _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM)
         
-        return (all_jpegs, np.stack(all_mels), np.stack(all_alive_masks), stats, pos_hm,
-                mouse, keyboard, _coords_to_heatmap_np(gs_target['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents),
-                _bitmask_to_multihot_np(gs_target['round_state'], ROUND_STATE_DIM))
+        return {
+            "jpegs": all_jpegs, "mels": np.stack(all_mels), "alive": np.stack(all_alive_masks),
+            "stats": stats, "pos_hm": pos_hm, "mouse": mouse, "kbd": keyboard,
+            "enemy_hm": _coords_to_heatmap_np(gs_target['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents),
+            "state": _bitmask_to_multihot_np(gs_target['round_state'], ROUND_STATE_DIM)
+        }
 
 @pipeline_def
-def create_dali_pipeline(external_source_iterator, dali_prefetch, target_hw, interp_str, mean, std):
+def create_dali_pipeline(external_source_iterator, target_hw, interp_str, mean, std):
     """Defines the DALI processing graph."""
     target_h, target_w = target_hw
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
     interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
+    # FIX: Switched to per-sample (`batch=False`) parallel (`parallel=True`) external source
     jpegs, mels, alive_mask, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
         source=external_source_iterator,
         num_outputs=9,
-        batch=True,
+        batch=False,
         parallel=True,
-        prefetch_queue_depth=dali_prefetch,
         dtype=[types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
                types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT],
+        # Dims for a single item, not a batch
         ndim=[1, 3, 2, 2, 4, 2, 2, 3, 1]
     )
     
@@ -367,33 +378,40 @@ if __name__ == "__main__":
         if data_cfg.use_dali and not DALI_AVAILABLE: raise ImportError("use_dali=True but NVIDIA DALI is not installed.")
         if data_cfg.use_dali and not torch.cuda.is_available(): raise RuntimeError("use_dali=True requires a CUDA-enabled PyTorch and DALI.")
         
-        # This must happen before any CUDA context is created
+        # This CPU-only setup can happen before any CUDA context is created
         target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
-        
         indexer = DatasetIndexer(lmdb_root_path=data_cfg.lmdb_root_path, manifest_path=data_cfg.manifest_path)
+        data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, mean_rgb=mean)
         
         print("\n--- Using NVIDIA DALI Data Pipeline ---")
-        device_id = torch.cuda.current_device()
         
-        data_iterator = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, train_cfg.batch_size, mean_rgb=mean)
-        
+        # The total number of individual images DALI will process in a batch
         effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
         
+        # FIX: Defer CUDA device query until just before pipeline creation
+        # and pass spawn method to pipeline constructor to prevent forking errors.
+        device_id = torch.cuda.current_device()
+        
         pipeline = create_dali_pipeline(
-            external_source_iterator=data_iterator,
-            dali_prefetch=data_cfg.dali_prefetch,
-            target_hw=target_hw,
-            interp_str=interp_str,
-            mean=mean,
-            std=std,
+            # DALI's pipeline arguments
             batch_size=effective_batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id,
+            prefetch_queue_depth=data_cfg.dali_prefetch,
             py_num_workers=data_cfg.num_workers,
-            # CRITICAL FIX: Use 'spawn' to avoid forking a process with an initialized CUDA context.
-            py_start_method='spawn'
+            py_start_method='spawn', # CRITICAL FIX: Avoids forking a process with an initialized CUDA context.
+            # Custom arguments for our decorated function
+            external_source_iterator=data_iterator,
+            target_hw=target_hw,
+            interp_str=interp_str,
+            mean=mean,
+            std=std
         )
         
+        # FIX: Explicitly build the pipeline. This is when the worker processes are spawned.
+        pipeline.build()
+        print("DALI pipeline built successfully. Python workers started via 'spawn'.")
+
         output_map = ["images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
         
         dali_loader = DALIGenericIterator([pipeline], output_map, reader_name=None, auto_reset=True, last_batch_padded=True)
