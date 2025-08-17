@@ -40,6 +40,7 @@ try:
     import nvidia.dali.fn as fn
     import nvidia.dali.types as types
     from nvidia.dali.plugin.pytorch import DALIGenericIterator
+    from nvidia.dali.types import SampleInfo
     DALI_AVAILABLE = True
 except ImportError:
     DALI_AVAILABLE = False
@@ -199,8 +200,8 @@ class DALIExternalSource:
         self.current_chunk_data = None
         self.current_idx_in_chunk = 0
         self.items_in_chunk = self.train_cfg.context_frames * NUM_PLAYERS
-
-    def __call__(self):
+            
+    def __call__(self, sample_info: "SampleInfo"):
         """Called by DALI for each sample. Returns one sample's data."""
         if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
             self._load_and_process_new_chunk()
