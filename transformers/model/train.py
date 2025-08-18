@@ -374,21 +374,40 @@ def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, 
     )
     
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
-    images = fn.resize(images, size=(target_h, target_w), mode="not_larger", interp_type=interp_dali)
-    # _FIX: `fill_value` must be a scalar float. Changed from mean255 to 0.0.
-    images = fn.paste(
+   
+    # --- Letterbox 640x480 -> centered 518x518 ---
+    # 1) Resize to fit within 518x518 while preserving AR (640x480 -> 518x389)
+    resized = fn.resize(
         images,
-        ratio=1.0,
-        paste_x=0.5,
-        paste_y=0.5,
-        min_canvas_size=[int(target_h), int(target_w)],  # list, not tuple
-        fill_value=0.0
+        size=[518, 518],   # [H, W]
+        mode="not_larger"
     )
-    images = fn.crop_mirror_normalize(images, dtype=types.FLOAT16, output_layout="CHW",
-                                      mean=mean255, std=std255)
-    
-    pos_hm = fn.cast(pos_hm, dtype=types.FLOAT16)
+
+    # 2) Paste onto a 518x518 canvas, vertically centered (anchor_y = (518-389)//2 = 64)
+    letterboxed = fn.multi_paste(
+        resized,
+        output_size=[518, 518],      # target canvas HxW
+        out_anchors=[64, 0],         # [y, x]
+        shapes=[389, 518],           # src HxW after the resize step
+        dtype=types.UINT8,
+        fill_value=114               # neutral gray bars
+    )
+
+    images = letterboxed
+
+    # --- Normalize + layout + dtype for the model ---
+    images = fn.crop_mirror_normalize(
+        images,
+        dtype=types.FLOAT16,
+        output_layout="CHW",
+        mean=mean255,    # e.g., [123.675*255/255, ...] or your existing scaled values
+        std=std255
+    )
+
+    # Heatmaps to FP16 as well (keeps everything consistent if the model is half-precision)
+    pos_hm   = fn.cast(pos_hm,   dtype=types.FLOAT16)
     enemy_hm = fn.cast(enemy_hm, dtype=types.FLOAT16)
+
 
     return (
         chunk_id, sample_id, images, mels.gpu(),
