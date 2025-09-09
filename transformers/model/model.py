@@ -1,4 +1,5 @@
 """
+Erstellt mit Buntstiften. Weil C++ zu schwierig ist für mich.
 ====================================================================================================
 A Causal Autoregressive Multi-Modal Transformer for CS2 Gameplay Generation
 ====================================================================================================
@@ -431,7 +432,7 @@ class AudioCNN(nn.Module):
         x = torch.flatten(x, 1)
         x = self.head(x)  # [N, d_model]
         x = x.reshape(B, T, P, -1)
-        return x
+        return x #das ist mein roter buntstift, habe ich ganz alleine gemalt. (mithilfe von chef gpt)
     
 class PlayerTokenFuser(nn.Module):
     """Fuse visual+audio via elementwise add, add slot identity, then LayerNorm.
