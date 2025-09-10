@@ -1,143 +1,135 @@
-# bench_dali_video.py
-# Benchmark DALI video decoding on GPU and verify padding + frame selection.
-# Usage:
-#   python bench_dali_video.py --file sample.mp4 --start 500 --end 1000 --batch-size 4 --iters 200 --size 224 224
+# bench_multi_pov_5.py
+# Decode+resize 5 concurrent POV streams with DALI and report throughput.
+# Requires an NVIDIA driver with NVDEC (libnvcuvid), and a DALI wheel matching your CUDA.
 
 import argparse, os, tempfile, time
-import numpy as np
-
+from typing import List, Tuple
 from nvidia.dali import pipeline_def
 import nvidia.dali.fn as fn
 
-def make_file_list(path: str, start: int, end: int) -> str:
-    """Create a temp DALI file_list with one line: <abs_path>  <label>  <start_frame>  <end_frame>."""
+def make_file_list(path: str, start: int, end: int, lines: int) -> str:
+    """
+    Create a temp DALI file_list with `lines` identical entries:
+      <abs_path>  <label>  <start_frame>  <end_frame>
+    start/end are treated as frame indices by the reader.
+    """
     abs_path = os.path.abspath(path)
-    text = f"{abs_path} 0 {start} {end}\n"
+    text = "\n".join(f"{abs_path} 0 {start} {end}" for _ in range(lines)) + "\n"
     tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
     tf.write(text)
     tf.close()
     return tf.name
 
-@pipeline_def
-def dali_video_pipe(file_list, seq_len, resize_hw=None):
-    # Use readers.video so enable_frame_num yields frame indices as a 3rd output
-    video, labels, frame_nums = fn.readers.video(
-        device="gpu",
-        file_list=file_list,
-        file_list_frame_num=True,             # interpret start/end as frame indices
-        sequence_length=seq_len,
-        step=seq_len,                         # one clip per line
-        random_shuffle=False,
-        enable_frame_num=True,                # return per-frame indices
-        pad_sequences=True,                   # zero-pad beyond EOF; frame_nums = -1 for padded frames
-        file_list_include_preceding_frame=False,  # silence the warning; make behavior explicit
-        name="video_reader",
-    )
-    if resize_hw is not None:
-        h, w = resize_hw
-        video = fn.resize(video, resize_y=h, resize_x=w)
-    return video, labels, frame_nums  # [B,F,H,W,C], [B], [B,F]
+def make_5_file_lists(files5: List[str], start: int, end: int, batch_size: int) -> List[str]:
+    """Return a list of 5 file_list paths, one per POV."""
+    return [make_file_list(files5[i], start, end, batch_size) for i in range(5)]
 
-def _run_and_unpack(pipe):
-    """Run the pipeline and always return (video_tl, labels_tl, frame_nums_tl or None)."""
-    outs = pipe.run()
-    video_tl = outs[0]
-    labels_tl = outs[1] if len(outs) > 1 else None
-    frame_nums_tl = outs[2] if len(outs) > 2 else None
-    return video_tl, labels_tl, frame_nums_tl
+@pipeline_def
+def pipe_5pov(file_lists: List[str], seq_len: int, H: int, W: int,
+              add_surfaces: int, read_ahead: bool):
+    """
+    Build 5 parallel video readers (decode+resize fused) and return only the video outputs.
+    Each output is a uint8 tensor of shape [B, F, H, W, C] on GPU (CUDA).
+    """
+    outs = []
+    for i in range(5):
+        # readers.video_resize returns (video, labels); we keep only `video`.
+        v, _ = fn.readers.video_resize(
+            device="gpu",
+            file_list=file_lists[i],
+            file_list_frame_num=True,            # interpret start/end as frame indices
+            sequence_length=seq_len, step=seq_len,  # one T-length clip per line
+            random_shuffle=False,
+            pad_sequences=True,                  # zero-pad tail past EOF
+            read_ahead=read_ahead,
+            additional_decode_surfaces=add_surfaces,
+            resize_y=H, resize_x=W,
+            name=f"vid{i}",
+        )
+        outs.append(v)  # uint8 [B, F, H, W, C]
+    return tuple(outs)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", type=str, default="sample.mp4")
-    ap.add_argument("--start", type=int, default=0)
-    ap.add_argument("--end", type=int, default=64, help="exclusive; seq_len=end-start")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--files", nargs=5, help="Five MP4s: p0 p1 p2 p3 p4")
+    g.add_argument("--file", help="Single MP4 to reuse for all 5 readers (for testing)")
+    ap.add_argument("--start", type=int, default=500)
+    ap.add_argument("--end", type=int, default=1000, help="exclusive; seq_len=end-start")
     ap.add_argument("--batch-size", type=int, default=4)
-    ap.add_argument("--iters", type=int, default=200, help="timed iterations (after warmup)")
+    ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--size", type=int, nargs=2, default=None, metavar=("H","W"),
-                    help="optional resize (e.g., 224 224). If omitted, native size is used.")
+    ap.add_argument("--size", type=int, nargs=2, default=[224, 224], metavar=("H","W"))
+    ap.add_argument("--threads", type=int, default=12)
+    ap.add_argument("--prefetch", type=int, default=4)
     ap.add_argument("--device-id", type=int, default=0)
-    ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--add-surfaces", type=int, default=12, help="additional_decode_surfaces")
+    ap.add_argument("--read-ahead", action="store_true", help="enable read_ahead in the reader")
     args = ap.parse_args()
+
+    if args.files:
+        if len(args.files) != 5:
+            ap.error("--files requires exactly 5 paths")
+        files5 = args.files
+    else:
+        files5 = [args.file] * 5
 
     assert args.end > args.start, "end must be > start"
     seq_len = args.end - args.start
-    file_list = make_file_list(args.file, args.start, args.end)
+    H, W = args.size
 
-    pipe = dali_video_pipe(
+    # Build per-POV file_lists (one line per batch sample)
+    file_lists = make_5_file_lists(files5, args.start, args.end, args.batch_size)
+
+    # Construct pipeline
+    pipe = pipe_5pov(
         batch_size=args.batch_size,
         num_threads=args.threads,
         device_id=args.device_id,
-        file_list=file_list,
+        prefetch_queue_depth=args.prefetch,
+        file_lists=file_lists,
         seq_len=seq_len,
-        resize_hw=tuple(args.size) if args.size else None,
-        prefetch_queue_depth=2,
+        H=H, W=W,
+        add_surfaces=args.add_surfaces,
+        read_ahead=args.read_ahead,
     )
     pipe.build()
 
     # Warmup
     for _ in range(args.warmup):
-        video_tl, labels_tl, frame_nums_tl = _run_and_unpack(pipe)
-        _ = video_tl.as_cpu().as_array()  # host copy only for warmup/verify
+        _ = pipe.run()
 
     # Timed loop
     t0 = time.time()
     for _ in range(args.iters):
-        _run_and_unpack(pipe)  # decode stays on GPU
+        _ = pipe.run()   # returns 5 TensorLists: one per POV
     t1 = time.time()
-    elapsed = t1 - t0
-    total_frames = args.batch_size * seq_len * args.iters
-    fps = total_frames / max(elapsed, 1e-9)
 
-    # One verification fetch (host copy for printing / padding checks)
-    video_tl, labels_tl, frame_nums_tl = _run_and_unpack(pipe)
-    video = video_tl.as_cpu().as_array()                   # [B,F,H,W,C] uint8
-    frame_nums = (frame_nums_tl.as_cpu().as_array()
-                  if frame_nums_tl is not None else None) # [B,F] int32
+    # Compute throughput (frames/sec) across all 5 POVs
+    total_frames = args.batch_size * seq_len * args.iters * 5
+    fps = total_frames / max(t1 - t0, 1e-9)
 
-    print("\n=== DALI decode summary ===")
-    print(f"file:         {os.path.abspath(args.file)}")
-    print(f"range:        [{args.start}, {args.end})  (seq_len={seq_len})")
-    print(f"batch size:   {args.batch_size}")
-    print(f"iters:        {args.iters} (warmup={args.warmup})")
-    print(f"throughput:   {fps:,.1f} frames/sec  ({elapsed:.3f}s total)")
-    print(f"video shape:  {video.shape}  dtype={video.dtype}  (layout: [B,F,H,W,C])")
+    # Fetch one batch to report shapes
+    outs = pipe.run()  # tuple of 5 TensorLists
+    shapes = []
+    for i, tl in enumerate(outs):
+        arr = tl.as_cpu().as_array()  # [B, F, H, W, C] uint8
+        shapes.append((i, arr.shape, arr.dtype))
 
-    # Show first sample’s frame indices and detect padding
-    if frame_nums is not None:
-        fnums0 = frame_nums[0]                                # [F]
-        pad_mask = (fnums0 == -1)
-        num_pad = int(pad_mask.sum())
-        head = fnums0[:min(8, fnums0.shape[0])].tolist()
-        tail = fnums0[max(0, fnums0.shape[0]-8):].tolist()
-        print("\nFrame indices (sample 0):")
-        print(f"  head: {head}")
-        print(f"  tail: {tail}")
-        if num_pad > 0:
-            print(f"  padding detected: {num_pad} trailing frame(s) with index -1 "
-                  "(zero-filled pixels per pad_sequences).")
-            zeros_ok = bool((video[0, pad_mask] == 0).all()) if video.shape[1] == fnums0.shape[0] else True
-            print(f"  padded frames are zero: {zeros_ok}")
-        else:
-            print("  no padding in this window.")
-        valid = fnums0[fnums0 >= 0]
-        if valid.size > 0:
-            start_ok = int(valid[0]) == args.start
-            step_ok = bool(np.all(np.diff(valid) == 1))
-            print("\nSelection check:")
-            print(f"  starts at requested start: {start_ok} (got {int(valid[0])})")
-            print(f"  consecutive frames step=1: {step_ok}")
-    else:
-        # Fallback if your DALI build doesn’t provide frame numbers:
-        tail_zero = bool((video[0, -8:] == 0).all())
-        print("\nFrame indices not provided by reader; "
-              f"zero-tail padding detected: {tail_zero}")
+    print("\n=== DALI 5-POV decode+resize benchmark ===")
+    print(f"files:       {[os.path.abspath(p) for p in files5]}")
+    print(f"range:       [{args.start}, {args.end})  (seq_len={seq_len})")
+    print(f"batch size:  {args.batch_size}   iters: {args.iters}   warmup: {args.warmup}")
+    print(f"size:        {H}x{W}   threads: {args.threads}   prefetch: {args.prefetch}")
+    print(f"read_ahead:  {bool(args.read_ahead)}   add_surfaces: {args.add_surfaces}")
+    print(f"throughput:  {fps:,.1f} frames/sec  (across all 5 POVs)")
+    for i, shp, dt in shapes:
+        print(f"p{i} shape:  {shp}  dtype={dt}  (layout: [B,F,H,W,C])")
 
-    # Clean up temp file_list
-    try:
-        os.remove(file_list)
-    except OSError:
-        pass
+    # Cleanup temp file_lists
+    for fl in file_lists:
+        try: os.remove(fl)
+        except OSError: pass
 
 if __name__ == "__main__":
     main()
