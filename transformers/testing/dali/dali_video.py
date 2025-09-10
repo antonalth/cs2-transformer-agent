@@ -23,30 +23,26 @@ def make_file_list(path: str, start: int, end: int) -> str:
     tf.close()
     return tf.name
 
+
 @pipeline_def
 def dali_video_pipe(file_list, seq_len, resize_hw=None):
-    """
-    When resize_hw is provided, uses readers.video_resize (decode+resize in one op).
-    We enable frame numbers so we can detect any padding (=-1) at the tail.
-    """
-    common = dict(
+    # Always use readers.video so enable_frame_num works reliably
+    video, labels, frame_nums = fn.readers.video(
         device="gpu",
         file_list=file_list,
-        file_list_frame_num=True,   # treat start/end as frame indices
+        file_list_frame_num=True,   # interpret start/end as frame indices
         sequence_length=seq_len,
         step=seq_len,               # one clip per line
         random_shuffle=False,
-        enable_frame_num=True,      # get per-frame indices to verify/padding
-        pad_sequences=True,         # zero-pad past EOF if needed
+        enable_frame_num=True,      # <-- ensures 3rd output
+        pad_sequences=True,         # zero-pad tail past EOF
         name="video_reader",
     )
-    if resize_hw is None:
-        video, labels, frame_nums = fn.readers.video(**common)
-    else:
+    if resize_hw is not None:
         h, w = resize_hw
-        video, labels, frame_nums = fn.readers.video_resize(resize_y=h, resize_x=w, **common)
-    # Keep raw uint8 to make zero-padding easy to check; layout: [F,H,W,C]
-    return video, frame_nums
+        video = fn.resize(video, resize_y=h, resize_x=w)
+    # Keep uint8 for easy zero checks (you can normalize later if you like)
+    return video, labels, frame_nums
 
 def main():
     ap = argparse.ArgumentParser()
