@@ -41,10 +41,10 @@ def dali_video_pipe(file_list, seq_len, resize_hw=None):
         name="video_reader",
     )
     if resize_hw is None:
-        video, frame_nums = fn.readers.video(**common)
+        video, labels, frame_nums = fn.readers.video(**common)
     else:
         h, w = resize_hw
-        video, frame_nums = fn.readers.video_resize(resize_y=h, resize_x=w, **common)
+        video, labels, frame_nums = fn.readers.video_resize(resize_y=h, resize_x=w, **common)
     # Keep raw uint8 to make zero-padding easy to check; layout: [F,H,W,C]
     return video, frame_nums
 
@@ -80,7 +80,7 @@ def main():
 
     # Warmup
     for _ in range(args.warmup):
-        video_tl, frame_nums_tl = pipe.run()
+        video_tl, labels_tl, frame_nums_tl = pipe.run()
         # .as_cpu().as_array() for host-side inspection (only during warmup/verify)
         _ = video_tl.as_cpu().as_array()
 
