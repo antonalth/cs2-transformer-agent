@@ -69,20 +69,54 @@ ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
 # =============================================================================
 
 def merge_tick_data(tick1, tick2):
-    if not tick1: return tick2 or None
-    if not tick2: return tick1
+    """
+    Merges data from two consecutive game ticks to represent one video frame.
+
+    This version correctly handles position averaging. If only one tick provides
+    position data, that data is used directly instead of being incorrectly halved.
+    """
+    # Handle cases where one or both ticks are missing
+    if not tick1:
+        return tick2
+    if not tick2:
+        return tick1
+
+    # Start with a copy of the first tick's data
     m = tick1.copy()
-    m['mouse_x'] = (tick1.get('mouse_x') or 0) + (tick2.get('mouse_x') or 0)
-    m['mouse_y'] = (tick1.get('mouse_y') or 0) + (tick2.get('mouse_y') or 0)
-    m['position_x'] = ((tick1.get('position_x') or 0) + (tick2.get('position_x') or 0)) / 2.0
-    m['position_y'] = ((tick1.get('position_y') or 0) + (tick2.get('position_y') or 0)) / 2.0
-    m['position_z'] = ((tick1.get('position_z') or 0) + (tick2.get('position_z') or 0)) / 2.0
+
+    # Mouse movements are summed over the frame, as they are deltas
+    m['mouse_x'] = (tick1.get('mouse_x', 0)) + (tick2.get('mouse_x', 0))
+    m['mouse_y'] = (tick1.get('mouse_y', 0)) + (tick2.get('mouse_y', 0))
+
+    # --- CORRECTED POSITION MERGING ---
+    # For each coordinate, collect all non-None values and find their mean.
+    # This correctly averages when two values are present, and uses the single
+    # value when only one is present.
+    for coord in ['position_x', 'position_y', 'position_z']:
+        positions = []
+        pos1 = tick1.get(coord)
+        if pos1 is not None:
+            positions.append(pos1)
+
+        pos2 = tick2.get(coord)
+        if pos2 is not None:
+            positions.append(pos2)
+
+        # If the list is not empty, calculate the average; otherwise, default to 0.0
+        if positions:
+            m[coord] = sum(positions) / len(positions)
+        else:
+            m[coord] = 0.0
+
+    # Union of keyboard and buy inputs remains the same
     kb1 = set(filter(None, (tick1.get('keyboard_input') or '').split(',')))
     kb2 = set(filter(None, (tick2.get('keyboard_input') or '').split(',')))
     m['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
+
     b1 = set(filter(None, (tick1.get('buy_sell_input') or '').split(',')))
     b2 = set(filter(None, (tick2.get('buy_sell_input') or '').split(',')))
     m['buy_sell_input'] = ",".join(sorted(list(b1.union(b2))))
+
     return m
 
 def get_bitmask(actions, mapping, name):
