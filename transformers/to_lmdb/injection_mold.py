@@ -69,17 +69,14 @@ ITEM_TO_INDEX = {item: i for i, item in enumerate(ITEM_NAMES)}
 # =============================================================================
 
 def merge_tick_data(tick1, tick2):
-    """Merges data from two consecutive game ticks to represent one video frame."""
-    if not tick1: return tick2
+    if not tick1: return tick2 or None
     if not tick2: return tick1
     m = tick1.copy()
-    # Average positions, sum mouse movements
-    m['mouse_x'] = (tick1.get('mouse_x', 0)) + (tick2.get('mouse_x', 0))
-    m['mouse_y'] = (tick1.get('mouse_y', 0)) + (tick2.get('mouse_y', 0))
-    m['position_x'] = ((tick1.get('position_x', 0)) + (tick2.get('position_x', 0))) / 2.0
-    m['position_y'] = ((tick1.get('position_y', 0)) + (tick2.get('position_y', 0))) / 2.0
-    m['position_z'] = ((tick1.get('position_z', 0)) + (tick2.get('position_z', 0))) / 2.0
-    # Union of keyboard and buy inputs
+    m['mouse_x'] = (tick1.get('mouse_x') or 0) + (tick2.get('mouse_x') or 0)
+    m['mouse_y'] = (tick1.get('mouse_y') or 0) + (tick2.get('mouse_y') or 0)
+    m['position_x'] = ((tick1.get('position_x') or 0) + (tick2.get('position_x') or 0)) / 2.0
+    m['position_y'] = ((tick1.get('position_y') or 0) + (tick2.get('position_y') or 0)) / 2.0
+    m['position_z'] = ((tick1.get('position_z') or 0) + (tick2.get('position_z') or 0)) / 2.0
     kb1 = set(filter(None, (tick1.get('keyboard_input') or '').split(',')))
     kb2 = set(filter(None, (tick2.get('keyboard_input') or '').split(',')))
     m['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
