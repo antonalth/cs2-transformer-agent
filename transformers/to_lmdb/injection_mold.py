@@ -397,7 +397,7 @@ if __name__ == '__main__':
             round_team_pov_paths[key] = []
         
         recordings_map[key].append(rec)
-        round_team_pov_paths[key].append(str(mp4.resolve()))
+        round_team_pov_paths[key].append(str(mp4))
     
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
     for key, paths in round_team_pov_paths.items():
