@@ -350,7 +350,7 @@ if __name__ == '__main__':
 
     audio_group = parser.add_argument_group('Audio Spectrogram Parameters')
     audio_group.add_argument('--no-audio', action='store_true', help="Disable audio processing entirely and store None for audio.")
-    audio_grop.add_argument('--n-mels', type=int, default=128, help="Number of Mel bands to generate. Default: 128.")
+    audio_group.add_argument('--n-mels', type=int, default=128, help="Number of Mel bands to generate. Default: 128.")
     audio_group.add_argument('--n-fft', type=int, default=2048, help="Length of the FFT window. Default: 2048.")
     audio_group.add_argument('--hop-length', type=int, default=512, help="Number of samples between successive frames. Default: 512.")
 
