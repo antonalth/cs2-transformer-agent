@@ -387,7 +387,7 @@ if __name__ == '__main__':
         fname = f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
         mp4, wav = args.recdir / f"{fname}.mp4", args.recdir / f"{fname}.wav"
         if not mp4.exists() or not wav.exists():
-            LOG.critical(f"Media not found: {fname}")
+            LOG.critical(f"Media not found: {fname}, searched under {mp4}")
             sys.exit(1)
         
         rec['mp4_path'], rec['wav_path'] = mp4, wav
