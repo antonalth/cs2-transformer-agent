@@ -239,7 +239,7 @@ def main():
         rec['mp4_path'], rec['wav_path'] = str(mp4), wav
         key = (round_num, team)
         recordings_map.setdefault(key, []).append(rec)
-        round_team_pov_paths.setdefault(key, []).append(str(mp4))
+        round_team_pov_paths.setdefault(key, []).append(str(f"{fname}.mp4"))
 
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
     for key, paths in round_team_pov_paths.items():
