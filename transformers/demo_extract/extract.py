@@ -73,7 +73,7 @@ ITEM_ID_MAP = {
     1: "deagle", 2: "elite", 3: "fiveseven", 4: "glock", 7: "ak47", 8: "aug", 9: "awp",
     10: "famas", 11: "g3sg1", 13: "galilar", 14: "m249", 16: "m4a1", 17: "mac10", 19: "p90",
     23: "mp5sd", 24: "ump45", 25: "xm1014", 26: "bizon", 27: "mag7", 28: "negev", 29: "sawedoff",
-    30: "tec9", 32: "p2000", 33: "mp7", 34: "mp9", 35: "nova", 36: "p250", 38: "scar20",
+    30: "tec9", 31: "zeus",32: "p2000", 33: "mp7", 34: "mp9", 35: "nova", 36: "p250", 38: "scar20",
     39: "sg556", 40: "ssg08", 42: "knife", 43: "flashbang", 44: "hegrenade", 45: "smokegrenade",
     46: "molotov", 47: "decoy", 48: "incgrenade", 49: "c4", 59: "knife_t", 60: "m4a1_silencer",
     61: "usp_silencer", 63: "cz75a", 64: "revolver", 500: "knife_default_ct", 506: "knife_gut",
