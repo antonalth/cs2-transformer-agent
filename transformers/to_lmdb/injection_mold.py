@@ -72,8 +72,10 @@ def merge_tick_data(tick1, tick2):
     """
     Merges data from two consecutive game ticks to represent one video frame.
 
-    This version correctly handles position averaging. If only one tick provides
-    position data, that data is used directly instead of being incorrectly halved.
+    This robust version correctly handles two distinct issues:
+    1.  Prevents TypeError by treating potential 'None' values in numeric fields.
+    2.  Correctly averages position data only when two valid points exist,
+        otherwise using the single available point.
     """
     # Handle cases where one or both ticks are missing
     if not tick1:
@@ -81,34 +83,37 @@ def merge_tick_data(tick1, tick2):
     if not tick2:
         return tick1
 
-    # Start with a copy of the first tick's data
     m = tick1.copy()
 
-    # Mouse movements are summed over the frame, as they are deltas
-    m['mouse_x'] = (tick1.get('mouse_x', 0)) + (tick2.get('mouse_x', 0))
-    m['mouse_y'] = (tick1.get('mouse_y', 0)) + (tick2.get('mouse_y', 0))
+    # --- FIX for Mouse Deltas ---
+    # Mouse movements are deltas and should be summed.
+    # The `(get() or 0)` pattern handles None values correctly here.
+    m['mouse_x'] = (tick1.get('mouse_x') or 0) + (tick2.get('mouse_x') or 0)
+    m['mouse_y'] = (tick1.get('mouse_y') or 0) + (tick2.get('mouse_y') or 0)
 
-    # --- CORRECTED POSITION MERGING ---
-    # For each coordinate, collect all non-None values and find their mean.
-    # This correctly averages when two values are present, and uses the single
-    # value when only one is present.
+    # --- FIX for Position Averaging ---
+    # This logic gathers only valid (non-None) coordinate values and calculates
+    # a true average, solving both the TypeError and the division bug.
     for coord in ['position_x', 'position_y', 'position_z']:
         positions = []
+        
+        # Get value from the first tick, add it to list if it's not None
         pos1 = tick1.get(coord)
         if pos1 is not None:
             positions.append(pos1)
 
+        # Get value from the second tick, add it to list if it's not None
         pos2 = tick2.get(coord)
         if pos2 is not None:
             positions.append(pos2)
 
-        # If the list is not empty, calculate the average; otherwise, default to 0.0
+        # If the list has any values, calculate the mean. Otherwise, default to 0.0.
         if positions:
             m[coord] = sum(positions) / len(positions)
         else:
             m[coord] = 0.0
 
-    # Union of keyboard and buy inputs remains the same
+    # Union of keyboard and buy inputs is unaffected and already robust
     kb1 = set(filter(None, (tick1.get('keyboard_input') or '').split(',')))
     kb2 = set(filter(None, (tick2.get('keyboard_input') or '').split(',')))
     m['keyboard_input'] = ",".join(sorted(list(kb1.union(kb2))))
