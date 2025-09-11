@@ -6,7 +6,7 @@ Main training harness for the CS2Transformer model.
 This script orchestrates the data loading, model training, validation,
 and checkpointing for the project.
 
-VERSION: 4.8 (Refactor: Emit per-sample, per-player labels from DALI source)
+VERSION: 5.0 (Major Refactor: DALI video decoding from file paths)
 """
 
 # ===================================================================
@@ -16,14 +16,15 @@ import os
 import json
 import argparse
 import random
+import tempfile
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Any, Sequence
+from typing import Dict, List
 
 # Third-party libraries
 import lmdb
 import yaml
-import cv2
 import numpy as np
 import msgpack
 import msgpack_numpy as mpnp
@@ -31,8 +32,6 @@ from tqdm import tqdm
 
 # PyTorch imports
 import torch
-import torch.distributed as dist
-from torch.utils.data import IterableDataset, DataLoader
 
 # DALI Imports
 try:
@@ -56,10 +55,11 @@ NUM_PLAYERS = 5
 class DataConfig:
     lmdb_root_path: str
     manifest_path: str
-    num_workers: int = 4
-    use_dali: bool = True
-    dali_num_threads: int = 4
+    num_workers: int = 8
+    dali_num_threads: int = 6
     dali_prefetch: int = 2
+    dali_video_read_ahead: bool = True
+    dali_video_add_surfaces: int = 12
     map_extents: Dict = field(default_factory=lambda: {
         "x": (-2000.0, 3000.0), "y": (-3500.0, 2500.0), "z": (-500.0, 500.0)
     })
@@ -67,7 +67,7 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     context_frames: int = 128
-    steps_per_epoch: int = 10000
+    steps_per_epoch: int = 1000
     batch_size: int = 4
     model_name: str = "vit_base_patch14_dinov2.lvd142m"
 
@@ -80,7 +80,7 @@ def load_config_from_yaml(path: str) -> tuple[DataConfig, TrainConfig]:
 
 
 # ===================================================================
-# 3. DATASET INDEXING & VALIDATION
+# 3. DATASET INDEXING & EPOCH PREPARATION
 # ===================================================================
 class DatasetIndexer:
     """Handles the initial setup and validation of the dataset."""
@@ -100,12 +100,8 @@ class DatasetIndexer:
         print("---------------------------------")
     def _load_manifest(self) -> dict:
         if not self.manifest_path.is_file():
-            raise FileNotFoundError(f"FATAL: Manifest file not found at the specified path: {self.manifest_path}")
-        try:
-            with open(self.manifest_path, 'r') as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"FATAL: Error decoding JSON from manifest file: {self.manifest_path}\n{e}")
+            raise FileNotFoundError(f"FATAL: Manifest file not found at: {self.manifest_path}")
+        return json.loads(self.manifest_path.read_text())
     def _index_demos(self, demo_names: list, set_name: str) -> list:
         round_pool = []
         if not demo_names:
@@ -117,24 +113,71 @@ class DatasetIndexer:
             if not demo_path.is_dir():
                 raise FileNotFoundError(f"FATAL: Manifest lists demo '{demo_name}' but not found at: {demo_path}")
             demo_name_base = demo_name.removesuffix('.lmdb')
-            env = lmdb.open(str(demo_path), readonly=True, lock=False, readahead=False, meminit=False)
-            with env.begin(write=False) as txn:
-                info_key = f"{demo_name_base}_INFO".encode('utf-8')
-                info_bytes = txn.get(info_key)
-                if info_bytes is None:
-                    env.close()
-                    raise KeyError(f"FATAL: Could not find metadata key '{info_key.decode()}' in LMDB for '{demo_name}'.")
-                info_data = json.loads(info_bytes.decode('utf-8'))
-                cursor = txn.cursor()
-                for round_entry in info_data.get("rounds", []):
-                    round_num, start_tick, end_tick = round_entry
-                    for team in ['T', 'CT']:
-                        test_key = f"{demo_name_base}_round_{round_num:03d}_team_{team}_tick_{start_tick:08d}".encode('utf-8')
-                        if cursor.set_key(test_key):
-                            metadata = { "lmdb_path": str(demo_path), "demo_name": demo_name_base, "round_num": round_num, "team": team, "start_tick": start_tick, "end_tick": end_tick }
-                            round_pool.append(metadata)
-            env.close()
+            with lmdb.open(str(demo_path), readonly=True, lock=False) as env:
+                with env.begin(write=False) as txn:
+                    info_key = f"{demo_name_base}_INFO".encode('utf-8')
+                    info_bytes = txn.get(info_key)
+                    if info_bytes is None:
+                        raise KeyError(f"FATAL: Metadata key '{info_key.decode()}' not in LMDB for '{demo_name}'.")
+                    info_data = json.loads(info_bytes.decode('utf-8'))
+                    for round_entry in info_data.get("rounds", []):
+                        if len(round_entry.get("pov_videos", [])) == NUM_PLAYERS:
+                            round_entry["lmdb_path"] = str(demo_path)
+                            round_entry["demo_name"] = demo_name_base
+                            round_pool.append(round_entry)
         return round_pool
+
+def build_epoch_files(
+    sampling_pool: list,
+    epoch_size: int,
+    context_frames: int,
+    ticks_per_frame: int
+) -> tuple[List[str], List[dict]]:
+    """
+    Creates random windows for one epoch and writes 5 temporary file_lists for DALI.
+    """
+    lines_per_pov = [[] for _ in range(NUM_PLAYERS)]
+    epoch_meta = []
+    
+    # Create a list of samples for the epoch by randomly choosing from the pool
+    epoch_samples = random.choices(sampling_pool, k=epoch_size)
+
+    for round_info in epoch_samples:
+        t0, t1 = round_info['start_tick'], round_info['end_tick']
+        
+        # Ensure there's enough room for a full context window
+        min_duration = context_frames * ticks_per_frame
+        if (t1 - t0) < min_duration:
+            continue # Should be rare if data is well-formed, but good to guard
+
+        max_start_tick = t1 - min_duration
+        start_tick = random.randint(t0, max_start_tick)
+        
+        start_frame = (start_tick - t0) // ticks_per_frame
+        end_frame = start_frame + context_frames
+
+        for p in range(NUM_PLAYERS):
+            abs_path = os.path.abspath(round_info['pov_videos'][p])
+            lines_per_pov[p].append(f"{abs_path} 0 {start_frame} {end_frame}")
+
+        epoch_meta.append({
+            "lmdb_path": round_info['lmdb_path'],
+            "demo_name": round_info['demo_name'],
+            "round_num": round_info['round_num'],
+            "team": round_info['team'],
+            "start_tick": start_tick,
+            "context_frames": context_frames
+        })
+
+    file_lists = []
+    for p in range(NUM_PLAYERS):
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=f".p{p}.txt", mode="w", encoding="utf-8")
+        tf.write("\n".join(lines_per_pov[p]) + "\n")
+        tf.close()
+        file_lists.append(tf.name)
+
+    return file_lists, epoch_meta
+
 
 # ===================================================================
 # 4. DATA TRANSFORMATION HELPERS
@@ -144,28 +187,16 @@ KEYBOARD_DIM = 31
 ROUND_STATE_DIM = 5
 MEL_SPEC_TIME_FRAMES = 8
 
-if DALI_AVAILABLE:
-    INTERP_MAP = {
-        "bicubic":  types.INTERP_CUBIC,
-        "bilinear": types.INTERP_LINEAR,
-        "nearest":  types.INTERP_NN,
-        "lanczos":  types.INTERP_LANCZOS3,
-    }
-
 def _resolve_timm_config(model_name: str):
-    try:
-        import timm
-        from timm.data import resolve_model_data_config
-    except ImportError:
-        raise ImportError("Please install timm: `pip install timm`")
+    import timm
+    from timm.data import resolve_model_data_config
     m = timm.create_model(model_name, pretrained=True, num_classes=0)
     cfg = resolve_model_data_config(m)
     H, W = cfg["input_size"][1], cfg["input_size"][2]
-    interp = cfg.get("interpolation", "bicubic")
     mean = torch.tensor(cfg.get("mean", (0.485, 0.456, 0.406)), dtype=torch.float32)
     std  = torch.tensor(cfg.get("std",  (0.229, 0.224, 0.225)), dtype=torch.float32)
-    print(f"[TIMM Config Resolver] Model: {model_name} -> Input: {H}x{W}, Interp: {interp}")
-    return (H, W), interp, mean, std
+    print(f"[TIMM Config Resolver] Model: {model_name} -> Input: {H}x{W}")
+    return (H, W), mean, std
 
 def find_nth_set_bit_pos(n: int, j: int) -> int:
     count = 0
@@ -176,367 +207,276 @@ def find_nth_set_bit_pos(n: int, j: int) -> int:
     return -1
 
 # ===================================================================
-# 5. DALI PIPELINE & DATA SOURCE
+# 5. DALI PIPELINE & DATA SOURCE (FOR TARGETS)
 # ===================================================================
-class DALIExternalSource:
-    """
-    Callable, stateful source for DALI's external_source operator.
-    By implementing `__call__` instead of `__iter__`, DALI can create
-    independent instances of this class in each worker process,
-    allowing for true multiprocessing.
-    """
-    def __init__(self, sampling_pool: list, data_cfg: DataConfig, train_cfg: TrainConfig, mean_rgb: torch.Tensor):
-        self.pool = sampling_pool
+class DALITargetsSource:
+    """Callable source for DALI's external_source operator to fetch non-visual data."""
+    def __init__(self, epoch_meta: list, data_cfg: DataConfig):
+        self.epoch_meta = epoch_meta
         self.data_cfg = data_cfg
-        self.train_cfg = train_cfg
-        self.mean = mean_rgb
-        self.chunk_size_frames = self.train_cfg.context_frames
-        
         self.envs = {}
-        self.current_chunk_data = None
-        self.current_idx_in_chunk = 0
-        self.items_in_chunk = self.train_cfg.context_frames * NUM_PLAYERS
-        
-        self.chunk_count = 0
-        self.current_chunk_id = -1
-        
         self._rng = random.Random()
-
-    def __call__(self, sample_info: "SampleInfo"):
-        if self.current_chunk_data is None or self.current_idx_in_chunk >= self.items_in_chunk:
-            self._load_and_process_new_chunk(sample_info)
-            self.current_idx_in_chunk = 0
-
-        idx = self.current_idx_in_chunk
-        t = idx // NUM_PLAYERS
-
-        jpeg  = self.current_chunk_data['jpegs'][idx]
-        mel   = self.current_chunk_data['mels'][idx]
-        alive = self.current_chunk_data['alive'][idx]
-        stats = self.current_chunk_data['stats'][idx]
-        pos   = self.current_chunk_data['pos_hm'][idx]
-        mouse = self.current_chunk_data['mouse'][idx]
-        kbd   = self.current_chunk_data['kbd'][idx]
-
-        enemy = self.current_chunk_data['enemy_hm_seq'][t]
-        state = self.current_chunk_data['state_seq'][t]
-
-        chunk_id = self.current_chunk_id
-        sample_id = np.int32(idx)
-
-        self.current_idx_in_chunk += 1
-        return (chunk_id, sample_id, jpeg, mel, alive, stats, pos, mouse, kbd, enemy, state)
-
-    def _load_and_process_new_chunk(self, sample_info: "SampleInfo"):
-        worker_id = getattr(sample_info, "worker_id", 0)
-        if not hasattr(self, "_seeded"):
-            base_seed = int(os.getenv("DL_SEED", "1337"))
-            self._rng.seed((base_seed ^ (worker_id + 1) << 16) & 0xFFFFFFFF)
-            self._seeded = True
-            
-        self.current_chunk_id = np.int64((worker_id << 32) | self.chunk_count)
-        self.chunk_count += 1
         
-        while True:
-            round_info = self._rng.choice(self.pool)
-            start_tick, end_tick = round_info['start_tick'], round_info['end_tick']
-            total_frames = (end_tick - start_tick) // TICKS_PER_FRAME
-            if total_frames < self.chunk_size_frames: continue
+    def __call__(self, sample_info: "SampleInfo"):
+        # DALI iterates through the source, sample_info.idx gives the sample index
+        meta = self.epoch_meta[sample_info.idx]
+        
+        env = self._get_env(meta['lmdb_path'])
+        raw_frame_data = []
+        with env.begin(write=False) as txn:
+            for i in range(meta['context_frames']):
+                current_tick = meta['start_tick'] + (i * TICKS_PER_FRAME)
+                key = (f"{meta['demo_name']}_round_{meta['round_num']:03d}_"
+                       f"team_{meta['team']}_tick_{current_tick:08d}").encode('utf-8')
+                value_bytes = txn.get(key)
+                if value_bytes:
+                    raw_frame_data.append(msgpack.unpackb(value_bytes, raw=False, object_hook=mpnp.decode))
+                else: # Handle missing ticks by appending the last valid frame
+                    raw_frame_data.append(raw_frame_data[-1] if raw_frame_data else None)
+        
+        # If the very first frame is missing, we must generate a dummy
+        if raw_frame_data[0] is None:
+            # This is a fatal error in data quality, but we can return zeros to avoid a crash
+            print(f"WARNING: First frame missing for sample {sample_info.idx}, returning zeros.")
+            return self._get_dummy_data(meta['context_frames'])
 
-            max_start_frame_idx = total_frames - self.chunk_size_frames
-            start_frame_idx = self._rng.randint(0, max_start_frame_idx)
-            
-            raw_chunk_data = []
-            env = self._get_env(round_info['lmdb_path'])
-            with env.begin(write=False) as txn:
-                for i in range(self.chunk_size_frames):
-                    current_tick = start_tick + ((start_frame_idx + i) * TICKS_PER_FRAME)
-                    key = (f"{round_info['demo_name']}_round_{round_info['round_num']:03d}_"
-                           f"team_{round_info['team']}_tick_{current_tick:08d}").encode('utf-8')
-                    value_bytes = txn.get(key)
-                    raw_chunk_data.append(msgpack.unpackb(value_bytes, raw=False, object_hook=mpnp.decode) if value_bytes else None)
-            
-            if any(item is None for item in raw_chunk_data): continue
-            
-            self.current_chunk_data = self._process_chunk(raw_chunk_data, round_info)
-            return
+        return self._process_frames(raw_frame_data, self.data_cfg)
 
-    def _process_chunk(self, raw_chunk_data, round_info) -> dict:
-        dummy_jpeg = self._get_dummy_mean_jpeg()
-
+    def _process_frames(self, raw_frame_data, data_cfg):
         def _bitmask_to_multihot_np(m, nc): 
             return np.array([(m >> i) & 1 for i in range(nc)], dtype=np.float32)
-
         def _coords_to_heatmap_np(coords, dims, ext):
-            Z, Y, X = dims
-            hm = np.zeros(dims, dtype=np.float32)
-            if coords is None or (isinstance(coords, np.ndarray) and coords.size == 0):
-                return hm
+            Z, Y, X = dims; hm = np.zeros(dims, dtype=np.float32)
+            if coords is None: return hm
             coords = np.atleast_2d(coords)
             for x, y, z in coords:
-                if not np.all(np.isfinite([x, y, z])): 
-                    continue
+                if not np.all(np.isfinite([x, y, z])): continue
                 ix = int(((x - ext['x'][0]) / (ext['x'][1] - ext['x'][0])) * (X - 1))
                 iy = int(((y - ext['y'][0]) / (ext['y'][1] - ext['y'][0])) * (Y - 1))
                 iz = int(((z - ext['z'][0]) / (ext['z'][1] - ext['z'][0])) * (Z - 1))
                 hm[np.clip(iz, 0, Z-1), np.clip(iy, 0, Y-1), np.clip(ix, 0, X-1)] = 1.0
             return hm
 
-        all_jpegs, all_mels = [], []
-        all_alive, all_stats, all_pos, all_mouse, all_kbd = [], [], [], [], []
-        enemy_seq, state_seq = [], []
+        seq_len = len(raw_frame_data)
         
-        for i, frame_data in enumerate(raw_chunk_data):
+        # Pre-allocate numpy arrays for the entire sequence
+        mels = np.full((seq_len, NUM_PLAYERS, 1, 128, MEL_SPEC_TIME_FRAMES), -80.0, dtype=np.float32)
+        alive = np.zeros((seq_len, NUM_PLAYERS), dtype=np.bool_)
+        stats = np.zeros((seq_len, NUM_PLAYERS, 3), dtype=np.float32)
+        pos_hm = np.zeros((seq_len, NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
+        mouse = np.zeros((seq_len, NUM_PLAYERS, 2), dtype=np.float32)
+        kbd = np.zeros((seq_len, NUM_PLAYERS, KEYBOARD_DIM), dtype=np.float32)
+        enemy_hm = np.zeros((seq_len, *HEATMAP_DIMS), dtype=np.float32)
+        state = np.zeros((seq_len, ROUND_STATE_DIM), dtype=np.float32)
+
+        for i, frame_data in enumerate(raw_frame_data):
+            if frame_data is None: # Use previous frame's data if a tick is missing
+                mels[i], alive[i], stats[i], pos_hm[i], mouse[i], kbd[i] = mels[i-1], alive[i-1], stats[i-1], pos_hm[i-1], mouse[i-1], kbd[i-1]
+                enemy_hm[i], state[i] = enemy_hm[i-1], state[i-1]
+                continue
+
             gs = frame_data['game_state'][0]
             pd_list = frame_data['player_data']
             mask_int = gs['team_alive']
-
-            slot_to_jpeg = {s: dummy_jpeg for s in range(NUM_PLAYERS)}
-            slot_to_mel = {s: np.full((1, 128, MEL_SPEC_TIME_FRAMES), -80.0, dtype=np.float32) for s in range(NUM_PLAYERS)}
-            slot_alive = np.zeros(NUM_PLAYERS, dtype=np.bool_)
-            slot_stats = np.zeros((NUM_PLAYERS, 3), dtype=np.float32)
-            slot_pos   = np.zeros((NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
-            slot_mouse = np.zeros((NUM_PLAYERS, 2), dtype=np.float32)
-            slot_kbd   = np.zeros((NUM_PLAYERS, KEYBOARD_DIM), dtype=np.float32)
 
             for p_idx, p_tuple in enumerate(pd_list):
                 slot = find_nth_set_bit_pos(mask_int, p_idx)
                 if slot == -1: continue
                 
-                p_info, jpeg_bytes, mel_spec = p_tuple[0][0], p_tuple[1], p_tuple[2]
+                p_info, _, mel_spec = p_tuple
+                p_info = p_info[0]
 
-                slot_alive[slot] = True
-                slot_to_jpeg[slot] = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                alive[i, slot] = True
                 if mel_spec is not None:
-                    mel = torch.from_numpy(mel_spec.copy()).unsqueeze(0)
-                    mel = torch.nn.functional.pad(mel, (0, max(0, MEL_SPEC_TIME_FRAMES - mel.shape[-1])), 'constant', -80.0)[:, :, :MEL_SPEC_TIME_FRAMES]
-                    slot_to_mel[slot] = mel.numpy()
+                    mel_tensor = torch.from_numpy(mel_spec.copy()).unsqueeze(0)
+                    padded = torch.nn.functional.pad(mel_tensor, (0, max(0, MEL_SPEC_TIME_FRAMES - mel_tensor.shape[-1])), 'constant', -80.0)
+                    mels[i, slot, 0] = padded[:, :, :MEL_SPEC_TIME_FRAMES].numpy()
 
-                slot_stats[slot] = [p_info['health'], p_info['armor'], p_info['money']]
-                slot_pos[slot]   = _coords_to_heatmap_np(p_info['pos'], HEATMAP_DIMS, self.data_cfg.map_extents)
-                slot_mouse[slot] = p_info['mouse']
-                slot_kbd[slot]   = _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM)
+                stats[i, slot] = [p_info['health'], p_info['armor'], p_info['money']]
+                pos_hm[i, slot] = _coords_to_heatmap_np(p_info['pos'], HEATMAP_DIMS, data_cfg.map_extents)
+                mouse[i, slot] = p_info['mouse']
+                kbd[i, slot] = _bitmask_to_multihot_np(p_info['keyboard_bitmask'], KEYBOARD_DIM)
 
-            for s in range(NUM_PLAYERS):
-                all_jpegs.append(slot_to_jpeg[s])
-                all_mels.append(slot_to_mel[s])
-                all_alive.append(slot_alive[s])
-                all_stats.append(slot_stats[s])
-                all_pos.append(slot_pos[s])
-                all_mouse.append(slot_mouse[s])
-                all_kbd.append(slot_kbd[s])
-
-            enemy_seq.append(_coords_to_heatmap_np(gs['enemy_pos'], HEATMAP_DIMS, self.data_cfg.map_extents))
-            state_seq.append(_bitmask_to_multihot_np(gs['round_state'], ROUND_STATE_DIM))
-
-        return {
-            "jpegs": all_jpegs,
-            "mels": np.stack(all_mels),
-            "alive": np.asarray(all_alive, dtype=np.bool_),
-            "stats": np.asarray(all_stats, dtype=np.float32),
-            "pos_hm": np.asarray(all_pos, dtype=np.float32),
-            "mouse": np.asarray(all_mouse, dtype=np.float32),
-            "kbd":   np.asarray(all_kbd, dtype=np.float32),
-            "enemy_hm_seq": np.asarray(enemy_seq, dtype=np.float32),
-            "state_seq":    np.asarray(state_seq, dtype=np.float32),
-        }
+            enemy_hm[i] = _coords_to_heatmap_np(gs['enemy_pos'], HEATMAP_DIMS, data_cfg.map_extents)
+            state[i] = _bitmask_to_multihot_np(gs['round_state'], ROUND_STATE_DIM)
+        
+        return mels, alive, stats, pos_hm, mouse, kbd, enemy_hm, state
 
     def _get_env(self, lmdb_path):
         if lmdb_path not in self.envs:
-            self.envs[lmdb_path] = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
+            self.envs[lmdb_path] = lmdb.open(lmdb_path, readonly=True, lock=False)
         return self.envs[lmdb_path]
     
-    def _get_dummy_mean_jpeg(self):
-        if hasattr(self, "_cached_dummy_jpeg"): return self._cached_dummy_jpeg
-        rgb = (self.mean.numpy() * 255.0).round().astype(np.uint8)
-        img = np.full((1, 1, 3), rgb, dtype=np.uint8)
-        ok, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        assert ok, "Failed to encode dummy JPEG"
-        self._cached_dummy_jpeg = np.frombuffer(bytes(enc), dtype=np.uint8)
-        return self._cached_dummy_jpeg
+    def _get_dummy_data(self, seq_len):
+        mels = np.full((seq_len, NUM_PLAYERS, 1, 128, MEL_SPEC_TIME_FRAMES), -80.0, dtype=np.float32)
+        alive = np.zeros((seq_len, NUM_PLAYERS), dtype=np.bool_)
+        stats = np.zeros((seq_len, NUM_PLAYERS, 3), dtype=np.float32)
+        pos_hm = np.zeros((seq_len, NUM_PLAYERS, *HEATMAP_DIMS), dtype=np.float32)
+        mouse = np.zeros((seq_len, NUM_PLAYERS, 2), dtype=np.float32)
+        kbd = np.zeros((seq_len, NUM_PLAYERS, KEYBOARD_DIM), dtype=np.float32)
+        enemy_hm = np.zeros((seq_len, *HEATMAP_DIMS), dtype=np.float32)
+        state = np.zeros((seq_len, ROUND_STATE_DIM), dtype=np.float32)
+        return mels, alive, stats, pos_hm, mouse, kbd, enemy_hm, state
 
-# _FIX: Renamed `seed` to `pipeline_seed` to avoid shadowing warning
 @pipeline_def
-def create_dali_pipeline(external_source_callable, target_hw, interp_str, mean, std, pipeline_seed=1337):
-    """Defines the DALI processing graph."""
-    target_h, target_w = target_hw
+def create_dali_pipeline(
+    data_cfg: DataConfig,
+    train_cfg: TrainConfig,
+    file_lists: List[str],
+    target_source_callable,
+    target_hw, mean, std
+):
+    """Defines the DALI processing graph with video readers and a target source."""
+    H, W = target_hw
     mean255, std255 = (mean.numpy() * 255.0).tolist(), (std.numpy() * 255.0).tolist()
-    interp_dali = INTERP_MAP.get(interp_str, types.INTERP_LINEAR)
     
-    chunk_id, sample_id, jpegs, mels, alive, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
-        source=external_source_callable,
-        num_outputs=11,
-        batch=False,
-        parallel=True,
-        dtype=[types.INT64, types.INT32, types.UINT8, types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT,
-               types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT],
-        ndim=[0, 0, 1, 3, 0, 1, 3, 1, 1, 3, 1]
-    )
+    # --- 1. Video Decoding and Pre-processing ---
+    videos = []
+    for i in range(NUM_PLAYERS):
+        v, _ = fn.readers.video_resize(
+            device="gpu",
+            file_list=file_lists[i],
+            file_list_frame_num=True,
+            sequence_length=train_cfg.context_frames,
+            step=1,
+            random_shuffle=False,
+            pad_sequences=True,
+            read_ahead=data_cfg.dali_video_read_ahead,
+            additional_decode_surfaces=data_cfg.dali_video_add_surfaces,
+            resize_y=H, resize_x=W,
+            name=f"vid_reader_{i}",
+        )
+        videos.append(v)
+
+    # Stack videos along a new 'player' dimension, result shape: [B, F, P, H, W, C]
+    video_stack = fn.stack(*videos, axis=2)
     
-    images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
-   
-    # --- Letterbox 640x480 -> centered 518x518 ---
-    # 1) Resize to fit within 518x518 while preserving AR (640x480 -> 518x389)
-    resized = fn.resize(
-        images,
-        size=[518, 518],   # [H, W]
-        mode="not_larger"
-    )
+    # Flatten for per-frame processing: [B*F*P, H, W, C]
+    B, F, P, H, W, C = video_stack.shape
+    video_flat = fn.reshape(video_stack, layout="HW", shape=(-1, H, W, C))
 
-    # 2) Paste onto a 518x518 canvas, vertically centered (anchor_y = (518-389)//2 = 64)
-    letterboxed = fn.multi_paste(
-        resized,
-        output_size=[518, 518],      # target canvas HxW
-        out_anchors=[64, 0],         # [y, x]
-        shapes=[389, 518],           # src HxW after the resize step
-        dtype=types.UINT8,
-        fill_value=114               # neutral gray bars
-    )
-
-    images = letterboxed
-
-    # --- Normalize + layout + dtype for the model ---
-    images = fn.crop_mirror_normalize(
-        images,
+    # Normalize, cast to FP16, and change layout to CHW
+    video_norm = fn.crop_mirror_normalize(
+        video_flat.gpu(),
         dtype=types.FLOAT16,
         output_layout="CHW",
-        mean=mean255,    # e.g., [123.675*255/255, ...] or your existing scaled values
+        mean=mean255,
         std=std255
     )
-
-    # Heatmaps to FP16 as well (keeps everything consistent if the model is half-precision)
-    pos_hm   = fn.cast(pos_hm,   dtype=types.FLOAT16)
-    enemy_hm = fn.cast(enemy_hm, dtype=types.FLOAT16)
-
-
-    return (
-        chunk_id, sample_id, images, mels.gpu(),
-        alive,
-        stats,
-        pos_hm.gpu(),
-        mouse,
-        kbd,
-        enemy_hm.gpu(),
-        state
+    
+    # --- 2. Target Data Loading ---
+    mels, alive, stats, pos_hm, mouse, kbd, enemy_hm, state = fn.external_source(
+        source=target_source_callable,
+        num_outputs=8,
+        batch=False,
+        parallel=True,
+        dtype=[types.FLOAT, types.BOOL, types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT, types.FLOAT]
     )
+
+    pos_hm_gpu = fn.cast(pos_hm.gpu(), dtype=types.FLOAT16)
+    enemy_hm_gpu = fn.cast(enemy_hm.gpu(), dtype=types.FLOAT16)
+    mels_gpu = mels.gpu()
+
+    return video_norm, mels_gpu, alive, stats, pos_hm_gpu, mouse, kbd, enemy_hm_gpu, state
 
 # ===================================================================
 # 6. SCRIPT ENTRYPOINT
 # ===================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test the Data Pipeline for the CS2Transformer.")
-    
-    dummy_config_path = "dummy_config.yaml"
-    with open(dummy_config_path, 'w') as f:
-        f.write("data:\n  lmdb_root_path: 'data/lmdb'\n  manifest_path: 'data/lmdb/split_manifest.json'\n")
-        f.write("  num_workers: 4\n  use_dali: true\n  dali_num_threads: 4\n  dali_prefetch: 2\n")
-        f.write("train:\n  context_frames: 128\n  batch_size: 2\n  model_name: 'vit_base_patch14_dinov2.lvd142m'\n")
-    
-    parser.add_argument("--config", type=str, default=dummy_config_path, help="Path to the YAML config file.")
+    if not DALI_AVAILABLE:
+        raise ImportError("NVIDIA DALI is not installed. Please install it to run this script.")
+
+    parser = argparse.ArgumentParser(description="Test the DALI Video Data Pipeline.")
+    parser.add_argument("--config", type=str, required=True, help="Path to the YAML config file.")
     args = parser.parse_args()
     
-    print(f"Loading configuration from: {args.config}")
-    data_cfg, train_cfg = load_config_from_yaml(args.config)
-
+    file_lists_cleanup = []
     try:
-        if data_cfg.use_dali and not DALI_AVAILABLE: raise ImportError("use_dali=True but NVIDIA DALI is not installed.")
-        if data_cfg.use_dali and not torch.cuda.is_available(): raise RuntimeError("use_dali=True requires a CUDA-enabled PyTorch and DALI.")
-        
-        target_hw, interp_str, mean, std = _resolve_timm_config(train_cfg.model_name)
-        indexer = DatasetIndexer(lmdb_root_path=data_cfg.lmdb_root_path, manifest_path=data_cfg.manifest_path)
-        dali_source_callable = DALIExternalSource(indexer.train_pool, data_cfg, train_cfg, mean_rgb=mean)
-        
-        print("\n--- Using NVIDIA DALI Data Pipeline ---")
-        
-        effective_batch_size = train_cfg.batch_size * train_cfg.context_frames * NUM_PLAYERS
-        
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        num_gpus = torch.cuda.device_count()
-        if num_gpus == 0:
-            raise RuntimeError("use_dali=True requires a CUDA-enabled environment (no GPUs found).")
-        if local_rank >= num_gpus:
-            raise RuntimeError(f"LOCAL_RANK={local_rank} but only {num_gpus} GPU(s) visible.")
-        device_id = local_rank
+        print(f"Loading configuration from: {args.config}")
+        data_cfg, train_cfg = load_config_from_yaml(args.config)
 
+        if not torch.cuda.is_available():
+            raise RuntimeError("DALI requires a CUDA-enabled PyTorch environment.")
+
+        target_hw, mean, std = _resolve_timm_config(train_cfg.model_name)
+        
+        # --- 1. Index dataset ---
+        indexer = DatasetIndexer(lmdb_root_path=data_cfg.lmdb_root_path, manifest_path=data_cfg.manifest_path)
+        
+        # --- 2. Prepare files and metadata for one "epoch" ---
+        print("\n--- Preparing epoch data ---")
+        epoch_size = train_cfg.steps_per_epoch * train_cfg.batch_size
+        file_lists, epoch_meta = build_epoch_files(
+            sampling_pool=indexer.train_pool,
+            epoch_size=epoch_size,
+            context_frames=train_cfg.context_frames,
+            ticks_per_frame=TICKS_PER_FRAME
+        )
+        file_lists_cleanup = file_lists
+        print(f"Generated {len(file_lists)} file lists for DALI video readers.")
+        print(f"Created epoch metadata for {len(epoch_meta)} samples.")
+
+        # --- 3. Instantiate the target data source ---
+        target_source = DALITargetsSource(epoch_meta, data_cfg)
+        
+        # --- 4. Build and run the DALI pipeline ---
+        print("\n--- Using NVIDIA DALI Data Pipeline ---")
+        device_id = int(os.getenv("LOCAL_RANK", "0"))
+        
         pipeline = create_dali_pipeline(
-            batch_size=effective_batch_size,
+            batch_size=train_cfg.batch_size,
             num_threads=data_cfg.dali_num_threads,
             device_id=device_id,
-            seed=1337, # This is the main pipeline seed
+            seed=int(os.getenv("DL_SEED", "1337")),
             prefetch_queue_depth=data_cfg.dali_prefetch,
             py_num_workers=data_cfg.num_workers,
             py_start_method='spawn',
-            # _FIX: Pass the seed to the renamed argument
-            external_source_callable=dali_source_callable,
+            # Custom args
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            file_lists=file_lists,
+            target_source_callable=target_source,
             target_hw=target_hw,
-            interp_str=interp_str,
             mean=mean,
-            std=std,
-            pipeline_seed=int(os.getenv("DL_SEED", "1337"))
+            std=std
         )
-        
         pipeline.build()
         torch.cuda.set_device(device_id)
-        print(f"DALI pipeline built successfully for device {device_id}. Python workers started via 'spawn'.")
+        print(f"DALI pipeline built successfully for device {device_id}.")
 
-        output_map = ["chunk_id", "sample_id", "images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
+        output_map = ["images", "mel", "alive", "stats", "pos_hm", "mouse", "kbd", "enemy_hm", "state"]
         
-        dali_loader = DALIGenericIterator([pipeline], output_map, reader_name=None, auto_reset=True, last_batch_padded=True)
+        dali_loader = DALIGenericIterator(
+            [pipeline], output_map, 
+            reader_name=None, auto_reset=True, last_batch_padded=True
+        )
         
-        print("Attempting to fetch one batch from the DALI loader...")
-        first_batch_from_dali = next(iter(dali_loader))[0]
+        print("\nAttempting to fetch one batch from the DALI loader...")
+        batch = next(iter(dali_loader))[0]
         print("Successfully fetched one batch!")
 
-        print("Sorting batch to restore sequential order...")
-        chunk_id_cpu = first_batch_from_dali["chunk_id"].cpu()
-        sample_id_cpu = first_batch_from_dali["sample_id"].cpu()
-        
-        _, idx1 = torch.sort(sample_id_cpu, stable=True)
-        chunk_sorted = chunk_id_cpu[idx1]
-        _, idx2 = torch.sort(chunk_sorted, stable=True)
-        
-        sorted_idx_cpu = idx1[idx2]
-        sorted_idx_gpu = sorted_idx_cpu.cuda(device_id)
-        
-        sorted_batch = {}
-        for k, v in first_batch_from_dali.items():
-            if v.is_cuda:
-                sorted_batch[k] = v.index_select(0, sorted_idx_gpu)
-            else:
-                sorted_batch[k] = v.index_select(0, sorted_idx_cpu)
-                
-        print("Batch sorted successfully.")
-
+        # --- 5. Reshape and verify the output batch ---
         B, T, P = train_cfg.batch_size, train_cfg.context_frames, NUM_PLAYERS
 
-        C, H, W = sorted_batch["images"].shape[1:]
-        images_tensor = sorted_batch["images"].reshape(B, T, P, C, H, W)
-        mels_tensor   = sorted_batch["mel"].reshape(B, T, P, 1, 128, MEL_SPEC_TIME_FRAMES)
-        alive_tensor  = sorted_batch["alive"].reshape(B, T, P)
-        stats_tensor  = sorted_batch["stats"].reshape(B, T, P, 3)
-        pos_hm_tensor = sorted_batch["pos_hm"].reshape(B, T, P, *HEATMAP_DIMS)
-        mouse_tensor  = sorted_batch["mouse"].reshape(B, T, P, 2)
-        kbd_tensor    = sorted_batch["kbd"].reshape(B, T, P, KEYBOARD_DIM)
-        enemy_tensor  = sorted_batch["enemy_hm"].reshape(B, T, P, *HEATMAP_DIMS)
-        state_tensor  = sorted_batch["state"].reshape(B, T, P, ROUND_STATE_DIM)
-
+        # Reshape the flattened video tensor back to its structured form
+        C, H, W = batch["images"].shape[1:]
+        images_tensor = batch["images"].reshape(B, T, P, C, H, W)
+        
         batch_for_inspection = {
             "inputs": {
                 "images": images_tensor,
-                "mel_spectrogram": mels_tensor,
-                "alive_mask": alive_tensor
+                "mel_spectrogram": batch["mel"],
+                "alive_mask": batch["alive"]
             },
             "targets": {
-                "player_stats": stats_tensor,
-                "player_pos_heatmaps": pos_hm_tensor,
-                "player_mouse": mouse_tensor,
-                "player_keyboard": kbd_tensor,
-                "enemy_pos_heatmap": enemy_tensor,
-                "round_state": state_tensor
+                "player_stats": batch["stats"],
+                "player_pos_heatmaps": batch["pos_hm"],
+                "player_mouse": batch["mouse"],
+                "player_keyboard": batch["kbd"],
+                "enemy_pos_heatmap": batch["enemy_hm"],
+                "round_state": batch["state"]
             }
         }
-        
-        print(f"DALI is ENABLED. Image tensor device: '{batch_for_inspection['inputs']['images'].device}'.")
         
         print("\n--- Batch Content (Reshaped) ---")
         for key, value in batch_for_inspection.items():
@@ -553,5 +493,9 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
     finally:
-        if os.path.exists(dummy_config_path):
-            os.remove(dummy_config_path)
+        print("Cleaning up temporary file lists...")
+        for fl_path in file_lists_cleanup:
+            try:
+                os.remove(fl_path)
+            except OSError:
+                pass
