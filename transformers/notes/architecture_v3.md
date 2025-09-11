@@ -286,3 +286,31 @@ The loss (e.g., MSE for stats, Cross-Entropy for heatmaps) is calculated by comp
 Crucially, no loss is calculated for the unmasked frames.
 
 This approach forces the model to learn a deep, contextual understanding of game flow, using surrounding events to infer what must be happening at a specific, unknown moment in time.
+
+
+
+data/
+    manifest.json
+    db
+    lmdb
+    recordings
+    demos
+
+write split_manifest.py
+    splits up all lmdb and recordings e.g. data/lmdb/gamenameXXX.lmdb and data/recordings/gamenameXXX (contains .mp4s and .wav)
+    into a train test split (default 80 20)
+    receives as cli parameter the path to the data/ folder, the seed for the deterministic shuffle (default 42)
+    writes to manifest.json
+    metadata:
+        seed, creation date
+    train:
+        [
+            gamenameXXX (omit lmdb since base for both lmdb/... and recordings/...)
+            gamenameXXY
+        ]
+    test:
+        [
+            same
+        ]
+
+
