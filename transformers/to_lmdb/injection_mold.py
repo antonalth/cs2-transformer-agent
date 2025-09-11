@@ -290,6 +290,7 @@ def process_round_perspective(task_args):
                     
                     cursor = txn.cursor()
                     cursor.putmulti(results)
+                    txn.commit()
             finally:
                 env.close()
 
