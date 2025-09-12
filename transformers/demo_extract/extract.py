@@ -84,6 +84,23 @@ GRENADE_NAMES = {"flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "
 
 
 # =============================================================================
+# 2.5 UTILITY FUNCTION FOR PLAYER VALIDATION
+# =============================================================================
+BAD_PLAYER_PREFIXES = ["Coach", "Spectator", "GOTV"]
+
+def _is_valid_player(player_name: str | None) -> bool:
+    """
+    Checks if an entity is a valid player and not a coach, spectator, etc.
+    """
+    if not player_name:
+        return False
+    for prefix in BAD_PLAYER_PREFIXES:
+        if player_name.startswith(prefix):
+            return False
+    return True
+
+
+# =============================================================================
 # 3. PROCESSING STEP 1: MOUSE DATA
 # =============================================================================
 def _mouse_setup_database(conn: sqlite3.Connection, table_name: str):
@@ -108,6 +125,7 @@ def _mouse_process_demo(parser: DemoParser, conn: sqlite3.Connection, table_name
     props_to_parse = ["player_name", "pitch", "yaw", "aim_punch_angle"]
     
     ticks_df = parser.parse_ticks(props_to_parse)
+    ticks_df = ticks_df[ticks_df['player_name'].apply(_is_valid_player)].copy()
 
     if 'aim_punch_angle' in ticks_df.columns:
         aim_punch_components = ticks_df['aim_punch_angle'].apply(pd.Series)
@@ -167,7 +185,9 @@ def _rounds_parse_2x(demo_path: Path) -> list[dict[str, Any]]:
         if not plant_in_round.is_empty():
             bomb_plant_tick = plant_in_round["tick"][0]
         def team_list(side: str) -> list[list[Any]]:
-            roster = spawns.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= fz_end) & (pl.col("user_side") == side)).select("user_name").unique().to_series().to_list()
+            roster_df = spawns.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= fz_end) & (pl.col("user_side") == side)).select("user_name").unique()
+            filtered_roster_df = roster_df.filter(pl.col("user_name").apply(_is_valid_player, return_dtype=pl.Boolean))
+            roster = filtered_roster_df.to_series().to_list()
             died = deaths.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= e_tick)).select("victim_name", "tick")
             death_map = dict(zip(died["victim_name"], died["tick"]))
             return [[p, death_map.get(p, -1)] for p in roster]
@@ -228,6 +248,7 @@ def run_keyboard_location_processing(demo_path: str, conn: sqlite3.Connection):
 
     tick_props = ["tick", "steamid", "name", "buttons", "inventory", "X", "Y", "Z", "active_weapon_name", "health", "armor_value", "balance", "is_warmup_period"]
     tick_df = pd.DataFrame(dp.parse_ticks(wanted_props=tick_props))
+    tick_df = tick_df[tick_df['name'].apply(_is_valid_player)].copy()
     
     if 'is_warmup_period' in tick_df.columns:
         tick_df = tick_df[tick_df['is_warmup_period'] == False].copy()
@@ -320,6 +341,8 @@ def run_buy_sell_drop_processing(demo_path: str, input_conn: sqlite3.Connection,
 
     tick_props = ["tick", "player_steamid", "player_name", "balance", "inventory_as_ids", "in_buy_zone", "team_num", "ct_cant_buy", "terrorist_cant_buy"]
     all_ticks_df = parser.parse_ticks(tick_props)
+    all_ticks_df = all_ticks_df[all_ticks_df['player_name'].apply(_is_valid_player)].copy()
+
     all_ticks_df.sort_values(by=["tick", "player_steamid"], inplace=True)
     all_ticks_df["inventory_as_ids"] = all_ticks_df["inventory_as_ids"].apply(lambda x: set(x) if x is not None else set())
 
@@ -486,10 +509,9 @@ def _rc_fetch_and_process_rounds(conn: sqlite3.Connection) -> List[Tuple]:
 
         # Stage 2: Strict Validation
         is_round_valid = True
-        playercount = len(t_players) + len(ct_players)
-        #if playercount < 10 or playercount > 12:
+        # playercount = len(t_players) + len(ct_players)
         if len(t_players) != 5 or len(ct_players) != 5: 
-            print(f"    Skipping round {round_num}: Invalid team sizes. T: {len(t_players)}, CT: {len(ct_players)}. Expected between 10 and 12 players.")
+            print(f"    Skipping round {round_num}: Invalid team sizes. T: {len(t_players)}, CT: {len(ct_players)}. Expected 5v5.")
             is_round_valid = False
         
         if is_round_valid:
