@@ -1,694 +1,775 @@
 """
-train2.py — barebones scaffold (function definitions + comments)
+train.py — Data loading layer (Steps 1–9)
 
-Goal:
-- Provide a clear skeleton for training with GPU video decoding via DALI and LMDB-backed labels/features.
-- Encode *key insights* from the planning discussion directly into docstrings and TODOs.
-- Keep it minimal: no heavy logic, only signatures and comments describing what to implement.
-
-Assumptions / invariants from your data generation:
-- Demos are 64 ticks/s; videos are 32 fps → EXACT mapping: 2 ticks == 1 frame.
-- All 5 POV mp4s for a team-round start at the same tick (round start) and end when the player dies.
-- LMDB keys are written ONLY every 2 ticks with parity defined by round start (even-only or odd-only).
-- A "team-round window" is sampled as a fixed-length clip in FRAMES, e.g., T_frames=512.
-- We will:
-  1) Enumerate all team-rounds (across all games) from manifest.json and LMDB INFO blocks.
-  2) For each epoch, pick a valid random window per team-round.
-  3) Write 5 aligned DALI filelists (one per POV) **including sample_id as label**.
-  4) DALI decodes on GPU (pad after death); we then map frames → LMDB keys using tick(f) = start_tick_win + 2*f.
-  5) From LMDB, reinflate per-player data (alive-only list) into fixed 5 slots using a team_alive bitmask.
+This file implements the end-to-end data input subsystem for training, focusing on:
+  1) Round discovery from each game's LMDB `_INFO` entry
+  2) LMDB environment manager
+  3) Epoch index / window sampling (fixed-length frame windows)
+  4) Writing 5 aligned DALI filelists (one per POV)
+  5) Building a single DALI video pipeline with 5 branches
+  6) Tick-vector generator (64-tick demos → 32 fps, 2 ticks per frame)
+  7) LMDB feature fetch & reinflation (alive-only → 5 fixed slots), mel + alive_mask
+  8) Batch assembler (fuse DALI outputs with LMDB features)
+  9) Determinism, DDP sharding, and instrumentation
 
 Notes:
-- Replace "..." with your actual implementation.
-"""
+- This module does not define the training loop or losses; it only prepares data into a CS2Batch-like dict.
+- We assume each per-game LMDB contains an `<demoname>_INFO` entry with the schema provided.
+- Videos are recorded until player death, all starting at the round start tick. DALI zero-pads tails for short POVs.
+- Demos are 64 ticks/s; videos are 32 fps ⇒ 2 ticks == 1 frame. LMDB keys exist only on the parity of round start.
 
+If you only want to smoke-test the loader, see the __main__ section at the bottom for a minimal sanity run (DALI required).
+"""
 from __future__ import annotations
+
 import os
 import json
-import argparse
-import random
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
+import time
+import random
+import logging
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Any
 
-# import torch
-# from torch.utils.data import DataLoader
-# from model import CS2Transformer, CS2Config
+import lmdb  # pip install lmdb
+import msgpack  # pip install msgpack
+import numpy as np
+import msgpack_numpy as mpnp  # pip install msgpack-numpy
 
-# DALI imports will be needed in actual implementation:
-# from nvidia.dali import fn, types, pipeline_def
-# from nvidia.dali.plugin.pytorch import DALIGenericIterator
+# Torch is used for device placement and to hand CUDA tensors to the model later
+import torch
 
-# LMDB + msgpack (used by injection_mold.py outputs):
-# import lmdb
-# import msgpack
-
-
-# -----------------------------
-# Config / CLI
-# -----------------------------
-
-def parse_args() -> argparse.Namespace:
-    """
-    Define CLI arguments relevant to:
-    - Paths: data root, manifest.json, run dir for artifacts (filelists, checkpoints, logs).
-    - Video: fps (typically 32), resize HxW, T_frames (clip length).
-    - DALI: decode surfaces, prefetch, num threads, shard params (if DDP).
-    - LMDB: flags for precomputed mels or on-the-fly, cache size.
-    - Training: epochs, batch size, lr, wd, amp mode, grad clip, wandb/tb flags, resume.
-    - DDP: world size, local rank, seed, deterministic flags.
-    """
-    parser = argparse.ArgumentParser()
-    # Paths
-    parser.add_argument("--data-root", type=str, required=True, help="Root folder containing manifest.json, lmdb/, recordings/, demos/")
-    parser.add_argument("--manifest", type=str, default=None, help="Path to manifest.json (defaults to <data-root>/manifest.json)")
-    parser.add_argument("--run-dir", type=str, default="runs/exp1", help="Directory for filelists, checkpoints, logs")
-    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Which split to iterate")
-
-    # Video / sampling
-    parser.add_argument("--fps", type=int, default=32, help="Recorded video fps (32 per spec)")
-    parser.add_argument("--tick-rate", type=int, default=64, help="Demo tick rate (64 per spec)")
-    parser.add_argument("--t-frames", type=int, default=512, help="Fixed clip length in frames per sample (e.g., 512)")
-    parser.add_argument("--size", type=str, default="224x224", help="HxW resize for video frames, e.g., 224x224")
-
-    # DALI (placeholders; implement in build_dali_pipeline)
-    parser.add_argument("--dali-decode-surfaces", type=int, default=8)
-    parser.add_argument("--dali-read-ahead", action="store_true")
-    parser.add_argument("--dali-threads", type=int, default=4)
-    parser.add_argument("--prefetch-queue-depth", type=int, default=2)
-
-    # LMDB / features
-    parser.add_argument("--lmdb-readahead", action="store_true", help="Enable LMDB readahead (often False for SSD)")
-    parser.add_argument("--n-mels", type=int, default=128, help="Mel bins if needed")
-    parser.add_argument("--mel-time", type=int, default=6, help="Mel time bins per frame (example placeholder)")
-    parser.add_argument("--mels-from-lmdb", action="store_true", help="Expect mel spectrograms in LMDB payloads")
-
-    # Training knobs (minimal placeholders)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--amp", choices=["off", "fp16", "bf16"], default="bf16")
-    parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--eval-only", action="store_true")
-
-    # DDP placeholders
-    parser.add_argument("--world-size", type=int, default=1)
-    parser.add_argument("--local-rank", type=int, default=0)
-
-    return parser.parse_args()
+# --- Try to import DALI; provide a friendly message if missing ---
+try:
+    from nvidia.dali import fn, types, pipeline_def
+    from nvidia.dali.plugin.pytorch import DALIGenericIterator
+    DALI_AVAILABLE = True
+except Exception as _e:
+    DALI_AVAILABLE = False
+    _DALI_IMPORT_ERROR = _e
 
 
-def set_seed(seed: int) -> None:
-    """
-    Set Python / NumPy / Torch RNG seeds for reproducibility.
-    Key insight: Also seed per-epoch window sampling with (seed + epoch) so windows reshuffle deterministically each epoch.
-    """
-    random.seed(seed)
-    # import numpy as np
-    # np.random.seed(seed)
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
+# -------------------------------
+# Constants & utilities
+# -------------------------------
 
+TICK_RATE = 64     # demo ticks per second
+FPS = 32           # video frames per second
+TICKS_PER_FRAME = TICK_RATE // FPS  # == 2
 
-# -----------------------------
-# Data model
-# -----------------------------
 
 @dataclass
 class TeamRound:
-    """
-    Canonical description of a single team-round available for sampling windows.
-
-    Fields reflect what's expected from manifest.json + per-LMDB INFO record:
-    - demoname: base id of the demo/game (used to build LMDB keys)
-    - lmdb_path: absolute path to the game's LMDB
-    - round_num: integer round id
-    - team: string/enum ('CT' or 'T') used in LMDB key naming
-    - start_tick, end_tick: inclusive bounds of round ticks in demo time
-    - fps: 32 (recording fps), tick_rate: 64 (demo ticks/s)
-    - pov_videos: list[str] length 5; absolute paths to mp4 per roster slot (0..4), ordered consistently with roster index
+    """Canonical record for a single team-round as discovered from `<demoname>_INFO`.
+    The `pov_videos` list is ordered by roster slot index [0..4].
     """
     demoname: str
     lmdb_path: str
     round_num: int
-    team: str
+    team: str  # "T" or "CT"
     start_tick: int
     end_tick: int
-    fps: int
-    tick_rate: int
     pov_videos: List[str]
+    fps: int = FPS
+    tick_rate: int = TICK_RATE
+
+    @property
+    def parity(self) -> int:
+        return self.start_tick % 2
+
+    @property
+    def frame_count(self) -> int:
+        # Inclusive of start/end ticks; with 2 ticks per frame
+        return ((self.end_tick - self.start_tick) // TICKS_PER_FRAME) + 1
 
 
 @dataclass
 class SampleRecord:
-    """
-    A single sampled window for an epoch:
-    - sample_id: dense integer 0..N-1 PER EPOCH (used as DALI label to rejoin with LMDB)
-    - start_f: starting frame index (relative to round start)
-    - start_tick_win: exact demo tick for frame 0 in this window; must satisfy parity with round start
-    - T_frames: window length in frames
-    """
+    """A sampled fixed-length window inside a TeamRound for a given epoch."""
     sample_id: int
-    team_round: TeamRound
-    start_f: int
-    start_tick_win: int
+    demoname: str
+    lmdb_path: str
+    round_num: int
+    team: str
+    pov_videos: List[str]
+    start_f: int               # start frame index from round start
+    start_tick_win: int        # starting tick of the sampled window (parity-locked)
     T_frames: int
+    parity: int
 
 
-# -----------------------------
-# Manifest
-# -----------------------------
+# -------------------------------
+# Step 1: Manifest + `_INFO` reader
+# -------------------------------
 
 class Manifest:
+    """Loads `manifest.json` and enumerates games per split.
+
+    Expected flexible schema (examples):
+      {
+        "train": ["gameA", {"demoname": "gameB"}],
+        "val":   ["gameC"],
+        "test":  []
+      }
+    or
+      {
+        "train": [{"demoname": "gameA", "lmdb_path": ".../gameA.lmdb"}],
+        ...
+      }
+    If `lmdb_path` is omitted, we resolve it as `<data_root>/lmdb/<demoname>.lmdb`.
     """
-    Loads manifest.json and resolves absolute paths plus LMDB INFO metadata.
+    def __init__(self, data_root: str, manifest_path: str):
+        self.data_root = os.path.abspath(data_root)
+        self.manifest_path = manifest_path
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            self._data = json.load(f)
 
-    Responsibilities:
-    - Read manifest.json (from create_split.py) to get the list of games in each split and per-team-round metadata
-      OR minimally the path to each game's LMDB so we can open *_INFO to enumerate rounds.
-    - Normalize relative paths to absolute (based on data_root).
-    - Provide get_split(split) -> List[TeamRound].
+    def get_games(self, split: str) -> List[Tuple[str, str]]:
+        """Return list of (demoname, lmdb_path) for the given split."""
+        entries = self._data.get(split, [])
+        out: List[Tuple[str, str]] = []
+        for e in entries:
+            if isinstance(e, str):
+                demoname = e
+                lmdb_path = os.path.join(self.data_root, "lmdb", f"{demoname}.lmdb")
+            elif isinstance(e, dict):
+                demoname = e.get("demoname") or e.get("name")
+                if demoname is None:
+                    raise ValueError(f"Manifest entry missing 'demoname': {e}")
+                lmdb_path = e.get("lmdb_path") or os.path.join(self.data_root, "lmdb", f"{demoname}.lmdb")
+            else:
+                raise ValueError(f"Unsupported manifest entry: {e}")
+            out.append((demoname, os.path.abspath(lmdb_path)))
+        return out
 
-    Key insights:
-    - Each game has EXACTLY one LMDB.
-    - The LMDB contains an *_INFO record with round/teams, start/end ticks, and pov video paths.
-    - Use that INFO to build TeamRound entries with stable roster order matching POV mp4 ordering.
+
+class LmdbStore:
+    """Opens and caches LMDB environments. Also reads `<demoname>_INFO` once.
+
+    Use one `LmdbStore` instance per process/rank.
     """
+    def __init__(self, max_readers: int = 512, map_size: int = 0, readahead: bool = False):
+        self._envs: Dict[str, lmdb.Environment] = {}
+        self._info_cache: Dict[str, Dict[str, Any]] = {}
+        self._max_readers = max_readers
+        self._map_size = map_size
+        self._readahead = readahead
 
-    def __init__(self, data_root: str, manifest_path: Optional[str]):
-        self.data_root = data_root
-        self.manifest_path = manifest_path or os.path.join(data_root, "manifest.json")
-        self._raw = None  # store raw manifest dict as needed
+    def open(self, lmdb_path: str) -> lmdb.Environment:
+        env = self._envs.get(lmdb_path)
+        if env is None:
+            env = lmdb.open(
+                lmdb_path,
+                readonly=True,
+                lock=False,
+                max_readers=self._max_readers,
+                map_size=self._map_size or 1 << 30,  # 1GB virtual map is fine for read-only
+                readahead=self._readahead,
+            )
+            self._envs[lmdb_path] = env
+        return env
 
-    def load(self) -> None:
-        """Load manifest.json; validate expected structure. Populate self._raw."""
-        # with open(self.manifest_path, "r") as f:
-        #     self._raw = json.load(f)
-        # TODO: add validation and path normalization
-        pass
-
-    def get_split(self, split: str) -> List[TeamRound]:
-        """
-        Build a flat list of TeamRound objects for the requested split.
-
-        Implementation outline:
-        - For each game in manifest[split]:
-          - Resolve lmdb_path = <data_root>/lmdb/<game>.lmdb (or from manifest).
-          - Open LMDB and read INFO record (e.g., f"{demoname}_INFO").
-          - For each round and team present in INFO:
-            - Collect start_tick, end_tick, pov_videos (5 absolute mp4 paths in recordings/).
-            - Construct TeamRound(...).
-        - Return the complete list.
-        """
-        # TODO: implement reading INFO from LMDB, normalize paths
-        return []
+    def read_info(self, demoname: str, lmdb_path: str) -> Dict[str, Any]:
+        """Read and cache `<demoname>_INFO` from the LMDB."""
+        key = f"{demoname}_INFO".encode("utf-8")
+        cache_key = (demoname, lmdb_path)
+        if cache_key in self._info_cache:
+            return self._info_cache[cache_key]
+        env = self.open(lmdb_path)
+        with env.begin(write=False) as txn:
+            blob = txn.get(key)
+            if blob is None:
+                raise FileNotFoundError(f"Missing _INFO entry for {demoname} in {lmdb_path}")
+            info = json.loads(blob.decode("utf-8"))
+        # Basic validation
+        if info.get("demoname") and info["demoname"] != demoname:
+            logging.warning("INFO.demoname (%s) != expected (%s)", info["demoname"], demoname)
+        rounds = info.get("rounds")
+        if not isinstance(rounds, list) or not rounds:
+            raise ValueError(f"INFO.rounds malformed for {demoname}")
+        self._info_cache[cache_key] = info
+        return info
 
 
-# -----------------------------
-# Epoch indexing (sampling windows)
-# -----------------------------
+def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbStore) -> List[TeamRound]:
+    """Enumerate all TeamRounds for the split by reading each game's `<demoname>_INFO`.
+
+    Ensures absolute mp4 paths and basic validity.
+    """
+    team_rounds: List[TeamRound] = []
+    for demoname, lmdb_path in games:
+        info = store.read_info(demoname, lmdb_path)
+        for r in info["rounds"]:
+            pov_videos = r.get("pov_videos", [])
+            if len(pov_videos) != 5:
+                raise ValueError(f"{demoname} round {r.get('round_num')} missing POV videos (got {len(pov_videos)})")
+            
+            def _resolve_pov_path(data_root: str, demoname: str, pv: str) -> str:
+                if os.path.isabs(pv):
+                    return pv
+                # Try common layouts, prefer the canonical recordings/<demoname> first
+                candidates = [
+                    os.path.join(data_root, "recordings", demoname, pv),
+                    #os.path.join(data_root, pv),
+                ]
+                for c in candidates:
+                    if os.path.exists(c):
+                        return os.path.abspath(c)
+                raise FileNotFoundError(
+                    f"POV video not found for '{pv}'. Tried: {', '.join(map(os.path.abspath, candidates))}"
+                )
+
+            # inside build_team_rounds(...)
+            pov_abs = [_resolve_pov_path(data_root, demoname, pv) for pv in pov_videos]
+
+            # Validate files exist (fail fast). You can relax to warnings if needed.
+            for p in pov_abs:
+                if not os.path.exists(p):
+                    raise FileNotFoundError(f"POV video not found: {p}")
+            tr = TeamRound(
+                demoname=demoname,
+                lmdb_path=os.path.abspath(lmdb_path),
+                round_num=int(r["round_num"]),
+                team=str(r["team"]).upper(),
+                start_tick=int(r["start_tick"]),
+                end_tick=int(r["end_tick"]),
+                pov_videos=pov_abs,
+            )
+            if tr.start_tick >= tr.end_tick:
+                raise ValueError(f"Invalid ticks for {demoname} round {tr.round_num} {tr.team}: {tr.start_tick} >= {tr.end_tick}")
+            if tr.frame_count < 1:
+                logging.warning("Zero-length frame window for %s r%03d %s", demoname, tr.round_num, tr.team)
+                continue
+            team_rounds.append(tr)
+    logging.info("Discovered %d team-rounds across %d games.", len(team_rounds), len(games))
+    return team_rounds
+
+
+# -------------------------------
+# Step 3: EpochIndex (window sampler)
+# -------------------------------
 
 class EpochIndex:
+    """Samples a fixed-length frame window inside each TeamRound for a given epoch.
+
+    The sampling is deterministic given (seed, epoch).
     """
-    Per-epoch sampler and lookup.
-
-    Responsibilities:
-    - Given a list of TeamRound and a T_frames, sample ONE window per TeamRound (or multiple, as configured).
-    - Respect valid range: start_f in [0, max(0, frame_count - T_frames)] where frame_count = ((end_tick - start_tick)//2) + 1.
-    - Support padding option: when frame_count < T_frames, either skip or set start_f=0 and rely on pad_sequences + alive_mask.
-    - Assign dense sample_id (0..N-1) and store mapping id -> SampleRecord.
-    - Provide methods:
-        .build(seed_epoch) -> None          # regenerates windows for a new epoch
-        .records() -> List[SampleRecord]    # deterministic order used to write DALI filelists
-        .by_id(sample_id) -> SampleRecord   # lookup for LMDB fetch during batching
-
-    Key insight:
-    - start_tick_win = TeamRound.start_tick + 2 * start_f (parity guaranteed).
-    - Use seed + epoch for deterministic reshuffling.
-    """
-
-    def __init__(self, team_rounds: List[TeamRound], T_frames: int, allow_padding: bool = True):
-        self.team_rounds = team_rounds
+    def __init__(self, T_frames: int, seed: int):
         self.T_frames = T_frames
-        self.allow_padding = allow_padding
-        self._records: List[SampleRecord] = []
-        self._by_id: Dict[int, SampleRecord] = {}
+        self.seed = seed
+        self.records: List[SampleRecord] = []
+        self.id_to_sample: Dict[int, SampleRecord] = {}
 
-    def build(self, seed_for_epoch: int) -> None:
-        """Sample windows and populate self._records and self._by_id."""
-        # random.seed(seed_for_epoch)
-        # For each TeamRound, compute frame_count and choose start_f (or skip if too short and padding disabled).
-        # Compute start_tick_win = start_tick + 2 * start_f.
-        # Assign incremental sample_id and store SampleRecord.
-        pass
+    def build(self, team_rounds: List[TeamRound], epoch: int, allow_padding: bool = True) -> Tuple[List[SampleRecord], Dict[int, SampleRecord]]:
+        rnd = random.Random(self.seed + epoch)
+        self.records.clear()
+        self.id_to_sample.clear()
 
-    def records(self) -> List[SampleRecord]:
-        """Return records in the exact order to be written to filelists (also defines epoch ordering)."""
-        return self._records
+        sid = 0
+        for tr in team_rounds:
+            if tr.frame_count >= self.T_frames:
+                start_f = rnd.randint(0, tr.frame_count - self.T_frames)
+            else:
+                if not allow_padding:
+                    continue
+                start_f = 0
+            start_tick_win = tr.start_tick + TICKS_PER_FRAME * start_f
+            rec = SampleRecord(
+                sample_id=sid,
+                demoname=tr.demoname,
+                lmdb_path=tr.lmdb_path,
+                round_num=tr.round_num,
+                team=tr.team,
+                pov_videos=tr.pov_videos,
+                start_f=start_f,
+                start_tick_win=start_tick_win,
+                T_frames=self.T_frames,
+                parity=tr.parity,
+            )
+            self.records.append(rec)
+            self.id_to_sample[sid] = rec
+            sid += 1
 
-    def by_id(self, sample_id: int) -> SampleRecord:
-        """Return SampleRecord for a given sample_id."""
-        return self._by_id[sample_id]
+        logging.info("EpochIndex built: %d samples (T=%d)", len(self.records), self.T_frames)
+        return self.records, self.id_to_sample
 
 
-# -----------------------------
-# Filelists (for DALI video readers)
-# -----------------------------
+# -------------------------------
+# Step 4: Filelist writer (5 aligned lists)
+# -------------------------------
 
-def write_epoch_filelists(index: EpochIndex, out_dir: str) -> List[str]:
+class FilelistWriter:
+    """Writes five aligned DALI filelists (one per POV).
+
+    Each line: "<abs/path.mp4>  <sample_id>  <start_f>  <end_f>".
     """
-    Emit five text files (pov0.txt ... pov4.txt), each line aligned across files:
+    def __init__(self, out_dir: str):
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
 
-        "<abs/path/to/player_k.mp4>  <sample_id>  <start_frame>  <end_frame>"
+    def write(self, records: List[SampleRecord]) -> List[str]:
+        paths = [os.path.join(self.out_dir, f"pov{k}.txt") for k in range(5)]
+        files = [open(p, "w", encoding="utf-8") for p in paths]
+        try:
+            for rec in records:
+                end_f = rec.start_f + rec.T_frames
+                for k in range(5):
+                    files[k].write(f"{rec.pov_videos[k]} {rec.sample_id} {rec.start_f} {end_f}\n")
+        finally:
+            for f in files:
+                f.close()
+        # Basic parity: line counts equal
+        counts = [sum(1 for _ in open(p, "r", encoding="utf-8")) for p in paths]
+        if len(set(counts)) != 1:
+            raise RuntimeError(f"Filelist line count mismatch: {counts}")
+        logging.info("Wrote DALI filelists to %s (N=%d)", self.out_dir, counts[0])
+        return paths
 
-    Notes:
-    - Use file_list_frame_num=True in DALI so start/end are interpreted as frame indices.
-    - The label column is *sample_id*; DALI will return it with the batch, letting us rejoin with LMDB.
-    - end_frame should be start_f + T_frames (exclusive depending on DALI variant; align with chosen reader).
 
-    Returns:
-    - List of file paths in order [pov0.txt, pov1.txt, pov2.txt, pov3.txt, pov4.txt]
+# -------------------------------
+# Step 5: DALI video pipeline (5 branches)
+# -------------------------------
+
+@dataclass
+class DaliConfig:
+    height: int = 224
+    width: int = 224
+    sequence_length: int = 512
+    batch_size: int = 1
+    num_threads: int = 4
+    device_id: int = 0
+    prefetch_queue_depth: int = 2
+    additional_decode_surfaces: int = 8
+    read_ahead: bool = True
+    mean: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    std: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    shard_id: int = 0
+    num_shards: int = 1
+
+
+class DaliVideoInput:
+    """Builds a single DALI pipeline with 5 video branches and yields CUDA tensors.
+
+    Iterator output per batch:
+      {
+        "pov0": [B, T, C, H, W] (FP16 CUDA),
+        "pov1": ...,
+        ...,
+        "labels0": [B],  # sample_ids from branch 0 (others must match)
+        ...
+      }
     """
-    # Ensure out_dir exists, then open 5 files and write aligned lines for each SampleRecord.
-    # Return file paths for DALI to consume.
-    return []
-
-
-# -----------------------------
-# DALI pipeline & iterator
-# -----------------------------
-
-def build_dali_pipeline(
-    pov_filelists: List[str],
-    size_hw: Tuple[int, int],
-    T_frames: int,
-    batch_size: int,
-    shard_id: int,
-    num_shards: int,
-    dali_threads: int,
-    decode_surfaces: int,
-    read_ahead: bool,
-    prefetch_queue_depth: int,
-):
-    """
-    Construct a single DALI pipeline with FIVE branches (one per POV).
-
-    What to implement:
-    - For each POV filelist:
-        reader = fn.readers.video_resize(
-            file_list=..., sequence_length=T_frames, step=T_frames,
-            file_list_frame_num=True, random_shuffle=False, pad_sequences=True,
-            additional_decode_surfaces=decode_surfaces, read_ahead=read_ahead,
-            resize_y=H, resize_x=W, dtype=types.UINT8,
-            shard_id=shard_id, num_shards=num_shards, stick_to_shard=True,
-            enable_frame_num=True
+    def __init__(self, filelists: List[str], cfg: DaliConfig):
+        if not DALI_AVAILABLE:
+            raise ImportError(
+                f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}.\n"
+                "Install DALI to use GPU video decode: https://docs.nvidia.com/deeplearning/dali/user-guide/docs/installation.html"
+            )
+        assert len(filelists) == 5, "Expected 5 filelists (one per POV)"
+        self.filelists = filelists
+        self.cfg = cfg
+        self.pipeline = self._build_pipeline()
+        # Output map must match what the pipeline returns
+        out_map = [
+            "pov0", "labels0",
+            "pov1", "labels1",
+            "pov2", "labels2",
+            "pov3", "labels3",
+            "pov4", "labels4",
+        ]
+        self.iterator = DALIGenericIterator(
+            [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, fill_last_batch=False
         )
-        images = fn.crop_mirror_normalize(reader, output_layout="FCHW",
-                                          mean=..., std=..., output_dtype=types.FLOAT16)
-      Name the outputs pov0...pov4 so DALIGenericIterator can return them by name.
 
-    Key insights:
-    - pad_sequences=True zero-pads tails after player death; losses must be masked accordingly.
-    - We keep the *labels* emitted by DALI (they should equal our sample_id).
-    - For AMP=bf16, cast after iterator (fp16→bf16) before forward.
+    def _build_pipeline(self):
+        cfg = self.cfg
 
-    Return:
-    - A compiled DALI pipeline (or a tuple containing the pipeline and the list of output names).
+        @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, prefetch_queue_depth=cfg.prefetch_queue_depth)
+        def pipe():
+            seqs = []
+            labels = []
+            for k in range(5):
+                v, l = fn.readers.video_resize(
+                    file_list=self.filelists[k],
+                    file_list_frame_num=True,
+                    sequence_length=cfg.sequence_length,
+                    step=cfg.sequence_length,
+                    random_shuffle=False,
+                    pad_sequences=True,
+                    read_ahead=cfg.read_ahead,
+                    additional_decode_surfaces=cfg.additional_decode_surfaces,
+                    resize_x=cfg.width,
+                    resize_y=cfg.height,
+                    dtype=types.UINT8,
+                    shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards,
+                    stick_to_shard=True,
+                )
+                x = fn.crop_mirror_normalize(
+                    v.gpu(),
+                    output_layout="FCHW",
+                    dtype=types.FLOAT16,
+                    mean=cfg.mean,
+                    std=cfg.std,
+                )
+                seqs.append(x)
+                labels.append(l)
+            # Return interleaved (pov0, lab0, pov1, lab1, ...)
+            return tuple([seqs[0], labels[0], seqs[1], labels[1], seqs[2], labels[2], seqs[3], labels[3], seqs[4], labels[4]])
+
+        return pipe()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        out = next(self.iterator)  # list of dicts (one per GPU). We have one pipeline → [dict]
+        batch = out[0]
+        # Sanity: labels across POV branches must match
+        l0 = batch["labels0"].cpu().numpy().tolist()
+        for k in range(1, 5):
+            lk = batch[f"labels{k}"].cpu().numpy().tolist()
+            if lk != l0:
+                raise RuntimeError(f"Label mismatch between branches: {l0} vs {lk}")
+        return batch
+
+    def reset(self):
+        self.iterator.reset()
+
+
+# -------------------------------
+# Step 6: Tick vector generator
+# -------------------------------
+
+def ticks_for_window(start_tick_win: int, T_frames: int) -> np.ndarray:
+    """Compute tick indices for a fixed-length window, parity-locked to round start.
+    tick[f] = start_tick_win + 2*f
     """
-    pass
+    # Using int32 is enough and compact
+    return start_tick_win + (np.arange(T_frames, dtype=np.int32) * TICKS_PER_FRAME)
 
 
-def make_dali_iterator(pipeline, batch_size: int):
-    """
-    Wrap the built pipeline in a DALIGenericIterator.
+# -------------------------------
+# Step 7: LMDB fetch & reinflation
+# -------------------------------
 
-    Implementation details:
-    - Provide output_map like ["pov0", "pov1", "pov2", "pov3", "pov4"].
-    - Ensure 'reader_name' or 'fill_last_batch' are set correctly for epoch boundaries.
-    - Iterator should yield a dict with GPU tensors and 'labels' (sample_id) from at least one branch (e.g., pov0).
-    """
-    # iter = DALIGenericIterator([...])
-    # return iter
-    pass
-
-
-# -----------------------------
-# LMDB access
-# -----------------------------
-
-class LMDBStore:
-    """
-    Cache and manage LMDB environments per game.
-
-    Responsibilities:
-    - get_env(lmdb_path) -> env (open once per path; cache by path)
-    - close_all() on shutdown
-    - Set appropriate flags: readonly env, max_readers large enough, map_size irrelevant for read-only.
-
-    Tuning:
-    - readahead=False may be better on SSDs; allow CLI flag to toggle.
-    """
-
-    def __init__(self, readahead: bool = False):
-        self.readahead = readahead
-        self._cache: Dict[str, Any] = {}
-
-    def get_env(self, lmdb_path: str):
-        """Open (or return cached) LMDB environment for the path."""
-        # if lmdb_path not in self._cache:
-        #     env = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=self.readahead, max_readers=256)
-        #     self._cache[lmdb_path] = env
-        # return self._cache[lmdb_path]
-        pass
-
-    def close_all(self) -> None:
-        """Close all cached environments."""
-        # for env in self._cache.values():
-        #     env.close()
-        # self._cache.clear()
-        pass
+@dataclass
+class FeatureFetchResult:
+    mel_spectrogram: np.ndarray  # [T, 5, n_mels, mel_t]
+    alive_mask: np.ndarray       # [T, 5] (uint8/bool)
+    # Optional raw fields for future target extraction / debugging
+    game_state_list: List[Dict[str, Any]]
+    # per frame, per alive player; not inflated (debugging aid)
+    player_data_alive_list: List[List[Any]]
 
 
 class FeatureFetcher:
+    """Fetches per-frame features from LMDB for a sampled window and reinflates to 5 slots.
+
+    - Keys: "{demoname}_round_{rrr}_team_{team}_tick_{tick:08d}"
+    - Values: msgpack with {"game_state": gs, "player_data": pdl}, where pdl is alive-only, roster-ordered.
+    - Reinflation uses `gs['team_alive']` 5-bit mask to restore fixed 5-slot layout.
+    - Mel spectrogram is extracted per alive player if present; dead/missing → zeros.
     """
-    Fetch and assemble per-sample LMDB features aligned to decoded frames.
-
-    Responsibilities:
-    - Given SampleRecord (retrieved via sample_id), compute frame ticks:
-        tick[f] = start_tick_win + 2*f  (parity locked to round start)
-    - Build LMDB keys per tick:
-        f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode()
-    - Read each key under a single read-only txn; msgpack-unpack payload.
-
-    Reinflation logic:
-    - payload["game_state"] has a team_alive 5-bit mask (LSB = slot 0).
-    - payload["player_data"] is a list for *alive players only*, sorted by roster index.
-    - Reinflate to fixed 5 slots:
-        j = 0
-        for slot in 0..4:
-            if (mask_bits >> slot) & 1:
-                (pi, _, mel) = pdl[j]; j += 1
-                write into slot
-            else:
-                zeros (dead)
-    - Produce:
-        - mel_spectrogram: [T, 5, n_mels, mel_t] (zeros where dead or missing)
-        - alive_mask: [T, 5] (uint8/bool)
-        - targets dict for your heads (keyboard logits targets, eco, inventory, active weapon, positions, etc.)
-        - Optional: frame_pad_mask if you want to mask DALI's padded frames beyond true footage.
-
-    Missing keys:
-    - If txn.get(key) is None: interpret as "no live data" → alive_mask zeros, features zeros for that frame.
-
-    Performance:
-    - Keep one env per game in LMDBStore.
-    - Use a single txn per sample window to minimize overhead.
-    """
-
-    def __init__(self, store: LMDBStore, n_mels: int, mel_time: int, expect_mels: bool):
+    def __init__(self, store: LmdbStore):
         self.store = store
-        self.n_mels = n_mels
-        self.mel_time = mel_time
-        self.expect_mels = expect_mels
+        # Cache mel shape per LMDB (n_mels, mel_t). Discovered lazily.
+        self._mel_shape_hint: Dict[str, Tuple[int, int]] = {}
 
-    def fetch_window(self, rec: SampleRecord) -> Dict[str, Any]:
-        """Return dict with mel_spectrogram, alive_mask, and per-head targets for window rec."""
-        # env = self.store.get_env(rec.team_round.lmdb_path)
-        # ticks = [rec.start_tick_win + 2*f for f in range(rec.T_frames)]
-        # with env.begin(write=False) as txn:
-        #     for t in ticks:
-        #         key = ...
-        #         blob = txn.get(key)
-        #         if not blob:
-        #             # all zeros; continue
-        #         payload = msgpack.unpackb(blob, raw=False)
-        #         gs = payload["game_state"]; pdl = payload["player_data"]
-        #         # team_alive = int(gs["team_alive"])
-        #         # reinflate over slots 0..4
-        #         # write mel and targets per slot
-        # return {...}
-        return {}
+    @staticmethod
+    def _key(demoname: str, round_num: int, team: str, tick: int) -> bytes:
+        return f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode("utf-8")
+
+    @staticmethod
+    def _parse_player_entry(entry: Any) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
+        """Extract a (pi_dict, mel_array_or_None) from a `player_data` entry.
+        Supports either tuple-like (pi, maybe_inventory, mel) or dict-like.
+        """
+        if isinstance(entry, dict):
+            pi = entry.get("pi") or entry
+            mel = entry.get("mel")
+            if isinstance(mel, list):
+                mel = np.asarray(mel, dtype=np.float32)
+            return pi, mel
+        elif isinstance(entry, (list, tuple)):
+            # Heuristic: last element may be mel, first is pi
+            pi = entry[0] if len(entry) > 0 else {}
+            mel = entry[-1] if len(entry) > 0 else None
+            if isinstance(mel, list):
+                mel = np.asarray(mel, dtype=np.float32)
+            return pi, mel
+        # Fallback: unknown structure
+        return {}, None
+
+    def _ensure_mel_shape(self, lmdb_path: str, env: lmdb.Environment, demoname: str, round_num: int, team: str, start_tick_win: int, T_frames: int) -> Tuple[int, int]:
+        """Determine (n_mels, mel_t) if unknown by peeking at the first non-None mel in the window.
+        If no mel is found, default to (128, 6) but log a warning.
+        """
+        if lmdb_path in self._mel_shape_hint:
+            return self._mel_shape_hint[lmdb_path]
+        with env.begin(write=False) as txn:
+            for f in range(T_frames):
+                tick = int(start_tick_win + TICKS_PER_FRAME * f)
+                blob = txn.get(self._key(demoname, round_num, team, tick))
+                if not blob:
+                    continue
+                payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
+                pdl = payload.get("player_data") or []
+                for ent in pdl:
+                    _, mel = self._parse_player_entry(ent)
+                    if isinstance(mel, np.ndarray) and mel.ndim == 2:
+                        self._mel_shape_hint[lmdb_path] = (mel.shape[0], mel.shape[1])
+                        return self._mel_shape_hint[lmdb_path]
+        logging.warning("Could not infer mel shape in %s; defaulting to (128, 6)", lmdb_path)
+        self._mel_shape_hint[lmdb_path] = (128, 6)
+        return self._mel_shape_hint[lmdb_path]
+
+    def fetch(self, rec: SampleRecord) -> FeatureFetchResult:
+        env = self.store.open(rec.lmdb_path)
+        n_mels, mel_t = self._ensure_mel_shape(rec.lmdb_path, env, rec.demoname, rec.round_num, rec.team, rec.start_tick_win, rec.T_frames)
+
+        T = rec.T_frames
+        alive_mask = np.zeros((T, 5), dtype=np.uint8)
+        mel = np.zeros((T, 5, n_mels, mel_t), dtype=np.float32)
+        gs_list: List[Dict[str, Any]] = []
+        pdl_alive_list: List[List[Any]] = []
+
+        ticks = ticks_for_window(rec.start_tick_win, T)
+        with env.begin(write=False) as txn:
+            for f, tick in enumerate(ticks.tolist()):
+                blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(tick)))
+                if not blob:
+                    gs_list.append({})
+                    pdl_alive_list.append([])
+                    continue
+                payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
+                gs = payload.get("game_state") or {}
+                pdl = payload.get("player_data") or []
+                gs_list.append(gs)
+                pdl_alive_list.append(pdl)
+
+                # Reinflation: map alive-only list back to fixed 5 slots using team_alive bitmask
+                mask_bits = int(gs.get("team_alive", 0))
+                j = 0
+                for slot in range(5):
+                    if (mask_bits >> slot) & 1:
+                        alive_mask[f, slot] = 1
+                        if j < len(pdl):
+                            pi, mel_arr = self._parse_player_entry(pdl[j])
+                            j += 1
+                            if isinstance(mel_arr, np.ndarray) and mel_arr.ndim == 2:
+                                # Clip or pad mel to (n_mels, mel_t) if needed
+                                mh, mw = mel_arr.shape
+                                h = min(mh, n_mels)
+                                w = min(mw, mel_t)
+                                mel[f, slot, :h, :w] = mel_arr[:h, :w]
+                        # else: no entry despite alive bit → leave zeros (robustness)
+                    else:
+                        # dead slot: leave zeros
+                        pass
+        return FeatureFetchResult(mel_spectrogram=mel, alive_mask=alive_mask, game_state_list=gs_list, player_data_alive_list=pdl_alive_list)
 
 
-# -----------------------------
-# Batch assembly
-# -----------------------------
+# -------------------------------
+# Step 8: Batch assembler (fuse DALI + LMDB)
+# -------------------------------
 
 class BatchAssembler:
+    """Converts a raw DALI batch + FeatureFetcher outputs into model-ready tensors.
+
+    Output dict keys:
+      - images: [B, T, 5, C, H, W]  (CUDA, fp16)
+      - mel_spectrogram: [B, T, 5, n_mels, mel_t] (CUDA, float32/16)
+      - alive_mask: [B, T, 5] (CUDA, uint8)
+      - meta: {sample_ids, demonames, round_nums, teams}
+
+    Target extraction for heads can be added later using `game_state_list` and `player_data_alive_list`.
     """
-    Fuse DALI outputs (GPU) with LMDB features into the model's expected CS2Batch.
+    def __init__(self, id_to_sample: Dict[int, SampleRecord], fetcher: FeatureFetcher, device: Optional[torch.device] = None, amp_prefer_bf16: bool = False):
+        self.id_to_sample = id_to_sample
+        self.fetcher = fetcher
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.amp_prefer_bf16 = amp_prefer_bf16
 
-    Inputs per step:
-    - From DALIGenericIterator:
-        pov0..pov4: each [B, T, C, H, W] (FP16 CUDA)
-        labels: [B] (int sample_id) from at least one branch (pov0)
-    - From FeatureFetcher.fetch_window for each label:
-        mel_spectrogram [T, 5, n_mels, mel_t], alive_mask [T, 5], targets dict
+    def assemble(self, dali_batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        # 1) Stack the five POV tensors → [B, T, 5, C, H, W]
+        povs = []
+        labels = None
+        for k in range(5):
+            x = dali_batch[f"pov{k}"]  # torch.cuda.FloatTensor (fp16) with layout FCHW → [B, T, C, H, W]
+            povs.append(x)
+            lb = dali_batch[f"labels{k}"]
+            if labels is None:
+                labels = lb
+        # Shape: list of 5 tensors [B,T,C,H,W] → [B,T,5,C,H,W]
+        images = torch.stack(povs, dim=2)
+        if self.amp_prefer_bf16 and images.dtype == torch.float16:
+            images = images.to(torch.bfloat16)
 
-    Outputs (example shape expectations):
-    - images: [B, T, 5, 3, H, W]  (stack POVs; cast to bf16 if needed)
-    - mel_spectrogram: [B, T, 5, 1, n_mels, mel_t] (unsqueeze channel=1)
-    - alive_mask: [B, T, 5] (bool/uint8 on device)
-    - targets: dict with per-head tensors on device
-    - Optional: frame_pad_mask [B, T] / [B, T, 5] to mask DALI tail padding
+        # 2) For each sample in the batch, fetch LMDB features by sample_id
+        sample_ids = labels.cpu().numpy().tolist()
+        mel_list = []
+        mask_list = []
+        meta = {"sample_ids": sample_ids, "demonames": [], "round_nums": [], "teams": []}
+        for sid in sample_ids:
+            rec = self.id_to_sample[int(sid)]
+            meta["demonames"].append(rec.demoname)
+            meta["round_nums"].append(rec.round_num)
+            meta["teams"].append(rec.team)
+            feats = self.fetcher.fetch(rec)
+            mel_list.append(torch.from_numpy(feats.mel_spectrogram))
+            mask_list.append(torch.from_numpy(feats.alive_mask))
+        mel = torch.stack(mel_list, dim=0).to(self.device, non_blocking=True)  # [B,T,5,n_mels,mel_t]
+        mel = mel.unsqueeze(3)  # [B,T,5,1,n_mels,mel_t]
+        alive_mask = torch.stack(mask_list, dim=0).to(self.device, non_blocking=True)  # [B,T,5]
 
-    Key insights:
-    - Ordering: the 5 POV tensors correspond to roster slots 0..4; the reinflation logic uses the same slot order.
-    - AMP: DALI emits FP16; if training in BF16, cast images once (cheap).
-    - Device: LMDB-derived arrays must be moved to same CUDA device before forward.
+        # 3) Ensure images are on the target device
+        images = images.to(self.device, non_blocking=True)
+
+        batch = {
+            "images": images,
+            "mel_spectrogram": mel,
+            "alive_mask": alive_mask,
+            "meta": meta,
+        }
+        return batch
+
+
+# -------------------------------
+# Step 9: Determinism, DDP helpers, instrumentation
+# -------------------------------
+
+class Timer:
+    """Simple timer context for instrumentation."""
+    def __init__(self, name: str):
+        self.name = name
+        self.t0 = 0.0
+        self.dt = 0.0
+
+    def __enter__(self):
+        self.t0 = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.dt = time.time() - self.t0
+
+
+def get_ddp_info() -> Tuple[int, int]:
+    """Return (shard_id, num_shards) using torch.distributed if available; else (0,1)."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    # torchrun sets LOCAL_RANK; use it for device id, but sharding remains 0/1
+    return 0, 1
+
+
+# -------------------------------
+# Optional: minimal driver for sanity
+# -------------------------------
+
+@dataclass
+class DataArgs:
+    data_root: str
+    manifest: str
+    split: str = "train"
+    run_dir: str = "runs/exp1"
+    T_frames: int = 512
+    height: int = 224
+    width: int = 224
+    batch_size: int = 1
+    seed: int = 42
+    dali_threads: int = 4
+    decode_surfaces: int = 8
+
+
+def build_data_iter(args: DataArgs):
+    """Convenience function that wires Steps 1→8 and returns (dali_iter, assembler).
+    This is useful for plugging straight into a training loop later.
     """
+    os.makedirs(args.run_dir, exist_ok=True)
+    logging.info("=== Building data loader for split=%s ===", args.split)
 
-    def __init__(self, feature_fetcher: FeatureFetcher, amp_mode: str = "bf16"):
-        self.fetcher = feature_fetcher
-        self.amp_mode = amp_mode
+    # Step 1: Manifest + INFO
+    manifest = Manifest(args.data_root, args.manifest)
+    games = manifest.get_games(args.split)
+    store = LmdbStore()
+    team_rounds = build_team_rounds(args.data_root, games, store)
 
-    def assemble(self, dali_batch: Dict[str, Any], id_lookup: EpochIndex) -> Dict[str, Any]:
-        """
-        Build the final CS2Batch dict.
+    # Step 3: EpochIndex
+    index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
+    records, id_map = index.build(team_rounds, epoch=0, allow_padding=True)
 
-        Implementation steps:
-        - Extract labels (sample_id) from one branch (e.g., dali_batch["pov0"]["label"]).
-        - For each sample_id in the batch:
-            rec = id_lookup.by_id(sample_id)
-            feats = self.fetcher.fetch_window(rec)
-        - Stack LMDB features across the batch; convert dtypes; move to device.
-        - Stack pov0..pov4 along a new axis to [B, T, 5, C, H, W]; permute if needed to [B, T, 5, 3, H, W].
-        - Return a dict with keys matching your model's forward signature, e.g.:
-            {
-              "images": ...,
-              "mel_spectrogram": ...,
-              "alive_mask": ...,
-              "targets": {...}
-            }
-        """
-        return {}
+    # Step 4: Filelists
+    fl_dir = os.path.join(args.run_dir, "epoch_0")
+    filelists = FilelistWriter(fl_dir).write(records)
 
+    # Step 5: DALI input
+    shard_id, num_shards = get_ddp_info()
+    # Resolve normalization & input size from the ViT model (via timm) if available
+    dali_mean = (0.0, 0.0, 0.0)
+    dali_std = (1.0, 1.0, 1.0)
+    height = args.height
+    width = args.width
+    try:
+        from model import CS2Config, resolve_vit_preprocess  # resolve from the actual model config
+        vit_name = getattr(CS2Config, "vit_name_timm", "vit_base_patch14_dinov2.lvd142m")
+        pp = resolve_vit_preprocess(vit_name)
+        # timm returns mean/std in 0..1; DALI expects them in 0..255 when the input is uint8.
+        mean_01 = tuple(pp["mean"])
+        std_01 = tuple(pp["std"])
+        dali_mean = tuple(float(m) * 255.0 for m in mean_01)
+        dali_std  = tuple(float(s) * 255.0 for s in std_01)
+        height = int(pp["height"]) or height
+        width  = int(pp["width"])  or width
+        logging.info("Using model-driven preprocessing: vit=%s, HxW=%dx%d, mean=%s, std=%s",
+                    vit_name, height, width, mean_01, std_01)
+    except Exception as e:
+        logging.warning("Falling back to ImageNet defaults for preprocessing (%s).", e)
+        mean_01 = (0.485, 0.456, 0.406)
+        std_01  = (0.229, 0.224, 0.225)
+        dali_mean = tuple(float(m) * 255.0 for m in mean_01)
+        dali_std  = tuple(float(s) * 255.0 for s in std_01)
 
-# -----------------------------
-# Model / Optim / Loss
-# -----------------------------
+    dali_cfg = DaliConfig(
+        height=height,
+        width=width,
+        sequence_length=args.T_frames,
+        batch_size=args.batch_size,
+        num_threads=args.dali_threads,
+        device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
+        additional_decode_surfaces=args.decode_surfaces,
+        mean=dali_mean,                # <-- added
+        std=dali_std,                  # <-- added
+        shard_id=shard_id,
+        num_shards=num_shards,
+    )
+    dali_iter = DaliVideoInput(filelists, dali_cfg)
 
-def build_model(args) -> Any:
-    """
-    Instantiate CS2Config/CS2Transformer from model.py.
+    # Step 7: Feature fetcher
+    fetcher = FeatureFetcher(store)
 
-    TODO:
-    - Mirror CLI params to CS2Config (context frames, compute dtype, vision config, etc.).
-    - Optionally freeze ViT for warmup epochs (model.set_vit_frozen(True/False)).
-    - Consider torch.compile() if compatible.
-    """
-    # cfg = CS2Config(...)
-    # model = CS2Transformer(cfg, use_dummy_vision=False)
-    # return model
-    return None
+    # Step 8: Assembler
+    assembler = BatchAssembler(id_map, fetcher, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-
-def build_optim_sched(model: Any, args) -> Tuple[Any, Any]:
-    """
-    Build optimizer and LR scheduler.
-
-    Key insights:
-    - Use model.parameter_groups() to set group-wise LR scaling and weight decay.
-    - Common choice: AdamW + cosine decay with warmup.
-    - Step per-iteration or per-epoch depending on scheduler.
-    """
-    # groups = model.parameter_groups()
-    # for g in groups:
-    #     g["lr"] = args.lr * g.get("lr_scale", 1.0)
-    #     g["weight_decay"] = args.wd
-    # optim = torch.optim.AdamW(groups, betas=(0.9,0.999), eps=1e-8)
-    # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=total_steps)
-    # return optim, sched
-    return None, None
-
-
-def compute_losses(pred: Dict[str, Any], targets: Dict[str, Any], alive_mask) -> Dict[str, Any]:
-    """
-    Compute composite masked loss for multi-head outputs.
-
-    Heads (examples from plan):
-    - Heatmaps: BCEWithLogits/CE over spatial grid for player/enemy positions.
-    - Classification: keyboard/eco/inventory/active_weapon/round_state via CrossEntropy.
-    - Regression: mouse_delta_deg, stats via SmoothL1/L2.
-    - Round number: regression or CE if discretized.
-
-    Masking:
-    - Use alive_mask [B, T, 5] to exclude dead players' contributions.
-    - Optionally also apply frame_pad_mask to ignore DALI tail padding.
-
-    Return:
-    - {"loss_total": tensor, "loss_dict": {"heatmap":..., "keyboard":..., ...}}
-    """
-    # TODO: implement
-    return {}
-
-
-# -----------------------------
-# Train / Eval loops
-# -----------------------------
-
-def train_one_epoch(
-    model: Any,
-    dali_iter,
-    assembler: BatchAssembler,
-    optim: Any,
-    sched: Any,
-    device: str,
-    epoch: int,
-    args,
-) -> Dict[str, float]:
-    """
-    Single-epoch training loop.
-
-    Steps:
-    - Iterate DALI iterator (no DataLoader needed).
-    - For each batch:
-        batch = assembler.assemble(dali_batch, id_lookup=index)  # must have access to current EpochIndex
-        pred = model(batch_inputs)
-        loss_pack = compute_losses(pred, batch["targets"], batch["alive_mask"])
-        loss = loss_pack["loss_total"]
-        AMP: autocast + GradScaler (if fp16) or bfloat16 autocast (no scaler).
-        Backprop, grad clip, optim.step(), sched.step(), zero_grad.
-    - Track metrics and timing breakdown (decode vs LMDB fetch vs forward/backward).
-    - Return running loss averages for logging.
-    """
-    return {}
-
-
-@torch.no_grad()
-def evaluate(model: Any, dali_iter, assembler: BatchAssembler, device: str, args) -> Dict[str, float]:
-    """
-    Validation loop.
-
-    Steps mirror train_one_epoch but under no_grad() and model.eval():
-    - Assemble batch
-    - Forward
-    - Compute losses/metrics (accuracy for classification heads, error for regression, IoU for heatmaps)
-    - Aggregate across batches (and across DDP ranks if applicable)
-    """
-    return {}
-
-
-# -----------------------------
-# Checkpointing
-# -----------------------------
-
-def save_checkpoint(path: str, state: Dict[str, Any]) -> None:
-    """
-    Save a checkpoint including:
-    - model.state_dict()
-    - optimizer/scheduler state
-    - epoch, global_step
-    - RNG states if desired
-    - config snapshot
-    """
-    # torch.save(state, path)
-    pass
-
-
-def load_checkpoint(path: str, model: Any, optim: Any, sched: Any) -> int:
-    """
-    Load checkpoint and restore state.
-    Return: start_epoch (or global_step) to resume from.
-
-    Notes:
-    - Support strict=False if model has evolved.
-    - Handle AMP scaler state if using fp16.
-    """
-    # ckpt = torch.load(path, map_location="cpu")
-    # model.load_state_dict(ckpt["model"], strict=False)
-    # optim.load_state_dict(ckpt["optim"])
-    # sched.load_state_dict(ckpt["sched"])
-    # return ckpt.get("epoch", 0)
-    return 0
-
-
-# -----------------------------
-# Orchestration
-# -----------------------------
-
-def main() -> None:
-    """
-    High-level orchestration:
-    1) Parse args; set seeds; create run_dir subfolders (filelists/, ckpt/, logs/).
-    2) Load Manifest and build TeamRound list for selected split.
-    3) Build EpochIndex for the split and sample windows for epoch 0.
-    4) Write five aligned DALI filelists (pov0..pov4) for the epoch.
-    5) Build DALI pipeline + iterator for this epoch (with sharding if DDP).
-    6) Init LMDBStore and FeatureFetcher; create BatchAssembler.
-    7) Build model, optimizer, scheduler; resume if requested; amp config.
-    8) If eval-only: run evaluate() on a validation iterator and exit.
-    9) Training loop over epochs:
-        - Rebuild EpochIndex with seed + epoch.
-        - Rewrite filelists for the epoch.
-        - (Re)build DALI pipeline/iterator (tear down previous to avoid leaks).
-        - train_one_epoch(...)
-        - evaluate(...) periodically or each epoch.
-        - save_checkpoint(last.pt); if best metric, save best.pt.
-    10) Cleanup: close LMDB envs, finalize loggers.
-    """
-    # args = parse_args()
-    # set_seed(args.seed)
-    # manifest = Manifest(args.data_root, args.manifest); manifest.load()
-    # trs = manifest.get_split(args.split)
-    # index = EpochIndex(trs, T_frames=args.t_frames, allow_padding=True)
-    # index.build(seed_for_epoch=args.seed + 0)
-
-    # filelists_dir = os.path.join(args.run_dir, f"epoch_{0}")
-    # os.makedirs(filelists_dir, exist_ok=True)
-    # pov_lists = write_epoch_filelists(index, filelists_dir)
-
-    # H, W = map(int, args.size.lower().split("x"))
-    # pipe = build_dali_pipeline(
-    #     pov_filelists=pov_lists, size_hw=(H, W), T_frames=args.t_frames,
-    #     batch_size=args.batch_size, shard_id=args.local_rank, num_shards=args.world_size,
-    #     dali_threads=args.dali_threads, decode_surfaces=args.dali_decode_surfaces,
-    #     read_ahead=args.dali_read_ahead, prefetch_queue_depth=args.prefetch_queue_depth
-    # )
-    # dali_iter = make_dali_iterator(pipe, args.batch_size)
-
-    # store = LMDBStore(readahead=args.lmdb_readahead)
-    # fetcher = FeatureFetcher(store, n_mels=args.n_mels, mel_time=args.mel_time, expect_mels=args.mels_from_lmdb)
-    # assembler = BatchAssembler(fetcher, amp_mode=args.amp)
-
-    # model = build_model(args)
-    # optim, sched = build_optim_sched(model, args)
-
-    # if args.eval_only:
-    #     evaluate(model, dali_iter, assembler, device="cuda", args=args)
-    #     return
-
-    # for epoch in range(args.epochs):
-    #     # Regenerate epoch windows + filelists + pipeline
-    #     index.build(seed_for_epoch=args.seed + epoch)
-    #     filelists_dir = os.path.join(args.run_dir, f"epoch_{epoch}")
-    #     os.makedirs(filelists_dir, exist_ok=True)
-    #     pov_lists = write_epoch_filelists(index, filelists_dir)
-    #     # rebuild DALI pipeline/iterator ...
-    #     # train and eval ...
-    #     pass
-    pass
+    return dali_iter, assembler
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    # Example CLI-less smoke test (will fail if DALI missing or paths are placeholders)
+    data_root = os.environ.get("DATA_ROOT", "data")
+    manifest_path = os.path.join(data_root, "manifest.json")
+    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2)
+
+    if not DALI_AVAILABLE:
+        logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
+    else:
+        try:
+            dali_iter, assembler = build_data_iter(args)
+            with Timer("one batch") as t:
+                batch_raw = next(iter(dali_iter))  # dict with pov0..pov4, labels0..labels4
+            logging.info("DALI decode fetched in %.3fs", t.dt)
+            with Timer("assemble") as t2:
+                batch = assembler.assemble(batch_raw)
+            logging.info("Assembled batch in %.3fs; images=%s, mel=%s, alive=%s", t2.dt, tuple(batch["images"].shape), tuple(batch["mel_spectrogram"].shape), tuple(batch["alive_mask"].shape))
+        except Exception as e:
+            logging.exception("Data loader smoke test failed: %s", e)

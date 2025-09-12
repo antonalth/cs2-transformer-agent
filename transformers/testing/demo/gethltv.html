@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+
+<html>
+<head>
+<title>HLTV Demo Downloader</title>
+</head>
+<body>
+
+<h1>HLTV Demo Downloader</h1>
+
+<div>
+    <label for="demoNumber">Set Demo Number:</label>
+    <input type="number" id="demoNumber" value="100">
+    <button onclick="setDemoNumber()">Set</button>
+</div>
+
+<p>Current Demo Number: <span id="currentNumber">100</span></p>
+
+<button onclick="openNextDemo()">Next</button>
+
+<script>
+    let currentDemo = 100;
+
+    function updateCurrentNumberDisplay() {
+        document.getElementById('currentNumber').innerText = currentDemo;
+    }
+
+    function setDemoNumber() {
+        const inputElement = document.getElementById('demoNumber');
+        const newNumber = parseInt(inputElement.value, 10);
+
+        if (!isNaN(newNumber)) {
+            currentDemo = newNumber;
+            updateCurrentNumberDisplay();
+        }
+    }
+
+    function openNextDemo() {
+        const url = `https://www.hltv.org/download/demo/99${currentDemo}`;
+        window.open(url, '_blank');
+        currentDemo++;
+        updateCurrentNumberDisplay();
+        document.getElementById('demoNumber').value = currentDemo;
+    }
+
+</script>
+</body>
+</html>

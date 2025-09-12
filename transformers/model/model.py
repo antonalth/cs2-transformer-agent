@@ -248,6 +248,46 @@ class KVCache:
     value: torch.Tensor  # [B, L, H_kv, Hd]
     pos_end: int         # absolute position *after* last cached token
 
+# ---------------------------------------------------------------------------------
+# Helper: resolve ViT preprocessing (mean/std and input size) from timm by model name
+# ---------------------------------------------------------------------------------
+def resolve_vit_preprocess(vit_name: str) -> dict:
+    """
+    Returns a dict with:
+      - mean: Tuple[float, float, float] in [0,1] range
+      - std:  Tuple[float, float, float] in [0,1] range
+      - height: int
+      - width:  int
+
+    Uses timm to instantiate the model and read its pretrained data config.
+    Falls back to ImageNet defaults (224,224, mean/std) if unavailable.
+    """
+    try:
+        import timm
+        m = timm.create_model(vit_name, pretrained=True, num_classes=0)
+        # Try modern API first
+        mean = std = input_size = None
+        try:
+            from timm.data import resolve_model_data_config
+            data_cfg = resolve_model_data_config(m)
+            mean = tuple(map(float, data_cfg.get("mean", (0.485, 0.456, 0.406))))
+            std = tuple(map(float, data_cfg.get("std", (0.229, 0.224, 0.225))))
+            input_size = data_cfg.get("input_size", (3, 224, 224))
+        except Exception:
+            pass
+        if mean is None or std is None or input_size is None:
+            # Fallback to model attrs in older timm
+            cfg = getattr(m, "pretrained_cfg", None) or getattr(m, "default_cfg", {}) or {}
+            mean = tuple(map(float, cfg.get("mean", (0.485, 0.456, 0.406))))
+            std = tuple(map(float, cfg.get("std", (0.229, 0.224, 0.225))))
+            input_size = cfg.get("input_size", (3, 224, 224))
+        h, w = int(input_size[-2]), int(input_size[-1])
+        return {"mean": mean, "std": std, "height": h, "width": w}
+    except Exception:
+        # Last resort
+        return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225), "height": 224, "width": 224}
+
+
 def print_dataclass(dc: Any, indent: int = 0):
     """Recursively print a dataclass and its attributes."""
     if not is_dataclass(dc):
