@@ -186,7 +186,7 @@ def _rounds_parse_2x(demo_path: Path) -> list[dict[str, Any]]:
             bomb_plant_tick = plant_in_round["tick"][0]
         def team_list(side: str) -> list[list[Any]]:
             roster_df = spawns.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= fz_end) & (pl.col("user_side") == side)).select("user_name").unique()
-            filtered_roster_df = roster_df.filter(pl.col("user_name").apply(_is_valid_player, return_dtype=pl.Boolean))
+            filtered_roster_df = roster_df.filter(pl.col("user_name").map_elements(_is_valid_player, return_dtype=pl.Boolean))
             roster = filtered_roster_df.to_series().to_list()
             died = deaths.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= e_tick)).select("victim_name", "tick")
             death_map = dict(zip(died["victim_name"], died["tick"]))
