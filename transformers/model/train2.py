@@ -1,5 +1,5 @@
 """
-train.py — Data loading layer (Steps 1–9)
+train2.py — Data loading layer (Steps 1–9)
 
 This file implements the end-to-end data input subsystem for training, focusing on:
   1) Round discovery from each game's LMDB `_INFO` entry
@@ -549,7 +549,7 @@ class FeatureFetcher:
                 pdl_alive_list.append(pdl)
 
                 # Reinflation: map alive-only list back to fixed 5 slots using team_alive bitmask
-                mask_bits = int(gs.get("team_alive", 0))
+                mask_bits = int(gs["team_alive"][0]) #fix to use numpy (not a dict?)
                 j = 0
                 for slot in range(5):
                     if (mask_bits >> slot) & 1:

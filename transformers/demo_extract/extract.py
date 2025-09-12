@@ -486,8 +486,9 @@ def _rc_fetch_and_process_rounds(conn: sqlite3.Connection) -> List[Tuple]:
 
         # Stage 2: Strict Validation
         is_round_valid = True
-        if len(t_players) != 5 or len(ct_players) != 5:
-            print(f"    Skipping round {round_num}: Invalid team sizes. T: {len(t_players)}, CT: {len(ct_players)}. Expected 5v5.")
+        playercount = len(t_players) + len(ct_players)
+        if playercount < 10 or playercount > 12:
+            print(f"    Skipping round {round_num}: Invalid team sizes. T: {len(t_players)}, CT: {len(ct_players)}. Expected between 10 and 12 players.")
             is_round_valid = False
         
         if is_round_valid:

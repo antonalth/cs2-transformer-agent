@@ -149,15 +149,15 @@ def injection_mold_worker(demo_path, args):
             "--recdir", str(recdir_path),
             "--dbfile", str(db_path),
             "--outlmdb", str(lmdb_out_path),
-            "--workers", str(args.lmdbworkers),
-            "--quality", str(args.lmdbquality)
+            #"--workers", str(args.lmdbworkers),
+            #"--quality", str(args.lmdbquality)
         ]
         if args.lmdboverwrite:
             command.append("--overwrite")
         if args.lmdboverridesql:
             command.append("--overridesql")
-        if args.lmdbblockfile:
-            command.extend(["--blockfile", str(args.lmdbblockfile)])
+        #if args.lmdbblockfile:
+            #command.extend(["--blockfile", str(args.lmdbblockfile)])
 
         run_subprocess(command, prefix)
     except KeyboardInterrupt:
@@ -206,9 +206,9 @@ def main():
     lmdb_group = parser.add_argument_group('Phase 3: LMDB Generation Parameters')
     lmdb_group.add_argument("--lmdbpath", type=Path, help="Directory to store final LMDB folders. Required for step 3.")
     lmdb_group.add_argument("--step3workers", type=int, default=1, help="Number of parallel injection_mold.py processes to run.")
-    lmdb_group.add_argument("--lmdbworkers", type=int, default=5, help="Number of workers for each injection_mold.py instance.")
-    lmdb_group.add_argument("--lmdbquality", type=int, default=85, help="JPEG quality for injection_mold.py.")
-    lmdb_group.add_argument("--lmdbblockfile", type=Path, help="Path to blockfile for injection_mold.py.")
+    #lmdb_group.add_argument("--lmdbworkers", type=int, default=5, help="Number of workers for each injection_mold.py instance.")
+    #lmdb_group.add_argument("--lmdbquality", type=int, default=85, help="JPEG quality for injection_mold.py.")
+    #lmdb_group.add_argument("--lmdbblockfile", type=Path, help="Path to blockfile for injection_mold.py.")
     lmdb_group.add_argument("--lmdboverwrite", action="store_true", help="Pass --overwrite to injection_mold.py.")
     lmdb_group.add_argument("--lmdboverridesql", action="store_true", help="Pass --overridesql to injection_mold.py.")
 
