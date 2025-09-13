@@ -45,20 +45,17 @@ def setup_worker_logging(log_filename):
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     root_logger = logging.getLogger()
 
-    # Avoid adding duplicate handlers if this is called again in the same process
     if not root_logger.handlers:
         root_logger.setLevel(logging.INFO)
 
-        # Handler for writing to the log file
-        file_handler = logging.FileHandler(log_filename)
+        # FIX: Add encoding='utf-8' to the file handler
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
         file_handler.setFormatter(log_formatter)
         root_logger.addHandler(file_handler)
 
-        # Handler for writing to the console
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(log_formatter)
         root_logger.addHandler(console_handler)
-
 
 def run_subprocess(command_list, worker_prefix):
     """
