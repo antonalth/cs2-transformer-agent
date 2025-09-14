@@ -235,7 +235,7 @@ def main():
             LOG.critical(f"Media file not found: {mp4.name} or {wav.name} in {args.recdir}")
             sys.exit(1)
 
-        rec['mp4_path'], rec['wav_path'] = str(mp4), str(wav)
+        rec['mp4_path'], rec['wav_path'] = mp4.name, wav.name#str(mp4), str(wav)
         key = (round_num, team)
         recordings_map.setdefault(key, []).append(rec)
         round_team_pov_paths.setdefault(key, []).append(str(mp4))
