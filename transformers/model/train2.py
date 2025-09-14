@@ -402,26 +402,34 @@ class DaliInputPipeline:
         def pipe():
             outputs = []
             for k in range(5):
-                # --- Video Branch ---
-                video, label = fn.readers.video_resize(
+                # --- Video Branch (Corrected) ---
+                # FIX: Replaced video_resize with the more standard video reader, explicitly placing it on the GPU.
+                video, label = fn.readers.video(
+                    device="gpu",
                     name=f"VideoReader{k}",
                     file_list=self.video_filelists[k],
                     file_list_frame_num=True,
                     sequence_length=cfg.sequence_length,
-                    step=cfg.sequence_length,
                     random_shuffle=False,
                     pad_sequences=True,
                     read_ahead=cfg.read_ahead,
                     additional_decode_surfaces=cfg.additional_decode_surfaces,
-                    resize_x=cfg.width,
-                    resize_y=cfg.height,
-                    dtype=types.UINT8,
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     stick_to_shard=True,
                 )
+
+                # FIX: Added a separate resize operation since the new reader doesn't handle it.
+                video_resized = fn.resize(
+                    video,
+                    resize_x=cfg.width,
+                    resize_y=cfg.height,
+                    dtype=types.UINT8
+                )
+
+                # FIX: The tensor is already on the GPU, so the .gpu() call is removed.
                 video_norm = fn.crop_mirror_normalize(
-                    video.gpu(),
+                    video_resized,
                     output_layout="FCHW",
                     dtype=types.FLOAT16,
                     mean=cfg.mean,
