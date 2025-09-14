@@ -235,11 +235,11 @@ def main():
             LOG.critical(f"Media file not found: {mp4.name} or {wav.name} in {args.recdir}")
             sys.exit(1)
 
-        rec['mp4_path'], rec['wav_path'] = mp4.name, wav.name#str(mp4), str(wav)
+        rec['mp4_path'], rec['wav_path'] = str(mp4), str(wav)
         key = (round_num, team)
         recordings_map.setdefault(key, []).append(rec)
-        round_team_pov_paths.setdefault(key, []).append(str(mp4))
-        round_team_audio_paths.setdefault(key, []).append(str(wav))
+        round_team_pov_paths.setdefault(key, []).append(mp4.name)
+        round_team_audio_paths.setdefault(key, []).append(wav.name)
 
 
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
