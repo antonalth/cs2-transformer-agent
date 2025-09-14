@@ -397,82 +397,118 @@ class DaliInputPipeline:
 
     def _build_pipeline(self):
         cfg = self.cfg
+        video_filelists = self.video_filelists
+        audio_filelists = self.audio_filelists
+        FPS = cfg.fps  # label is start frame; convert to seconds via FPS
 
-        @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, prefetch_queue_depth=cfg.prefetch_queue_depth)
+        @pipeline_def(
+            batch_size=cfg.batch_size,
+            num_threads=cfg.num_threads,
+            device_id=cfg.device_id,
+            prefetch_queue_depth=cfg.prefetch_queue_depth,
+            seed=getattr(cfg, "seed", 42),
+            # NOTE: we intentionally DO NOT set exec_dynamic=True
+        )
         def pipe():
             outputs = []
-            for k in range(5):
-                # --- Video Branch ---
+
+            for k, (vlist, alist) in enumerate(zip(video_filelists, audio_filelists)):
+                # -------------------------
+                # VIDEO (GPU)
+                # -------------------------
                 video, label = fn.readers.video(
-                    device="gpu",
                     name=f"VideoReader{k}",
-                    file_list=self.video_filelists[k],
-                    file_list_frame_num=True,
+                    device="gpu",
+                    file_list=vlist,
                     sequence_length=cfg.sequence_length,
-                    random_shuffle=False,
-                    pad_sequences=True,
-                    read_ahead=cfg.read_ahead,
-                    additional_decode_surfaces=cfg.additional_decode_surfaces,
+                    file_list_frame_num=True,     # labels are start-frame indices
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
-                    stick_to_shard=True,
+                    random_shuffle=getattr(cfg, "shuffle", False),
+                    pad_last_batch=True,
+                    initial_fill=getattr(cfg, "initial_fill", 16),
+                    dtype=types.UINT8,
                 )
 
-                video_resized = fn.resize(
+                # resize / normalize on GPU
+                frames = fn.resize(
                     video,
-                    resize_x=cfg.width,
-                    resize_y=cfg.height,
-                    dtype=types.UINT8
+                    resize_x=cfg.resize_w,
+                    resize_y=cfg.resize_h,
+                    device="gpu",
+                )
+                frames = fn.crop_mirror_normalize(
+                    frames,
+                    device="gpu",
+                    dtype=types.FLOAT,
+                    output_layout="FCHW",          # frames, channels, height, width
+                    mean=cfg.mean,                 # e.g., (0.485, 0.456, 0.406)
+                    std=cfg.std,                   # e.g., (0.229, 0.224, 0.225)
                 )
 
-                video_norm = fn.crop_mirror_normalize(
-                    video_resized,
-                    output_layout="FCHW",
-                    dtype=types.FLOAT16,
-                    mean=cfg.mean,
-                    std=cfg.std,
+                # -------------------------
+                # AUDIO (keep on GPU)
+                # -------------------------
+                audio_raw, _ = fn.readers.file(
+                    name=f"AudioReader{k}",
+                    file_list=alist,
+                    shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards,
+                    random_shuffle=getattr(cfg, "shuffle", False),
+                )
+                decoded_audio, _ = fn.decoders.audio(
+                    audio_raw,
+                    sample_rate=cfg.sample_rate,
+                    downmix=True,
                 )
 
-                # --- Audio Branch ---
-                # FIX: 'label' is a GPU tensor from the video reader. Explicitly move it to the CPU
-                # before using it as an argument for the CPU-based slice operator.
-                label_cpu = label.cpu()
-                start_sec = label_cpu / FPS
+                # move decoded audio to GPU once; never bring label/audio to CPU
+                decoded_audio_gpu = decoded_audio.gpu()
+
+                # compute slice times on GPU from GPU label
+                start_sec    = label / FPS
                 duration_sec = cfg.sequence_length / FPS
-                
-                audio_raw, _ = fn.readers.file(name=f"AudioReader{k}", files=self.audio_filelists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards)
-                decoded_audio, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=True)
 
-                # Slice the audio on the CPU using the CPU-based start_sec
-                sliced_audio = fn.slice(
-                    decoded_audio,
+                sliced_audio_gpu = fn.slice(
+                    decoded_audio_gpu,
                     start=start_sec,
                     shape=duration_sec,
-                    axes=[0],
+                    axes=[0],                # slice along time
                     normalized_shape=False,
-                    axis_names="t"
+                    axis_names="t",
                 )
-                
-                sliced_audio_gpu = sliced_audio.gpu()
 
+                # spectrogram + mel on GPU
                 spec = fn.spectrogram(
                     sliced_audio_gpu,
-                    nfft=cfg.n_fft,
-                    window_length=cfg.win_length,
-                    window_step=cfg.hop_length
+                    nfft=cfg.nfft,
+                    window_length=cfg.window_length,  # samples
+                    window_step=cfg.hop_length,       # samples
+                    center_windows=False,
                 )
-                
-                mel_spec = fn.mel_filter_bank(
+                mel = fn.mel_filter_bank(
                     spec,
                     sample_rate=cfg.sample_rate,
-                    nfilter=cfg.n_mels,
+                    nfilter=cfg.mel_bins,
+                    freq_low=cfg.mel_fmin,
+                    freq_high=cfg.mel_fmax,
                 )
-                
-                outputs.extend([video_norm, label, mel_spec])
+                mel_db = fn.to_decibels(
+                    mel,
+                    multiplier=10.0,
+                    reference=1.0,
+                    cutoff_db=cfg.db_cutoff,
+                )
 
-            return tuple(outputs)
+                # Output order expected by your output_map: pov{k}, labels{k}, mel{k}
+                outputs += [frames, label, mel_db]
 
-        return pipe()
+            return outputs
+
+        pipe_inst = pipe()
+        pipe_inst.build()
+        return pipe_inst
+
 
     def __iter__(self):
         return self
