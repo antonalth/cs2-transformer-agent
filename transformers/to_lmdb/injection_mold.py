@@ -373,12 +373,24 @@ def main():
                 round_info = rounds_info[round_num]
                 team_roster = [p[0] for p in json.loads(round_info[f'{team.lower()}_team'])]
 
-                video_path_map = {Path(p).name.split('_')[2]: p for p in pov_video_paths}
+                # --- CORRECTED NAME PARSING LOGIC ---
+                video_path_map = {}
+                for p in pov_video_paths:
+                    # Reconstruct player name by joining the middle parts of the filename
+                    parts = Path(p).stem.split('_')
+                    player_name = '_'.join(parts[2:-2])
+                    video_path_map[player_name] = p
                 sorted_videos = [video_path_map.get(player_name) for player_name in team_roster]
 
                 pov_audio_paths = round_team_audio_paths.get((round_num, team), [])
-                audio_path_map = {Path(p).name.split('_')[2]: p for p in pov_audio_paths}
+                audio_path_map = {}
+                for p in pov_audio_paths:
+                    # Reconstruct player name by joining the middle parts of the filename
+                    parts = Path(p).stem.split('_')
+                    player_name = '_'.join(parts[2:-2])
+                    audio_path_map[player_name] = p
                 sorted_audio = [audio_path_map.get(player_name) for player_name in team_roster]
+                # --- END OF CORRECTION ---
 
                 if all(sorted_videos) and all(sorted_audio):
                     rounds_metadata.append({
