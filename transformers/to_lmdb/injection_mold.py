@@ -5,7 +5,7 @@ for model training.
 
 This version DOES NOT embed video frames or process audio. Instead, it processes
 all non-visual data (player states) and creates a final metadata key containing the
-paths to the corresponding MP4 files for each round-perspective, to be used
+paths to the corresponding MP4 and WAV files for each round-perspective, to be used
 by a video-aware training script. Audio processing (e.g., spectrograms) is
 expected to be handled at train time.
 
@@ -15,6 +15,9 @@ complexity and improve reliability.
 Patched:
 - Added perf timers for hot sections (db, LMDB writes).
 - Cached per-round JSON (team/enemy death ticks) outside the inner tick loop.
+- Added explicit check for WAV file existence.
+- Added WAV file paths to final metadata output.
+- Added --debug flag to print final metadata to stdout.
 """
 import argparse
 import json
@@ -174,7 +177,7 @@ def main():
     parser.add_argument("--outlmdb", required=True, type=Path, help="Path to write the output LMDB database.")
     parser.add_argument("--overwrite", action='store_true', help="If set, remove the output LMDB if it already exists.")
     parser.add_argument("--overridesql", action='store_true', help="If set, proceed even if DB flags a player as not recorded.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug-level logging.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug-level logging and print final metadata to stdout.")
     args = parser.parse_args()
 
     # --- Setup Logging ---
@@ -216,6 +219,7 @@ def main():
 
     recordings_map = {}
     round_team_pov_paths = {}
+    round_team_audio_paths = {}
     for rec_row in db_recordings:
         rec = dict(rec_row)
         round_num, team = rec['roundnumber'], rec['team']
@@ -231,10 +235,12 @@ def main():
             LOG.critical(f"Media file not found: {mp4.name} or {wav.name} in {args.recdir}")
             sys.exit(1)
 
-        rec['mp4_path'] = str(mp4)
+        rec['mp4_path'], rec['wav_path'] = str(mp4), str(wav)
         key = (round_num, team)
         recordings_map.setdefault(key, []).append(rec)
-        round_team_pov_paths.setdefault(key, []).append(str(f"{fname}.mp4"))
+        round_team_pov_paths.setdefault(key, []).append(str(mp4))
+        round_team_audio_paths.setdefault(key, []).append(str(wav))
+
 
     LOG.info(f"   - Validated {len(db_recordings)} recording entries.")
     for key, paths in round_team_pov_paths.items():
@@ -362,20 +368,26 @@ def main():
         # --- Phase 3: Finalize by writing metadata ---
         LOG.info("-> Phase 3: Finalizing and writing metadata...")
         rounds_metadata = []
-        for (round_num, team), pov_paths in sorted(round_team_pov_paths.items()):
-            if round_num in rounds_info and len(pov_paths) == 5:
+        for (round_num, team), pov_video_paths in sorted(round_team_pov_paths.items()):
+            if round_num in rounds_info and len(pov_video_paths) == 5:
                 round_info = rounds_info[round_num]
                 team_roster = [p[0] for p in json.loads(round_info[f'{team.lower()}_team'])]
-                path_map = {Path(p).name.split('_')[2]: p for p in pov_paths}
-                sorted_paths = [path_map.get(player_name) for player_name in team_roster]
 
-                if all(sorted_paths):
+                video_path_map = {Path(p).name.split('_')[2]: p for p in pov_video_paths}
+                sorted_videos = [video_path_map.get(player_name) for player_name in team_roster]
+
+                pov_audio_paths = round_team_audio_paths.get((round_num, team), [])
+                audio_path_map = {Path(p).name.split('_')[2]: p for p in pov_audio_paths}
+                sorted_audio = [audio_path_map.get(player_name) for player_name in team_roster]
+
+                if all(sorted_videos) and all(sorted_audio):
                     rounds_metadata.append({
                         "round_num": round_num,
                         "team": team,
                         "start_tick": round_info['starttick'],
                         "end_tick": round_info['endtick'],
-                        "pov_videos": sorted_paths
+                        "pov_videos": sorted_videos,
+                        "pov_audio": sorted_audio
                     })
                 else:
                     LOG.warning(f"Could not form a complete 5-player POV list for round {round_num}, team {team} due to name mismatch. Skipping from metadata.")
@@ -385,6 +397,10 @@ def main():
             with env.begin(write=True) as txn:
                 key = f"{demoname}_INFO".encode('utf-8')
                 txn.put(key, metadata_payload)
+
+        if args.debug:
+            LOG.info("--- Final Metadata (_INFO) ---")
+            print(metadata_payload.decode('utf-8'))
 
     except Exception as e:
         import traceback
