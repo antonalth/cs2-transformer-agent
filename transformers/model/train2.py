@@ -403,7 +403,9 @@ class DaliInputPipeline:
             outputs = []
             for k in range(5):
                 # --- Video Branch ---
+                # **FIX:** This is a GPU-only operator and must be explicitly placed on the GPU.
                 video, label = fn.readers.video_resize(
+                    device="gpu",  # <-- ADD THIS LINE
                     name=f"VideoReader{k}",
                     file_list=self.video_filelists[k],
                     file_list_frame_num=True,
@@ -420,23 +422,23 @@ class DaliInputPipeline:
                     num_shards=cfg.num_shards,
                     stick_to_shard=True,
                 )
+                # Note: The output 'video' is already on the GPU, so .gpu() is not strictly needed but is harmless.
+                # The output 'label' remains on the CPU, which is what we need.
                 video_norm = fn.crop_mirror_normalize(
-                    video.gpu(),
+                    video, # .gpu() is redundant here as the reader is on the GPU
                     output_layout="FCHW",
                     dtype=types.FLOAT16,
                     mean=cfg.mean,
                     std=cfg.std,
                 )
 
-                # --- Audio Branch ---
-                # **FIX:** Calculate start time on the CPU. 'label' is a CPU DataNode here.
+                # --- Audio Branch (with the previous fix) ---
                 start_sec = label / FPS
                 duration_sec = cfg.sequence_length / FPS
                 
                 audio_raw, _ = fn.readers.file(name=f"AudioReader{k}", files=self.audio_filelists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards)
                 decoded_audio, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=True)
 
-                # Slice the audio on the CPU using the CPU-based start_sec
                 sliced_audio = fn.slice(
                     decoded_audio,
                     start=start_sec,
@@ -446,18 +448,15 @@ class DaliInputPipeline:
                     axis_names="t"
                 )
                 
-                # **FIX:** Move the sliced audio to the GPU *before* heavy processing.
                 sliced_audio_gpu = sliced_audio.gpu()
 
-                # Generate spectrogram frames on the GPU
                 spec = fn.spectrogram(
-                    sliced_audio_gpu, # Use the GPU tensor
+                    sliced_audio_gpu,
                     nfft=cfg.n_fft,
                     window_length=cfg.win_length,
                     window_step=cfg.hop_length
                 )
                 
-                # Convert to Mel scale on the GPU
                 mel_spec = fn.mel_filter_bank(
                     spec,
                     sample_rate=cfg.sample_rate,
@@ -469,7 +468,7 @@ class DaliInputPipeline:
             return tuple(outputs)
 
         return pipe()
-
+    
     def __iter__(self):
         return self
 
