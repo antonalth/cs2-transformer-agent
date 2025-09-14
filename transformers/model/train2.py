@@ -341,19 +341,44 @@ class FilelistWriter:
 
 @dataclass
 class DaliConfig:
-    # Video
+    # -------- Video --------
     height: int = 224
     width: int = 224
     sequence_length: int = 512
     mean: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     std: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    # Audio
+    fps: float = 30.0  # used to convert label (frame index) -> seconds
+
+    # Optional explicit resize targets (if None, mirror width/height)
+    resize_h: Optional[int] = None
+    resize_w: Optional[int] = None
+
+    # Reader behavior
+    shuffle: bool = False
+    initial_fill: int = 16  # prefill for random shuffling
+
+    # -------- Audio --------
     sample_rate: float = 24000.0
-    n_mels: int = 128
-    n_fft: int = 1024
-    win_length: int = 1024 # n_fft
-    hop_length: int = 312 # Results in ~T_frames spectrograms
-    # Common
+
+    # Keep your original names, but the pipeline uses these aliases:
+    # (n_mels <-> mel_bins), (n_fft <-> nfft), (win_length <-> window_length)
+    n_mels: Optional[int] = 128
+    mel_bins: Optional[int] = None
+
+    n_fft: Optional[int] = 1024
+    nfft: Optional[int] = None
+
+    win_length: Optional[int] = 1024
+    window_length: Optional[int] = None
+
+    hop_length: int = 312  # results in ~T_frames spectrograms
+
+    # Mel / dB params used by the pipeline
+    mel_fmin: float = 0.0
+    mel_fmax: Optional[float] = None  # if None, set to sample_rate / 2 in __post_init__
+    db_cutoff: float = 80.0
+
+    # -------- Common / DALI runtime --------
     batch_size: int = 1
     num_threads: int = 4
     device_id: int = 0
@@ -362,6 +387,44 @@ class DaliConfig:
     read_ahead: bool = True
     shard_id: int = 0
     num_shards: int = 1
+    seed: int = 42
+
+    def __post_init__(self):
+        # Mirror resize_{h,w} from {height,width} if not explicitly set
+        if self.resize_h is None:
+            self.resize_h = self.height
+        if self.resize_w is None:
+            self.resize_w = self.width
+
+        # Sync alias pairs (prefer explicitly provided alias if set)
+        if self.mel_bins is None and self.n_mels is not None:
+            self.mel_bins = self.n_mels
+        if self.n_mels is None and self.mel_bins is not None:
+            self.n_mels = self.mel_bins
+
+        if self.nfft is None and self.n_fft is not None:
+            self.nfft = self.n_fft
+        if self.n_fft is None and self.nfft is not None:
+            self.n_fft = self.nfft
+
+        if self.window_length is None and self.win_length is not None:
+            self.window_length = self.win_length
+        if self.win_length is None and self.window_length is not None:
+            self.win_length = self.window_length
+
+        # Default mel_fmax to Nyquist if not set
+        if self.mel_fmax is None:
+            self.mel_fmax = float(self.sample_rate) / 2.0
+
+        # Basic sanity checks
+        assert self.sequence_length > 0, "sequence_length must be > 0"
+        assert self.batch_size > 0, "batch_size must be > 0"
+        assert self.num_threads > 0, "num_threads must be > 0"
+        assert self.nfft > 0, "nfft must be > 0"
+        assert self.window_length > 0, "window_length must be > 0"
+        assert self.hop_length > 0, "hop_length must be > 0"
+        assert len(self.mean) == 3 and len(self.std) == 3, "mean/std must be RGB triplets"
+
 
 
 class DaliInputPipeline:
