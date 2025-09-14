@@ -458,11 +458,12 @@ class DaliInputPipeline:
             [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, fill_last_batch=False
         )
 
+
     def _build_pipeline(self):
         cfg = self.cfg
         video_filelists = self.video_filelists
         audio_filelists = self.audio_filelists
-        FPS = cfg.fps  # convert start-frame label -> seconds
+        FPS = cfg.fps  # label is start frame; convert to seconds via FPS
 
         @pipeline_def(
             batch_size=cfg.batch_size,
@@ -470,26 +471,28 @@ class DaliInputPipeline:
             device_id=cfg.device_id,
             prefetch_queue_depth=cfg.prefetch_queue_depth,
             seed=getattr(cfg, "seed", 42),
-            # do NOT set exec_dynamic=True
+            # NOTE: no exec_dynamic here
         )
         def pipe():
             outputs = []
 
             for k, (vlist, alist) in enumerate(zip(video_filelists, audio_filelists)):
                 # -------------------------
-                # VIDEO (GPU)
+                # VIDEO branch (GPU-only)
                 # -------------------------
-                video, label = fn.readers.video(
+                video, _ = fn.readers.video(
                     name=f"VideoReader{k}",
                     device="gpu",
                     file_list=vlist,
                     sequence_length=cfg.sequence_length,
-                    file_list_frame_num=True,     # labels are start-frame indices
+                    file_list_frame_num=True,         # the filelist holds start-frame indices
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     random_shuffle=getattr(cfg, "shuffle", False),
                     pad_last_batch=True,
                     initial_fill=getattr(cfg, "initial_fill", 16),
+                    additional_decode_surfaces=getattr(cfg, "additional_decode_surfaces", 8),
+                    read_ahead=getattr(cfg, "read_ahead", True),
                     dtype=types.UINT8,
                 )
 
@@ -503,45 +506,51 @@ class DaliInputPipeline:
                     frames,
                     device="gpu",
                     dtype=types.FLOAT,
-                    output_layout="FCHW",
+                    output_layout="FCHW",              # frames, channels, height, width
                     mean=cfg.mean,
                     std=cfg.std,
                 )
 
                 # -------------------------
-                # AUDIO (GPU path)
+                # AUDIO branch (CPU -> GPU)
+                #   - get label from AUDIO reader (CPU)
+                #   - slice on CPU (start/shape must be CPU argument inputs)
+                #   - move to GPU for STFT/Mel
                 # -------------------------
-                audio_raw, _ = fn.readers.file(
+                audio_raw, label_cpu = fn.readers.file(
                     name=f"AudioReader{k}",
                     file_list=alist,
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     random_shuffle=getattr(cfg, "shuffle", False),
                 )
+
                 decoded_audio, _ = fn.decoders.audio(
                     audio_raw,
                     sample_rate=cfg.sample_rate,
                     downmix=True,
                 )
-                decoded_audio_gpu = decoded_audio.gpu()
 
-                # slice times on GPU
-                start_sec    = label / FPS
-                duration_sec = cfg.sequence_length / FPS
+                # Compute slice region on CPU (required by DALI for argument inputs)
+                start_sec    = label_cpu / FPS                # CPU DataNode
+                duration_sec = cfg.sequence_length / FPS      # Python scalar (broadcast)
 
-                sliced_audio_gpu = fn.slice(
-                    decoded_audio_gpu,
+                # Slice on CPU, then move result to GPU
+                sliced_audio = fn.slice(
+                    decoded_audio,
                     start=start_sec,
                     shape=duration_sec,
-                    axes=[0],                 # 1-D slice over time
+                    axes=[0],                 # slice over time dimension
                     normalized_shape=False,
                 )
+                sliced_audio_gpu = sliced_audio.gpu()
 
+                # Spectrogram + Mel on GPU
                 spec = fn.spectrogram(
                     sliced_audio_gpu,
                     nfft=cfg.nfft,
-                    window_length=cfg.window_length,
-                    window_step=cfg.hop_length,
+                    window_length=cfg.window_length,   # samples
+                    window_step=cfg.hop_length,        # samples
                     center_windows=False,
                 )
                 mel = fn.mel_filter_bank(
@@ -558,16 +567,14 @@ class DaliInputPipeline:
                     cutoff_db=cfg.db_cutoff,
                 )
 
-                # IMPORTANT: extend (flatten), don't append a tuple/list
-                outputs.extend((frames, label, mel_db))
+                # IMPORTANT: flatten outputs (no tuples)
+                outputs += [frames, label_cpu, mel_db]
 
-            # Return a flat tuple of DataNodes
             return tuple(outputs)
 
         pipe_inst = pipe()
         pipe_inst.build()
         return pipe_inst
-
 
 
     def __iter__(self):
