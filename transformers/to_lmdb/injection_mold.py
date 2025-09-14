@@ -10,6 +10,13 @@ by a video-aware training script.
 
 This refactored version is single-threaded to eliminate multiprocessing-related
 complexity and improve reliability.
+
+Patched:
+- Added perf timers for hot sections (audio read/decode, mel, db, LMDB writes).
+- Cached per-round JSON (team/enemy death ticks) outside the inner tick loop.
+- Fast mel path (default): precompute mel filterbank + Hann window, do single RFFT per frame,
+  return (n_mels, 1) dB-scaled vector.
+- Optional fallback to original librosa melspectrogram with --librosa-mel.
 """
 import argparse
 import json
@@ -19,6 +26,8 @@ import shutil
 import sqlite3
 import sys
 from pathlib import Path
+from time import perf_counter
+from collections import defaultdict
 
 import lmdb
 import numpy as np
@@ -44,10 +53,20 @@ AUDIO_CHANNELS = 2
 AUDIO_BIT_DEPTH = 2
 AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNELS * AUDIO_BIT_DEPTH
 INITIAL_MAP_SIZE = 2 * 1024**3  # 2 GB
-MAP_RESIZE_INCREMENT = 1 * 1024**3 # 1 GB
+MAP_RESIZE_INCREMENT = 1 * 1024**3  # 1 GB
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold")
+
+# --- Lightweight timing helpers ---
+TIMERS = defaultdict(float)
+def t(label: str):
+    class _T:
+        def __enter__(self):
+            self.t0 = perf_counter()
+        def __exit__(self, *exc):
+            TIMERS[label] += perf_counter() - self.t0
+    return _T()
 
 # =============================================================================
 # DATA ENCODING MAPPINGS (Canonical Source)
@@ -56,9 +75,11 @@ KEYBOARD_ONLY_ACTIONS = ["IN_ATTACK", "IN_JUMP", "IN_DUCK", "IN_FORWARD", "IN_BA
 ITEM_NAMES = sorted(list(set(["AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553", "AWP", "SSG 08", "G3SG1", "SCAR-20", "Glock-18", "USP-S", "P250", "P2000", "Dual Berettas", "Five-SeveN", "Tec-9", "CZ75-Auto", "R8 Revolver", "Desert Eagle", "MP9", "MAC-10", "MP7", "MP5-SD", "UMP-45", "P90", "PP-Bizon", "Nova", "XM1014", "MAG-7", "Sawed-Off", "M249", "Negev", "Knife", "knife_t", "knife_ct", "Bayonet", "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife", "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers", "Ursus Knife", "Navaja Knife", "Stiletto Knife", "Talon Knife", "Classic Knife", "Paracord Knife", "Survival Knife", "Nomad Knife", "Skeleton Knife", "High Explosive Grenade", "Flashbang", "Smoke Grenade", "Molotov", "Incendiary Grenade", "Decoy Grenade", "C4 Explosive", "Defuse Kit", "Zeus x27", "Kevlar Vest", "Kevlar and Helmet", "Helmet"])))
 ECO_ACTIONS = ["IN_BUYZONE"]
 safe_item_names = [name.replace(" ", "_").replace("-", "_") for name in ITEM_NAMES]
-for name in safe_item_names: ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
+for name in safe_item_names:
+    ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
 item_id_map_names = ["deagle", "elite", "fiveseven", "glock", "ak47", "aug", "awp", "famas", "g3sg1", "galilar", "m249", "m4a1", "mac10", "p90", "mp5sd", "ump45", "xm1014", "bizon", "mag7", "negev", "sawedoff", "tec9", "zeus","p2000", "mp7", "mp9", "nova", "p250", "scar20", "sg556", "ssg08", "knife", "flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade", "c4", "knife_t", "m4a1_silencer", "usp_silencer", "cz75a", "revolver", "defuser", "vest", "vesthelm"]
-for name in item_id_map_names: ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
+for name in item_id_map_names:
+    ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
 ECO_ACTIONS = sorted(list(set(ECO_ACTIONS)))
 KEYBOARD_TO_BIT = {action: i for i, action in enumerate(KEYBOARD_ONLY_ACTIONS)}
 ECO_TO_BIT = {action: i for i, action in enumerate(ECO_ACTIONS)}
@@ -86,28 +107,18 @@ def merge_tick_data(tick1, tick2):
     m = tick1.copy()
 
     # --- FIX for Mouse Deltas ---
-    # Mouse movements are deltas and should be summed.
-    # The `(get() or 0)` pattern handles None values correctly here.
     m['mouse_x'] = (tick1.get('mouse_x') or 0) + (tick2.get('mouse_x') or 0)
     m['mouse_y'] = (tick1.get('mouse_y') or 0) + (tick2.get('mouse_y') or 0)
 
     # --- FIX for Position Averaging ---
-    # This logic gathers only valid (non-None) coordinate values and calculates
-    # a true average, solving both the TypeError and the division bug.
     for coord in ['position_x', 'position_y', 'position_z']:
         positions = []
-        
-        # Get value from the first tick, add it to list if it's not None
         pos1 = tick1.get(coord)
         if pos1 is not None:
             positions.append(pos1)
-
-        # Get value from the second tick, add it to list if it's not None
         pos2 = tick2.get(coord)
         if pos2 is not None:
             positions.append(pos2)
-
-        # If the list has any values, calculate the mean. Otherwise, default to 0.0.
         if positions:
             m[coord] = sum(positions) / len(positions)
         else:
@@ -183,6 +194,8 @@ def main():
     audio_group.add_argument('--n-mels', type=int, default=128, help="Number of Mel bands to generate (Default: 128).")
     audio_group.add_argument('--n-fft', type=int, default=2048, help="Length of the FFT window (Default: 2048).")
     audio_group.add_argument('--hop-length', type=int, default=512, help="Samples between frames (Default: 512).")
+    audio_group.add_argument('--librosa-mel', action='store_true',
+                             help="Use librosa.feature.melspectrogram (slow path) instead of fast RFFT+mel.")
     args = parser.parse_args()
 
     # --- Setup Logging ---
@@ -207,13 +220,16 @@ def main():
     # --- Phase 1: Load all metadata from database ---
     LOG.info("-> Phase 1: Validating database and loading all metadata into memory...")
     try:
-        conn = sqlite3.connect(f"file:{args.dbfile}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        rounds_info = {r['round']: dict(r) for r in conn.execute("SELECT * FROM rounds").fetchall()}
+        with t("db_connect"):
+            conn = sqlite3.connect(f"file:{args.dbfile}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        with t("db_load_rounds"):
+            rounds_info = {r['round']: dict(r) for r in conn.execute("SELECT * FROM rounds").fetchall()}
         LOG.info(f"   - Loaded info for {len(rounds_info)} rounds.")
-
-        db_recordings = conn.execute("SELECT * FROM recording ORDER BY roundnumber, team, playername").fetchall()
-        player_data_cache = {f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall()}
+        with t("db_load_recordings"):
+            db_recordings = conn.execute("SELECT * FROM recording ORDER BY roundnumber, team, playername").fetchall()
+        with t("db_load_player_cache"):
+            player_data_cache = {f"{r['playername']}:{r['tick']}": dict(r) for r in conn.execute("SELECT * FROM player").fetchall()}
         LOG.info(f"   - Cached data for {len(player_data_cache)} player-tick entries.")
     finally:
         if 'conn' in locals():
@@ -246,6 +262,15 @@ def main():
         if len(paths) != 5:
             LOG.warning(f"Round perspective {key} does not have 5 recordings ({len(paths)} found). It will be skipped.")
 
+    # --- Precompute fast mel path setup (if audio enabled and not using librosa slow path) ---
+    MEL_FB = None
+    HANN = None
+    EPS = 1e-10
+    if not args.no_audio and not args.librosa_mel:
+        with t("mel_setup"):
+            MEL_FB = librosa.filters.mel(sr=AUDIO_SAMPLE_RATE, n_fft=args.n_fft, n_mels=args.n_mels).astype(np.float32)
+            HANN = np.hanning(args.n_fft).astype(np.float32)
+
     # --- Phase 2: Process rounds sequentially and write to LMDB ---
     demoname = args.recdir.name
     tasks = sorted(recordings_map.keys())
@@ -257,18 +282,22 @@ def main():
         for round_num, team in pbar:
             round_data = recordings_map.get((round_num, team), [])
             if len(round_data) != 5:
-                continue # Skip perspectives that don't have all 5 players
+                continue  # Skip perspectives that don't have all 5 players
 
             # Open all audio files for this perspective
             audio_files = {rec['playername']: open(rec['wav_path'], 'rb') for rec in round_data}
             for aud in audio_files.values():
-                aud.seek(44) # Skip WAV header
+                aud.seek(44)  # Skip WAV header
 
-            # Get rosters
-            t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]
-            ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
-            current_roster = t_roster if team == 'T' else ct_roster
-            enemy_roster = ct_roster if team == 'T' else t_roster
+            # Get rosters and cache death tick maps ONCE per perspective
+            with t("json_rosters"):
+                t_roster = [p[0] for p in json.loads(rounds_info[round_num]['t_team'])]
+                ct_roster = [p[0] for p in json.loads(rounds_info[round_num]['ct_team'])]
+                current_roster = t_roster if team == 'T' else ct_roster
+                enemy_roster = ct_roster if team == 'T' else t_roster
+            with t("json_team_maps"):
+                team_deaths_map = {p[0]: p[1] for p in json.loads(rounds_info[round_num][f"{team.lower()}_team"])}
+                enemy_deaths_map = {p[0]: p[1] for p in json.loads(rounds_info[round_num][f"{'ct' if team == 'T' else 't'}_team"])}
 
             start_tick = rounds_info[round_num]['starttick']
             end_tick = max(rec['stoptick'] for rec in round_data)
@@ -276,10 +305,10 @@ def main():
 
             for tick in range(start_tick, end_tick + 1, TICKS_PER_FRAME):
                 # --- Process Game State ---
-                team_deaths = {p[0]: p[1] for p in json.loads(rounds_info[round_num][f"{team.lower()}_team"])}
-                enemy_deaths = {p[0]: p[1] for p in json.loads(rounds_info[round_num][f"{'ct' if team == 'T' else 't'}_team"])}
-                team_alive = sum(1 << i for i, n in enumerate(current_roster) if team_deaths.get(n, 0) == -1 or tick < team_deaths.get(n, 0))
-                enemy_alive = sum(1 << i for i, n in enumerate(enemy_roster) if enemy_deaths.get(n, 0) == -1 or tick < enemy_deaths.get(n, 0))
+                team_alive = sum(1 << i for i, n in enumerate(current_roster)
+                                 if team_deaths_map.get(n, 0) == -1 or tick < team_deaths_map.get(n, 0))
+                enemy_alive = sum(1 << i for i, n in enumerate(enemy_roster)
+                                  if enemy_deaths_map.get(n, 0) == -1 or tick < enemy_deaths_map.get(n, 0))
 
                 gs = np.zeros(1, dtype=gs_dtype)
                 gs[0]['tick'], gs[0]['team_alive'], gs[0]['enemy_alive'] = tick, team_alive, enemy_alive
@@ -309,28 +338,56 @@ def main():
                     try:
                         p_idx = current_roster.index(pn)
                     except ValueError:
-                        continue # Player not in the official roster for this round
+                        continue  # Player not in the official roster for this round
 
                     if not ((team_alive >> p_idx) & 1) or tick >= rec['stoptick']:
-                        continue # Player is dead or their recording stopped
+                        continue  # Player is dead or their recording stopped
 
                     # Process Audio
                     mel_spectrogram = None
                     if not args.no_audio:
-                        audio_bytes = audio_files[pn].read(AUDIO_BYTES_PER_FRAME)
+                        with t("audio_read"):
+                            audio_bytes = audio_files[pn].read(AUDIO_BYTES_PER_FRAME)
                         if len(audio_bytes) == AUDIO_BYTES_PER_FRAME:
-                            waveform_int = np.frombuffer(audio_bytes, dtype=np.int16)
-                            waveform_float = waveform_int.astype(np.float32) / 32768.0
-                            waveform_mono = waveform_float.reshape((-1, AUDIO_CHANNELS)).mean(axis=1)
-                            
-                            if len(waveform_mono) < args.n_fft:
-                                pad_width = args.n_fft - len(waveform_mono)
-                                waveform_mono = np.pad(waveform_mono, (pad_width // 2, pad_width - pad_width // 2), mode='constant')
+                            with t("audio_decode"):
+                                waveform_int = np.frombuffer(audio_bytes, dtype=np.int16)
+                                waveform_float = waveform_int.astype(np.float32) * (1.0 / 32768.0)
+                                waveform_mono = waveform_float.reshape((-1, AUDIO_CHANNELS)).mean(axis=1)
 
-                            S = librosa.feature.melspectrogram(y=waveform_mono, sr=AUDIO_SAMPLE_RATE, n_mels=args.n_mels, n_fft=args.n_fft, hop_length=args.hop_length)
-                            mel_spectrogram = librosa.power_to_db(S, ref=np.max)
+                                if len(waveform_mono) < args.n_fft:
+                                    pad_width = args.n_fft - len(waveform_mono)
+                                    waveform_mono = np.pad(
+                                        waveform_mono,
+                                        (pad_width // 2, pad_width - pad_width // 2),
+                                        mode='constant'
+                                    )
+
+                            if args.librosa_mel:
+                                # Original (slow) path for parity testing
+                                with t("mel_librosa"):
+                                    S = librosa.feature.melspectrogram(
+                                        y=waveform_mono,
+                                        sr=AUDIO_SAMPLE_RATE,
+                                        n_mels=args.n_mels,
+                                        n_fft=args.n_fft,
+                                        hop_length=args.hop_length,
+                                        center=False,
+                                        power=2.0
+                                    )
+                                with t("db"):
+                                    mel_spectrogram = librosa.power_to_db(S, ref=np.max)
+                            else:
+                                # Fast path: single-frame RFFT + precomputed mel filter; return (n_mels, 1)
+                                with t("mel_rfft"):
+                                    frame = waveform_mono[:args.n_fft] * HANN
+                                    P = np.abs(np.fft.rfft(frame, n=args.n_fft))**2  # power spectrum
+                                    mel = MEL_FB @ P  # (n_mels,)
+                                with t("db"):
+                                    mel_db = 10.0 * np.log10(np.maximum(mel, 1e-10))
+                                    mel_db -= mel_db.max() if mel_db.size > 0 else 0.0
+                                    mel_spectrogram = mel_db[:, None]
                         else:
-                            continue # Not enough audio data, skip this tick for this player
+                            continue  # Not enough audio data, skip this tick for this player
 
                     # Process Player State
                     td = merge_tick_data(player_data_cache.get(f"{pn}:{tick}"), player_data_cache.get(f"{pn}:{tick+1}"))
@@ -350,36 +407,38 @@ def main():
                         pi[0]['health'], pi[0]['armor'], pi[0]['money'] = td.get('health', 0), td.get('armor', 0), td.get('money', 0)
                         im, wm = get_inventory_bitmasks(td.get('inventory'), td.get('active_weapon'), ITEM_TO_INDEX)
                         pi[0]['inventory_bitmask'], pi[0]['active_weapon_bitmask'] = im, wm
-                    
+
                     pdl_unsorted.append((p_idx, (pi, None, mel_spectrogram)))
 
                 if not pdl_unsorted:
-                    continue # No living, recorded players this tick
+                    continue  # No living, recorded players this tick
 
                 # Sort player data by their index in the roster
                 pdl_unsorted.sort(key=lambda item: item[0])
                 pdl = [item[1] for item in pdl_unsorted]
 
                 key = f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode('utf-8')
-                payload = msgpack.packb({"game_state": gs, "player_data": pdl}, use_bin_type=True, default=mpnp.encode)
+                with t("payload_pack"):
+                    payload = msgpack.packb({"game_state": gs, "player_data": pdl}, use_bin_type=True, default=mpnp.encode)
                 results_for_round.append((key, payload))
 
             # --- Write accumulated results for the round to LMDB ---
             if results_for_round:
                 # Pre-check and resize if needed (must NOT be inside a write txn)
-                batch_size = sum(len(p) for _, p in results_for_round)
-                info = env.info()
-                stats = env.stat()
-                available = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                if available < batch_size:
-                    new_size = int(info['map_size'] + max(batch_size * 2, MAP_RESIZE_INCREMENT))
-                    LOG.info(f"Resizing LMDB map from {info['map_size']/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
-                    env.set_mapsize(new_size)
+                with t("lmdb_resize_check"):
+                    batch_size = sum(len(p) for _, p in results_for_round)
+                    info = env.info()
+                    stats = env.stat()
+                    available = info['map_size'] - (info['last_pgno'] * stats['psize'])
+                    if available < batch_size:
+                        new_size = int(info['map_size'] + max(batch_size * 2, MAP_RESIZE_INCREMENT))
+                        LOG.info(f"Resizing LMDB map from {info['map_size']/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
+                        env.set_mapsize(new_size)
 
-                # Now open a fresh transaction and write
-                with env.begin(write=True) as txn:
-                    cursor = txn.cursor()
-                    cursor.putmulti(results_for_round)
+                with t("lmdb_write"):
+                    with env.begin(write=True) as txn:
+                        cursor = txn.cursor()
+                        cursor.putmulti(results_for_round)
 
             # Close all audio files for this perspective
             for aud in audio_files.values():
@@ -407,9 +466,10 @@ def main():
                     LOG.warning(f"Could not form a complete 5-player POV list for round {round_num}, team {team} due to name mismatch. Skipping from metadata.")
 
         metadata_payload = json.dumps({"demoname": demoname, "rounds": rounds_metadata}, indent=2).encode('utf-8')
-        with env.begin(write=True) as txn:
-            key = f"{demoname}_INFO".encode('utf-8')
-            txn.put(key, metadata_payload)
+        with t("lmdb_write"):
+            with env.begin(write=True) as txn:
+                key = f"{demoname}_INFO".encode('utf-8')
+                txn.put(key, metadata_payload)
 
     except Exception as e:
         import traceback
@@ -419,6 +479,14 @@ def main():
     finally:
         if 'env' in locals():
             env.close()
+
+    # --- Timing summary ---
+    if TIMERS:
+        total = sum(TIMERS.values())
+        LOG.info("---- Timing (hot sections) ----")
+        for k, v in sorted(TIMERS.items(), key=lambda kv: kv[1], reverse=True):
+            LOG.info(f"{k:18s} {v:8.3f}s  ({(v/total*100):5.1f}%)")
+        LOG.info(f"Total timed sections: {total:.3f}s")
 
     LOG.info("All processing steps completed successfully.")
     LOG.info(f"Final LMDB database is at: {args.outlmdb}")
