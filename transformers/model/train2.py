@@ -395,7 +395,7 @@ class DaliInputPipeline:
             [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, fill_last_batch=False
         )
 
-    def _build_pipeline(self):
+        def _build_pipeline(self):
         cfg = self.cfg
 
         @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, prefetch_queue_depth=cfg.prefetch_queue_depth)
@@ -429,14 +429,14 @@ class DaliInputPipeline:
                 )
 
                 # --- Audio Branch ---
-                # DALI reads the whole file; we slice it based on video start_f (label)
-                start_sec = label.gpu() / FPS
+                # **FIX:** Calculate start time on the CPU. 'label' is a CPU DataNode here.
+                start_sec = label / FPS
                 duration_sec = cfg.sequence_length / FPS
                 
                 audio_raw, _ = fn.readers.file(name=f"AudioReader{k}", files=self.audio_filelists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards)
                 decoded_audio, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=True)
 
-                # Slice the audio to match the video window
+                # Slice the audio on the CPU using the CPU-based start_sec
                 sliced_audio = fn.slice(
                     decoded_audio,
                     start=start_sec,
@@ -446,15 +446,18 @@ class DaliInputPipeline:
                     axis_names="t"
                 )
                 
-                # Generate spectrogram frames aligned with video frames
+                # **FIX:** Move the sliced audio to the GPU *before* heavy processing.
+                sliced_audio_gpu = sliced_audio.gpu()
+
+                # Generate spectrogram frames on the GPU
                 spec = fn.spectrogram(
-                    sliced_audio,
+                    sliced_audio_gpu, # Use the GPU tensor
                     nfft=cfg.n_fft,
                     window_length=cfg.win_length,
                     window_step=cfg.hop_length
                 )
                 
-                # Convert to Mel scale
+                # Convert to Mel scale on the GPU
                 mel_spec = fn.mel_filter_bank(
                     spec,
                     sample_rate=cfg.sample_rate,
