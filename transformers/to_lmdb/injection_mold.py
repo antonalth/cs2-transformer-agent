@@ -3,20 +3,18 @@
 injection_mold.py - Compile CS2 recordings and database into a unified LMDB
 for model training.
 
-This version DOES NOT embed video frames. Instead, it processes all non-visual
-data (player states, audio) and creates a final metadata key containing the
+This version DOES NOT embed video frames or process audio. Instead, it processes
+all non-visual data (player states) and creates a final metadata key containing the
 paths to the corresponding MP4 files for each round-perspective, to be used
-by a video-aware training script.
+by a video-aware training script. Audio processing (e.g., spectrograms) is
+expected to be handled at train time.
 
 This refactored version is single-threaded to eliminate multiprocessing-related
 complexity and improve reliability.
 
 Patched:
-- Added perf timers for hot sections (audio read/decode, mel, db, LMDB writes).
+- Added perf timers for hot sections (db, LMDB writes).
 - Cached per-round JSON (team/enemy death ticks) outside the inner tick loop.
-- Fast mel path (default): precompute mel filterbank + Hann window, do single RFFT per frame,
-  return (n_mels, 1) dB-scaled vector.
-- Optional fallback to original librosa melspectrogram with --librosa-mel.
 """
 import argparse
 import json
@@ -37,21 +35,10 @@ from tqdm import tqdm
 import msgpack
 import msgpack_numpy as mpnp
 
-try:
-    import librosa
-except ImportError:
-    print("Error: The 'librosa' library is required for spectrogram generation.", file=sys.stderr)
-    print("Please install it using: pip install librosa", file=sys.stderr)
-    sys.exit(1)
-
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64
 EXPECTED_VIDEO_FPS = 32
 TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
-AUDIO_SAMPLE_RATE = 44100
-AUDIO_CHANNELS = 2
-AUDIO_BIT_DEPTH = 2
-AUDIO_BYTES_PER_FRAME = (AUDIO_SAMPLE_RATE // EXPECTED_VIDEO_FPS) * AUDIO_CHANNELS * AUDIO_BIT_DEPTH
 INITIAL_MAP_SIZE = 2 * 1024**3  # 2 GB
 MAP_RESIZE_INCREMENT = 1 * 1024**3  # 1 GB
 
@@ -188,14 +175,6 @@ def main():
     parser.add_argument("--overwrite", action='store_true', help="If set, remove the output LMDB if it already exists.")
     parser.add_argument("--overridesql", action='store_true', help="If set, proceed even if DB flags a player as not recorded.")
     parser.add_argument("--debug", action="store_true", help="Enable debug-level logging.")
-
-    audio_group = parser.add_argument_group('Audio Spectrogram Parameters')
-    audio_group.add_argument('--no-audio', action='store_true', help="Disable audio processing and store None for audio.")
-    audio_group.add_argument('--n-mels', type=int, default=128, help="Number of Mel bands to generate (Default: 128).")
-    audio_group.add_argument('--n-fft', type=int, default=2048, help="Length of the FFT window (Default: 2048).")
-    audio_group.add_argument('--hop-length', type=int, default=512, help="Samples between frames (Default: 512).")
-    audio_group.add_argument('--librosa-mel', action='store_true',
-                             help="Use librosa.feature.melspectrogram (slow path) instead of fast RFFT+mel.")
     args = parser.parse_args()
 
     # --- Setup Logging ---
@@ -252,7 +231,7 @@ def main():
             LOG.critical(f"Media file not found: {mp4.name} or {wav.name} in {args.recdir}")
             sys.exit(1)
 
-        rec['mp4_path'], rec['wav_path'] = str(mp4), wav
+        rec['mp4_path'] = str(mp4)
         key = (round_num, team)
         recordings_map.setdefault(key, []).append(rec)
         round_team_pov_paths.setdefault(key, []).append(str(f"{fname}.mp4"))
@@ -261,15 +240,6 @@ def main():
     for key, paths in round_team_pov_paths.items():
         if len(paths) != 5:
             LOG.warning(f"Round perspective {key} does not have 5 recordings ({len(paths)} found). It will be skipped.")
-
-    # --- Precompute fast mel path setup (if audio enabled and not using librosa slow path) ---
-    MEL_FB = None
-    HANN = None
-    EPS = 1e-10
-    if not args.no_audio and not args.librosa_mel:
-        with t("mel_setup"):
-            MEL_FB = librosa.filters.mel(sr=AUDIO_SAMPLE_RATE, n_fft=args.n_fft, n_mels=args.n_mels).astype(np.float32)
-            HANN = np.hanning(args.n_fft).astype(np.float32)
 
     # --- Phase 2: Process rounds sequentially and write to LMDB ---
     demoname = args.recdir.name
@@ -283,11 +253,6 @@ def main():
             round_data = recordings_map.get((round_num, team), [])
             if len(round_data) != 5:
                 continue  # Skip perspectives that don't have all 5 players
-
-            # Open all audio files for this perspective
-            audio_files = {rec['playername']: open(rec['wav_path'], 'rb') for rec in round_data}
-            for aud in audio_files.values():
-                aud.seek(44)  # Skip WAV header
 
             # Get rosters and cache death tick maps ONCE per perspective
             with t("json_rosters"):
@@ -343,52 +308,6 @@ def main():
                     if not ((team_alive >> p_idx) & 1) or tick >= rec['stoptick']:
                         continue  # Player is dead or their recording stopped
 
-                    # Process Audio
-                    mel_spectrogram = None
-                    if not args.no_audio:
-                        with t("audio_read"):
-                            audio_bytes = audio_files[pn].read(AUDIO_BYTES_PER_FRAME)
-                        if len(audio_bytes) == AUDIO_BYTES_PER_FRAME:
-                            with t("audio_decode"):
-                                waveform_int = np.frombuffer(audio_bytes, dtype=np.int16)
-                                waveform_float = waveform_int.astype(np.float32) * (1.0 / 32768.0)
-                                waveform_mono = waveform_float.reshape((-1, AUDIO_CHANNELS)).mean(axis=1)
-
-                                if len(waveform_mono) < args.n_fft:
-                                    pad_width = args.n_fft - len(waveform_mono)
-                                    waveform_mono = np.pad(
-                                        waveform_mono,
-                                        (pad_width // 2, pad_width - pad_width // 2),
-                                        mode='constant'
-                                    )
-
-                            if args.librosa_mel:
-                                # Original (slow) path for parity testing
-                                with t("mel_librosa"):
-                                    S = librosa.feature.melspectrogram(
-                                        y=waveform_mono,
-                                        sr=AUDIO_SAMPLE_RATE,
-                                        n_mels=args.n_mels,
-                                        n_fft=args.n_fft,
-                                        hop_length=args.hop_length,
-                                        center=False,
-                                        power=2.0
-                                    )
-                                with t("db"):
-                                    mel_spectrogram = librosa.power_to_db(S, ref=np.max)
-                            else:
-                                # Fast path: single-frame RFFT + precomputed mel filter; return (n_mels, 1)
-                                with t("mel_rfft"):
-                                    frame = waveform_mono[:args.n_fft] * HANN
-                                    P = np.abs(np.fft.rfft(frame, n=args.n_fft))**2  # power spectrum
-                                    mel = MEL_FB @ P  # (n_mels,)
-                                with t("db"):
-                                    mel_db = 10.0 * np.log10(np.maximum(mel, 1e-10))
-                                    mel_db -= mel_db.max() if mel_db.size > 0 else 0.0
-                                    mel_spectrogram = mel_db[:, None]
-                        else:
-                            continue  # Not enough audio data, skip this tick for this player
-
                     # Process Player State
                     td = merge_tick_data(player_data_cache.get(f"{pn}:{tick}"), player_data_cache.get(f"{pn}:{tick+1}"))
                     pi = np.zeros(1, dtype=pi_dtype)
@@ -408,7 +327,7 @@ def main():
                         im, wm = get_inventory_bitmasks(td.get('inventory'), td.get('active_weapon'), ITEM_TO_INDEX)
                         pi[0]['inventory_bitmask'], pi[0]['active_weapon_bitmask'] = im, wm
 
-                    pdl_unsorted.append((p_idx, (pi, None, mel_spectrogram)))
+                    pdl_unsorted.append((p_idx, pi))
 
                 if not pdl_unsorted:
                     continue  # No living, recorded players this tick
@@ -439,10 +358,6 @@ def main():
                     with env.begin(write=True) as txn:
                         cursor = txn.cursor()
                         cursor.putmulti(results_for_round)
-
-            # Close all audio files for this perspective
-            for aud in audio_files.values():
-                aud.close()
 
         # --- Phase 3: Finalize by writing metadata ---
         LOG.info("-> Phase 3: Finalizing and writing metadata...")
