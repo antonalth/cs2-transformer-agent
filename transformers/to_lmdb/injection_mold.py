@@ -366,19 +366,18 @@ def main():
 
             # --- Write accumulated results for the round to LMDB ---
             if results_for_round:
-                with env.begin(write=True) as txn:
-                    # Check if DB needs resizing before writing
-                    batch_size = sum(len(p) for _, p in results_for_round)
-                    info = env.info()
-                    stats = env.stat()
-                    available = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                    if available < batch_size:
-                        new_size = info['map_size'] + max(batch_size * 1.5, MAP_RESIZE_INCREMENT)
-                        LOG.info(f"Resizing LMDB map from {info['map_size']/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
-                        txn.commit() # Must commit before resizing
-                        env.set_mapsize(new_size)
-                        txn = env.begin(write=True) # Start new transaction
+                # Pre-check and resize if needed (must NOT be inside a write txn)
+                batch_size = sum(len(p) for _, p in results_for_round)
+                info = env.info()
+                stats = env.stat()
+                available = info['map_size'] - (info['last_pgno'] * stats['psize'])
+                if available < batch_size:
+                    new_size = int(info['map_size'] + max(batch_size * 2, MAP_RESIZE_INCREMENT))
+                    LOG.info(f"Resizing LMDB map from {info['map_size']/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
+                    env.set_mapsize(new_size)
 
+                # Now open a fresh transaction and write
+                with env.begin(write=True) as txn:
                     cursor = txn.cursor()
                     cursor.putmulti(results_for_round)
 
