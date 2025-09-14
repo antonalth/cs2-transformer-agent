@@ -462,7 +462,7 @@ class DaliInputPipeline:
         cfg = self.cfg
         video_filelists = self.video_filelists
         audio_filelists = self.audio_filelists
-        FPS = cfg.fps  # label is start frame; convert to seconds via FPS
+        FPS = cfg.fps  # convert start-frame label -> seconds
 
         @pipeline_def(
             batch_size=cfg.batch_size,
@@ -470,7 +470,7 @@ class DaliInputPipeline:
             device_id=cfg.device_id,
             prefetch_queue_depth=cfg.prefetch_queue_depth,
             seed=getattr(cfg, "seed", 42),
-            # NOTE: we intentionally DO NOT set exec_dynamic=True
+            # do NOT set exec_dynamic=True
         )
         def pipe():
             outputs = []
@@ -493,7 +493,6 @@ class DaliInputPipeline:
                     dtype=types.UINT8,
                 )
 
-                # resize / normalize on GPU
                 frames = fn.resize(
                     video,
                     resize_x=cfg.resize_w,
@@ -504,13 +503,13 @@ class DaliInputPipeline:
                     frames,
                     device="gpu",
                     dtype=types.FLOAT,
-                    output_layout="FCHW",          # frames, channels, height, width
-                    mean=cfg.mean,                 # e.g., (0.485, 0.456, 0.406)
-                    std=cfg.std,                   # e.g., (0.229, 0.224, 0.225)
+                    output_layout="FCHW",
+                    mean=cfg.mean,
+                    std=cfg.std,
                 )
 
                 # -------------------------
-                # AUDIO (keep on GPU)
+                # AUDIO (GPU path)
                 # -------------------------
                 audio_raw, _ = fn.readers.file(
                     name=f"AudioReader{k}",
@@ -524,11 +523,9 @@ class DaliInputPipeline:
                     sample_rate=cfg.sample_rate,
                     downmix=True,
                 )
-
-                # move decoded audio to GPU once; never bring label/audio to CPU
                 decoded_audio_gpu = decoded_audio.gpu()
 
-                # compute slice times on GPU from GPU label
+                # slice times on GPU
                 start_sec    = label / FPS
                 duration_sec = cfg.sequence_length / FPS
 
@@ -536,17 +533,15 @@ class DaliInputPipeline:
                     decoded_audio_gpu,
                     start=start_sec,
                     shape=duration_sec,
-                    axes=[0],                # slice along time
+                    axes=[0],                 # 1-D slice over time
                     normalized_shape=False,
-                    axis_names="t",
                 )
 
-                # spectrogram + mel on GPU
                 spec = fn.spectrogram(
                     sliced_audio_gpu,
                     nfft=cfg.nfft,
-                    window_length=cfg.window_length,  # samples
-                    window_step=cfg.hop_length,       # samples
+                    window_length=cfg.window_length,
+                    window_step=cfg.hop_length,
                     center_windows=False,
                 )
                 mel = fn.mel_filter_bank(
@@ -563,14 +558,16 @@ class DaliInputPipeline:
                     cutoff_db=cfg.db_cutoff,
                 )
 
-                # Output order expected by your output_map: pov{k}, labels{k}, mel{k}
-                outputs += [frames, label, mel_db]
+                # IMPORTANT: extend (flatten), don't append a tuple/list
+                outputs.extend((frames, label, mel_db))
 
-            return outputs
+            # Return a flat tuple of DataNodes
+            return tuple(outputs)
 
         pipe_inst = pipe()
         pipe_inst.build()
         return pipe_inst
+
 
 
     def __iter__(self):
