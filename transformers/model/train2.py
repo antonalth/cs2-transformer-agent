@@ -378,8 +378,8 @@ class FilelistWriter:
 
                     vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
                     
-                    # Audio line (pack sample_id and start_f)
-                    packed = rec.sample_id * LABEL_SCALE + rec.start_f
+                    # Audio line (pack sample_id and the clamped start frame)
+                    packed = rec.sample_id * LABEL_SCALE + start
                     aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
         finally:
             for f in vid_files + aud_files:
@@ -404,7 +404,7 @@ class DaliConfig:
     sequence_length: int = 512
     mean: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     std: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    fps: float = 30.0  # used to convert label (frame index) -> seconds
+    fps: float = 32.0  # used to convert label (frame index) -> seconds
 
     # Optional explicit resize targets (if None, mirror width/height)
     resize_h: Optional[int] = None
@@ -428,7 +428,7 @@ class DaliConfig:
     win_length: Optional[int] = 1024
     window_length: Optional[int] = None
 
-    hop_length: int = 312  # results in ~T_frames spectrograms
+    hop_length: int = 375  # 24k / (32fps * 2 mel/frame) = 375
 
     # Mel / dB params used by the pipeline
     mel_fmin: float = 0.0
@@ -520,8 +520,7 @@ class DaliInputPipeline:
         cfg = self.cfg
         video_filelists = self.video_filelists
         audio_filelists = self.audio_filelists
-        FPS = cfg.fps  # label is start frame; convert to seconds via FPS
-
+        
         @pipeline_def(
             batch_size=cfg.batch_size,
             num_threads=cfg.num_threads,
@@ -597,20 +596,20 @@ class DaliInputPipeline:
                 )
 
                 # Compute slice arguments on the CPU using the unpacked `start_f`.
-                start_in_seconds = start_f_f32 / FPS
+                start_in_seconds = start_f_f32 / cfg.fps
                 start_in_samples_f = start_in_seconds * cfg.sample_rate
                 start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT32)
 
-                # The slice shape can be a constant Python integer.
-                shape_in_seconds = cfg.sequence_length / FPS
-                shape_in_samples = int(shape_in_seconds * cfg.sample_rate)
+                # Calculate shape to produce exactly sequence_length * TICKS_PER_FRAME mel columns
+                M = cfg.sequence_length * TICKS_PER_FRAME
+                shape_in_samples = (M - 1) * cfg.hop_length + cfg.window_length
 
                 # Move audio to GPU *then* slice on GPU, using CPU arguments.
                 audio_gpu = decoded_audio.gpu()
                 sliced_audio_gpu = fn.slice(
                     audio_gpu,
                     start=start_in_samples,
-                    shape=shape_in_samples,
+                    shape=int(shape_in_samples),
                     axes=[0],
                     normalized_anchor=False,
                     normalized_shape=False,
@@ -657,7 +656,7 @@ class DaliInputPipeline:
         # Robustly flatten labels for consistency check
         l0 = np.array(batch["labels0"].cpu()).reshape(-1).tolist()
         for k in range(1, 5):
-            lk = np.array(batch[f"labels{k}"].cpu()).reshape(-1).tolist()
+            lk = np.array(batch[f"labels{k}"].cpu()).reshape(-in1).tolist()
             if lk != l0:
                 raise RuntimeError(f"Label mismatch between branches: {l0} vs {lk}")
         return batch
@@ -770,12 +769,13 @@ class BatchAssembler:
         images = images.to(self.device, non_blocking=True)
         mel = mel.to(self.device, non_blocking=True, dtype=images.dtype)
 
-        # 4) Pad mel spectrogram if its time dimension doesn't match images
-        if images.shape[1] != mel.shape[1]:
-            pad_len = images.shape[1] - mel.shape[1]
+        # 4) Pad mel spectrogram to match the target time dimension (T * TICKS_PER_FRAME)
+        target_len = images.shape[1] * TICKS_PER_FRAME
+        if mel.shape[1] != target_len:
+            pad_len = target_len - mel.shape[1]
             if pad_len > 0:
                 mel = torch.nn.functional.pad(mel, (0, 0, 0, 0, 0, 0, 0, pad_len), "constant", 0)
-            mel = mel[:, :images.shape[1], ...]
+            mel = mel[:, :target_len, ...]
 
         batch = {
             "images": images,
@@ -872,6 +872,7 @@ def build_data_iter(args: DataArgs):
         additional_decode_surfaces=args.decode_surfaces,
         mean=dali_mean, std=dali_std,
         shard_id=shard_id, num_shards=num_shards,
+        fps=FPS,  # Use the correct FPS (32)
     )
     dali_iter = DaliInputPipeline(video_filelists, audio_filelists, dali_cfg)
 
