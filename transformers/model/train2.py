@@ -78,19 +78,28 @@ def ticks_to_frames(start_tick: int, end_tick: int) -> int:
     return ((end_tick - start_tick) // TICKS_PER_FRAME) + 1
 
 
-def clamp_start_for_padding(req_start: int, T_frames: int, start_tick: int, end_tick: int) -> tuple[int, int]:
+def clamp_window_to_pov(req_start_f: int, T_frames: int, pov_start_tick: int, pov_end_tick: int) -> tuple[int, int]:
     """
-    Clamp req_start to the last valid frame index for this POV.
-    Return (start, end) where end = start + T_frames - 1 (inclusive).
+    Clamps the requested frame window to the actual bounds of a specific POV video.
+    Returns a (start, end) tuple for the filelist, both inclusive and valid.
     """
-    n = ticks_to_frames(start_tick, end_tick)
-    if n <= 0:
-        # corrupt/empty segment; signal caller to skip
+    pov_frame_count = ticks_to_frames(pov_start_tick, pov_end_tick)
+    if pov_frame_count <= 0:
+        # This POV has no frames, signal an error.
         return -1, -1
-    last = n - 1
-    start = min(req_start, last)
-    end = start + T_frames - 1
-    return start, end
+
+    # The last valid frame index in this specific POV video (0-indexed).
+    pov_last_f = pov_frame_count - 1
+
+    # Clamp the requested start frame to be a valid index within the POV.
+    # If req_start_f is past the end, we start at the very last frame.
+    start_f = min(req_start_f, pov_last_f)
+
+    # The end frame for the filelist must also be within the POV's bounds.
+    # It's the smaller of the desired window end or the actual video end.
+    end_f = min(start_f + T_frames - 1, pov_last_f)
+
+    return start_f, end_f
 
 
 @dataclass
@@ -361,7 +370,7 @@ class FilelistWriter:
                         raise ValueError(f"Could not parse start/end ticks from filename: {pov_path}")
 
                     pov_start_tick, pov_end_tick = ticks
-                    start, end = clamp_start_for_padding(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
+                    start, end = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
 
                     if start < 0:
                         raise ValueError(f"POV segment {os.path.basename(pov_path)} for sample {rec.sample_id} has no frames.")
