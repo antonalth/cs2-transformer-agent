@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 train2.py — Data loading layer (Steps 1–9)
 
@@ -712,10 +713,24 @@ class LmdbMetaFetcher:
                     continue
                 
                 payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
-                gs = payload.get("game_state") or {}
-                gs_list.append(gs)
+                
+                # --- START FIX ---
+                # The 'game_state' is a NumPy structured array, not a dictionary.
+                # Access its fields directly instead of using .get().
+                gs = payload.get("game_state")
+                
+                if gs is not None:
+                    # Successfully decoded a game_state object (expected to be a numpy array)
+                    gs_list.append(gs)
+                    # Correctly access the 'team_alive' field from the numpy structured array.
+                    # It's an array of size 1, so we access the first element with [0].
+                    mask_bits = int(gs['team_alive'][0])
+                else:
+                    # Handle cases where 'game_state' is missing from the payload
+                    gs_list.append({})
+                    mask_bits = 0
+                # --- END FIX ---
 
-                mask_bits = int(gs.get("team_alive", [0])[0])
                 for slot in range(5):
                     if (mask_bits >> slot) & 1:
                         alive_mask[f, slot] = 1
