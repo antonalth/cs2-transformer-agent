@@ -513,7 +513,7 @@ class DaliInputPipeline:
             out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
 
         self.iterator = DALIGenericIterator(
-            [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, fill_last_batch=False
+            [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, last_batch_policy="DROP"
         )
 
 
@@ -544,6 +544,7 @@ class DaliInputPipeline:
                     file_list=vlist,
                     sequence_length=cfg.sequence_length,
                     file_list_frame_num=True,
+                    file_list_include_preceding_frame=True,  # Set explicitly for future compatibility
                     pad_sequences=True,
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
@@ -612,8 +613,6 @@ class DaliInputPipeline:
                     start=start_in_samples,
                     shape=int(shape_in_samples),
                     axes=[0],
-                    normalized_anchor=False,
-                    normalized_shape=False,
                 )
 
                 # Spectrogram + Mel on GPU
