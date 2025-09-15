@@ -513,7 +513,7 @@ class DaliInputPipeline:
             out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
 
         self.iterator = DALIGenericIterator(
-            [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, last_batch_policy="DROP"
+            [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, last_batch_policy=types.LastBatchPolicy.DROP
         )
 
 
