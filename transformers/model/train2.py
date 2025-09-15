@@ -529,7 +529,6 @@ class DaliInputPipeline:
             device_id=cfg.device_id,
             prefetch_queue_depth=cfg.prefetch_queue_depth,
             seed=getattr(cfg, "seed", 42),
-            enable_nvtx=True,
         )
         def pipe():
             outputs = []
