@@ -81,7 +81,7 @@ def ticks_to_frames(start_tick: int, end_tick: int) -> int:
 def clamp_window_to_pov(req_start_f: int, T_frames: int, pov_start_tick: int, pov_end_tick: int) -> tuple[int, int]:
     """
     Clamps the requested frame window to the actual bounds of a specific POV video.
-    Returns a (start, end) tuple for the filelist, both inclusive and valid.
+    Returns a (start, end_exclusive) tuple for the filelist, as DALI's end frame is exclusive.
     """
     pov_frame_count = ticks_to_frames(pov_start_tick, pov_end_tick)
     if pov_frame_count <= 0:
@@ -95,11 +95,10 @@ def clamp_window_to_pov(req_start_f: int, T_frames: int, pov_start_tick: int, po
     # If req_start_f is past the end, we start at the very last frame.
     start_f = min(req_start_f, pov_last_f)
 
-    # The end frame for the filelist must also be within the POV's bounds.
-    # It's the smaller of the desired window end or the actual video end.
-    end_f = min(start_f + T_frames - 1, pov_last_f)
+    # The end frame for the filelist is exclusive and clamped to the total frame count.
+    end_f_exclusive = min(start_f + T_frames, pov_frame_count)
 
-    return start_f, end_f
+    return start_f, end_f_exclusive
 
 
 @dataclass
@@ -347,7 +346,7 @@ class EpochIndex:
 class FilelistWriter:
     """Writes ten aligned DALI filelists (five for video, five for audio).
 
-    Video line: "<abs/path.mp4>  <sample_id>  <start_f>  <end_f>".
+    Video line: "<abs/path.mp4>  <sample_id>  <start_f>  <end_f_exclusive>".
     Audio line: "<abs/path.wav>   <sample_id>".
     """
     def __init__(self, out_dir: str):
@@ -370,12 +369,12 @@ class FilelistWriter:
                         raise ValueError(f"Could not parse start/end ticks from filename: {pov_path}")
 
                     pov_start_tick, pov_end_tick = ticks
-                    start, end = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
+                    start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
 
                     if start < 0:
                         raise ValueError(f"POV segment {os.path.basename(pov_path)} for sample {rec.sample_id} has no frames.")
 
-                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end}\n")
+                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
                     
                     # Audio line
                     aud_files[k].write(f"{rec.pov_audio[k]} {rec.sample_id}\n")
@@ -535,7 +534,7 @@ class DaliInputPipeline:
                 # -------------------------
                 # VIDEO branch (GPU-only)
                 # -------------------------
-                video, _ = fn.readers.video(
+                video, label_cpu = fn.readers.video(
                     name=f"VideoReader{k}",
                     device="gpu",
                     file_list=vlist,
@@ -573,7 +572,7 @@ class DaliInputPipeline:
                 #   - slice on CPU (start/shape must be CPU argument inputs)
                 #   - move to GPU for STFT/Mel
                 # -------------------------
-                audio_raw, label_cpu = fn.readers.file(
+                audio_raw, _ = fn.readers.file(
                     name=f"AudioReader{k}",
                     file_list=alist,
                     shard_id=cfg.shard_id,
@@ -587,16 +586,22 @@ class DaliInputPipeline:
                     downmix=True,
                 )
 
-                # Compute slice region on CPU (required by DALI for argument inputs)
-                start_sec    = label_cpu / FPS                # CPU DataNode
-                duration_sec = cfg.sequence_length / FPS      # Python scalar (broadcast)
+                # Compute slice region in SAMPLES on CPU.
+                # `start` and `shape` must be integer types for non-normalized slicing.
+                start_in_seconds = label_cpu / FPS
+                start_in_samples_f = start_in_seconds * cfg.sample_rate
+                start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT64)
+
+                shape_in_seconds = cfg.sequence_length / FPS
+                shape_in_samples = int(shape_in_seconds * cfg.sample_rate)
 
                 # Slice on CPU, then move result to GPU
                 sliced_audio = fn.slice(
                     decoded_audio,
-                    start=start_sec,
-                    shape=duration_sec,
+                    start=start_in_samples,
+                    shape=shape_in_samples,
                     axes=[0],                 # slice over time dimension
+                    normalized_anchor=False,  # Explicitly set for absolute sample indices
                     normalized_shape=False,
                 )
                 sliced_audio_gpu = sliced_audio.gpu()
