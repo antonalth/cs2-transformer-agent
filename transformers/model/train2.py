@@ -534,7 +534,8 @@ class DaliInputPipeline:
                 # -------------------------
                 # VIDEO branch (GPU-only)
                 # -------------------------
-                video, label_cpu = fn.readers.video(
+                # The reader on device="gpu" places BOTH video and label on the GPU.
+                video, label_gpu = fn.readers.video(
                     name=f"VideoReader{k}",
                     device="gpu",
                     file_list=vlist,
@@ -550,6 +551,10 @@ class DaliInputPipeline:
                     read_ahead=getattr(cfg, "read_ahead", True),
                     dtype=types.UINT8,
                 )
+
+                # Argument inputs to operators (like `start` for fn.slice) must be CPU nodes.
+                # We explicitly copy the label to the CPU. The `.cpu()` method is a shorthand for this.
+                label_cpu = label_gpu.cpu()
 
                 frames = fn.resize(
                     video,
@@ -586,25 +591,24 @@ class DaliInputPipeline:
                     downmix=True,
                 )
 
-                # Compute slice arguments on the CPU. The `label_cpu` tensor from the
-                # video reader is already a CPU node.
+                # Compute slice arguments on the CPU using the `label_cpu` tensor.
+                # All operations here will now correctly result in a CPU node.
                 start_in_seconds = label_cpu / FPS
                 start_in_samples_f = start_in_seconds * cfg.sample_rate
-                # DALI op arguments like `start` must be CPU nodes. Use INT32 as it's safer.
                 start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT32)
 
-                # The slice shape can be a constant Python integer.
+                # The slice shape can be a constant Python integer if it doesn't vary per sample.
                 shape_in_seconds = cfg.sequence_length / FPS
                 shape_in_samples = int(shape_in_seconds * cfg.sample_rate)
 
-                # Move audio to GPU *then* slice on GPU, using CPU arguments
+                # Move audio to GPU *then* slice on GPU, using the CPU-based arguments
                 audio_gpu = decoded_audio.gpu()
                 sliced_audio_gpu = fn.slice(
                     audio_gpu,
-                    start=start_in_samples,
-                    shape=shape_in_samples,
+                    start=start_in_samples,   # <-- Correctly a CPU node
+                    shape=shape_in_samples,   # <-- Python int
                     axes=[0],                 # slice over time dimension
-                    normalized_anchor=False,  # Explicitly set for absolute sample indices
+                    normalized_anchor=False,
                     normalized_shape=False,
                 )
 
@@ -630,7 +634,7 @@ class DaliInputPipeline:
                     cutoff_db=cfg.db_cutoff,
                 )
 
-                # IMPORTANT: flatten outputs (no tuples)
+                # IMPORTANT: flatten outputs (no tuples). Use the CPU label for the output.
                 outputs += [frames, label_cpu, mel_db]
 
             return tuple(outputs)
