@@ -59,6 +59,8 @@ except Exception as _e:
 TICK_RATE = 64     # demo ticks per second
 FPS = 32           # video frames per second
 TICKS_PER_FRAME = TICK_RATE // FPS  # == 2
+LABEL_SCALE = 1_000_000 # pack sample_id + start_f into one int; ensure start_f << LABEL_SCALE
+
 
 TICK_RE = re.compile(r"_([0-9]+)_([0-9]+)\.(mp4|wav)$")
 
@@ -347,7 +349,7 @@ class FilelistWriter:
     """Writes ten aligned DALI filelists (five for video, five for audio).
 
     Video line: "<abs/path.mp4>  <sample_id>  <start_f>  <end_f_exclusive>".
-    Audio line: "<abs/path.wav>   <sample_id>".
+    Audio line: "<abs/path.wav>  <packed_label = sample_id*LABEL_SCALE + start_f>".
     """
     def __init__(self, out_dir: str):
         self.out_dir = out_dir
@@ -376,8 +378,9 @@ class FilelistWriter:
 
                     vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
                     
-                    # Audio line
-                    aud_files[k].write(f"{rec.pov_audio[k]} {rec.sample_id}\n")
+                    # Audio line (pack sample_id and start_f)
+                    packed = rec.sample_id * LABEL_SCALE + rec.start_f
+                    aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
         finally:
             for f in vid_files + aud_files:
                 f.close()
@@ -579,6 +582,13 @@ class DaliInputPipeline:
                     num_shards=cfg.num_shards,
                     random_shuffle=getattr(cfg, "shuffle", False),
                 )
+                
+                # Unpack: label_cpu is INT; pack = sample_id*LABEL_SCALE + start_f
+                packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
+                sample_id_f = packed_i64 * (1.0 / LABEL_SCALE)       # float
+                sample_id_i32 = fn.cast(sample_id_f, dtype=types.INT32)  # floor -> sample_id
+                start_f_i64 = packed_i64 - fn.cast(sample_id_i32, dtype=types.INT64) * LABEL_SCALE
+                start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
 
                 decoded_audio, _ = fn.decoders.audio(
                     audio_raw,
@@ -586,8 +596,8 @@ class DaliInputPipeline:
                     downmix=True,
                 )
 
-                # Compute slice arguments on the CPU using the `label_cpu` tensor.
-                start_in_seconds = label_cpu / FPS
+                # Compute slice arguments on the CPU using the unpacked `start_f`.
+                start_in_seconds = start_f_f32 / FPS
                 start_in_samples_f = start_in_seconds * cfg.sample_rate
                 start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT32)
 
@@ -628,8 +638,8 @@ class DaliInputPipeline:
                     cutoff_db=cfg.db_cutoff,
                 )
 
-                # IMPORTANT: flatten outputs. Use the CPU label for the output.
-                outputs += [frames, label_cpu, mel_db]
+                # IMPORTANT: flatten outputs. Emit the unpacked sample_id as the label.
+                outputs += [frames, sample_id_i32, mel_db]
 
             return tuple(outputs)
 
@@ -644,9 +654,10 @@ class DaliInputPipeline:
     def __next__(self):
         out = next(self.iterator)
         batch = out[0]
-        l0 = batch["labels0"].cpu().numpy().tolist()
+        # Robustly flatten labels for consistency check
+        l0 = np.array(batch["labels0"].cpu()).reshape(-1).tolist()
         for k in range(1, 5):
-            lk = batch[f"labels{k}"].cpu().numpy().tolist()
+            lk = np.array(batch[f"labels{k}"].cpu()).reshape(-1).tolist()
             if lk != l0:
                 raise RuntimeError(f"Label mismatch between branches: {l0} vs {lk}")
         return batch
@@ -741,7 +752,8 @@ class BatchAssembler:
         mel = torch.stack(mels, dim=1).permute(0, 2, 1, 3).unsqueeze(3)
 
         # 2) For each sample, fetch alive_mask from LMDB
-        sample_ids = labels.cpu().numpy().tolist()
+        # Flatten labels tensor to handle both [B] and [B, 1] shapes
+        sample_ids = labels.detach().view(-1).cpu().tolist()
         mask_list = []
         meta = {"sample_ids": sample_ids, "demonames": [], "round_nums": [], "teams": []}
         for sid in sample_ids:
