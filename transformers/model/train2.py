@@ -197,7 +197,7 @@ class LmdbStore:
 
     Use one `LmdbStore` instance per process/rank.
     """
-    def __init__(self, max_readers: int = 512, map_size: int = 0, readahead: bool = False):
+    def __init__(self, max_readers: int = 512, map_size: int = 0, readahead: bool = True):
         self._envs: Dict[str, lmdb.Environment] = {}
         self._info_cache: Dict[str, Dict[str, Any]] = {}
         self._max_readers = max_readers
@@ -903,18 +903,22 @@ if __name__ == "__main__":
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
     else:
-        for i in range(10):
-            try:
-                dali_iter, assembler = build_data_iter(args)
-                with Timer("one batch") as t:
-                    batch_raw = next(iter(dali_iter))
-                logging.info("DALI fetched video+audio in %.3fs", t.dt)
-                with Timer("assemble") as t2:
-                    batch = assembler.assemble(batch_raw)
-                logging.info("Assembled batch in %.3fs; images=%s, mel=%s, alive=%s", t2.dt, tuple(batch["images"].shape), tuple(batch["mel_spectrogram"].shape), tuple(batch["alive_mask"].shape))
-                # Smoke assertion
-                assert batch["images"].shape[1] * 2 == batch["mel_spectrogram"].shape[1], "A/V time mismatch"
-                logging.info("Smoke assertion passed: mel spectrogram time dimension is 2x video time dimension.")
-            except Exception as e:
-                logging.exception("Data loader smoke test failed. Ensure manifest.json is correct, media files exist, and LMDB is populated.")
-                logging.error("Failed with error: %s", e)
+        try:
+            dali_iter, assembler = build_data_iter(args)
+            for i in range(10):
+                try:
+                    with Timer("one batch") as t:
+                        batch_raw = next(iter(dali_iter))
+                    logging.info("DALI fetched video+audio in %.3fs", t.dt)
+                    with Timer("assemble") as t2:
+                        batch = assembler.assemble(batch_raw)
+                    logging.info("Assembled batch in %.3fs; images=%s, mel=%s, alive=%s", t2.dt, tuple(batch["images"].shape), tuple(batch["mel_spectrogram"].shape), tuple(batch["alive_mask"].shape))
+                    # Smoke assertion
+                    assert batch["images"].shape[1] * 2 == batch["mel_spectrogram"].shape[1], "A/V time mismatch"
+                    logging.info("Smoke assertion passed: mel spectrogram time dimension is 2x video time dimension.")
+                except StopIteration:
+                    print("Finished iterator.")
+                    break
+        except Exception as e:
+            logging.exception("Data loader smoke test failed. Ensure manifest.json is correct, media files exist, and LMDB is populated.")
+            logging.error("Failed with error: %s", e)
