@@ -525,7 +525,6 @@ class DaliInputPipeline:
             device_id=cfg.device_id,
             prefetch_queue_depth=cfg.prefetch_queue_depth,
             seed=getattr(cfg, "seed", 42),
-            # NOTE: no exec_dynamic here
         )
         def pipe():
             outputs = []
@@ -534,14 +533,15 @@ class DaliInputPipeline:
                 # -------------------------
                 # VIDEO branch (GPU-only)
                 # -------------------------
-                # The reader on device="gpu" places BOTH video and label on the GPU.
-                video, label_gpu = fn.readers.video(
+                # The video reader is on the GPU. We only need the video output from it.
+                # We will ignore its label output because it would be on the GPU.
+                video, _ = fn.readers.video(
                     name=f"VideoReader{k}",
                     device="gpu",
                     file_list=vlist,
                     sequence_length=cfg.sequence_length,
-                    file_list_frame_num=True,         # the filelist holds start-frame indices
-                    pad_sequences=True,               # repeat-last to fill beyond end
+                    file_list_frame_num=True,
+                    pad_sequences=True,
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     random_shuffle=getattr(cfg, "shuffle", False),
@@ -551,10 +551,6 @@ class DaliInputPipeline:
                     read_ahead=getattr(cfg, "read_ahead", True),
                     dtype=types.UINT8,
                 )
-
-                # Argument inputs to operators (like `start` for fn.slice) must be CPU nodes.
-                # We explicitly copy the label to the CPU. The `.cpu()` method is a shorthand for this.
-                label_cpu = label_gpu.cpu()
 
                 frames = fn.resize(
                     video,
@@ -566,18 +562,17 @@ class DaliInputPipeline:
                     frames,
                     device="gpu",
                     dtype=types.FLOAT,
-                    output_layout="FCHW",              # frames, channels, height, width
+                    output_layout="FCHW",
                     mean=cfg.mean,
                     std=cfg.std,
                 )
 
                 # -------------------------
                 # AUDIO branch (CPU -> GPU)
-                #   - get label from VIDEO reader (CPU)
-                #   - slice on GPU (start/shape must be CPU argument inputs)
-                #   - move to GPU for STFT/Mel
                 # -------------------------
-                audio_raw, _ = fn.readers.file(
+                # The audio file reader is a CPU operator. It can give us the label
+                # (the sample_id) directly on the CPU, which is what we need.
+                audio_raw, label_cpu = fn.readers.file(
                     name=f"AudioReader{k}",
                     file_list=alist,
                     shard_id=cfg.shard_id,
@@ -592,22 +587,21 @@ class DaliInputPipeline:
                 )
 
                 # Compute slice arguments on the CPU using the `label_cpu` tensor.
-                # All operations here will now correctly result in a CPU node.
                 start_in_seconds = label_cpu / FPS
                 start_in_samples_f = start_in_seconds * cfg.sample_rate
                 start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT32)
 
-                # The slice shape can be a constant Python integer if it doesn't vary per sample.
+                # The slice shape can be a constant Python integer.
                 shape_in_seconds = cfg.sequence_length / FPS
                 shape_in_samples = int(shape_in_seconds * cfg.sample_rate)
 
-                # Move audio to GPU *then* slice on GPU, using the CPU-based arguments
+                # Move audio to GPU *then* slice on GPU, using CPU arguments.
                 audio_gpu = decoded_audio.gpu()
                 sliced_audio_gpu = fn.slice(
                     audio_gpu,
-                    start=start_in_samples,   # <-- Correctly a CPU node
-                    shape=shape_in_samples,   # <-- Python int
-                    axes=[0],                 # slice over time dimension
+                    start=start_in_samples,
+                    shape=shape_in_samples,
+                    axes=[0],
                     normalized_anchor=False,
                     normalized_shape=False,
                 )
@@ -616,8 +610,8 @@ class DaliInputPipeline:
                 spec = fn.spectrogram(
                     sliced_audio_gpu,
                     nfft=cfg.nfft,
-                    window_length=cfg.window_length,   # samples
-                    window_step=cfg.hop_length,        # samples
+                    window_length=cfg.window_length,
+                    window_step=cfg.hop_length,
                     center_windows=False,
                 )
                 mel = fn.mel_filter_bank(
@@ -634,7 +628,7 @@ class DaliInputPipeline:
                     cutoff_db=cfg.db_cutoff,
                 )
 
-                # IMPORTANT: flatten outputs (no tuples). Use the CPU label for the output.
+                # IMPORTANT: flatten outputs. Use the CPU label for the output.
                 outputs += [frames, label_cpu, mel_db]
 
             return tuple(outputs)
