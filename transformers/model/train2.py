@@ -584,8 +584,8 @@ class DaliInputPipeline:
                 
                 # Unpack: label_cpu is INT; pack = sample_id*LABEL_SCALE + start_f
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
-                sample_id_f = packed_i64 * (1.0 / LABEL_SCALE)       # float
-                sample_id_i32 = fn.cast(sample_id_f, dtype=types.INT32)  # floor -> sample_id
+                # integer: sample_id = packed // LABEL_SCALE
+                sample_id_i32 = fn.cast(packed_i64 // LABEL_SCALE, dtype=types.INT32)
                 start_f_i64 = packed_i64 - fn.cast(sample_id_i32, dtype=types.INT64) * LABEL_SCALE
                 start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
 
@@ -636,6 +636,8 @@ class DaliInputPipeline:
                     reference=1.0,
                     cutoff_db=cfg.db_cutoff,
                 )
+                # DALI returns [mel_bins, time]; assembler expects [time, mel_bins]
+                mel_db = fn.transpose(mel_db, perm=[1, 0])
 
                 # IMPORTANT: flatten outputs. Emit the unpacked sample_id as the label.
                 outputs += [frames, sample_id_i32, mel_db]
@@ -654,9 +656,9 @@ class DaliInputPipeline:
         out = next(self.iterator)
         batch = out[0]
         # Robustly flatten labels for consistency check
-        l0 = np.array(batch["labels0"].cpu()).reshape(-1).tolist()
+        l0 = batch["labels0"].cpu().numpy().reshape(-1).tolist()
         for k in range(1, 5):
-            lk = np.array(batch[f"labels{k}"].cpu()).reshape(-1).tolist()
+            lk = batch[f"labels{k}"].cpu().numpy().reshape(-1).tolist()
             if lk != l0:
                 raise RuntimeError(f"Label mismatch between branches: {l0} vs {lk}")
         return batch
@@ -902,6 +904,9 @@ if __name__ == "__main__":
             with Timer("assemble") as t2:
                 batch = assembler.assemble(batch_raw)
             logging.info("Assembled batch in %.3fs; images=%s, mel=%s, alive=%s", t2.dt, tuple(batch["images"].shape), tuple(batch["mel_spectrogram"].shape), tuple(batch["alive_mask"].shape))
+            # Smoke assertion
+            assert batch["images"].shape[1] * 2 == batch["mel_spectrogram"].shape[1], "A/V time mismatch"
+            logging.info("Smoke assertion passed: mel spectrogram time dimension is 2x video time dimension.")
         except Exception as e:
             logging.exception("Data loader smoke test failed. Ensure manifest.json is correct, media files exist, and LMDB is populated.")
             logging.error("Failed with error: %s", e)
