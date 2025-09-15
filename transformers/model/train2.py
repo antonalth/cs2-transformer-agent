@@ -139,7 +139,7 @@ class SampleRecord:
     round_num: int
     team: str
     pov_videos: List[str]
-    pov_audio: List[str]  # <-- ADDED
+    pov_audio: List[str]
     start_f: int               # start frame index from round start
     start_tick_win: int        # starting tick of the sampled window (parity-locked)
     T_frames: int
@@ -714,22 +714,14 @@ class LmdbMetaFetcher:
                 
                 payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
                 
-                # --- START FIX ---
-                # The 'game_state' is a NumPy structured array, not a dictionary.
-                # Access its fields directly instead of using .get().
                 gs = payload.get("game_state")
                 
                 if gs is not None:
-                    # Successfully decoded a game_state object (expected to be a numpy array)
                     gs_list.append(gs)
-                    # Correctly access the 'team_alive' field from the numpy structured array.
-                    # It's an array of size 1, so we access the first element with [0].
                     mask_bits = int(gs['team_alive'][0])
                 else:
-                    # Handle cases where 'game_state' is missing from the payload
                     gs_list.append({})
                     mask_bits = 0
-                # --- END FIX ---
 
                 for slot in range(5):
                     if (mask_bits >> slot) & 1:
