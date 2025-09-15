@@ -1,5 +1,3 @@
---- START OF FILE train2.py ---
-
 """
 train2.py — Data loading layer (Steps 1–9)
 
