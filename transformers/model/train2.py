@@ -561,7 +561,7 @@ class DaliInputPipeline:
                 frames = fn.crop_mirror_normalize(
                     frames,
                     device="gpu",
-                    dtype=types.FLOAT,
+                    dtype=types.FLOAT16,
                     output_layout="FCHW",
                     mean=cfg.mean,
                     std=cfg.std,
@@ -876,7 +876,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     data_root = os.environ.get("DATA_ROOT", "data")
     manifest_path = os.path.join(data_root, "manifest.json")
-    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2)
+    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=1)
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
