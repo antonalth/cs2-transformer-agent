@@ -47,6 +47,7 @@ import torch
 try:
     from nvidia.dali import fn, types, pipeline_def
     from nvidia.dali.plugin.pytorch import DALIGenericIterator
+    from nvidia.dali.plugin.base_iterator import LastBatchPolicy
     DALI_AVAILABLE = True
 except Exception as _e:
     DALI_AVAILABLE = False
