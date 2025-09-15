@@ -441,7 +441,7 @@ class DaliConfig:
     batch_size: int = 1
     num_threads: int = 4
     device_id: int = 0
-    prefetch_queue_depth: int = 2
+    prefetch_queue_depth: int = 1
     additional_decode_surfaces: int = 8
     read_ahead: bool = True
     shard_id: int = 0
@@ -529,6 +529,7 @@ class DaliInputPipeline:
             device_id=cfg.device_id,
             prefetch_queue_depth=cfg.prefetch_queue_depth,
             seed=getattr(cfg, "seed", 42),
+            enable_nvtx=True,
         )
         def pipe():
             outputs = []
