@@ -568,8 +568,8 @@ class DaliInputPipeline:
 
                 # -------------------------
                 # AUDIO branch (CPU -> GPU)
-                #   - get label from AUDIO reader (CPU)
-                #   - slice on CPU (start/shape must be CPU argument inputs)
+                #   - get label from VIDEO reader (CPU)
+                #   - slice on GPU (start/shape must be CPU argument inputs)
                 #   - move to GPU for STFT/Mel
                 # -------------------------
                 audio_raw, _ = fn.readers.file(
@@ -586,25 +586,27 @@ class DaliInputPipeline:
                     downmix=True,
                 )
 
-                # Compute slice region in SAMPLES on CPU.
-                # `start` and `shape` must be integer types for non-normalized slicing.
+                # Compute slice arguments on the CPU. The `label_cpu` tensor from the
+                # video reader is already a CPU node.
                 start_in_seconds = label_cpu / FPS
                 start_in_samples_f = start_in_seconds * cfg.sample_rate
-                start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT64)
+                # DALI op arguments like `start` must be CPU nodes. Use INT32 as it's safer.
+                start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT32)
 
+                # The slice shape can be a constant Python integer.
                 shape_in_seconds = cfg.sequence_length / FPS
                 shape_in_samples = int(shape_in_seconds * cfg.sample_rate)
 
-                # Slice on CPU, then move result to GPU
-                sliced_audio = fn.slice(
-                    decoded_audio,
+                # Move audio to GPU *then* slice on GPU, using CPU arguments
+                audio_gpu = decoded_audio.gpu()
+                sliced_audio_gpu = fn.slice(
+                    audio_gpu,
                     start=start_in_samples,
                     shape=shape_in_samples,
                     axes=[0],                 # slice over time dimension
                     normalized_anchor=False,  # Explicitly set for absolute sample indices
                     normalized_shape=False,
                 )
-                sliced_audio_gpu = sliced_audio.gpu()
 
                 # Spectrogram + Mel on GPU
                 spec = fn.spectrogram(
