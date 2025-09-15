@@ -656,7 +656,7 @@ class DaliInputPipeline:
         # Robustly flatten labels for consistency check
         l0 = np.array(batch["labels0"].cpu()).reshape(-1).tolist()
         for k in range(1, 5):
-            lk = np.array(batch[f"labels{k}"].cpu()).reshape(-in1).tolist()
+            lk = np.array(batch[f"labels{k}"].cpu()).reshape(-1).tolist()
             if lk != l0:
                 raise RuntimeError(f"Label mismatch between branches: {l0} vs {lk}")
         return batch
