@@ -393,11 +393,23 @@ def main():
                 # --- END OF CORRECTION ---
 
                 if all(sorted_videos) and all(sorted_audio):
+                    # --- MODIFICATION START ---
+                    # Calculate the end tick based on the last moment any player
+                    # on this team was recorded, rather than the absolute round end.
+                    recordings_for_perspective = recordings_map.get((round_num, team), [])
+                    team_pov_end_tick = 0
+                    if recordings_for_perspective:
+                        team_pov_end_tick = max(rec['stoptick'] for rec in recordings_for_perspective)
+                    else:
+                        # Fallback to the original round end tick if no recordings are found
+                        team_pov_end_tick = round_info['endtick']
+                    # --- MODIFICATION END ---
+
                     rounds_metadata.append({
                         "round_num": round_num,
                         "team": team,
                         "start_tick": round_info['starttick'],
-                        "end_tick": round_info['endtick'],
+                        "end_tick": team_pov_end_tick, # Use the calculated team-specific end tick
                         "pov_videos": sorted_videos,
                         "pov_audio": sorted_audio
                     })
