@@ -614,6 +614,8 @@ class DaliInputPipeline:
                     start=start_in_samples,
                     shape=int(shape_in_samples),
                     axes=[0],
+                    out_of_bounds_policy="pad",     # <-- important
+                    fill_values=0.0               # optional; defaults to 0.0
                 )
 
                 # Spectrogram + Mel on GPU
