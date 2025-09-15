@@ -1,3 +1,5 @@
+--- START OF FILE train2.py ---
+
 """
 train2.py — Data loading layer (Steps 1–9)
 
@@ -25,6 +27,7 @@ If you only want to smoke-test the loader, see the __main__ section at the botto
 from __future__ import annotations
 
 import os
+import re
 import json
 import math
 import time
@@ -58,6 +61,38 @@ except Exception as _e:
 TICK_RATE = 64     # demo ticks per second
 FPS = 32           # video frames per second
 TICKS_PER_FRAME = TICK_RATE // FPS  # == 2
+
+TICK_RE = re.compile(r"_([0-9]+)_([0-9]+)\.(mp4|wav)$")
+
+
+def ticks_from_filename(path: str) -> tuple[int, int] | None:
+    """Extracts start and end ticks from a media filename."""
+    m = TICK_RE.search(os.path.basename(path))
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def ticks_to_frames(start_tick: int, end_tick: int) -> int:
+    """Inclusive frame count derived from ticks."""
+    if end_tick < start_tick:
+        return 0
+    return ((end_tick - start_tick) // TICKS_PER_FRAME) + 1
+
+
+def clamp_start_for_padding(req_start: int, T_frames: int, start_tick: int, end_tick: int) -> tuple[int, int]:
+    """
+    Clamp req_start to the last valid frame index for this POV.
+    Return (start, end) where end = start + T_frames - 1 (inclusive).
+    """
+    n = ticks_to_frames(start_tick, end_tick)
+    if n <= 0:
+        # corrupt/empty segment; signal caller to skip
+        return -1, -1
+    last = n - 1
+    start = min(req_start, last)
+    end = start + T_frames - 1
+    return start, end
 
 
 @dataclass
@@ -320,9 +355,22 @@ class FilelistWriter:
         aud_files = [open(p, "w", encoding="utf-8") for p in aud_paths]
         try:
             for rec in records:
-                end_f = rec.start_f + rec.T_frames
                 for k in range(5):
-                    vid_files[k].write(f"{rec.pov_videos[k]} {rec.sample_id} {rec.start_f} {end_f}\n")
+                    # Video line
+                    pov_path = rec.pov_videos[k]
+                    ticks = ticks_from_filename(pov_path)
+                    if not ticks:
+                        raise ValueError(f"Could not parse start/end ticks from filename: {pov_path}")
+
+                    pov_start_tick, pov_end_tick = ticks
+                    start, end = clamp_start_for_padding(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
+
+                    if start < 0:
+                        raise ValueError(f"POV segment {os.path.basename(pov_path)} for sample {rec.sample_id} has no frames.")
+
+                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end}\n")
+                    
+                    # Audio line
                     aud_files[k].write(f"{rec.pov_audio[k]} {rec.sample_id}\n")
         finally:
             for f in vid_files + aud_files:
@@ -486,6 +534,7 @@ class DaliInputPipeline:
                     file_list=vlist,
                     sequence_length=cfg.sequence_length,
                     file_list_frame_num=True,         # the filelist holds start-frame indices
+                    pad_sequences=True,               # repeat-last to fill beyond end
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     random_shuffle=getattr(cfg, "shuffle", False),
