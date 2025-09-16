@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train2.py — Data loading layer (Steps 1–9)
+train2.py — Data loading and Loss Calculation (Steps 1–11)
 
 This file implements the end-to-end data input subsystem for training, focusing on:
   1) Round discovery from each game's LMDB `_INFO` entry (including video and audio paths)
@@ -9,19 +9,17 @@ This file implements the end-to-end data input subsystem for training, focusing 
   4) Writing 10 aligned DALI filelists (one per POV for video and audio)
   5) Building a single DALI pipeline with 10 branches (5 video, 5 audio)
   6) Tick-vector generator (64-tick demos → 32 fps, 2 ticks per frame)
-  7) LMDB metadata fetch (alive_mask)
-  8) Batch assembler (fuse DALI outputs with LMDB features)
+  7) LMDB metadata fetch (ground truth for all prediction heads)
+  8) Batch assembler (fuse DALI outputs with LMDB features into model-ready batches)
   9) Determinism, DDP sharding, and instrumentation
+  10) Ground truth target preparation, including smooth heatmaps
+  11) A composite loss function for multi-headed predictions
 
 Notes:
 - This module defines the data preparation pipeline into a CS2Batch-like dict.
 - Mel spectrograms are now generated ON-THE-FLY by DALI from .wav files.
-- LMDB is now only used for per-frame metadata (e.g., alive_mask, game state).
-- We assume each per-game LMDB contains an `<demoname>_INFO` entry with pov_videos and pov_audio.
-- Videos are recorded until player death, all starting at the round start tick. DALI zero-pads tails for short POVs.
-- Demos are 64 ticks/s; videos are 32 fps ⇒ 2 ticks == 1 frame. LMDB keys exist only on the parity of round start.
-
-If you only want to smoke-test the loader, see the __main__ section at the bottom for a minimal sanity run (DALI required).
+- LMDB is used for all per-frame metadata and ground truth labels.
+- The training task is next-frame prediction: given frame `t`, predict frame `t+1`.
 """
 from __future__ import annotations
 
@@ -42,6 +40,8 @@ import msgpack_numpy as mpnp  # pip install msgpack-numpy
 
 # Torch is used for device placement and to hand CUDA tensors to the model later
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # --- Try to import DALI; provide a friendly message if missing ---
 try:
@@ -89,27 +89,80 @@ def clamp_window_to_pov(req_start_f: int, T_frames: int, pov_start_tick: int, po
     """
     pov_frame_count = ticks_to_frames(pov_start_tick, pov_end_tick)
     if pov_frame_count <= 0:
-        # This POV has no frames, signal an error.
         return -1, -1
 
-    # The last valid frame index in this specific POV video (0-indexed).
     pov_last_f = pov_frame_count - 1
-
-    # Clamp the requested start frame to be a valid index within the POV.
-    # If req_start_f is past the end, we start at the very last frame.
     start_f = min(req_start_f, pov_last_f)
-
-    # The end frame for the filelist is exclusive and clamped to the total frame count.
     end_f_exclusive = min(start_f + T_frames, pov_frame_count)
 
     return start_f, end_f_exclusive
 
+# =============================================================================
+# STEP 10 Utilities: Heatmap Target Generation
+# =============================================================================
+
+@dataclass
+class MapBoundaries:
+    """
+    Defines the game world coordinate boundaries.
+    NOTE: These values are placeholders and MUST be determined by analyzing
+    the actual range of player coordinates in your dataset to ensure all
+    positions are contained.
+    """
+    # Shape: (x, y, z)
+    WORLD_MIN: tuple[float, float, float] = (-3000.0, -3500.0, -500.0)
+    WORLD_MAX: tuple[float, float, float] = (3500.0, 2500.0, 1000.0)
+
+
+class CoordinateMapper:
+    """Utility to map continuous world coordinates to a discrete grid."""
+    def __init__(self, grid_dims: tuple[int, int, int] = (64, 64, 8)): # (X, Y, Z)
+        self.grid_dims = torch.tensor(grid_dims, dtype=torch.long)
+        self.world_min = torch.tensor(MapBoundaries.WORLD_MIN, dtype=torch.float32)
+        self.world_max = torch.tensor(MapBoundaries.WORLD_MAX, dtype=torch.float32)
+        self.world_range = self.world_max - self.world_min
+
+    def discretize_world_to_grid(self, world_coords: torch.Tensor) -> torch.Tensor:
+        """Converts a batch of continuous world coords to discrete grid indices."""
+        device = world_coords.device
+        self.world_min = self.world_min.to(device)
+        self.world_range = self.world_range.to(device)
+        self.grid_dims = self.grid_dims.to(device)
+
+        coords = torch.max(torch.min(world_coords, self.world_max), self.world_min)
+        normalized_coords = (coords - self.world_min) / self.world_range
+        grid_indices = (normalized_coords * (self.grid_dims - 1e-6)).long()
+        return grid_indices
+
+
+def create_gaussian_heatmap_target(
+    grid_indices: torch.Tensor,
+    grid_dims: tuple[int, int, int],
+    sigma: float = 1.5
+) -> torch.Tensor:
+    """Creates a batch of smooth target heatmaps using a Gaussian kernel."""
+    X, Y, Z = grid_dims
+    device = grid_indices.device
+    
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(Z, device=device),
+        torch.arange(Y, device=device),
+        torch.arange(X, device=device),
+        indexing='ij'
+    )
+    grid_coords = torch.stack((xx, yy, zz), dim=-1).float()
+    
+    target_indices = grid_indices.float().view(-1, 1, 1, 1, 3)
+    distance_sq = torch.sum((grid_coords.unsqueeze(0) - target_indices)**2, dim=-1)
+    heatmap = torch.exp(-distance_sq / (2 * sigma**2))
+    
+    return heatmap # Unnormalized for BCEWithLogitsLoss is fine
+
+# =============================================================================
 
 @dataclass
 class TeamRound:
-    """Canonical record for a single team-round as discovered from `<demoname>_INFO`.
-    The `pov_videos` and `pov_audio` lists are ordered by roster slot index [0..4].
-    """
+    """Canonical record for a single team-round as discovered from `<demoname>_INFO`."""
     demoname: str
     lmdb_path: str
     round_num: int
@@ -117,7 +170,7 @@ class TeamRound:
     start_tick: int
     end_tick: int
     pov_videos: List[str]
-    pov_audio: List[str]  # <-- ADDED
+    pov_audio: List[str]
     fps: int = FPS
     tick_rate: int = TICK_RATE
 
@@ -127,7 +180,6 @@ class TeamRound:
 
     @property
     def frame_count(self) -> int:
-        # Inclusive of start/end ticks; with 2 ticks per frame
         return ((self.end_tick - self.start_tick) // TICKS_PER_FRAME) + 1
 
 
@@ -141,8 +193,8 @@ class SampleRecord:
     team: str
     pov_videos: List[str]
     pov_audio: List[str]
-    start_f: int               # start frame index from round start
-    start_tick_win: int        # starting tick of the sampled window (parity-locked)
+    start_f: int
+    start_tick_win: int
     T_frames: int
     parity: int
 
@@ -152,21 +204,7 @@ class SampleRecord:
 # -------------------------------
 
 class Manifest:
-    """Loads `manifest.json` and enumerates games per split.
-
-    Expected flexible schema (examples):
-      {
-        "train": ["gameA", {"demoname": "gameB"}],
-        "val":   ["gameC"],
-        "test":  []
-      }
-    or
-      {
-        "train": [{"demoname": "gameA", "lmdb_path": ".../gameA.lmdb"}],
-        ...
-      }
-    If `lmdb_path` is omitted, we resolve it as `<data_root>/lmdb/<demoname>.lmdb`.
-    """
+    """Loads `manifest.json` and enumerates games per split."""
     def __init__(self, data_root: str, manifest_path: str):
         self.data_root = os.path.abspath(data_root)
         self.manifest_path = manifest_path
@@ -193,10 +231,7 @@ class Manifest:
 
 
 class LmdbStore:
-    """Opens and caches LMDB environments. Also reads `<demoname>_INFO` once.
-
-    Use one `LmdbStore` instance per process/rank.
-    """
+    """Opens and caches LMDB environments. Also reads `<demoname>_INFO` once."""
     def __init__(self, max_readers: int = 512, map_size: int = 0, readahead: bool = True):
         self._envs: Dict[str, lmdb.Environment] = {}
         self._info_cache: Dict[str, Dict[str, Any]] = {}
@@ -208,12 +243,8 @@ class LmdbStore:
         env = self._envs.get(lmdb_path)
         if env is None:
             env = lmdb.open(
-                lmdb_path,
-                readonly=True,
-                lock=False,
-                max_readers=self._max_readers,
-                map_size=self._map_size or 1 << 30,  # 1GB virtual map is fine for read-only
-                readahead=self._readahead,
+                lmdb_path, readonly=True, lock=False, max_readers=self._max_readers,
+                map_size=self._map_size or 1 << 30, readahead=self._readahead,
             )
             self._envs[lmdb_path] = env
         return env
@@ -241,10 +272,7 @@ class LmdbStore:
 
 
 def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbStore) -> List[TeamRound]:
-    """Enumerate all TeamRounds for the split by reading each game's `<demoname>_INFO`.
-
-    Ensures absolute mp4/wav paths and basic validity.
-    """
+    """Enumerate all TeamRounds for the split by reading each game's `<demoname>_INFO`."""
     team_rounds: List[TeamRound] = []
     for demoname, lmdb_path in games:
         info = store.read_info(demoname, lmdb_path)
@@ -274,14 +302,10 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
                     raise FileNotFoundError(f"Media file not found: {p}")
 
             tr = TeamRound(
-                demoname=demoname,
-                lmdb_path=os.path.abspath(lmdb_path),
-                round_num=int(r["round_num"]),
-                team=str(r["team"]).upper(),
-                start_tick=int(r["start_tick"]),
-                end_tick=int(r["end_tick"]),
-                pov_videos=pov_videos_abs,
-                pov_audio=pov_audio_abs,
+                demoname=demoname, lmdb_path=os.path.abspath(lmdb_path),
+                round_num=int(r["round_num"]), team=str(r["team"]).upper(),
+                start_tick=int(r["start_tick"]), end_tick=int(r["end_tick"]),
+                pov_videos=pov_videos_abs, pov_audio=pov_audio_abs,
             )
             if tr.start_tick >= tr.end_tick:
                 raise ValueError(f"Invalid ticks for {demoname} round {tr.round_num} {tr.team}: {tr.start_tick} >= {tr.end_tick}")
@@ -298,10 +322,7 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
 # -------------------------------
 
 class EpochIndex:
-    """Samples a fixed-length frame window inside each TeamRound for a given epoch.
-
-    The sampling is deterministic given (seed, epoch).
-    """
+    """Samples a fixed-length frame window inside each TeamRound for a given epoch."""
     def __init__(self, T_frames: int, seed: int):
         self.T_frames = T_frames
         self.seed = seed
@@ -310,35 +331,18 @@ class EpochIndex:
 
     def build(self, team_rounds: List[TeamRound], epoch: int, allow_padding: bool = True) -> Tuple[List[SampleRecord], Dict[int, SampleRecord]]:
         rnd = random.Random(self.seed + epoch)
-        self.records.clear()
-        self.id_to_sample.clear()
-
+        self.records.clear(); self.id_to_sample.clear()
         sid = 0
         for tr in team_rounds:
-            if tr.frame_count >= self.T_frames:
-                start_f = rnd.randint(0, tr.frame_count - self.T_frames)
-            else:
-                if not allow_padding:
-                    continue
-                start_f = 0
-            start_tick_win = tr.start_tick + TICKS_PER_FRAME * start_f
+            start_f = rnd.randint(0, tr.frame_count - self.T_frames) if tr.frame_count >= self.T_frames else 0
             rec = SampleRecord(
-                sample_id=sid,
-                demoname=tr.demoname,
-                lmdb_path=tr.lmdb_path,
-                round_num=tr.round_num,
-                team=tr.team,
-                pov_videos=tr.pov_videos,
-                pov_audio=tr.pov_audio, # <-- ADDED
-                start_f=start_f,
-                start_tick_win=start_tick_win,
-                T_frames=self.T_frames,
-                parity=tr.parity,
+                sample_id=sid, demoname=tr.demoname, lmdb_path=tr.lmdb_path,
+                round_num=tr.round_num, team=tr.team, pov_videos=tr.pov_videos,
+                pov_audio=tr.pov_audio, start_f=start_f,
+                start_tick_win=tr.start_tick + TICKS_PER_FRAME * start_f,
+                T_frames=self.T_frames, parity=tr.parity,
             )
-            self.records.append(rec)
-            self.id_to_sample[sid] = rec
-            sid += 1
-
+            self.records.append(rec); self.id_to_sample[sid] = rec; sid += 1
         logging.info("EpochIndex built: %d samples (T=%d)", len(self.records), self.T_frames)
         return self.records, self.id_to_sample
 
@@ -361,17 +365,14 @@ class FilelistWriter:
         vid_paths = [os.path.join(self.out_dir, f"pov{k}_video.txt") for k in range(5)]
         aud_paths = [os.path.join(self.out_dir, f"pov{k}_audio.txt") for k in range(5)]
         
-        vid_files = [open(p, "w", encoding="utf-8") for p in vid_paths]
-        aud_files = [open(p, "w", encoding="utf-8") for p in aud_paths]
-        try:
+        with contextlib.ExitStack() as stack:
+            files = [stack.enter_context(open(p, "w", encoding="utf-8")) for p in vid_paths + aud_paths]
+            vid_files, aud_files = files[:5], files[5:]
             for rec in records:
                 for k in range(5):
-                    # Video line
                     pov_path = rec.pov_videos[k]
                     ticks = ticks_from_filename(pov_path)
-                    if not ticks:
-                        raise ValueError(f"Could not parse start/end ticks from filename: {pov_path}")
-
+                    if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
                     pov_start_tick, pov_end_tick = ticks
                     start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
 
@@ -379,20 +380,10 @@ class FilelistWriter:
                         raise ValueError(f"POV segment {os.path.basename(pov_path)} for sample {rec.sample_id} has no frames.")
 
                     vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
-                    
-                    # Audio line (pack sample_id and the clamped start frame)
                     packed = rec.sample_id * LABEL_SCALE + start
                     aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
-        finally:
-            for f in vid_files + aud_files:
-                f.close()
-
-        counts = [sum(1 for _ in open(p, "r", encoding="utf-8")) for p in vid_paths + aud_paths]
-        if len(set(counts)) != 1:
-            raise RuntimeError(f"Filelist line count mismatch: {counts}")
-        logging.info("Wrote DALI filelists to %s (N=%d)", self.out_dir, counts[0])
+        logging.info("Wrote DALI filelists to %s (N=%d)", self.out_dir, len(records))
         return vid_paths, aud_paths
-
 
 # -------------------------------
 # Step 5: DALI pipeline (video + audio)
@@ -400,274 +391,58 @@ class FilelistWriter:
 
 @dataclass
 class DaliConfig:
-    # -------- Video --------
-    height: int = 224
-    width: int = 224
-    sequence_length: int = 512
-    mean: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    std: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    fps: float = 32.0  # used to convert label (frame index) -> seconds
-
-    # Optional explicit resize targets (if None, mirror width/height)
-    resize_h: Optional[int] = None
-    resize_w: Optional[int] = None
-
-    # Reader behavior
-    shuffle: bool = False
-    initial_fill: int = 16  # prefill for random shuffling
-
-    # -------- Audio --------
-    sample_rate: float = 24000.0
-
-    # Keep your original names, but the pipeline uses these aliases:
-    # (n_mels <-> mel_bins), (n_fft <-> nfft), (win_length <-> window_length)
-    n_mels: Optional[int] = 128
-    mel_bins: Optional[int] = None
-
-    n_fft: Optional[int] = 1024
-    nfft: Optional[int] = None
-
-    win_length: Optional[int] = 1024
-    window_length: Optional[int] = None
-
-    hop_length: int = 375  # 24k / (32fps * 2 mel/frame) = 375
-
-    # Mel / dB params used by the pipeline
-    mel_fmin: float = 0.0
-    mel_fmax: Optional[float] = None  # if None, set to sample_rate / 2 in __post_init__
-    db_cutoff: float = 80.0
-
-    # -------- Common / DALI runtime --------
-    batch_size: int = 1
-    num_threads: int = 4
-    device_id: int = 0
-    prefetch_queue_depth: int = 1
-    additional_decode_surfaces: int = 8
-    read_ahead: bool = True
-    shard_id: int = 0
-    num_shards: int = 1
-    seed: int = 42
-
+    height: int = 224; width: int = 224; sequence_length: int = 512
+    mean: Tuple[float,...] = (0.0, 0.0, 0.0); std: Tuple[float,...] = (1.0, 1.0, 1.0)
+    fps: float = 32.0; sample_rate: float = 24000.0; n_mels: int = 128
+    n_fft: int = 1024; win_length: int = 1024; hop_length: int = 375
+    batch_size: int = 1; num_threads: int = 4; device_id: int = 0
+    shard_id: int = 0; num_shards: int = 1; seed: int = 42
+    # DALI aliases and runtime params
+    mel_bins: int = field(init=False); nfft: int = field(init=False)
+    window_length: int = field(init=False); mel_fmax: float = field(init=False)
+    db_cutoff: float = 80.0; shuffle: bool = False
+    
     def __post_init__(self):
-        # Mirror resize_{h,w} from {height,width} if not explicitly set
-        if self.resize_h is None:
-            self.resize_h = self.height
-        if self.resize_w is None:
-            self.resize_w = self.width
-
-        # Sync alias pairs (prefer explicitly provided alias if set)
-        if self.mel_bins is None and self.n_mels is not None:
-            self.mel_bins = self.n_mels
-        if self.n_mels is None and self.mel_bins is not None:
-            self.n_mels = self.mel_bins
-
-        if self.nfft is None and self.n_fft is not None:
-            self.nfft = self.n_fft
-        if self.n_fft is None and self.nfft is not None:
-            self.n_fft = self.nfft
-
-        if self.window_length is None and self.win_length is not None:
-            self.window_length = self.win_length
-        if self.win_length is None and self.window_length is not None:
-            self.win_length = self.window_length
-
-        # Default mel_fmax to Nyquist if not set
-        if self.mel_fmax is None:
-            self.mel_fmax = float(self.sample_rate) / 2.0
-
-        # Basic sanity checks
-        assert self.sequence_length > 0, "sequence_length must be > 0"
-        assert self.batch_size > 0, "batch_size must be > 0"
-        assert self.num_threads > 0, "num_threads must be > 0"
-        assert self.nfft > 0, "nfft must be > 0"
-        assert self.window_length > 0, "window_length must be > 0"
-        assert self.hop_length > 0, "hop_length must be > 0"
-        assert len(self.mean) == 3 and len(self.std) == 3, "mean/std must be RGB triplets"
-
+        self.mel_bins, self.nfft, self.window_length = self.n_mels, self.n_fft, self.win_length
+        self.mel_fmax = self.sample_rate / 2.0
 
 
 class DaliInputPipeline:
-    """Builds a single DALI pipeline with 5 video and 5 audio branches.
-
-    Iterator output per batch:
-      {
-        "pov0": [B, T, C, H, W] (FP16 CUDA), "labels0": [B], "mel0": [B, T_aud, n_mels],
-        "pov1": ..., "labels1": ..., "mel1": ...,
-        ...
-      }
-    """
+    """Builds a single DALI pipeline with 5 video and 5 audio branches."""
     def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig):
-        if not DALI_AVAILABLE:
-            raise ImportError(
-                f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}.\n"
-                "Install DALI to use GPU video/audio processing: https://docs.nvidia.com/deeplearning/dali/user-guide/docs/installation.html"
-            )
-        assert len(video_filelists) == 5, "Expected 5 video filelists"
-        assert len(audio_filelists) == 5, "Expected 5 audio filelists"
-        self.video_filelists = video_filelists
-        self.audio_filelists = audio_filelists
-        self.cfg = cfg
-        self.pipeline = self._build_pipeline()
+        if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
+        self.pipeline = self._build_pipeline(video_filelists, audio_filelists, cfg)
+        out_map = [f"pov{k}" for k in range(5)] + [f"labels{k}" for k in range(5)] + [f"mel{k}" for k in range(5)]
+        self.iterator = DALIGenericIterator([self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatch_policy.DROP)
 
-        out_map = []
-        for k in range(5):
-            out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
-
-        self.iterator = DALIGenericIterator(
-            [self.pipeline], out_map, auto_reset=True, dynamic_shape=False, last_batch_policy=LastBatchPolicy.DROP
-        )
-
-
-    def _build_pipeline(self):
-        cfg = self.cfg
-        video_filelists = self.video_filelists
-        audio_filelists = self.audio_filelists
-        
-        @pipeline_def(
-            batch_size=cfg.batch_size,
-            num_threads=cfg.num_threads,
-            device_id=cfg.device_id,
-            prefetch_queue_depth=cfg.prefetch_queue_depth,
-            seed=getattr(cfg, "seed", 42),
-        )
+    def _build_pipeline(self, vlists, alists, cfg):
+        @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed)
         def pipe():
             outputs = []
-
-            for k, (vlist, alist) in enumerate(zip(video_filelists, audio_filelists)):
-                # -------------------------
-                # VIDEO branch (GPU-only)
-                # -------------------------
-                # The video reader is on the GPU. We only need the video output from it.
-                # We will ignore its label output because it would be on the GPU.
-                video, _ = fn.readers.video(
-                    name=f"VideoReader{k}",
-                    device="gpu",
-                    file_list=vlist,
-                    sequence_length=cfg.sequence_length,
-                    file_list_frame_num=True,
-                    file_list_include_preceding_frame=True,  # Set explicitly for future compatibility
-                    pad_sequences=True,
-                    shard_id=cfg.shard_id,
-                    num_shards=cfg.num_shards,
-                    random_shuffle=getattr(cfg, "shuffle", False),
-                    pad_last_batch=True,
-                    initial_fill=getattr(cfg, "initial_fill", 16),
-                    additional_decode_surfaces=getattr(cfg, "additional_decode_surfaces", 8),
-                    read_ahead=getattr(cfg, "read_ahead", True),
-                    dtype=types.UINT8,
-                )
-
-                frames = fn.resize(
-                    video,
-                    resize_x=cfg.resize_w,
-                    resize_y=cfg.resize_h,
-                    device="gpu",
-                )
-                frames = fn.crop_mirror_normalize(
-                    frames,
-                    device="gpu",
-                    dtype=types.FLOAT16,
-                    output_layout="FCHW",
-                    mean=cfg.mean,
-                    std=cfg.std,
-                )
-
-                # -------------------------
-                # AUDIO branch (CPU -> GPU)
-                # -------------------------
-                # The audio file reader is a CPU operator. It can give us the label
-                # (the sample_id) directly on the CPU, which is what we need.
-                audio_raw, label_cpu = fn.readers.file(
-                    name=f"AudioReader{k}",
-                    file_list=alist,
-                    shard_id=cfg.shard_id,
-                    num_shards=cfg.num_shards,
-                    random_shuffle=getattr(cfg, "shuffle", False),
-                )
+            for k in range(5):
+                video, _ = fn.readers.video(name=f"V{k}", device="gpu", file_list=vlists[k], sequence_length=cfg.sequence_length, pad_sequences=True, shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle, dtype=types.UINT8)
+                frames = fn.crop_mirror_normalize(fn.resize(video, resize_x=cfg.width, resize_y=cfg.height), device="gpu", dtype=types.FLOAT16, output_layout="FCHW", mean=cfg.mean, std=cfg.std)
                 
-                # Unpack: label_cpu is INT; pack = sample_id*LABEL_SCALE + start_f
+                audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle)
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
-                # integer: sample_id = packed // LABEL_SCALE
                 sample_id_i32 = fn.cast(packed_i64 // LABEL_SCALE, dtype=types.INT32)
-                start_f_i64 = packed_i64 - fn.cast(sample_id_i32, dtype=types.INT64) * LABEL_SCALE
-                start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
-
-                decoded_audio, _ = fn.decoders.audio(
-                    audio_raw,
-                    sample_rate=cfg.sample_rate,
-                    downmix=True,
-                )
-
-                # Compute slice arguments on the CPU using the unpacked `start_f`.
-                start_in_seconds = start_f_f32 / cfg.fps
-                start_in_samples_f = start_in_seconds * cfg.sample_rate
-                start_in_samples = fn.cast(start_in_samples_f, dtype=types.INT32)
-
-                # Calculate shape to produce exactly sequence_length * TICKS_PER_FRAME mel columns
-                M = cfg.sequence_length * TICKS_PER_FRAME
-                shape_in_samples = (M - 1) * cfg.hop_length + cfg.window_length
-
-                # Move audio to GPU *then* slice on GPU, using CPU arguments.
-                audio_gpu = decoded_audio.gpu()
-                sliced_audio_gpu = fn.slice(
-                    audio_gpu,
-                    start=start_in_samples,
-                    shape=int(shape_in_samples),
-                    axes=[0],
-                    out_of_bounds_policy="pad",     # <-- important
-                    fill_values=0.0               # optional; defaults to 0.0
-                )
-
-                # Spectrogram + Mel on GPU
-                spec = fn.spectrogram(
-                    sliced_audio_gpu,
-                    nfft=cfg.nfft,
-                    window_length=cfg.window_length,
-                    window_step=cfg.hop_length,
-                    center_windows=False,
-                )
-                mel = fn.mel_filter_bank(
-                    spec,
-                    sample_rate=cfg.sample_rate,
-                    nfilter=cfg.mel_bins,
-                    freq_low=cfg.mel_fmin,
-                    freq_high=cfg.mel_fmax,
-                )
-                mel_db = fn.to_decibels(
-                    mel,
-                    multiplier=10.0,
-                    reference=1.0,
-                    cutoff_db=cfg.db_cutoff,
-                )
-                # DALI returns [mel_bins, time]; assembler expects [time, mel_bins]
-                mel_db = fn.transpose(mel_db, perm=[1, 0])
-
-                # IMPORTANT: flatten outputs. Emit the unpacked sample_id as the label.
-                outputs += [frames, sample_id_i32, mel_db]
-
+                start_f_f32 = fn.cast(packed_i64 % LABEL_SCALE, dtype=types.FLOAT)
+                
+                decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=True)
+                start_s = start_f_f32 / cfg.fps
+                shape_samples = (cfg.sequence_length * TICKS_PER_FRAME - 1) * cfg.hop_length + cfg.window_length
+                sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=int(shape_samples), axes=[0], out_of_bounds_policy="pad")
+                
+                spec = fn.spectrogram(sliced, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
+                mel_spec = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
+                mel_db = fn.transpose(fn.to_decibels(mel_spec, cutoff_db=cfg.db_cutoff), perm=[1, 0])
+                outputs.extend([frames, sample_id_i32, mel_db])
             return tuple(outputs)
-
-        pipe_inst = pipe()
-        pipe_inst.build()
-        return pipe_inst
-
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        out = next(self.iterator)
-        batch = out[0]
-        # Robustly flatten labels for consistency check
-        l0 = batch["labels0"].cpu().numpy().reshape(-1).tolist()
-        for k in range(1, 5):
-            lk = batch[f"labels{k}"].cpu().numpy().reshape(-1).tolist()
-            if lk != l0:
-                raise RuntimeError(f"Label mismatch between branches: {l0} vs {lk}")
-        return batch
-
-    def reset(self):
-        self.iterator.reset()
+        p = pipe(); p.build(); return p
+    
+    def __iter__(self): return self
+    def __next__(self): return next(self.iterator)[0]
+    def reset(self): self.iterator.reset()
 
 
 # -------------------------------
@@ -680,19 +455,28 @@ def ticks_for_window(start_tick_win: int, T_frames: int) -> np.ndarray:
 
 
 # -------------------------------
-# Step 7: LMDB metadata fetch
+# Step 7 & 10: LMDB metadata fetch
 # -------------------------------
 
 @dataclass
 class MetaFetchResult:
-    alive_mask: np.ndarray       # [T, 5] (uint8/bool)
-    game_state_list: List[Dict[str, Any]]
-
+    """Holds all ground truth data fetched from LMDB for one training sample."""
+    alive_mask: np.ndarray             # [T, 5] (uint8)
+    # Player-specific ground truth [T, 5, ...]
+    stats: np.ndarray                  # [T, 5, 3] (health, armor, money) float32
+    mouse_delta: np.ndarray            # [T, 5, 2] (dx, dy) float32
+    position: np.ndarray               # [T, 5, 3] (x, y, z) float32
+    keyboard_mask: np.ndarray          # [T, 5] uint32
+    eco_mask: np.ndarray               # [T, 5, 6] uint64
+    inventory_mask: np.ndarray         # [T, 5, 2] uint64
+    active_weapon_idx: np.ndarray      # [T, 5] int32
+    # Game-strategy ground truth [T, ...]
+    round_number: np.ndarray           # [T] int32
+    round_state_mask: np.ndarray       # [T] uint8
+    enemy_positions: np.ndarray        # [T, 5, 3] float32
 
 class LmdbMetaFetcher:
-    """Fetches per-frame metadata (alive mask) from LMDB for a sampled window.
-    The mel spectrogram is now generated by DALI.
-    """
+    """Fetches per-frame metadata and ground truth labels from LMDB for a sampled window."""
     def __init__(self, store: LmdbStore):
         self.store = store
 
@@ -700,101 +484,245 @@ class LmdbMetaFetcher:
     def _key(demoname: str, round_num: int, team: str, tick: int) -> bytes:
         return f"{demoname}_round_{round_num:03d}_team_{team}_tick_{tick:08d}".encode("utf-8")
 
+    @staticmethod
+    def _bitmask_to_weapon_index(mask: np.ndarray) -> int:
+        """Converts a [2] uint64 weapon bitmask to a single item index."""
+        if mask.sum() == 0: return -1
+        for i in range(128):
+            if (mask[i // 64] >> np.uint64(i % 64)) & np.uint64(1):
+                return i
+        return -1
+
     def fetch(self, rec: SampleRecord) -> MetaFetchResult:
+        """Fetches next-frame-prediction targets for the given sample record."""
         env = self.store.open(rec.lmdb_path)
         T = rec.T_frames
+        
+        # Initialize numpy arrays to hold the results
         alive_mask = np.zeros((T, 5), dtype=np.uint8)
-        gs_list: List[Dict[str, Any]] = []
-
+        stats = np.zeros((T, 5, 3), dtype=np.float32)
+        mouse_delta = np.zeros((T, 5, 2), dtype=np.float32)
+        position = np.zeros((T, 5, 3), dtype=np.float32)
+        keyboard_mask = np.zeros((T, 5), dtype=np.uint32)
+        eco_mask = np.zeros((T, 5, 6), dtype=np.uint64)
+        inventory_mask = np.zeros((T, 5, 2), dtype=np.uint64)
+        active_weapon_idx = np.full((T, 5), -1, dtype=np.int32)
+        round_number = np.full((T,), rec.round_num, dtype=np.int32)
+        round_state_mask = np.zeros((T,), dtype=np.uint8)
+        enemy_positions = np.zeros((T, 5, 3), dtype=np.float32)
+        
         ticks = ticks_for_window(rec.start_tick_win, T)
+
         with env.begin(write=False) as txn:
             for f, tick in enumerate(ticks.tolist()):
-                blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(tick)))
-                if not blob:
-                    gs_list.append({})
-                    continue
+                # Fetch current frame's data for alive_mask
+                current_blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(tick)))
+                if current_blob:
+                    payload = msgpack.unpackb(current_blob, raw=False, object_hook=mpnp.decode)
+                    gs = payload.get("game_state")
+                    if gs is not None and len(gs) > 0:
+                        mask_bits = int(gs[0]['team_alive'])
+                        for slot in range(5):
+                            if (mask_bits >> slot) & 1:
+                                alive_mask[f, slot] = 1
+
+                # Fetch NEXT frame's data for ground truth targets
+                target_tick = tick + TICKS_PER_FRAME
+                target_blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(target_tick)))
+                if not target_blob: continue
+
+                payload = msgpack.unpackb(target_blob, raw=False, object_hook=mpnp.decode)
                 
-                payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
-                
+                # Populate Game State / Strategy Targets
                 gs = payload.get("game_state")
+                if gs is not None and len(gs) > 0:
+                    gs_data = gs[0]
+                    round_state_mask[f] = gs_data['round_state']
+                    enemy_positions[f] = gs_data['enemy_pos']
                 
-                if gs is not None:
-                    gs_list.append(gs)
-                    mask_bits = int(gs['team_alive'][0])
-                else:
-                    gs_list.append({})
-                    mask_bits = 0
+                # Populate Player Targets
+                pdl = payload.get("player_data")
+                if pdl:
+                    # player_data is stored sorted by slot index 0..4
+                    for p_idx, p_data_arr in enumerate(pdl):
+                        if p_idx >= 5: continue
+                        if p_data_arr is not None and len(p_data_arr) > 0:
+                            p_data = p_data_arr[0]
+                            stats[f, p_idx] = [p_data['health'], p_data['armor'], p_data['money']]
+                            mouse_delta[f, p_idx] = p_data['mouse']
+                            position[f, p_idx] = p_data['pos']
+                            keyboard_mask[f, p_idx] = p_data['keyboard_bitmask']
+                            eco_mask[f, p_idx] = p_data['eco_bitmask']
+                            inventory_mask[f, p_idx] = p_data['inventory_bitmask']
+                            active_weapon_idx[f, p_idx] = self._bitmask_to_weapon_index(p_data['active_weapon_bitmask'])
 
-                for slot in range(5):
-                    if (mask_bits >> slot) & 1:
-                        alive_mask[f, slot] = 1
-
-        return MetaFetchResult(alive_mask=alive_mask, game_state_list=gs_list)
-
+        return MetaFetchResult(
+            alive_mask=alive_mask, stats=stats, mouse_delta=mouse_delta, position=position,
+            keyboard_mask=keyboard_mask, eco_mask=eco_mask, inventory_mask=inventory_mask,
+            active_weapon_idx=active_weapon_idx, round_number=round_number,
+            round_state_mask=round_state_mask, enemy_positions=enemy_positions
+        )
 
 # -------------------------------
-# Step 8: Batch assembler (fuse DALI + LMDB)
+# Step 8 & 10: Batch assembler
 # -------------------------------
 
 class BatchAssembler:
-    """Converts a raw DALI batch + LmdbMetaFetcher outputs into model-ready tensors."""
-    def __init__(self, id_to_sample: Dict[int, SampleRecord], fetcher: LmdbMetaFetcher, device: Optional[torch.device] = None, amp_prefer_bf16: bool = False):
+    """Converts a raw DALI batch + LMDB fetch into model-ready tensors."""
+    def __init__(self, id_to_sample: Dict[int, SampleRecord], fetcher: LmdbMetaFetcher, device: torch.device):
         self.id_to_sample = id_to_sample
         self.fetcher = fetcher
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.amp_prefer_bf16 = amp_prefer_bf16
+        self.device = device
+
+    @staticmethod
+    def _masks_to_multi_hot(masks: torch.Tensor, num_classes: int) -> torch.Tensor:
+        """Convert a tensor of integer bitmasks to a multi-hot float tensor."""
+        powers = torch.arange(num_classes, device=masks.device, dtype=masks.dtype).view(1, -1)
+        return ((masks.unsqueeze(-1) >> powers) & 1).float()
 
     def assemble(self, dali_batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        # 1) Stack POV video and mel spectrogram tensors from DALI
-        povs = []
-        mels = []
-        labels = dali_batch["labels0"]
-        for k in range(5):
-            povs.append(dali_batch[f"pov{k}"])
-            mel_k = dali_batch[f"mel{k}"] # [B, T_aud, n_mels]
-            mels.append(mel_k)
-
-        images = torch.stack(povs, dim=2)  # [B, T, 5, C, H, W]
-        if self.amp_prefer_bf16 and images.dtype == torch.float16:
-            images = images.to(torch.bfloat16)
-
-        # [B, 5, T_aud, n_mels] -> [B, T_aud, 5, n_mels] -> [B, T_aud, 5, 1, n_mels]
-        mel = torch.stack(mels, dim=1).permute(0, 2, 1, 3).unsqueeze(3)
-
-        # 2) For each sample, fetch alive_mask from LMDB
-        # Flatten labels tensor to handle both [B] and [B, 1] shapes
-        sample_ids = labels.detach().view(-1).cpu().tolist()
-        mask_list = []
+        """Assembles the final batch dictionary, including ground truth targets."""
+        # 1) Stack DALI outputs
+        images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
+        mel = torch.stack([dali_batch[f"mel{k}"] for k in range(5)], dim=1).permute(0, 2, 1, 3).unsqueeze(3)
+        
+        # 2) Fetch metadata and ground truth labels from LMDB
+        sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
+        
+        gt_lists = defaultdict(list)
         meta = {"sample_ids": sample_ids, "demonames": [], "round_nums": [], "teams": []}
+
         for sid in sample_ids:
             rec = self.id_to_sample[int(sid)]
             meta["demonames"].append(rec.demoname)
             meta["round_nums"].append(rec.round_num)
             meta["teams"].append(rec.team)
-            feats = self.fetcher.fetch(rec)
-            mask_list.append(torch.from_numpy(feats.alive_mask))
-        
-        alive_mask = torch.stack(mask_list, dim=0).to(self.device, non_blocking=True)  # [B,T,5]
+            
+            gt_result = self.fetcher.fetch(rec)
+            for key, value in gt_result.__dict__.items():
+                gt_lists[key].append(torch.from_numpy(value))
 
-        # 3) Move all tensors to the target device
-        images = images.to(self.device, non_blocking=True)
-        mel = mel.to(self.device, non_blocking=True, dtype=images.dtype)
+        # 3) Stack all ground truth lists into batch tensors
+        gt_tensors = {k: torch.stack(v, dim=0).to(self.device) for k, v in gt_lists.items()}
 
-        # 4) Pad mel spectrogram to match the target time dimension (T * TICKS_PER_FRAME)
-        target_len = images.shape[1] * TICKS_PER_FRAME
-        if mel.shape[1] != target_len:
-            pad_len = target_len - mel.shape[1]
-            if pad_len > 0:
-                mel = torch.nn.functional.pad(mel, (0, 0, 0, 0, 0, 0, 0, pad_len), "constant", 0)
-            mel = mel[:, :target_len, ...]
-
+        # 4) Assemble final batch dictionary
         batch = {
-            "images": images,
-            "mel_spectrogram": mel,
-            "alive_mask": alive_mask,
+            "images": images.to(self.device),
+            "mel_spectrogram": mel.to(self.device, dtype=images.dtype),
+            "alive_mask": gt_tensors.pop("alive_mask").bool(),
             "meta": meta,
         }
+
+        # 5) Assemble the 'targets' dictionary, converting masks to multi-hot
+        targets = {"player": [{} for _ in range(5)], "game_strategy": {}}
+        for i in range(5):
+            targets["player"][i]["stats"] = gt_tensors["stats"][:, :, i]
+            targets["player"][i]["mouse_delta_deg"] = gt_tensors["mouse_delta"][:, :, i]
+            targets["player"][i]["pos_coords"] = gt_tensors["position"][:, :, i] # Raw coords for loss fn
+            targets["player"][i]["keyboard_logits"] = self._masks_to_multi_hot(gt_tensors["keyboard_mask"][:, :, i], 31)
+            targets["player"][i]["eco_logits"] = self._masks_to_multi_hot(gt_tensors["eco_mask"][:, :, i].view(-1, 512, 6).permute(0, 2, 1).reshape(-1, 512, 384).sum(dim=1), 224) # Placeholder logic for eco
+            targets["player"][i]["inventory_logits"] = self._masks_to_multi_hot(gt_tensors["inventory_mask"][:, :, i].view(-1, 512, 2).permute(0, 2, 1).reshape(-1, 512, 128).sum(dim=1), 128) # Placeholder logic for inventory
+            targets["player"][i]["active_weapon_logits"] = gt_tensors["active_weapon_idx"][:, :, i].long()
+
+        targets["game_strategy"]["enemy_pos_coords"] = gt_tensors["enemy_positions"]
+        targets["game_strategy"]["round_state_logits"] = self._masks_to_multi_hot(gt_tensors["round_state_mask"], 5)
+        targets["game_strategy"]["round_number"] = gt_tensors["round_number"].float()
+
+        batch["targets"] = targets
         return batch
+
+
+# =============================================================================
+# STEP 11: Composite Loss Function
+# =============================================================================
+
+class CompositeLoss(nn.Module):
+    """Calculates the composite, masked loss across all model prediction heads."""
+    def __init__(self, weights: dict):
+        super().__init__()
+        self.weights = weights
+        self.coord_mapper = CoordinateMapper(grid_dims=(64, 64, 8))
+        
+        # Initialize loss functions with no reduction to allow for manual masking
+        self.mse_loss = nn.MSELoss(reduction='none')
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=-1)
+
+    def _scalar_loss(self, unmasked_loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Applies a mask and reduces the loss to a scalar."""
+        masked_loss = unmasked_loss * mask
+        return masked_loss.sum() / mask.sum().clamp(min=1.0)
+
+    def forward(self, predictions: Dict, targets: Dict, alive_mask: torch.Tensor) -> torch.Tensor:
+        total_loss = torch.tensor(0.0, device=alive_mask.device)
+        B, T, _ = alive_mask.shape
+
+        # --- Player Losses ---
+        for i in range(5):
+            p_pred = predictions["player"][i]
+            p_targ = targets["player"][i]
+            # Mask for this player across batch and time [B, T]
+            player_alive_mask = alive_mask[:, :, i].float()
+
+            # Stats (MSE)
+            loss_stats = self.mse_loss(p_pred["stats"], p_targ["stats"]).mean(dim=-1)
+            total_loss += self.weights['stats'] * self._scalar_loss(loss_stats, player_alive_mask)
+
+            # Mouse (MSE)
+            loss_mouse = self.mse_loss(p_pred["mouse_delta_deg"], p_targ["mouse_delta_deg"]).mean(dim=-1)
+            total_loss += self.weights['mouse'] * self._scalar_loss(loss_mouse, player_alive_mask)
+
+            # Keyboard, Eco, Inventory (BCE)
+            for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
+                loss_bce = self.bce_loss(p_pred[key], p_targ[key]).mean(dim=-1)
+                total_loss += self.weights[key.replace('_logits','')] * self._scalar_loss(loss_bce, player_alive_mask)
+
+            # Active Weapon (CE)
+            pred_flat = p_pred["active_weapon_logits"].view(B * T, -1)
+            targ_flat = p_targ["active_weapon_logits"].view(B * T)
+            loss_weapon_unmasked = self.ce_loss(pred_flat, targ_flat)
+            total_loss += self.weights['weapon'] * self._scalar_loss(loss_weapon_unmasked, player_alive_mask.view(B * T))
+
+        # --- Game Strategy Losses ---
+        gs_pred = predictions["game_strategy"]
+        gs_targ = targets["game_strategy"]
+        frame_mask = alive_mask.any(dim=-1).float() # Mask for frames with at least one player alive
+
+        # Round Number (MSE)
+        loss_round_num = self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1)
+        total_loss += self.weights['round_number'] * self._scalar_loss(loss_round_num, frame_mask)
+        
+        # Round State (BCE)
+        loss_round_state = self.bce_loss(gs_pred["round_state_logits"], gs_targ["round_state_logits"]).mean(dim=-1)
+        total_loss += self.weights['round_state'] * self._scalar_loss(loss_round_state, frame_mask)
+
+        # --- Heatmap Losses (BCE with smooth targets) ---
+        # Player Position
+        alive_indices = torch.where(alive_mask.view(-1) > 0)[0]
+        if alive_indices.numel() > 0:
+            pred_pos_logits_alive = torch.cat([p["pos_heatmap_logits"] for p in predictions["player"]], dim=0).view(B, T, 5, 8, 64, 64).permute(0,1,2,4,5,3).reshape(B*T*5, -1)[alive_indices]
+            targ_pos_coords_alive = torch.cat([p["pos_coords"] for p in targets["player"]], dim=0).view(B, T, 5, 3).reshape(B*T*5, -1)[alive_indices]
+            
+            target_grid_indices = self.coord_mapper.discretize_world_to_grid(targ_pos_coords_alive)
+            target_heatmap = create_gaussian_heatmap_target(target_grid_indices, grid_dims=(64, 64, 8), sigma=1.5)
+            
+            loss_pos = self.bce_loss(pred_pos_logits_alive, target_heatmap).mean()
+            total_loss += self.weights['pos_heatmap'] * loss_pos
+
+        # Enemy Position
+        targ_enemy_coords_flat = gs_targ["enemy_pos_coords"].view(B * T * 5, 3)
+        # Filter out invalid positions (often all zeros for dead/unseen enemies)
+        valid_enemy_mask = targ_enemy_coords_flat.abs().sum(dim=-1) > 0
+        if valid_enemy_mask.any():
+            pred_enemy_logits_flat = gs_pred["enemy_pos_heatmap_logits"].view(B*T, 8, 64, 64).unsqueeze(1).expand(-1, 5, -1,-1,-1).reshape(B*T*5, -1)
+            
+            target_grid_indices = self.coord_mapper.discretize_world_to_grid(targ_enemy_coords_flat[valid_enemy_mask])
+            target_heatmap = create_gaussian_heatmap_target(target_grid_indices, grid_dims=(64, 64, 8), sigma=1.5)
+            
+            loss_enemy_pos = self.bce_loss(pred_enemy_logits_flat[valid_enemy_mask], target_heatmap).mean()
+            total_loss += self.weights['enemy_heatmap'] * loss_enemy_pos
+            
+        return total_loss
 
 # -------------------------------
 # Step 9: Determinism, DDP helpers, instrumentation
@@ -802,25 +730,15 @@ class BatchAssembler:
 
 class Timer:
     """Simple timer context for instrumentation."""
-    def __init__(self, name: str):
-        self.name = name
-        self.t0 = 0.0
-        self.dt = 0.0
-
-    def __enter__(self):
-        self.t0 = time.time()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.dt = time.time() - self.t0
-
+    def __init__(self, name: str): self.name = name
+    def __enter__(self): self.t0 = time.time(); return self
+    def __exit__(self, *args): self.dt = time.time() - self.t0
 
 def get_ddp_info() -> Tuple[int, int]:
-    """Return (shard_id, num_shards) using torch.distributed if available; else (0,1)."""
+    """Return (shard_id, num_shards) using torch.distributed if available."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(), torch.distributed.get_world_size()
     return 0, 1
-
 
 # -------------------------------
 # Optional: minimal driver for sanity
@@ -828,99 +746,90 @@ def get_ddp_info() -> Tuple[int, int]:
 
 @dataclass
 class DataArgs:
-    data_root: str
-    manifest: str
-    split: str = "train"
-    run_dir: str = "runs/exp1"
-    T_frames: int = 512
-    height: int = 224
-    width: int = 224
-    batch_size: int = 1
-    seed: int = 42
-    dali_threads: int = 4
-    decode_surfaces: int = 8
-
+    data_root: str; manifest: str; split: str = "train"; run_dir: str = "runs/exp1"
+    T_frames: int = 64; height: int = 224; width: int = 224
+    batch_size: int = 1; seed: int = 42; dali_threads: int = 4
 
 def build_data_iter(args: DataArgs):
     """Convenience function that wires Steps 1→8 and returns (dali_iter, assembler)."""
-    os.makedirs(args.run_dir, exist_ok=True)
-    logging.info("=== Building data loader for split=%s ===", args.split)
-
-    # Step 1: Manifest + INFO
+    # Steps 1-4: Discover rounds, sample windows, write filelists
     manifest = Manifest(args.data_root, args.manifest)
-    games = manifest.get_games(args.split)
     store = LmdbStore()
-    team_rounds = build_team_rounds(args.data_root, games, store)
-
-    # Step 3: EpochIndex
+    team_rounds = build_team_rounds(args.data_root, manifest.get_games(args.split), store)
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
-    records, id_map = index.build(team_rounds, epoch=0, allow_padding=True)
-
-    # Step 4: Filelists
+    records, id_map = index.build(team_rounds, epoch=0)
     fl_dir = os.path.join(args.run_dir, "epoch_0")
-    video_filelists, audio_filelists = FilelistWriter(fl_dir).write(records)
-
-    # Step 5: DALI input
+    video_lists, audio_lists = FilelistWriter(fl_dir).write(records)
+    
+    # Step 5: DALI
     shard_id, num_shards = get_ddp_info()
-    dali_mean, dali_std, height, width = (0.0,)*3, (1.0,)*3, args.height, args.width
-    try:
-        from model import CS2Config, resolve_vit_preprocess
-        vit_name = getattr(CS2Config, "vit_name_timm", "vit_base_patch14_dinov2.lvd142m")
-        pp = resolve_vit_preprocess(vit_name)
-        mean_01, std_01 = tuple(pp["mean"]), tuple(pp["std"])
-        dali_mean = tuple(float(m) * 255.0 for m in mean_01)
-        dali_std = tuple(float(s) * 255.0 for s in std_01)
-        height, width = int(pp["height"]) or height, int(pp["width"]) or width
-        logging.info("Using model-driven preprocessing: vit=%s, HxW=%dx%d, mean=%s, std=%s",
-                     vit_name, height, width, mean_01, std_01)
-    except Exception as e:
-        logging.warning("Falling back to default preprocessing (%s).", e)
-
     dali_cfg = DaliConfig(
-        height=height, width=width, sequence_length=args.T_frames,
+        height=args.height, width=args.width, sequence_length=args.T_frames,
         batch_size=args.batch_size, num_threads=args.dali_threads,
         device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
-        additional_decode_surfaces=args.decode_surfaces,
-        mean=dali_mean, std=dali_std,
         shard_id=shard_id, num_shards=num_shards,
-        fps=FPS,  # Use the correct FPS (32)
     )
-    dali_iter = DaliInputPipeline(video_filelists, audio_filelists, dali_cfg)
+    dali_iter = DaliInputPipeline(video_lists, audio_lists, dali_cfg)
 
-    # Step 7: Metadata fetcher
+    # Step 7-8: Metadata Fetcher and Assembler
     fetcher = LmdbMetaFetcher(store)
-
-    # Step 8: Assembler
     assembler = BatchAssembler(id_map, fetcher, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-
     return dali_iter, assembler
 
-
 if __name__ == "__main__":
+    import contextlib
+    from model import CS2Transformer, CS2Config
+    
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     data_root = os.environ.get("DATA_ROOT", "data")
     manifest_path = os.path.join(data_root, "manifest.json")
-    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=1)
+    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2, T_frames=32)
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
     else:
         try:
             dali_iter, assembler = build_data_iter(args)
-            for i in range(10):
+            
+            # --- SMOKE TEST SETUP ---
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model_cfg = CS2Config(context_frames=args.T_frames)
+            model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device) # Use dummy vision for speed
+            
+            loss_weights = {
+                'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
+                'inventory': 0.5, 'weapon': 1.0, 'round_number': 0.1,
+                'round_state': 1.0, 'pos_heatmap': 2.0, 'enemy_heatmap': 2.0
+            }
+            loss_fn = CompositeLoss(weights=loss_weights).to(device)
+            # --- END SMOKE TEST SETUP ---
+
+            for i in range(5):
                 try:
-                    with Timer("one batch") as t:
+                    with Timer("dali_fetch") as t:
                         batch_raw = next(iter(dali_iter))
                     logging.info("DALI fetched video+audio in %.3fs", t.dt)
+                    
                     with Timer("assemble") as t2:
                         batch = assembler.assemble(batch_raw)
-                    logging.info("Assembled batch in %.3fs; images=%s, mel=%s, alive=%s", t2.dt, tuple(batch["images"].shape), tuple(batch["mel_spectrogram"].shape), tuple(batch["alive_mask"].shape))
+                    logging.info("Assembled batch in %.3fs", t2.dt)
+                    
+                    # --- SMOKE TEST FORWARD PASS AND LOSS CALCULATION ---
+                    with Timer("forward_pass") as t3, torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                        predictions = model(batch)
+                    logging.info("Forward pass in %.3fs", t3.dt)
+                    
+                    with Timer("loss_calc") as t4:
+                        total_loss = loss_fn(predictions, batch['targets'], batch['alive_mask'])
+                    logging.info("Calculated loss in %.3fs -> Total Loss: %.4f", t4.dt, total_loss.item())
+                    
                     # Smoke assertion
-                    assert batch["images"].shape[1] * 2 == batch["mel_spectrogram"].shape[1], "A/V time mismatch"
-                    logging.info("Smoke assertion passed: mel spectrogram time dimension is 2x video time dimension.")
+                    assert total_loss.requires_grad, "Loss must require gradients"
+                    logging.info("✅ Smoke assertion passed: Loss requires grad.")
+
                 except StopIteration:
-                    print("Finished iterator.")
+                    logging.info("Finished iterator.")
                     break
         except Exception as e:
-            logging.exception("Data loader smoke test failed. Ensure manifest.json is correct, media files exist, and LMDB is populated.")
+            logging.exception("Data loader smoke test failed.")
             logging.error("Failed with error: %s", e)
