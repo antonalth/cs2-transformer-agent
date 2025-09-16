@@ -98,7 +98,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--datadir", required=True, type=Path, help="Directory containing the .db files.")
-    parser.add_-argument("--recdir", required=True, type=Path, help="Base directory where final video folders are stored.")
+    parser.add_argument("--recdir", required=True, type=Path, help="Base directory where final video folders are stored.")
     parser.add_argument("--dry-run", action="store_true", help="Show what changes would be made without actually renaming files or updating the DB.")
     args = parser.parse_args()
 
