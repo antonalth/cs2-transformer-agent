@@ -612,8 +612,19 @@ class BatchAssembler:
             targets["player"][i]["mouse_delta_deg"] = gt_tensors["mouse_delta"][:, :, i]
             targets["player"][i]["pos_coords"] = gt_tensors["position"][:, :, i] # Raw coords for loss fn
             targets["player"][i]["keyboard_logits"] = self._masks_to_multi_hot(gt_tensors["keyboard_mask"][:, :, i], 31)
-            targets["player"][i]["eco_logits"] = self._masks_to_multi_hot(gt_tensors["eco_mask"][:, :, i].view(-1, 512, 6).permute(0, 2, 1).reshape(-1, 512, 384).sum(dim=1), 224) # Placeholder logic for eco
-            targets["player"][i]["inventory_logits"] = self._masks_to_multi_hot(gt_tensors["inventory_mask"][:, :, i].view(-1, 512, 2).permute(0, 2, 1).reshape(-1, 512, 128).sum(dim=1), 128) # Placeholder logic for inventory
+            
+            # Eco Logits (6x uint64 -> 384 bits, truncated to 224 classes)
+            eco_mask_player = gt_tensors["eco_mask"][:, :, i]  # Shape: [B, T, 6]
+            eco_parts = [self._masks_to_multi_hot(eco_mask_player[:, :, k], 64) for k in range(6)]
+            full_eco_logits = torch.cat(eco_parts, dim=-1)  # Shape: [B, T, 384]
+            targets["player"][i]["eco_logits"] = full_eco_logits[..., :224]
+
+            # Inventory Logits (2x uint64 -> 128 bits)
+            inv_mask_player = gt_tensors["inventory_mask"][:, :, i]  # Shape: [B, T, 2]
+            inv_parts = [self._masks_to_multi_hot(inv_mask_player[:, :, k], 64) for k in range(2)]
+            targets["player"][i]["inventory_logits"] = torch.cat(inv_parts, dim=-1) # Shape: [B, T, 128]
+            # --- END FIX ---
+
             targets["player"][i]["active_weapon_logits"] = gt_tensors["active_weapon_idx"][:, :, i].long()
 
         targets["game_strategy"]["enemy_pos_coords"] = gt_tensors["enemy_positions"]
