@@ -692,27 +692,19 @@ class CompositeLoss(nn.Module):
         total_loss = torch.tensor(0.0, device=alive_mask.device)
         B, T, _ = alive_mask.shape
 
-        # --- Player Losses ---
+        # --- Player Losses (No changes here) ---
         for i in range(5):
             p_pred = predictions["player"][i]
             p_targ = targets["player"][i]
-            # Mask for this player across batch and time [B, T]
             player_alive_mask = alive_mask[:, :, i].float()
 
-            # Stats (MSE)
             loss_stats = self.mse_loss(p_pred["stats"], p_targ["stats"]).mean(dim=-1)
             total_loss += self.weights['stats'] * self._scalar_loss(loss_stats, player_alive_mask)
-
-            # Mouse (MSE)
             loss_mouse = self.mse_loss(p_pred["mouse_delta_deg"], p_targ["mouse_delta_deg"]).mean(dim=-1)
             total_loss += self.weights['mouse'] * self._scalar_loss(loss_mouse, player_alive_mask)
-
-            # Keyboard, Eco, Inventory (BCE)
             for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
                 loss_bce = self.bce_loss(p_pred[key], p_targ[key]).mean(dim=-1)
                 total_loss += self.weights[key.replace('_logits','')] * self._scalar_loss(loss_bce, player_alive_mask)
-
-            # Active Weapon (CE)
             pred_flat = p_pred["active_weapon_logits"].view(B * T, -1)
             targ_flat = p_targ["active_weapon_logits"].view(B * T)
             loss_weapon_unmasked = self.ce_loss(pred_flat, targ_flat)
@@ -721,9 +713,7 @@ class CompositeLoss(nn.Module):
         # --- Game Strategy Losses ---
         gs_pred = predictions["game_strategy"]
         gs_targ = targets["game_strategy"]
-        frame_mask = alive_mask.any(dim=-1).float() # Mask for frames with at least one player alive
-
-        # Round Number (MSE)
+        frame_mask = alive_mask.any(dim=-1).float()
         loss_round_num = self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1)
         total_loss += self.weights['round_number'] * self._scalar_loss(loss_round_num, frame_mask)
         
@@ -733,11 +723,20 @@ class CompositeLoss(nn.Module):
 
         # --- Heatmap Losses (BCE with smooth targets) ---
         # Player Position
-        alive_indices = torch.where(alive_mask.view(-1) > 0)[0]
-        if alive_indices.numel() > 0:
-            pred_pos_logits_alive = torch.cat([p["pos_heatmap_logits"] for p in predictions["player"]], dim=0).view(B, T, 5, 8, 64, 64).permute(0,1,2,4,5,3).reshape(B*T*5, -1)[alive_indices]
-            targ_pos_coords_alive = torch.cat([p["pos_coords"] for p in targets["player"]], dim=0).view(B, T, 5, 3).reshape(B*T*5, -1)[alive_indices]
+        # Stack predictions and targets from the list of players into single tensors
+        pred_pos_heatmaps = torch.stack([p["pos_heatmap_logits"] for p in predictions["player"]], dim=2) # Shape: [B, T, 5, Z, Y, X]
+        targ_pos_coords = torch.stack([p["pos_coords"] for p in targets["player"]], dim=2)             # Shape: [B, T, 5, 3]
+
+        # Use the boolean alive_mask to select only the valid entries.
+        if alive_mask.any():
+            # Flatten the batch, time, and player dimensions to get a simple list
+            alive_mask_flat = alive_mask.view(-1)
             
+            # Select the predictions and targets for alive players, preserving the heatmap shape
+            pred_pos_logits_alive = pred_pos_heatmaps.view(-1, *pred_pos_heatmaps.shape[3:])[alive_mask_flat]
+            targ_pos_coords_alive = targ_pos_coords.view(-1, 3)[alive_mask_flat]
+
+            # Generate the target heatmap, which will have shape [num_alive, Z, Y, X]
             target_grid_indices = self.coord_mapper.discretize_world_to_grid(targ_pos_coords_alive)
             target_heatmap = create_gaussian_heatmap_target(target_grid_indices, grid_dims=(64, 64, 8), sigma=1.5)
             
@@ -745,20 +744,30 @@ class CompositeLoss(nn.Module):
             total_loss += self.weights['pos_heatmap'] * loss_pos
 
         # Enemy Position
-        targ_enemy_coords_flat = gs_targ["enemy_pos_coords"].view(B * T * 5, 3)
-        # Filter out invalid positions (often all zeros for dead/unseen enemies)
-        valid_enemy_mask = targ_enemy_coords_flat.abs().sum(dim=-1) > 0
+        targ_enemy_coords = gs_targ["enemy_pos_coords"] # Shape: [B, T, 5, 3]
+        pred_enemy_heatmaps = gs_pred["enemy_pos_heatmap_logits"] # Shape: [B, T, Z, Y, X]
+        
+        # Filter out invalid target positions (often all zeros for dead/unseen enemies)
+        valid_enemy_mask = targ_enemy_coords.abs().sum(dim=-1) > 0 # Shape: [B, T, 5]
+        
         if valid_enemy_mask.any():
-            pred_enemy_logits_flat = gs_pred["enemy_pos_heatmap_logits"].view(B*T, 8, 64, 64).unsqueeze(1).expand(-1, 5, -1,-1,-1).reshape(B*T*5, -1)
+            # Select the valid ground truth coordinates
+            valid_targ_coords = targ_enemy_coords[valid_enemy_mask] # Shape: [num_valid_enemies, 3]
+
+            # Expand the single predicted heatmap to match the 5 potential enemy targets
+            # then select only the predictions corresponding to valid targets
+            expanded_preds = pred_enemy_heatmaps.unsqueeze(2).expand(-1, -1, 5, -1, -1, -1) # Shape: [B, T, 5, Z, Y, X]
+            valid_pred_logits = expanded_preds[valid_enemy_mask] # Shape: [num_valid_enemies, Z, Y, X]
             
-            target_grid_indices = self.coord_mapper.discretize_world_to_grid(targ_enemy_coords_flat[valid_enemy_mask])
+            # Generate target heatmaps
+            target_grid_indices = self.coord_mapper.discretize_world_to_grid(valid_targ_coords)
             target_heatmap = create_gaussian_heatmap_target(target_grid_indices, grid_dims=(64, 64, 8), sigma=1.5)
             
-            loss_enemy_pos = self.bce_loss(pred_enemy_logits_flat[valid_enemy_mask], target_heatmap).mean()
+            # The shapes now match: both are [num_valid_enemies, 8, 64, 64]
+            loss_enemy_pos = self.bce_loss(valid_pred_logits, target_heatmap).mean()
             total_loss += self.weights['enemy_heatmap'] * loss_enemy_pos
             
         return total_loss
-
 # -------------------------------
 # Step 9: Determinism, DDP helpers, instrumentation
 # -------------------------------
