@@ -558,8 +558,10 @@ class BatchAssembler:
     @staticmethod
     def _masks_to_multi_hot(masks: torch.Tensor, num_classes: int) -> torch.Tensor:
         """Convert a tensor of integer bitmasks to a multi-hot float tensor."""
-        powers = torch.arange(num_classes, device=masks.device, dtype=torch.long).view(1, -1)
-        return ((masks.unsqueeze(-1) >> powers.to(masks.dtype)) & 1).float()
+        safe_masks = masks.long()
+        powers = torch.arange(num_classes, device=safe_masks.device, dtype=torch.long).view(1, -1)
+        return ((safe_masks.unsqueeze(-1) >> powers) & 1).float()
+
 
     def assemble(self, dali_batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         """Assembles the final batch dictionary, including ground truth targets."""
