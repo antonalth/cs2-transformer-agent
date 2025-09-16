@@ -415,21 +415,32 @@ class DaliInputPipeline:
                 sample_id_i32 = fn.cast(sample_id_i64, dtype=types.INT32)
                 start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
 
+                # 1. Decode audio to stereo [length, 2]
                 decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=False)
                 start_s = start_f_f32 / cfg.fps
                 shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
                 sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=int(shape_samples), axes=[0], out_of_bounds_policy="pad")
                 
-                # Transpose from [length, 2] to [2, length] to treat channels as a batch.
-                sliced_transposed = fn.transpose(sliced, perm=[1, 0])
+                # 2. Split the [length, 2] tensor into two [length, 1] tensors (L and R channels)
+                left, right = fn.split(sliced, axis=1, num_outputs=2)
 
-                # The spectrogram will now be computed for each channel separately.
-                spec = fn.spectrogram(sliced_transposed, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
-                mel_spec = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
+                # 3. Process each 1D channel separately
+                def to_mel_db(channel_1d):
+                    # Squeeze to make it truly 1D for the spectrogram
+                    squeezed_channel = fn.squeeze(channel_1d, axes=[1])
+                    spec = fn.spectrogram(squeezed_channel, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
+                    mel = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
+                    db = fn.to_decibels(mel, cutoff_db=cfg.db_cutoff)
+                    # Transpose to [time, n_mels]
+                    return fn.transpose(db, perm=[1, 0])
 
-                # Adjust the final transpose to handle the new channel dimension.
-                # Input is [2, n_mels, time], output should be [2, time, n_mels].
-                mel_db = fn.transpose(fn.to_decibels(mel_spec, cutoff_db=cfg.db_cutoff), perm=[0, 2, 1])
+                mel_db_left = to_mel_db(left)
+                mel_db_right = to_mel_db(right)
+
+                # 4. Stack the results back together on a new channel axis
+                # Output shape will be [2, time, n_mels]
+                mel_db = fn.stack(mel_db_left, mel_db_right, axis=0)
+
                 outputs.extend([frames, sample_id_i32, mel_db])
             return tuple(outputs)
         p = pipe(); p.build(); return p
