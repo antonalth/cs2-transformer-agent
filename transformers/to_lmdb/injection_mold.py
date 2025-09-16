@@ -58,8 +58,8 @@ def sanitize_player_name(player_name: str) -> str:
 GAME_TICKS_PER_SEC = 64
 EXPECTED_VIDEO_FPS = 32
 TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
-INITIAL_MAP_SIZE = 2 * 1024**3  # 2 GB
-MAP_RESIZE_INCREMENT = 1 * 1024**3  # 1 GB
+INITIAL_MAP_SIZE = 100 * 1024**2  # 200MB
+MAP_RESIZE_INCREMENT = 100 * 1024**2  # 100MB
 
 # --- Globals ---
 LOG = logging.getLogger("InjectionMold")
