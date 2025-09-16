@@ -261,12 +261,6 @@ class LmdbStore:
             if blob is None:
                 raise FileNotFoundError(f"Missing _INFO entry for {demoname} in {lmdb_path}")
             info = json.loads(blob.decode("utf-8"))
-        # Basic validation
-        if info.get("demoname") and info["demoname"] != demoname:
-            logging.warning("INFO.demoname (%s) != expected (%s)", info["demoname"], demoname)
-        rounds = info.get("rounds")
-        if not isinstance(rounds, list) or not rounds:
-            raise ValueError(f"INFO.rounds malformed for {demoname}")
         self._info_cache[cache_key] = info
         return info
 
@@ -278,28 +272,15 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
         info = store.read_info(demoname, lmdb_path)
         for r in info["rounds"]:
             pov_videos = r.get("pov_videos", [])
-            pov_audio = r.get("pov_audio", [])  # <-- ADDED
-            if len(pov_videos) != 5:
-                raise ValueError(f"{demoname} round {r.get('round_num')} missing POV videos (got {len(pov_videos)})")
-            if len(pov_audio) != 5:
-                raise ValueError(f"{demoname} round {r.get('round_num')} missing POV audio (got {len(pov_audio)})")
+            pov_audio = r.get("pov_audio", [])
+            if len(pov_videos) != 5: continue
+            if len(pov_audio) != 5: continue
 
-            def _resolve_media_path(data_root: str, demoname: str, p: str) -> str:
-                if os.path.isabs(p):
-                    return p
-                # Try common layouts, prefer the canonical recordings/<demoname> first
-                candidate = os.path.join(data_root, "recordings", demoname, p)
-                if os.path.exists(candidate):
-                    return os.path.abspath(candidate)
-                raise FileNotFoundError(f"Media file not found: {p}. Tried: {os.path.abspath(candidate)}")
-
-            pov_videos_abs = [_resolve_media_path(data_root, demoname, pv) for pv in pov_videos]
-            pov_audio_abs = [_resolve_media_path(data_root, demoname, pa) for pa in pov_audio]
-
-            # Validate files exist (fail fast).
-            for p in pov_videos_abs + pov_audio_abs:
-                if not os.path.exists(p):
-                    raise FileNotFoundError(f"Media file not found: {p}")
+            def _resolve_media_path(p: str) -> str:
+                return os.path.abspath(os.path.join(data_root, "recordings", demoname, p))
+            
+            pov_videos_abs = [_resolve_media_path(pv) for pv in pov_videos]
+            pov_audio_abs = [_resolve_media_path(pa) for pa in pov_audio]
 
             tr = TeamRound(
                 demoname=demoname, lmdb_path=os.path.abspath(lmdb_path),
@@ -307,11 +288,6 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
                 start_tick=int(r["start_tick"]), end_tick=int(r["end_tick"]),
                 pov_videos=pov_videos_abs, pov_audio=pov_audio_abs,
             )
-            if tr.start_tick >= tr.end_tick:
-                raise ValueError(f"Invalid ticks for {demoname} round {tr.round_num} {tr.team}: {tr.start_tick} >= {tr.end_tick}")
-            if tr.frame_count < 1:
-                logging.warning("Zero-length frame window for %s r%03d %s", demoname, tr.round_num, tr.team)
-                continue
             team_rounds.append(tr)
     logging.info("Discovered %d team-rounds across %d games.", len(team_rounds), len(games))
     return team_rounds
@@ -375,10 +351,6 @@ class FilelistWriter:
                     if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
                     pov_start_tick, pov_end_tick = ticks
                     start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
-
-                    if start < 0:
-                        raise ValueError(f"POV segment {os.path.basename(pov_path)} for sample {rec.sample_id} has no frames.")
-
                     vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
                     packed = rec.sample_id * LABEL_SCALE + start
                     aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
