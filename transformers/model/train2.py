@@ -347,8 +347,7 @@ class FilelistWriter:
                     if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
                     pov_start_tick, pov_end_tick = ticks
                     start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
-                    #vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
-                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start}\n") #fix?
+                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
                     packed = rec.sample_id * LABEL_SCALE + start
                     aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
         logging.info("Wrote DALI filelists to %s (N=%d)", self.out_dir, len(records))
