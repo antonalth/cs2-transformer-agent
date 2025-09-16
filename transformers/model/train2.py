@@ -421,25 +421,24 @@ class DaliInputPipeline:
                 shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
                 sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=int(shape_samples), axes=[0], out_of_bounds_policy="pad")
                 
-                # 2. Split the [length, 2] tensor into two [length, 1] tensors (L and R channels)
-                left, right = fn.split(sliced, axis=1, num_outputs=2)
+                # 2. Use slicing syntax (which calls fn.slice) to separate the channels.
+                # This is the correct DALI idiom.
+                left = sliced[:, 0]
+                right = sliced[:, 1]
 
                 # 3. Process each 1D channel separately
                 def to_mel_db(channel_1d):
-                    # Squeeze to make it truly 1D for the spectrogram
-                    squeezed_channel = fn.squeeze(channel_1d, axes=[1])
-                    spec = fn.spectrogram(squeezed_channel, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
+                    # The channel is already 1D, so the squeeze is no longer needed.
+                    spec = fn.spectrogram(channel_1d, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
                     mel = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
                     db = fn.to_decibels(mel, cutoff_db=cfg.db_cutoff)
-                    # Transpose to [time, n_mels]
-                    return fn.transpose(db, perm=[1, 0])
+                    return fn.transpose(db, perm=[1, 0]) # Transpose to [time, n_mels]
 
                 mel_db_left = to_mel_db(left)
                 mel_db_right = to_mel_db(right)
 
                 # 4. Stack the results back together on a new channel axis
-                # Output shape will be [2, time, n_mels]
-                mel_db = fn.stack(mel_db_left, mel_db_right, axis=0)
+                mel_db = fn.stack(mel_db_left, mel_db_right, axis=0) # [2, time, n_mels]
 
                 outputs.extend([frames, sample_id_i32, mel_db])
             return tuple(outputs)
