@@ -380,7 +380,9 @@ class DaliInputPipeline:
     def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig):
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
         self.pipeline = self._build_pipeline(video_filelists, audio_filelists, cfg)
-        out_map = [f"pov{k}" for k in range(5)] + [f"labels{k}" for k in range(5)] + [f"mel{k}" for k in range(5)]
+        out_map = []
+        for k in range(5):
+            out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
         self.iterator = DALIGenericIterator([self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
     def _build_pipeline(self, vlists, alists, cfg):
