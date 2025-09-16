@@ -328,11 +328,7 @@ class EpochIndex:
 # -------------------------------
 
 class FilelistWriter:
-    """Writes ten aligned DALI filelists (five for video, five for audio).
-
-    Video line: "<abs/path.mp4>  <sample_id>  <start_f>  <end_f_exclusive>".
-    Audio line: "<abs/path.wav>  <packed_label = sample_id*LABEL_SCALE + start_f>".
-    """
+    """Writes ten aligned DALI filelists (five for video, five for audio)."""
     def __init__(self, out_dir: str):
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
@@ -351,7 +347,8 @@ class FilelistWriter:
                     if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
                     pov_start_tick, pov_end_tick = ticks
                     start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
-                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
+                    #vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
+                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start}\n") #fix?
                     packed = rec.sample_id * LABEL_SCALE + start
                     aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
         logging.info("Wrote DALI filelists to %s (N=%d)", self.out_dir, len(records))
