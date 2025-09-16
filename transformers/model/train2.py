@@ -420,9 +420,16 @@ class DaliInputPipeline:
                 shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
                 sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=int(shape_samples), axes=[0], out_of_bounds_policy="pad")
                 
-                spec = fn.spectrogram(sliced, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
+                # Transpose from [length, 2] to [2, length] to treat channels as a batch.
+                sliced_transposed = fn.transpose(sliced, perm=[1, 0])
+
+                # The spectrogram will now be computed for each channel separately.
+                spec = fn.spectrogram(sliced_transposed, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
                 mel_spec = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
-                mel_db = fn.transpose(fn.to_decibels(mel_spec, cutoff_db=cfg.db_cutoff), perm=[1, 0])
+
+                # Adjust the final transpose to handle the new channel dimension.
+                # Input is [2, n_mels, time], output should be [2, time, n_mels].
+                mel_db = fn.transpose(fn.to_decibels(mel_spec, cutoff_db=cfg.db_cutoff), perm=[0, 2, 1])
                 outputs.extend([frames, sample_id_i32, mel_db])
             return tuple(outputs)
         p = pipe(); p.build(); return p
@@ -576,7 +583,21 @@ class BatchAssembler:
         """Assembles the final batch dictionary, including ground truth targets."""
         # 1) Stack DALI outputs
         images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
-        mel = torch.stack([dali_batch[f"mel{k}"] for k in range(5)], dim=1).permute(0, 2, 1, 3).unsqueeze(3)
+
+        # The mel spectrograms now have a stereo channel dimension. We must stack
+        # and permute them correctly to match the model's expected input shape.
+        mels_list = [dali_batch[f"mel{k}"] for k in range(5)]
+
+        # mel_k shape: [B, 2, T, Mels] (Batch, Channels, Time, Mel Bins)
+        # Stack along the player dimension (P) -> [B, 2, 5, T, Mels]
+        mel_stacked = torch.stack(mels_list, dim=2)
+
+        # Permute to the model's expected order: [B, T, P, C, Mels]
+        mel_permuted = mel_stacked.permute(0, 3, 2, 1, 4)
+        
+        # Unsqueeze to add the final singleton dimension for the CNN filter.
+        # Final shape: [B, T, P, C, Mels, 1]
+        mel = mel_permuted.unsqueeze(-1)
         
         # 2) Fetch metadata and ground truth labels from LMDB
         sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()

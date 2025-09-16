@@ -445,8 +445,8 @@ class ViTVisualEncoder(nn.Module):
 class AudioCNN(nn.Module):
     """Small 2D-CNN over Mel-spectrograms → [B, T, P, d_model].
 
-    Robust to variable time dimension via AdaptiveAvgPool2d.
-    Input mel: [B, T, P, 1, mel_bins(=128), mel_t(~6..N)]
+    This version accepts a 2-channel (Stereo) spectrogram.
+    Input mel: [B, T, P, 2, mel_bins, mel_t]
     """
     def __init__(self, cfg: CS2Config):
         super().__init__()
@@ -461,7 +461,7 @@ class AudioCNN(nn.Module):
         self.head = nn.Linear(c3 * 4 * 4, cfg.d_model)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        # mel: [B, T, P, 1, 128, ~6] → pack to [B*T*P, 1, 128, ~6]
+        # mel: [B, T, P, 2, mel_bins, mel_t] -> pack to [B*T*P, 2, mel_bins, mel_t]
         B, T, P = mel.shape[:3]
         x = mel.reshape(B * T * P, mel.shape[3], mel.shape[4], mel.shape[5])
         x = F.gelu(self.gn1(self.conv1(x)))
