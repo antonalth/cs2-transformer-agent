@@ -58,7 +58,7 @@ def sanitize_player_name(player_name: str) -> str:
 GAME_TICKS_PER_SEC = 64
 EXPECTED_VIDEO_FPS = 32
 TICKS_PER_FRAME = GAME_TICKS_PER_SEC // EXPECTED_VIDEO_FPS
-INITIAL_MAP_SIZE = 100 * 1024**2  # 200MB
+INITIAL_MAP_SIZE = 500 * 1024**2  # 500MB
 MAP_RESIZE_INCREMENT = 100 * 1024**2  # 100MB
 
 # --- Globals ---
@@ -83,7 +83,7 @@ ECO_ACTIONS = ["IN_BUYZONE"]
 safe_item_names = [name.replace(" ", "_").replace("-", "_") for name in ITEM_NAMES]
 for name in safe_item_names:
     ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
-item_id_map_names = ["deagle", "elite", "fiveseven", "glock", "ak47", "aug", "awp", "famas", "g3sg1", "galilar", "m249", "m4a1", "mac10", "p90", "mp5sd", "ump45", "xm1014", "bizon", "mag7", "negev", "sawedoff", "tec9", "zeus","p2000", "mp7", "mp9", "nova", "p250", "scar20", "sg556", "ssg08", "knife", "flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade", "c4", "knife_t", "m4a1_silencer", "usp_silencer", "cz75a", "revolver", "defuser", "vest", "vesthelm"]
+item_id_map_names = ["deagle", "elite", "fiveseven", "glock", "ak47", "aug", "awp", "famas", "g3sg1", "galilar", "m249", "m4a1", "mac10", "p90", "mp5sd", "ump45", "xm1014", "bizon", "mag7", "negev", "sawedoff", "tec9", "zeus", "p2000", "mp7", "mp9", "nova", "p250", "scar20", "sg556", "ssg08", "knife", "flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade", "c4", "knife_t", "m4a1_silencer", "usp_silencer", "cz75a", "revolver", "knife_default_ct", "knife_gut", "knife_flip", "knife_bayonet", "knife_m9_bayonet", "knife_karambit", "knife_stiletto", "knife_ursus", "defuser", "vest", "vesthelm"]
 for name in item_id_map_names:
     ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
 ECO_ACTIONS = sorted(list(set(ECO_ACTIONS)))
