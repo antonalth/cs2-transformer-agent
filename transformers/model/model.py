@@ -451,7 +451,7 @@ class AudioCNN(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         c1, c2, c3 = cfg.audio_cnn_channels
-        self.conv1 = nn.Conv2d(1, c1, 5, padding=2)
+        self.conv1 = nn.Conv2d(2, c1, 5, padding=2)
         self.gn1 = _GN2d(c1)
         self.conv2 = nn.Conv2d(c1, c2, 3, stride=2, padding=1)
         self.gn2 = _GN2d(c2)
@@ -463,7 +463,7 @@ class AudioCNN(nn.Module):
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         # mel: [B, T, P, 1, 128, ~6] → pack to [B*T*P, 1, 128, ~6]
         B, T, P = mel.shape[:3]
-        x = mel.reshape(B * T * P, 1, mel.shape[-2], mel.shape[-1])
+        x = mel.reshape(B * T * P, mel.shape[3], mel.shape[4], mel.shape[5])
         x = F.gelu(self.gn1(self.conv1(x)))
         x = F.gelu(self.gn2(self.conv2(x)))
         x = F.gelu(self.gn3(self.conv3(x)))

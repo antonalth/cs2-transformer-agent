@@ -363,7 +363,7 @@ class DaliConfig:
     height: int = 224; width: int = 224; sequence_length: int = 512
     mean: Tuple[float,...] = (0.0, 0.0, 0.0); std: Tuple[float,...] = (1.0, 1.0, 1.0)
     fps: float = 32.0; sample_rate: float = 24000.0; n_mels: int = 128
-    n_fft: int = 1024; win_length: int = 1024; hop_length: int = 375
+    n_fft: int = 1024; win_length: int = 1024; hop_length: int = 750
     batch_size: int = 1; num_threads: int = 4; device_id: int = 0
     shard_id: int = 0; num_shards: int = 1; seed: int = 42
     # DALI aliases and runtime params
@@ -415,9 +415,9 @@ class DaliInputPipeline:
                 sample_id_i32 = fn.cast(sample_id_i64, dtype=types.INT32)
                 start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
 
-                decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=True)
+                decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=False)
                 start_s = start_f_f32 / cfg.fps
-                shape_samples = (cfg.sequence_length * TICKS_PER_FRAME - 1) * cfg.hop_length + cfg.window_length
+                shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
                 sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=int(shape_samples), axes=[0], out_of_bounds_policy="pad")
                 
                 spec = fn.spectrogram(sliced, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
@@ -612,7 +612,7 @@ class BatchAssembler:
             targets["player"][i]["mouse_delta_deg"] = gt_tensors["mouse_delta"][:, :, i]
             targets["player"][i]["pos_coords"] = gt_tensors["position"][:, :, i] # Raw coords for loss fn
             targets["player"][i]["keyboard_logits"] = self._masks_to_multi_hot(gt_tensors["keyboard_mask"][:, :, i], 31)
-            
+
             # Eco Logits (6x uint64 -> 384 bits, truncated to 224 classes)
             eco_mask_player = gt_tensors["eco_mask"][:, :, i]  # Shape: [B, T, 6]
             eco_parts = [self._masks_to_multi_hot(eco_mask_player[:, :, k], 64) for k in range(6)]
