@@ -388,7 +388,19 @@ class DaliInputPipeline:
         def pipe():
             outputs = []
             for k in range(5):
-                video, _ = fn.readers.video(name=f"V{k}", device="gpu", file_list=vlists[k], sequence_length=cfg.sequence_length, pad_sequences=True, shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle, dtype=types.UINT8)
+                video, _ = fn.readers.video(
+                    name=f"V{k}",
+                    device="gpu",
+                    file_list=vlists[k],
+                    sequence_length=cfg.sequence_length,
+                    pad_sequences=True,
+                    shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards,
+                    random_shuffle=cfg.shuffle,
+                    dtype=types.UINT8,
+                    file_list_frame_num=True, 
+                    file_list_include_preceding_frame=True,
+                )
                 frames = fn.crop_mirror_normalize(fn.resize(video, resize_x=cfg.width, resize_y=cfg.height), device="gpu", dtype=types.FLOAT16, output_layout="FCHW", mean=cfg.mean, std=cfg.std)
                 
                 audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle)
