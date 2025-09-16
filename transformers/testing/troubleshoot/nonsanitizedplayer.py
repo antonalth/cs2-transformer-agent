@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Scans a directory of CS2 pipeline SQLite databases (.db files) to identify
-player names in the 'RECORDING' table that do not conform to the safe
+and summarize all unique player names that do not conform to the safe
 filename sanitization logic.
 
 This script is used to assess the impact of a bugfix where player names
-were not being sanitized before being used in filenames, causing errors on
-certain operating systems (e.g., Windows).
+were not being sanitized before being used in filenames. It categorizes
+problematic names into 'CRITICAL' (error-causing) and 'INCONSISTENT'.
 
 Usage:
     python find_offending_playernames.py --datadir /path/to/your/db_files
@@ -38,8 +38,8 @@ def sanitize_player_name(player_name: str) -> str:
 
 def find_nonconforming_names(directory_path: Path):
     """
-    Searches through all .db files in a directory to find player names
-    that would be changed by the sanitization logic.
+    Searches through all .db files in a directory to find all unique player names
+    that would be changed by the sanitization logic and categorizes them.
     """
     print(f"[*] Scanning for .db files in: {directory_path.resolve()}")
     db_files = list(directory_path.glob('*.db'))
@@ -48,35 +48,27 @@ def find_nonconforming_names(directory_path: Path):
         print("[!] No .db files found in the specified directory.")
         return
 
-    total_issues_found = 0
-    print("-" * 70)
+    # A set to store unique tuples of (original, sanitized)
+    unique_offending_names = set()
+    # Regex to find characters illegal in Windows filenames (excluding space, which we handle)
+    error_causing_pattern = re.compile(r'[:*?"<>|/\\]')
 
     for db_path in sorted(db_files):
-        issues_in_file = 0
-        
         try:
-            # Connect in read-only mode for safety
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             cursor = conn.cursor()
-            
-            # Get all unique player names from the RECORDING table
             cursor.execute("SELECT DISTINCT playername FROM RECORDING")
-            # The result is a list of tuples, e.g., [('Player1',), ('mahar:>',)]
             all_names = cursor.fetchall()
             
             for name_tuple in all_names:
                 original_name = name_tuple[0]
                 if not original_name:
-                    continue # Skip null or empty names
+                    continue
 
                 sanitized = sanitize_player_name(original_name)
 
-                # The core logic: if the sanitized name is different, report it.
                 if original_name != sanitized:
-                    if issues_in_file == 0:
-                        print(f"\n[*] Issues found in: {db_path.name}")
-                    print(f"  - Original: '{original_name}'  ->  Sanitized: '{sanitized}'")
-                    issues_in_file += 1
+                    unique_offending_names.add((original_name, sanitized))
             
         except sqlite3.OperationalError as e:
             if "no such table: RECORDING" in str(e):
@@ -88,18 +80,43 @@ def find_nonconforming_names(directory_path: Path):
         finally:
             if 'conn' in locals():
                 conn.close()
-            total_issues_found += issues_in_file
 
     print("-" * 70)
-    if total_issues_found > 0:
-        print(f"\n[SUCCESS] Scan complete. Found a total of {total_issues_found} player names that require sanitization.")
-    else:
+    
+    if not unique_offending_names:
         print(f"\n[SUCCESS] Scan complete. All player names across {len(db_files)} files already conform to the sanitization rules.")
+        return
+
+    print(f"\n[INFO] Scan complete. Found {len(unique_offending_names)} unique player name formats that require fixing.")
+
+    # --- Categorize and Print the Summary ---
+    critical_names = []
+    inconsistent_names = []
+
+    for original, sanitized in sorted(list(unique_offending_names)):
+        if error_causing_pattern.search(original):
+            critical_names.append({'orig': original, 'san': sanitized})
+        else:
+            inconsistent_names.append({'orig': original, 'san': sanitized})
+
+    if critical_names:
+        print("\n--- CRITICAL (Error-Causing) Names ---")
+        print("These names contain characters that crash the recording script on Windows.")
+        for item in critical_names:
+            print(f"  - Original: '{item['orig']}'  ->  Sanitized: '{item['san']}'")
+    
+    if inconsistent_names:
+        print("\n--- INCONSISTENT Names (Require Fixing) ---")
+        print("These names did not cause errors but will be changed by the new logic.")
+        for item in inconsistent_names:
+            print(f"  - Original: '{item['orig']}'  ->  Sanitized: '{item['san']}'")
+    
+    print("-" * 70)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Find non-conforming player names in CS2 pipeline databases.",
+        description="Find and summarize all non-conforming player names in CS2 pipeline databases.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(

@@ -17,3 +17,4 @@ gemini.md
 /scripts/node_modules
 /scripts/broker/node_modules
 /cache/**/ */
+*.log
