@@ -371,7 +371,7 @@ def main():
                     info = env.info()
                     stats = env.stat()
                     available = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                    if available < batch_size:
+                    if available < batch_size * 2:
                         new_size = int(info['map_size'] + max(batch_size * 2, MAP_RESIZE_INCREMENT))
                         LOG.info(f"Resizing LMDB map from {info['map_size']/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
                         env.set_mapsize(new_size)
