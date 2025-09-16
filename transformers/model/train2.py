@@ -507,26 +507,34 @@ class LmdbMetaFetcher:
 
                 payload = msgpack.unpackb(target_blob, raw=False, object_hook=mpnp.decode)
 
-                # Populate alive_mask from the current tick's data
                 gs = payload.get("game_state")
-                if gs is not None and len(gs) > 0:
-                    mask_bits = int(gs[0]['team_alive'])
-                    for slot in range(5):
-                        if (mask_bits >> slot) & 1:
-                            alive_mask[f, slot] = 1
+                if gs is None or len(gs) == 0: continue
 
-                # Populate Game State / Strategy Targets from the same current tick data
-                if gs is not None and len(gs) > 0:
-                    gs_data = gs[0]
-                    round_state_mask[f] = gs_data['round_state']
-                    enemy_positions[f] = gs_data['enemy_pos']
+                gs_data = gs[0]
+                mask_bits = int(gs_data['team_alive'])
+                
+                # Populate alive_mask from the current tick's data
+                for slot in range(5):
+                    if (mask_bits >> slot) & 1:
+                        alive_mask[f, slot] = 1
 
-                # Populate Player Targets from the same current tick data
+                # Populate Game State / Strategy Targets
+                round_state_mask[f] = gs_data['round_state']
+                enemy_positions[f] = gs_data['enemy_pos']
+
+                # --- START MODIFICATION ---
+                # Reconstruct correct player indices from the alive bitmask
+                # and map them to the sparse player_data list.
                 pdl = payload.get("player_data")
                 if pdl:
-                    # player_data is stored sorted by slot index 0..4
-                    for p_idx, p_data_arr in enumerate(pdl):
-                        if p_idx >= 5: continue
+                    alive_indices = [i for i in range(5) if (mask_bits >> i) & 1]
+                    
+                    # Sanity check: the number of alive players must match the data list length
+                    if len(alive_indices) != len(pdl):
+                        # This can happen if data is corrupt, log and skip frame.
+                        continue
+                        
+                    for p_idx, p_data_arr in zip(alive_indices, pdl):
                         if p_data_arr is not None and len(p_data_arr) > 0:
                             p_data = p_data_arr[0]
                             stats[f, p_idx] = [p_data['health'], p_data['armor'], p_data['money']]
@@ -536,6 +544,7 @@ class LmdbMetaFetcher:
                             eco_mask[f, p_idx] = p_data['eco_bitmask']
                             inventory_mask[f, p_idx] = p_data['inventory_bitmask']
                             active_weapon_idx[f, p_idx] = self._bitmask_to_weapon_index(p_data['active_weapon_bitmask'])
+                # --- END MODIFICATION ---
 
         return MetaFetchResult(
             alive_mask=alive_mask, stats=stats, mouse_delta=mouse_delta, position=position,
