@@ -31,6 +31,7 @@ import time
 import random
 import logging
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Any
 
 import lmdb  # pip install lmdb
