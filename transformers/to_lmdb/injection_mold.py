@@ -37,6 +37,22 @@ from tqdm import tqdm
 # Import msgpack and numpy extension for serialization
 import msgpack
 import msgpack_numpy as mpnp
+import re
+
+def sanitize_player_name(player_name: str) -> str:
+    """
+    Sanitizes a player name to make it safe for use in filenames.
+    - Replaces spaces with underscores.
+    - Removes any character that is NOT an alphanumeric character, underscore, or hyphen.
+    - Strips leading/trailing whitespace.
+    """
+    if not player_name:
+        return "unknown_player"
+    
+    name = player_name.replace(' ', '_')
+    sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '', name)
+    return sanitized_name.strip()
+
 
 # --- Configuration ---
 GAME_TICKS_PER_SEC = 64
@@ -229,7 +245,7 @@ def main():
             LOG.critical(f"DB indicates recording for {rec['playername']} round {round_num} is missing. Use --overridesql to ignore.")
             sys.exit(1)
 
-        fname = f"{rec['roundnumber']:02d}_{rec['team']}_{rec['playername']}_{rec['starttick']}_{rec['stoptick']}"
+        fname = f"{rec['roundnumber']:02d}_{rec['team']}_{sanitize_player_name(rec['playername'])}_{rec['starttick']}_{rec['stoptick']}"
         mp4, wav = args.recdir / f"{fname}.mp4", args.recdir / f"{fname}.wav"
         if not mp4.exists() or not wav.exists():
             LOG.critical(f"Media file not found: {mp4.name} or {wav.name} in {args.recdir}")
@@ -380,7 +396,7 @@ def main():
                     parts = Path(p).stem.split('_')
                     player_name = '_'.join(parts[2:-2])
                     video_path_map[player_name] = p
-                sorted_videos = [video_path_map.get(player_name) for player_name in team_roster]
+                sorted_videos = [video_path_map.get(sanitize_player_name(player_name)) for player_name in team_roster]
 
                 pov_audio_paths = round_team_audio_paths.get((round_num, team), [])
                 audio_path_map = {}
@@ -389,7 +405,7 @@ def main():
                     parts = Path(p).stem.split('_')
                     player_name = '_'.join(parts[2:-2])
                     audio_path_map[player_name] = p
-                sorted_audio = [audio_path_map.get(player_name) for player_name in team_roster]
+                sorted_audio = [audio_path_map.get(sanitize_player_name(player_name)) for player_name in team_roster]
                 # --- END OF CORRECTION ---
 
                 if all(sorted_videos) and all(sorted_audio):

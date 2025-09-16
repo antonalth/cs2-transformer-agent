@@ -16,6 +16,22 @@ except ImportError:
     print("Error: 'requests' library not found. Please install it using 'pip install requests'")
     sys.exit(1)
 
+import re
+
+def sanitize_player_name(player_name: str) -> str:
+    """
+    Sanitizes a player name to make it safe for use in filenames.
+    - Replaces spaces with underscores.
+    - Removes any character that is NOT an alphanumeric character, underscore, or hyphen.
+    - Strips leading/trailing whitespace.
+    """
+    if not player_name:
+        return "unknown_player"
+    
+    name = player_name.replace(' ', '_')
+    sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '', name)
+    return sanitized_name.strip()
+
 # --- Globals for Script Instance ---
 # These are set in main() after parsing arguments.
 ARGS = None
@@ -196,7 +212,7 @@ def process_recordings(demo_file: Path, output_dir: Path):
         wait_for_ffmpeg_to_finish()
         
         LOG.info("Processing recorded files...")
-        new_filename_base = f"{round_num:02d}_{team}_{player_name}_{start_tick}_{stop_tick}"
+        new_filename_base = f"{round_num:02d}_{team}_{sanitize_player_name(player_name)}_{start_tick}_{stop_tick}"
         
         try:
             take_dirs = [d for d in TEMP_RECORD_DIR.iterdir() if d.is_dir() and d.name.startswith("take")]
