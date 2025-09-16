@@ -429,7 +429,7 @@ class DaliInputPipeline:
                 # 3. Process each 1D channel separately
                 def to_mel_db(channel_1d):
                     # The channel is already 1D, so the squeeze is no longer needed.
-                    spec = fn.spectrogram(channel_1d, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length)
+                    spec = fn.spectrogram(channel_1d, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length, center_windows=False)
                     mel = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
                     db = fn.to_decibels(mel, cutoff_db=cfg.db_cutoff)
                     return fn.transpose(db, perm=[1, 0]) # Transpose to [time, n_mels]
