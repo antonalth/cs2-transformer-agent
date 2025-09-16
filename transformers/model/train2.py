@@ -385,7 +385,7 @@ class DaliInputPipeline:
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
         self.pipeline = self._build_pipeline(video_filelists, audio_filelists, cfg)
         out_map = [f"pov{k}" for k in range(5)] + [f"labels{k}" for k in range(5)] + [f"mel{k}" for k in range(5)]
-        self.iterator = DALIGenericIterator([self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatch_policy.DROP)
+        self.iterator = DALIGenericIterator([self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
     def _build_pipeline(self, vlists, alists, cfg):
         @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed)
@@ -397,9 +397,13 @@ class DaliInputPipeline:
                 
                 audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle)
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
-                sample_id_i32 = fn.cast(packed_i64 // LABEL_SCALE, dtype=types.INT32)
-                start_f_f32 = fn.cast(packed_i64 % LABEL_SCALE, dtype=types.FLOAT)
-                
+                sample_id_i64 = packed_i64 // LABEL_SCALE
+                start_f_i64 = packed_i64 - sample_id_i64 * LABEL_SCALE
+
+                # Cast to the final desired dtypes
+                sample_id_i32 = fn.cast(sample_id_i64, dtype=types.INT32)
+                start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
+
                 decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=True)
                 start_s = start_f_f32 / cfg.fps
                 shape_samples = (cfg.sequence_length * TICKS_PER_FRAME - 1) * cfg.hop_length + cfg.window_length
@@ -487,32 +491,26 @@ class LmdbMetaFetcher:
 
         with env.begin(write=False) as txn:
             for f, tick in enumerate(ticks.tolist()):
-                # Fetch current frame's data for alive_mask
-                current_blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(tick)))
-                if current_blob:
-                    payload = msgpack.unpackb(current_blob, raw=False, object_hook=mpnp.decode)
-                    gs = payload.get("game_state")
-                    if gs is not None and len(gs) > 0:
-                        mask_bits = int(gs[0]['team_alive'])
-                        for slot in range(5):
-                            if (mask_bits >> slot) & 1:
-                                alive_mask[f, slot] = 1
-
-                # Fetch NEXT frame's data for ground truth targets
-                target_tick = tick + TICKS_PER_FRAME
-                target_blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(target_tick)))
+                target_blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(tick)))
                 if not target_blob: continue
 
                 payload = msgpack.unpackb(target_blob, raw=False, object_hook=mpnp.decode)
-                
-                # Populate Game State / Strategy Targets
+
+                # Populate alive_mask from the current tick's data
                 gs = payload.get("game_state")
+                if gs is not None and len(gs) > 0:
+                    mask_bits = int(gs[0]['team_alive'])
+                    for slot in range(5):
+                        if (mask_bits >> slot) & 1:
+                            alive_mask[f, slot] = 1
+
+                # Populate Game State / Strategy Targets from the same current tick data
                 if gs is not None and len(gs) > 0:
                     gs_data = gs[0]
                     round_state_mask[f] = gs_data['round_state']
                     enemy_positions[f] = gs_data['enemy_pos']
-                
-                # Populate Player Targets
+
+                # Populate Player Targets from the same current tick data
                 pdl = payload.get("player_data")
                 if pdl:
                     # player_data is stored sorted by slot index 0..4
