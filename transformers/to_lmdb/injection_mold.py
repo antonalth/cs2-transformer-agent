@@ -365,21 +365,50 @@ def main():
 
             # --- Write accumulated results for the round to LMDB ---
             if results_for_round:
-                # Pre-check and resize if needed (must NOT be inside a write txn)
-                with t("lmdb_resize_check"):
-                    batch_size = sum(len(p) for _, p in results_for_round)
-                    info = env.info()
-                    stats = env.stat()
-                    available = info['map_size'] - (info['last_pgno'] * stats['psize'])
-                    if available < batch_size * 2:
-                        new_size = int(info['map_size'] + max(batch_size * 2, MAP_RESIZE_INCREMENT))
-                        LOG.info(f"Resizing LMDB map from {info['map_size']/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
+                # --- Robust "Retry on Failure" Loop for Windows Compatibility ---
+                written_successfully = False
+                attempts = 0
+                max_attempts = 5 # A safety break to prevent infinite loops
+
+                while not written_successfully and attempts < max_attempts:
+                    try:
+                        # Attempt to write the entire batch in a single transaction
+                        with t("lmdb_write"):
+                            with env.begin(write=True) as txn:
+                                cursor = txn.cursor()
+                                cursor.putmulti(results_for_round)
+                        
+                        # If the transaction completes without error, we're done.
+                        written_successfully = True
+
+                    except lmdb.MapFullError:
+                        attempts += 1
+                        LOG.warning(f"LMDB MapFullError caught on attempt {attempts}. Resizing database and retrying.")
+
+                        # The transaction failed, so now we resize.
+                        # This must be done OUTSIDE of a transaction.
+                        current_info = env.info()
+                        current_size = current_info['map_size']
+                        
+                        # Calculate a smart new size. We need to accommodate the batch that just failed.
+                        failed_batch_size = sum(len(p) for _, p in results_for_round)
+                        
+                        # Grow by at least MAP_RESIZE_INCREMENT, but more if the failed batch was huge.
+                        # The multiplier (e.g., 2) provides a buffer for LMDB overhead.
+                        resize_amount = max(failed_batch_size * 2, MAP_RESIZE_INCREMENT)
+                        new_size = current_size + resize_amount
+
+                        LOG.info(f"Resizing LMDB map from {current_size/(1024**2):.2f}MB to {new_size/(1024**2):.2f}MB")
                         env.set_mapsize(new_size)
 
-                with t("lmdb_write"):
-                    with env.begin(write=True) as txn:
-                        cursor = txn.cursor()
-                        cursor.putmulti(results_for_round)
+                    except Exception as e:
+                        LOG.critical(f"An unexpected error occurred during LMDB write: {e}")
+                        # Break the loop on any other kind of error
+                        break
+                
+                if not written_successfully:
+                    LOG.critical(f"Failed to write batch for round {round_num} after {max_attempts} attempts. Aborting.")
+                    sys.exit(1)
 
         # --- Phase 3: Finalize by writing metadata ---
         LOG.info("-> Phase 3: Finalizing and writing metadata...")
