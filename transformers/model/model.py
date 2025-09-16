@@ -1203,7 +1203,14 @@ class CS2Transformer(nn.Module):
 
 
     def forward(self, batch: CS2Batch) -> Predictions:
-        """Compute next-frame predictions (t+1) given frames 1..t."""
+        """
+        Compute per-frame predictions given frames 1..T.
+        Returns a dict with:
+        {
+            "player": List[Dict[str, Tensor]],  # len == num_players, each with [B, T, ...]
+            "game_strategy": Dict[str, Tensor]  # each with [B, T, ...]
+        }
+        """
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )

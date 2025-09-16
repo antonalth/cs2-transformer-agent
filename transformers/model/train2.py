@@ -125,8 +125,10 @@ class CoordinateMapper:
 
     def discretize_world_to_grid(self, world_coords: torch.Tensor) -> torch.Tensor:
         """Converts a batch of continuous world coords to discrete grid indices."""
+        # Ensure the mapper's internal tensors are on the same device as the input.
         device = world_coords.device
         self.world_min = self.world_min.to(device)
+        self.world_max = self.world_max.to(device) # This line was missing
         self.world_range = self.world_range.to(device)
         self.grid_dims = self.grid_dims.to(device)
 
@@ -134,7 +136,6 @@ class CoordinateMapper:
         normalized_coords = (coords - self.world_min) / self.world_range
         grid_indices = (normalized_coords * (self.grid_dims - 1e-6)).long()
         return grid_indices
-
 
 def create_gaussian_heatmap_target(
     grid_indices: torch.Tensor,
