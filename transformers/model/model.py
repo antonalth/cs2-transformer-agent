@@ -1263,15 +1263,33 @@ class CS2Transformer(nn.Module):
             # ---- backbone ----
             h, _ = self.backbone(seq, attn_mask=None, kv_cache_list=None)
 
-            # ---- slice last frame ----
-            last = h[:, -Lpf:, :]
-            num_players = getattr(self.cfg,"num_players")
-            player_tok = last[:, :num_players, :]
-            strat_tok  = last[:, num_players, :]
+            h_frames = h.reshape(B, T, Lpf, d)
 
-            # ---- heads ----
-            player_preds: List[PlayerPredictions] = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
-            strategy_preds = self.strategy_head(strat_tok)
+            num_players = self.cfg.num_players
+            assert h_frames.size(2) >= num_players + 1, "Not enough per-frame tokens."
+
+            player_tok_all_frames = h_frames[:, :, :num_players, :]   # [B, T, P, d]
+            strat_tok_all_frames  = h_frames[:, :, num_players, :]    # [B, T, d]
+
+            player_preds: List[PlayerPredictions] = []
+            for i in range(num_players):
+                p_tok_seq  = player_tok_all_frames[:, :, i, :]              # [B, T, d]
+                p_tok_flat = p_tok_seq.reshape(B * T, d)                    # [B*T, d]
+                preds_flat = self.player_head(p_tok_flat)
+
+                # Generic reshape back to [B, T, ...]
+                preds_seq = {k: v.reshape(B, T, *v.shape[1:]) for k, v in preds_flat.items()}
+
+                # If your heatmaps are flattened, replace the line above for those keys, e.g.:
+                # Z, Y, X = self.player_head.pos_shape
+                # preds_seq["pos_heatmap_logits"] = preds_flat["pos_heatmap_logits"].reshape(B, T, Z, Y, X)
+
+                player_preds.append(preds_seq)
+
+            # Strategy head
+            strat_preds_flat = self.strategy_head(strat_tok_all_frames.reshape(B * T, d))
+            strategy_preds   = {k: v.reshape(B, T, *v.shape[1:]) for k, v in strat_preds_flat.items()}
+
 
             return {"player": player_preds, "game_strategy": strategy_preds}
 

@@ -849,7 +849,7 @@ if __name__ == "__main__":
                     logging.info("Assembled batch in %.3fs", t2.dt)
                     
                     # --- SMOKE TEST FORWARD PASS AND LOSS CALCULATION ---
-                    with Timer("forward_pass") as t3, torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    with Timer("forward_pass") as t3, torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
                         predictions = model(batch)
                     logging.info("Forward pass in %.3fs", t3.dt)
                     
