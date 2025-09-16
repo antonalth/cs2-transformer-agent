@@ -129,8 +129,8 @@ def main():
         run_command(command)
 
         if i < args.num:
-            print("--- Waiting 15 seconds before launching the next client to ensure connection order ---")
-            time.sleep(15)
+            print("--- Waiting 25 seconds before launching the next client to ensure connection order ---")
+            time.sleep(25)
 
     print("\n\n🚀 All clients launched. The broker server is running.")
     print("Press Ctrl+C to shut down all processes.")
