@@ -77,15 +77,48 @@ def t(label: str):
 # =============================================================================
 # DATA ENCODING MAPPINGS (Canonical Source)
 # =============================================================================
-KEYBOARD_ONLY_ACTIONS = ["IN_ATTACK", "IN_JUMP", "IN_DUCK", "IN_FORWARD", "IN_BACK", "IN_USE", "IN_CANCEL", "IN_TURNLEFT", "IN_TURNRIGHT", "IN_MOVELEFT", "IN_MOVERIGHT", "IN_ATTACK2", "IN_RELOAD", "IN_ALT1", "IN_ALT2", "IN_SPEED", "IN_WALK", "IN_ZOOM", "IN_WEAPON1", "IN_WEAPON2", "IN_BULLRUSH", "IN_GRENADE1", "IN_GRENADE2", "IN_ATTACK3", "IN_SCORE", "IN_INSPECT", "SWITCH_1", "SWITCH_2", "SWITCH_3", "SWITCH_4", "SWITCH_5"]
-ITEM_NAMES = sorted(list(set(["AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553", "AWP", "SSG 08", "G3SG1", "SCAR-20", "Glock-18", "USP-S", "P250", "P2000", "Dual Berettas", "Five-SeveN", "Tec-9", "CZ75-Auto", "R8 Revolver", "Desert Eagle", "MP9", "MAC-10", "MP7", "MP5-SD", "UMP-45", "P90", "PP-Bizon", "Nova", "XM1014", "MAG-7", "Sawed-Off", "M249", "Negev", "Knife", "knife_t", "knife_ct", "Bayonet", "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife", "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers", "Ursus Knife", "Navaja Knife", "Stiletto Knife", "Talon Knife", "Classic Knife", "Paracord Knife", "Survival Knife", "Nomad Knife", "Skeleton Knife", "High Explosive Grenade", "Flashbang", "Smoke Grenade", "Molotov", "Incendiary Grenade", "Decoy Grenade", "C4 Explosive", "Defuse Kit", "Zeus x27", "Kevlar Vest", "Kevlar and Helmet", "Helmet"])))
+#dont ask why there are two kinds of item names...
+ITEM_NAMES = sorted(list(set([
+    "Desert Eagle", "Dual Berettas", "Five-SeveN", "Glock-18", "AK-47",
+    "AUG", "AWP", "FAMAS", "G3SG1", "Galil AR", "M249", "M4A4", "MAC-10",
+    "P90", "MP5-SD", "UMP-45", "XM1014", "PP-Bizon", "MAG-7", "Negev",
+    "Sawed-Off", "Tec-9", "Zeus x27", "P2000", "MP7", "MP9", "Nova",
+    "P250", "SCAR-20", "SG 553", "SSG 08", "Knife", "knife", "Flashbang",
+    "High Explosive Grenade", "Smoke Grenade", "Molotov", "Decoy Grenade",
+    "Incendiary Grenade", "C4 Explosive", "Kevlar Vest", "Kevlar & Helmet",
+    "Heavy Assault Suit", "item_nvg", "Defuse Kit", "Rescue Kit",
+    "Medi-Shot", "knife_t", "M4A1-S", "USP-S", "Trade Up Contract",
+    "CZ75-Auto", "R8 Revolver", "Charm Detachments", "Bayonet", "Classic Knife",
+    "Flip Knife", "Gut Knife", "Karambit", "M9 Bayonet", "Huntsman Knife",
+    "Falchion Knife", "Bowie Knife", "Butterfly Knife", "Shadow Daggers",
+    "Paracord Knife", "Survival Knife", "Ursus Knife", "Navaja Knife",
+    "Nomad Knife", "Stiletto Knife", "Talon Knife", "Skeleton Knife", "Kukri Knife"
+])))
+safe_item_names = [name.replace(' ', '_').replace('&', 'and').replace('-','_') for name in ITEM_NAMES]
+
+KEYBOARD_ONLY_ACTIONS = [
+    "IN_ATTACK", "IN_JUMP", "IN_DUCK", "IN_FORWARD", "IN_BACK", "IN_USE", "IN_CANCEL", "IN_TURNLEFT", 
+    "IN_TURNRIGHT", "IN_MOVELEFT", "IN_MOVERIGHT", "IN_ATTACK2", "IN_RELOAD", "IN_ALT1", "IN_ALT2", 
+    "IN_SPEED", "IN_WALK", "IN_ZOOM", "IN_WEAPON1", "IN_WEAPON2", "IN_BULLRUSH", "IN_GRENADE1", 
+    "IN_GRENADE2", "IN_ATTACK3", "IN_SCORE", "IN_INSPECT", "SWITCH_1", "SWITCH_2", "SWITCH_3", "SWITCH_4", "SWITCH_5"]
 ECO_ACTIONS = ["IN_BUYZONE"]
-safe_item_names = [name.replace(" ", "_").replace("-", "_") for name in ITEM_NAMES]
 for name in safe_item_names:
-    ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
-item_id_map_names = ["deagle", "elite", "fiveseven", "glock", "ak47", "aug", "awp", "famas", "g3sg1", "galilar", "m249", "m4a1", "mac10", "p90", "mp5sd", "ump45", "xm1014", "bizon", "mag7", "negev", "sawedoff", "tec9", "zeus", "p2000", "mp7", "mp9", "nova", "p250", "scar20", "sg556", "ssg08", "knife", "flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade", "c4", "knife_t", "m4a1_silencer", "usp_silencer", "cz75a", "revolver", "knife_default_ct", "knife_gut", "knife_flip", "knife_bayonet", "knife_m9_bayonet", "knife_karambit", "knife_stiletto", "knife_ursus", "defuser", "vest", "vesthelm"]
+    ECO_ACTIONS.append(f"BUY_{name}") #; ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}") #no needs since bullshit in extract.py
+item_id_map_names = [
+    "deagle", "elite", "fiveseven", "glock", "ak47", "aug", "awp", "famas", "g3sg1", "galilar",
+    "m249", "m4a1", "mac10", "p90", "mp5sd", "ump45", "xm1014", "ppbizon", "mag7", "negev",
+    "sawedoff", "tec9", "zeus", "p2000", "mp7", "mp9", "nova", "p250", "scar20", "sg556", "ssg08",
+    "knife", "flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade", "c4",
+    "vest", "vesthelm", "heavyassaultsuit", "nvgs", "defuser", "rescue_kit", "medishot", "knifet",
+    "m4a1_silencer", "usp_silencer", "tradeupcontract", "cz75auto", "r8revolver", "charmdetachments",
+    "bayonet", "knife_default_ct", "flipknife", "gutknife", "karambit", "knife_m9_bayonet",
+    "huntsmanknife", "falchionknife", "bowieknife", "butterflyknife", "shadowdaggers",
+    "paracordknife", "survivalknife", "ursusknife", "navajaknife", "nomadknife", "stilettoknife",
+    "talonknife", "skeletonknife", "kukriknife"
+]
 for name in item_id_map_names:
-    ECO_ACTIONS.append(f"BUY_{name}"); ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}")
+    ECO_ACTIONS.append(f"SELL_{name}"); ECO_ACTIONS.append(f"DROP_{name}") #ECO_ACTIONS.append(f"BUY_{name}"); #no need since extract.py bullshit
+
 ECO_ACTIONS = sorted(list(set(ECO_ACTIONS)))
 KEYBOARD_TO_BIT = {action: i for i, action in enumerate(KEYBOARD_ONLY_ACTIONS)}
 ECO_TO_BIT = {action: i for i, action in enumerate(ECO_ACTIONS)}
@@ -152,12 +185,12 @@ def get_bitmask(actions, mapping, name):
 
 def get_bitmask_array(actions, mapping, name):
     """Converts a list of actions into a numpy array of uint64 bitmasks."""
-    mask = np.zeros(6, dtype=np.uint64)
+    mask = np.zeros(4, dtype=np.uint64)
     if not actions: return mask
     for a in actions:
         if a not in mapping: raise ValueError(f"Unknown action '{a}' in '{name}'")
         idx, pi = mapping[a] // 64, mapping[a] % 64
-        if idx < 6: mask[idx] |= (np.uint64(1) << np.uint64(pi))
+        if idx < 4: mask[idx] |= (np.uint64(1) << np.uint64(pi))
     return mask
 
 def get_inventory_bitmasks(inv_json, weapon, mapping):
@@ -165,10 +198,7 @@ def get_inventory_bitmasks(inv_json, weapon, mapping):
     im, wm = np.zeros(2, dtype=np.uint64), np.zeros(2, dtype=np.uint64)
     def set_bit(m, item):
         if not isinstance(item, str): return
-        # Handle knife variants by mapping them to a canonical "Knife"
         bp = mapping.get(item)
-        if bp is None and ("knife" in item.lower() or "bayonet" in item.lower()):
-            bp = mapping.get("Knife")
         if bp is None: raise ValueError(f"Unknown item '{item}'")
         idx, pi = bp // 64, bp % 64
         if idx < 2: m[idx] |= (np.uint64(1) << np.uint64(pi))
@@ -210,9 +240,9 @@ def main():
 
     # --- Define Numpy data structures ---
     gs_dtype = np.dtype([('tick', np.int32), ('round_state', np.uint8), ('team_alive', np.uint8), ('enemy_alive', np.uint8), ('enemy_pos', np.float32, (5, 3))])
-    pi_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (6,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
+    pi_dtype = np.dtype([('pos', np.float32, (3,)), ('mouse', np.float32, (2,)), ('health', np.uint8), ('armor', np.uint8), ('money', np.int32), ('keyboard_bitmask', np.uint32), ('eco_bitmask', np.uint64, (4,)), ('inventory_bitmask', np.uint64, (2,)), ('active_weapon_bitmask', np.uint64, (2,))])
     assert len(KEYBOARD_TO_BIT) <= 32, "Too many keyboard actions for uint32 bitmask"
-    assert len(ECO_TO_BIT) <= 384, "Too many eco actions for 6x uint64 bitmask"
+    assert len(ECO_TO_BIT) <= 256, "Too many eco actions for 4x uint64 bitmask"
     assert len(ITEM_TO_INDEX) <= 128, "Too many items for 2x uint64 bitmask"
 
     # --- Phase 1: Load all metadata from database ---

@@ -472,7 +472,7 @@ class MetaFetchResult:
     mouse_delta: np.ndarray            # [T, 5, 2] (dx, dy) float32
     position: np.ndarray               # [T, 5, 3] (x, y, z) float32
     keyboard_mask: np.ndarray          # [T, 5] uint32
-    eco_mask: np.ndarray               # [T, 5, 6] uint64
+    eco_mask: np.ndarray               # [T, 5, 4] uint64
     inventory_mask: np.ndarray         # [T, 5, 2] uint64
     active_weapon_idx: np.ndarray      # [T, 5] int32
     # Game-strategy ground truth [T, ...]
@@ -509,7 +509,7 @@ class LmdbMetaFetcher:
         mouse_delta = np.zeros((T, 5, 2), dtype=np.float32)
         position = np.zeros((T, 5, 3), dtype=np.float32)
         keyboard_mask = np.zeros((T, 5), dtype=np.uint32)
-        eco_mask = np.zeros((T, 5, 6), dtype=np.uint64)
+        eco_mask = np.zeros((T, 5, 4), dtype=np.uint64)
         inventory_mask = np.zeros((T, 5, 2), dtype=np.uint64)
         active_weapon_idx = np.full((T, 5), -1, dtype=np.int32)
         round_number = np.full((T,), rec.round_num, dtype=np.int32)
@@ -645,10 +645,10 @@ class BatchAssembler:
             targets["player"][i]["pos_coords"] = gt_tensors["position"][:, :, i] # Raw coords for loss fn
             targets["player"][i]["keyboard_logits"] = self._masks_to_multi_hot(gt_tensors["keyboard_mask"][:, :, i], 31)
 
-            # Eco Logits (6x uint64 -> 384 bits, truncated to 224 classes)
-            eco_mask_player = gt_tensors["eco_mask"][:, :, i]  # Shape: [B, T, 6]
-            eco_parts = [self._masks_to_multi_hot(eco_mask_player[:, :, k], 64) for k in range(6)]
-            full_eco_logits = torch.cat(eco_parts, dim=-1)  # Shape: [B, T, 384]
+            # Eco Logits (4x uint64 -> 256 bits, truncated to 224 classes)
+            eco_mask_player = gt_tensors["eco_mask"][:, :, i]  # Shape: [B, T, 4]
+            eco_parts = [self._masks_to_multi_hot(eco_mask_player[:, :, k], 64) for k in range(4)]
+            full_eco_logits = torch.cat(eco_parts, dim=-1)  # Shape: [B, T, 256]
             targets["player"][i]["eco_logits"] = full_eco_logits[..., :224]
 
             # Inventory Logits (2x uint64 -> 128 bits)
