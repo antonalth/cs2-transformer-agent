@@ -283,7 +283,15 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
             
             pov_videos_abs = [_resolve_media_path(pv) for pv in pov_videos]
             pov_audio_abs = [_resolve_media_path(pa) for pa in pov_audio]
-
+            all_media_paths_exist = True
+            for p in pov_videos_abs + pov_audio_abs:
+                if not os.path.exists(p):
+                    logging.warning(f"Skipping round {demoname}/{r['round_num']} due to missing media file: {p}")
+                    all_media_paths_exist = False
+                    break
+            if not all_media_paths_exist:
+                continue
+            
             tr = TeamRound(
                 demoname=demoname, lmdb_path=os.path.abspath(lmdb_path),
                 round_num=int(r["round_num"]), team=str(r["team"]).upper(),
