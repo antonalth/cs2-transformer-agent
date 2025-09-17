@@ -800,7 +800,7 @@ def get_ddp_info() -> Tuple[int, int]:
 @dataclass
 class DataArgs:
     data_root: str; manifest: str; split: str = "train"; run_dir: str = "runs/exp1"
-    T_frames: int = 128; height: int = 480; width: int = 640
+    T_frames: int = 64; height: int = 480; width: int = 640
     batch_size: int = 1; seed: int = 42; dali_threads: int = 4
 
 def build_data_iter(args: DataArgs):
@@ -836,7 +836,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     data_root = os.environ.get("DATA_ROOT", "data")
     manifest_path = os.path.join(data_root, "manifest.json")
-    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2, T_frames=128)
+    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2, T_frames=64)
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
