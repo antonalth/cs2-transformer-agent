@@ -361,7 +361,7 @@ class FilelistWriter:
 
 @dataclass
 class DaliConfig:
-    height: int = 224; width: int = 224; sequence_length: int = 512
+    height: int = 480; width: int = 640; sequence_length: int = 512
     mean: Tuple[float,...] = (0.0, 0.0, 0.0); std: Tuple[float,...] = (1.0, 1.0, 1.0)
     fps: float = 32.0; sample_rate: float = 24000.0; n_mels: int = 128
     n_fft: int = 1024; win_length: int = 1024; hop_length: int = 750
@@ -433,6 +433,7 @@ class DaliInputPipeline:
                     spec = fn.spectrogram(channel_1d, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length, center_windows=False)
                     mel = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
                     db = fn.to_decibels(mel, cutoff_db=cfg.db_cutoff)
+                    db = fn.cast(db, dtype=types.FLOAT16) #todo check correct
                     return fn.transpose(db, perm=[1, 0]) # Transpose to [time, n_mels]
 
                 mel_db_left = to_mel_db(left)
@@ -791,7 +792,7 @@ def get_ddp_info() -> Tuple[int, int]:
 @dataclass
 class DataArgs:
     data_root: str; manifest: str; split: str = "train"; run_dir: str = "runs/exp1"
-    T_frames: int = 64; height: int = 224; width: int = 224
+    T_frames: int = 64; height: int = 480; width: int = 640
     batch_size: int = 1; seed: int = 42; dali_threads: int = 4
 
 def build_data_iter(args: DataArgs):
