@@ -286,3 +286,69 @@ The loss (e.g., MSE for stats, Cross-Entropy for heatmaps) is calculated by comp
 Crucially, no loss is calculated for the unmasked frames.
 
 This approach forces the model to learn a deep, contextual understanding of game flow, using surrounding events to infer what must be happening at a specific, unknown moment in time.
+
+
+
+data/
+    manifest.json
+    db
+    lmdb
+    recordings
+    demos
+
+write split_manifest.py
+    splits up all lmdb and recordings e.g. data/lmdb/gamenameXXX.lmdb and data/recordings/gamenameXXX (contains .mp4s and .wav)
+    into a train test split (default 80 20)
+    receives as cli parameter the path to the data/ folder, the seed for the deterministic shuffle (default 42)
+    writes to manifest.json
+    metadata:
+        seed, creation date
+    train:
+        [
+            gamenameXXX (omit lmdb since base for both lmdb/... and recordings/...)
+            gamenameXXY
+        ]
+    test:
+        [
+            same
+        ]
+
+
+
+Strat for train.py
+
+Here’s our DALI plan in a nutshell:
+
+* **Fix clip length per epoch:** choose a constant window in **frames** (e.g., `T_frames = 512` ≈ 16s at 32 fps). We still get variety by randomizing **start** each sample.
+
+* **Sample windows randomly (once per epoch):**
+
+  * For every team-round, pick a random `start_tick`, then compute
+    `start_frame = (start_tick - round_start_tick) // ticks_per_frame`,
+    `end_frame = start_frame + T_frames`.
+
+* **Write five aligned file lists (per epoch):**
+
+  * Create **5 `.txt` files** (one per POV).
+  * **Line k** in each file = the same sample’s POV:
+    `<abs/path/to/player_i.mp4>  0  <start_frame>  <end_frame>`
+  * All files have the same number of lines; order defines the epoch order.
+
+* **Build one DALI pipeline for the epoch:**
+
+  * For each POV use `fn.readers.video_resize(..., file_list_frame_num=True, sequence_length=T_frames, step=T_frames, random_shuffle=False, pad_sequences=True, read_ahead=True, additional_decode_surfaces=8, resize_y=H, resize_x=W)`.
+  * Follow with `fn.crop_mirror_normalize(..., output_layout="FCHW", mean=…, std=…, output_dtype=FLOAT16)` to get AMP-friendly `[B, T, C, H, W]` CUDA tensors.
+
+* **Iterate batches without rebuilding:**
+
+  * Each step: call `pipe.run()` (or `DALIGenericIterator`) to get 5 tensors, stack to `[B, T, 5, C, H, W]`.
+  * Fetch **mel/alive/targets** from LMDB in the **same sample order**, move to GPU, and run the model.
+
+* **Handle early deaths:** `pad_sequences=True` zero-pads tails if a POV ends early (or use experimental reader with `pad_mode="edge"` to repeat last frame).
+
+* **Rebuild only at epoch boundaries:**
+
+  * Delete temp file lists, re-sample new random windows, rewrite the 5 files, and rebuild the pipeline.
+
+* **Extras:** For multi-GPU, pass `num_shards/shard_id` to each reader (or pre-split lists). If you need multiple lengths (15–30s), either **bucket by T** (one pipeline per bucket) or set T to max and **pad shorter** clips.
+

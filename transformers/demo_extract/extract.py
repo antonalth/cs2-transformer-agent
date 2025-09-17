@@ -70,17 +70,38 @@ KEY_MAPPING = {
 
 # --- From buy_sell_drop.py ---
 ITEM_ID_MAP = {
-    1: "deagle", 2: "elite", 3: "fiveseven", 4: "glock", 7: "ak47", 8: "aug", 9: "awp",
-    10: "famas", 11: "g3sg1", 13: "galilar", 14: "m249", 16: "m4a1", 17: "mac10", 19: "p90",
-    23: "mp5sd", 24: "ump45", 25: "xm1014", 26: "bizon", 27: "mag7", 28: "negev", 29: "sawedoff",
-    30: "tec9", 32: "p2000", 33: "mp7", 34: "mp9", 35: "nova", 36: "p250", 38: "scar20",
-    39: "sg556", 40: "ssg08", 42: "knife", 43: "flashbang", 44: "hegrenade", 45: "smokegrenade",
-    46: "molotov", 47: "decoy", 48: "incgrenade", 49: "c4", 59: "knife_t", 60: "m4a1_silencer",
-    61: "usp_silencer", 63: "cz75a", 64: "revolver", 500: "knife_default_ct", 506: "knife_gut",
-    507: "knife_flip", 508: "knife_bayonet", 509: "knife_m9_bayonet", 515: "knife_karambit",
-    522: "knife_stiletto", 523: "knife_ursus", 80: "defuser", 81: "vest", 82: "vesthelm"
+    1: "deagle", 2: "elite", 3: "fiveseven", 4: "glock", 7: "ak47", 8: "aug", 9: "awp", 10: "famas", 11: "g3sg1",
+    13: "galilar", 14: "m249", 16: "m4a1", 17: "mac10", 19: "p90", 23: "mp5sd", 24: "ump45", 25: "xm1014",
+    26: "ppbizon", 27: "mag7", 28: "negev", 29: "sawedoff", 30: "tec9", 31: "zeus", 32: "p2000", 33: "mp7",
+    34: "mp9", 35: "nova", 36: "p250", 38: "scar20", 39: "sg556", 40: "ssg08", 41: "knife", 42: "knife",
+    43: "flashbang", 44: "hegrenade", 45: "smokegrenade", 46: "molotov", 47: "decoy", 48: "incgrenade",
+    49: "c4", 50: "vest", 51: "vesthelm", 52: "heavyassaultsuit", 54: "nvgs", 55: "defuser", 56: "rescue_kit",
+    57: "medishot", 59: "knifet", 60: "m4a1_silencer", 61: "usp_silencer", 62: "tradeupcontract", 63: "cz75auto",
+    64: "r8revolver", 65: "charmdetachments", 500: "bayonet", 503: "knife_default_ct", 505: "flipknife",
+    506: "gutknife", 507: "karambit", 508: "knife_m9_bayonet", 509: "huntsmanknife", 512: "falchionknife",
+    514: "bowieknife", 515: "butterflyknife", 516: "shadowdaggers", 517: "paracordknife", 518: "survivalknife",
+    519: "ursusknife", 520: "navajaknife", 521: "nomadknife", 522: "stilettoknife", 523: "talonknife",
+    525: "skeletonknife", 526: "kukriknife",
 }
+
 GRENADE_NAMES = {"flashbang", "hegrenade", "smokegrenade", "molotov", "decoy", "incgrenade"}
+
+
+# =============================================================================
+# 2.5 UTILITY FUNCTION FOR PLAYER VALIDATION
+# =============================================================================
+BAD_PLAYER_PREFIXES = ["Coach", "Spectator", "GOTV"]
+
+def _is_valid_player(player_name: str | None) -> bool:
+    """
+    Checks if an entity is a valid player and not a coach, spectator, etc.
+    """
+    if not player_name:
+        return False
+    for prefix in BAD_PLAYER_PREFIXES:
+        if player_name.startswith(prefix):
+            return False
+    return True
 
 
 # =============================================================================
@@ -108,6 +129,7 @@ def _mouse_process_demo(parser: DemoParser, conn: sqlite3.Connection, table_name
     props_to_parse = ["player_name", "pitch", "yaw", "aim_punch_angle"]
     
     ticks_df = parser.parse_ticks(props_to_parse)
+    ticks_df = ticks_df[ticks_df['player_name'].apply(_is_valid_player)].copy()
 
     if 'aim_punch_angle' in ticks_df.columns:
         aim_punch_components = ticks_df['aim_punch_angle'].apply(pd.Series)
@@ -167,7 +189,9 @@ def _rounds_parse_2x(demo_path: Path) -> list[dict[str, Any]]:
         if not plant_in_round.is_empty():
             bomb_plant_tick = plant_in_round["tick"][0]
         def team_list(side: str) -> list[list[Any]]:
-            roster = spawns.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= fz_end) & (pl.col("user_side") == side)).select("user_name").unique().to_series().to_list()
+            roster_df = spawns.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= fz_end) & (pl.col("user_side") == side)).select("user_name").unique()
+            filtered_roster_df = roster_df.filter(pl.col("user_name").map_elements(_is_valid_player, return_dtype=pl.Boolean))
+            roster = filtered_roster_df.to_series().to_list()
             died = deaths.filter((pl.col("tick") >= s_tick) & (pl.col("tick") <= e_tick)).select("victim_name", "tick")
             death_map = dict(zip(died["victim_name"], died["tick"]))
             return [[p, death_map.get(p, -1)] for p in roster]
@@ -228,6 +252,7 @@ def run_keyboard_location_processing(demo_path: str, conn: sqlite3.Connection):
 
     tick_props = ["tick", "steamid", "name", "buttons", "inventory", "X", "Y", "Z", "active_weapon_name", "health", "armor_value", "balance", "is_warmup_period"]
     tick_df = pd.DataFrame(dp.parse_ticks(wanted_props=tick_props))
+    tick_df = tick_df[tick_df['name'].apply(_is_valid_player)].copy()
     
     if 'is_warmup_period' in tick_df.columns:
         tick_df = tick_df[tick_df['is_warmup_period'] == False].copy()
@@ -274,7 +299,7 @@ def run_keyboard_location_processing(demo_path: str, conn: sqlite3.Connection):
 # 6. PROCESSING STEP 4: BUY/SELL/DROP DATA
 # =============================================================================
 def _bsd_get_item_name(item_id: int) -> str:
-    return ITEM_ID_MAP.get(item_id, f"unknown_item_{item_id}")
+    return ITEM_ID_MAP.get(item_id, f"unknown_{item_id}")
 
 class _bsd_DatabaseManager:
     def __init__(self, conn: sqlite3.Connection):
@@ -320,6 +345,8 @@ def run_buy_sell_drop_processing(demo_path: str, input_conn: sqlite3.Connection,
 
     tick_props = ["tick", "player_steamid", "player_name", "balance", "inventory_as_ids", "in_buy_zone", "team_num", "ct_cant_buy", "terrorist_cant_buy"]
     all_ticks_df = parser.parse_ticks(tick_props)
+    all_ticks_df = all_ticks_df[all_ticks_df['player_name'].apply(_is_valid_player)].copy()
+
     all_ticks_df.sort_values(by=["tick", "player_steamid"], inplace=True)
     all_ticks_df["inventory_as_ids"] = all_ticks_df["inventory_as_ids"].apply(lambda x: set(x) if x is not None else set())
 
@@ -410,7 +437,7 @@ def run_merge_processing(mouse_conn, rounds_conn, kl_conn, bsd_conn, merged_conn
         final_kb_inputs, buy_sell_actions = kb_input.split(',') if kb_input else [], []
         
         for action, item in action_data.get((tick, playername), []):
-            safe_item = item.replace(' ', '_').replace('&', 'and')
+            safe_item = item.replace(' ', '_').replace('&', 'and').replace('-','_')
             if action == 'DROP': final_kb_inputs.append(f"DROP_{safe_item}")
             elif action in ('BUY', 'SELL'): buy_sell_actions.append(f"{action}_{safe_item}")
         
@@ -486,7 +513,8 @@ def _rc_fetch_and_process_rounds(conn: sqlite3.Connection) -> List[Tuple]:
 
         # Stage 2: Strict Validation
         is_round_valid = True
-        if len(t_players) != 5 or len(ct_players) != 5:
+        # playercount = len(t_players) + len(ct_players)
+        if len(t_players) != 5 or len(ct_players) != 5: 
             print(f"    Skipping round {round_num}: Invalid team sizes. T: {len(t_players)}, CT: {len(ct_players)}. Expected 5v5.")
             is_round_valid = False
         

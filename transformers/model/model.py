@@ -249,6 +249,46 @@ class KVCache:
     value: torch.Tensor  # [B, L, H_kv, Hd]
     pos_end: int         # absolute position *after* last cached token
 
+# ---------------------------------------------------------------------------------
+# Helper: resolve ViT preprocessing (mean/std and input size) from timm by model name
+# ---------------------------------------------------------------------------------
+def resolve_vit_preprocess(vit_name: str) -> dict:
+    """
+    Returns a dict with:
+      - mean: Tuple[float, float, float] in [0,1] range
+      - std:  Tuple[float, float, float] in [0,1] range
+      - height: int
+      - width:  int
+
+    Uses timm to instantiate the model and read its pretrained data config.
+    Falls back to ImageNet defaults (224,224, mean/std) if unavailable.
+    """
+    try:
+        import timm
+        m = timm.create_model(vit_name, pretrained=True, num_classes=0)
+        # Try modern API first
+        mean = std = input_size = None
+        try:
+            from timm.data import resolve_model_data_config
+            data_cfg = resolve_model_data_config(m)
+            mean = tuple(map(float, data_cfg.get("mean", (0.485, 0.456, 0.406))))
+            std = tuple(map(float, data_cfg.get("std", (0.229, 0.224, 0.225))))
+            input_size = data_cfg.get("input_size", (3, 224, 224))
+        except Exception:
+            pass
+        if mean is None or std is None or input_size is None:
+            # Fallback to model attrs in older timm
+            cfg = getattr(m, "pretrained_cfg", None) or getattr(m, "default_cfg", {}) or {}
+            mean = tuple(map(float, cfg.get("mean", (0.485, 0.456, 0.406))))
+            std = tuple(map(float, cfg.get("std", (0.229, 0.224, 0.225))))
+            input_size = cfg.get("input_size", (3, 224, 224))
+        h, w = int(input_size[-2]), int(input_size[-1])
+        return {"mean": mean, "std": std, "height": h, "width": w}
+    except Exception:
+        # Last resort
+        return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225), "height": 224, "width": 224}
+
+
 def print_dataclass(dc: Any, indent: int = 0):
     """Recursively print a dataclass and its attributes."""
     if not is_dataclass(dc):
@@ -406,13 +446,13 @@ class ViTVisualEncoder(nn.Module):
 class AudioCNN(nn.Module):
     """Small 2D-CNN over Mel-spectrograms → [B, T, P, d_model].
 
-    Robust to variable time dimension via AdaptiveAvgPool2d.
-    Input mel: [B, T, P, 1, mel_bins(=128), mel_t(~6..N)]
+    This version accepts a 2-channel (Stereo) spectrogram.
+    Input mel: [B, T, P, 2, mel_bins, mel_t]
     """
     def __init__(self, cfg: CS2Config):
         super().__init__()
         c1, c2, c3 = cfg.audio_cnn_channels
-        self.conv1 = nn.Conv2d(1, c1, 5, padding=2)
+        self.conv1 = nn.Conv2d(2, c1, 5, padding=2)
         self.gn1 = _GN2d(c1)
         self.conv2 = nn.Conv2d(c1, c2, 3, stride=2, padding=1)
         self.gn2 = _GN2d(c2)
@@ -422,9 +462,9 @@ class AudioCNN(nn.Module):
         self.head = nn.Linear(c3 * 4 * 4, cfg.d_model)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        # mel: [B, T, P, 1, 128, ~6] → pack to [B*T*P, 1, 128, ~6]
+        # mel: [B, T, P, 2, mel_bins, mel_t] -> pack to [B*T*P, 2, mel_bins, mel_t]
         B, T, P = mel.shape[:3]
-        x = mel.reshape(B * T * P, 1, mel.shape[-2], mel.shape[-1])
+        x = mel.reshape(B * T * P, mel.shape[3], mel.shape[4], mel.shape[5])
         x = F.gelu(self.gn1(self.conv1(x)))
         x = F.gelu(self.gn2(self.conv2(x)))
         x = F.gelu(self.gn3(self.conv3(x)))
@@ -1164,7 +1204,14 @@ class CS2Transformer(nn.Module):
 
 
     def forward(self, batch: CS2Batch) -> Predictions:
-        """Compute next-frame predictions (t+1) given frames 1..t."""
+        """
+        Compute per-frame predictions given frames 1..T.
+        Returns a dict with:
+        {
+            "player": List[Dict[str, Tensor]],  # len == num_players, each with [B, T, ...]
+            "game_strategy": Dict[str, Tensor]  # each with [B, T, ...]
+        }
+        """
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )
@@ -1224,15 +1271,33 @@ class CS2Transformer(nn.Module):
             # ---- backbone ----
             h, _ = self.backbone(seq, attn_mask=None, kv_cache_list=None)
 
-            # ---- slice last frame ----
-            last = h[:, -Lpf:, :]
-            num_players = getattr(self.cfg,"num_players")
-            player_tok = last[:, :num_players, :]
-            strat_tok  = last[:, num_players, :]
+            h_frames = h.reshape(B, T, Lpf, d)
 
-            # ---- heads ----
-            player_preds: List[PlayerPredictions] = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
-            strategy_preds = self.strategy_head(strat_tok)
+            num_players = self.cfg.num_players
+            assert h_frames.size(2) >= num_players + 1, "Not enough per-frame tokens."
+
+            player_tok_all_frames = h_frames[:, :, :num_players, :]   # [B, T, P, d]
+            strat_tok_all_frames  = h_frames[:, :, num_players, :]    # [B, T, d]
+
+            player_preds: List[PlayerPredictions] = []
+            for i in range(num_players):
+                p_tok_seq  = player_tok_all_frames[:, :, i, :]              # [B, T, d]
+                p_tok_flat = p_tok_seq.reshape(B * T, d)                    # [B*T, d]
+                preds_flat = self.player_head(p_tok_flat)
+
+                # Generic reshape back to [B, T, ...]
+                preds_seq = {k: v.reshape(B, T, *v.shape[1:]) for k, v in preds_flat.items()}
+
+                # If your heatmaps are flattened, replace the line above for those keys, e.g.:
+                # Z, Y, X = self.player_head.pos_shape
+                # preds_seq["pos_heatmap_logits"] = preds_flat["pos_heatmap_logits"].reshape(B, T, Z, Y, X)
+
+                player_preds.append(preds_seq)
+
+            # Strategy head
+            strat_preds_flat = self.strategy_head(strat_tok_all_frames.reshape(B * T, d))
+            strategy_preds   = {k: v.reshape(B, T, *v.shape[1:]) for k, v in strat_preds_flat.items()}
+
 
             return {"player": player_preds, "game_strategy": strategy_preds}
 

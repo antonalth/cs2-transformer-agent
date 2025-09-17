@@ -1,130 +1,137 @@
 #!/usr/bin/env python3
 """
-create_split.py
+split_manifest.py
 
-Scans a directory of LMDBs (where each subdirectory is a unique demo)
-and creates a deterministic, demo-wise train/validation split.
-
-The output is a 'split_manifest.json' file saved in the root of the
-LMDB directory, which serves as the single source of truth for all
-training runs to ensure reproducibility.
+Scans a data directory for corresponding LMDB and recordings folders,
+then deterministically shuffles and splits them into training and testing sets.
+The resulting split is saved to a manifest.json file in the data directory.
 """
 
+import argparse
+import datetime
 import json
 import random
-import argparse
+import sys
 from pathlib import Path
-from datetime import datetime, timezone
 
-# The hardcoded seed ensures that the shuffle is always the same,
-# making the split reproducible every time the script is run on the
-# same dataset.
-HARDCODED_SEED = 42
-
-def create_deterministic_split(lmdb_path: str, val_split_ratio: float, seed: int):
+def create_split_manifest(data_dir: Path, seed: int, train_percent: int):
     """
-    Finds all demo subdirectories, shuffles them deterministically,
-    and saves the train/val split to a JSON manifest file.
+    Finds all games, verifies data integrity, splits them, and writes a manifest.
 
     Args:
-        lmdb_path (str): The path to the root directory containing all LMDB folders.
-        val_split_ratio (float): The fraction of demos to reserve for the validation set.
-        seed (int): The random seed to use for shuffling.
+        data_dir (Path): The root data directory containing 'lmdb' and 'recordings'.
+        seed (int): The seed for deterministic shuffling.
+        train_percent (int): The percentage of data to allocate to the training set.
     """
-    print("--- Starting Deterministic Split Creation ---")
+    print(f"Scanning data directory: {data_dir}")
 
-    # 1. Validate the input path
-    lmdb_root = Path(lmdb_path)
-    if not lmdb_root.is_dir():
-        raise NotADirectoryError(f"Error: Provided LMDB path is not a valid directory: {lmdb_path}")
+    # 1. Define and validate paths
+    lmdb_dir = data_dir / "lmdb"
+    recordings_dir = data_dir / "recordings"
+    manifest_path = data_dir / "manifest.json"
 
-    # 2. Get a list of all unique demos by finding all subdirectories
-    print(f"Scanning for demo directories in: {lmdb_root.resolve()}")
-    demo_names = [d.name for d in lmdb_root.iterdir() if d.is_dir()]
+    if not lmdb_dir.is_dir():
+        print(f"Error: LMDB directory not found at '{lmdb_dir}'", file=sys.stderr)
+        sys.exit(1)
 
-    if not demo_names:
-        print(f"Warning: No subdirectories found in {lmdb_path}. No split created.")
-        return
+    if not recordings_dir.is_dir():
+        print(f"Error: Recordings directory not found at '{recordings_dir}'", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Found {len(demo_names)} total demos.")
+    # 2. Find all potential games based on LMDB folders
+    print(f"Searching for LMDB databases in: {lmdb_dir}")
+    # A game name is the directory name without the '.lmdb' suffix
+    game_names = sorted([p.stem for p in lmdb_dir.iterdir() if p.is_dir() and p.name.endswith('.lmdb')])
 
-    # 3. CRITICAL: Sort the list to ensure the initial order is always the same
-    # before shuffling. This is a key part of ensuring determinism.
-    demo_names.sort()
+    if not game_names:
+        print("Warning: No '.lmdb' directories found. Manifest will be empty.", file=sys.stderr)
+        all_valid_games = []
+    else:
+        print(f"Found {len(game_names)} potential games. Verifying recordings folders...")
+        all_valid_games = []
+        for name in game_names:
+            expected_rec_path = recordings_dir / name
+            if not expected_rec_path.is_dir():
+                print(
+                    f"Error: Found '{lmdb_dir / (name + '.lmdb')}' but the corresponding "
+                    f"recordings folder is missing at '{expected_rec_path}'. Failing fast.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+            all_valid_games.append(name)
+        print("All LMDB folders have a matching recordings folder.")
 
-    # 4. CRITICAL: Use the fixed seed to shuffle the list. The shuffle
-    # will be identical every time this script is run with the same seed.
-    print(f"Shuffling demos with fixed random seed: {seed}")
+
+    # 3. Deterministically shuffle and split the list of games
     random.seed(seed)
-    random.shuffle(demo_names)
+    random.shuffle(all_valid_games)
 
-    # 5. Split the shuffled list into training and validation sets
-    split_index = int(len(demo_names) * (1.0 - val_split_ratio))
-    train_demos = demo_names[:split_index]
-    val_demos = demo_names[split_index:]
+    split_index = int(len(all_valid_games) * (train_percent / 100.0))
+    
+    train_set = all_valid_games[:split_index]
+    test_set = all_valid_games[split_index:]
 
-    # 6. Prepare the manifest dictionary with useful metadata
-    print("Constructing manifest file...")
-    split_manifest = {
+    print(f"Splitting {len(all_valid_games)} games into {len(train_set)} train and {len(test_set)} test samples.")
+
+    # 4. Create the manifest dictionary
+    manifest_data = {
         "metadata": {
-            "description": "Official train/validation split. Each entry is a demo name (LMDB folder).",
-            "dataset_source_path": str(lmdb_root.resolve()),
-            "creation_timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "seed": seed,
-            "validation_split_ratio": val_split_ratio
+            "creation_date_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "split_ratio_train": train_percent,
+            "split_ratio_test": 100 - train_percent
         },
-        "split_summary": {
-            "num_train_demos": len(train_demos),
-            "num_validation_demos": len(val_demos),
-            "total_demos": len(demo_names)
-        },
-        "train_demos": train_demos,
-        "validation_demos": val_demos
+        "train": train_set,
+        "test": test_set
     }
 
-    # 7. Save the manifest to a JSON file
-    manifest_path = lmdb_root / "split_manifest.json"
+    # 5. Write to manifest.json
     try:
         with open(manifest_path, 'w') as f:
-            # Use indent=4 for human-readability
-            json.dump(split_manifest, f, indent=4)
+            json.dump(manifest_data, f, indent=4)
+        print(f"\nSuccessfully created manifest file at: {manifest_path}")
     except IOError as e:
-        print(f"Error: Could not write manifest file to {manifest_path}. Check permissions.")
-        print(e)
-        return
-
-    print("\n--- Split Creation Successful ---")
-    print(f"Manifest file saved to: {manifest_path.resolve()}")
-    print(f"  - Training demos:     {len(train_demos)}")
-    print(f"  - Validation demos:   {len(val_demos)}")
-    print("---------------------------------")
+        print(f"Error: Could not write to manifest file at '{manifest_path}'.\n{e}", file=sys.stderr)
+        sys.exit(1)
 
 
-if __name__ == "__main__":
+def main():
+    """Main entry point and argument parsing."""
     parser = argparse.ArgumentParser(
-        description="Create a deterministic, demo-wise train/validation split for a set of LMDBs.",
-        formatter_class=argparse.RawTextHelpFormatter
+        description="Create a train/test split manifest for LMDB/recordings data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
     parser.add_argument(
-        "--lmdbpath",
-        required=True,
-        type=str,
-        help="Path to the root directory containing the LMDB folders (one folder per demo)."
+        "data_dir",
+        type=Path,
+        help="Path to the root data directory (e.g., 'data/')."
     )
 
     parser.add_argument(
-        "--val_split_ratio",
-        type=float,
-        default=0.05,
-        help="Fraction of the demos to use for the validation set (e.g., 0.05 for 5%%). Default is 0.05."
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for the deterministic shuffle of the dataset."
     )
-
+    
+    parser.add_argument(
+        "--split",
+        type=int,
+        default=80,
+        choices=range(0, 101),
+        metavar="[0-100]",
+        help="Percentage of data to be used for the training set."
+    )
+    
     args = parser.parse_args()
 
-    # The seed is hardcoded as per the requirements to ensure reproducibility.
-    create_deterministic_split(
-        lmdb_path=args.lmdbpath,
-        val_split_ratio=args.val_split_ratio,
-        seed=HARDCODED_SEED
-    )
+    if not args.data_dir.is_dir():
+        print(f"Error: The specified data directory does not exist: {args.data_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    create_split_manifest(args.data_dir, args.seed, args.split)
+
+
+if __name__ == '__main__':
+    main()

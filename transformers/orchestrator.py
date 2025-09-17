@@ -17,6 +17,8 @@ import subprocess
 import sys
 import threading
 import queue
+import logging
+from datetime import datetime
 from pathlib import Path
 from multiprocessing import Pool, Manager, Process
 
@@ -38,6 +40,23 @@ RECORD_SCRIPT_PATH = SCRIPT_DIR / "recording" / "record2.py"
 INJECTION_MOLD_SCRIPT_PATH = SCRIPT_DIR / "to_lmdb" / "injection_mold.py"
 
 
+def setup_worker_logging(log_filename):
+    """Configures logging for a worker process."""
+    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    root_logger = logging.getLogger()
+
+    if not root_logger.handlers:
+        root_logger.setLevel(logging.INFO)
+
+        # FIX: Add encoding='utf-8' to the file handler
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+        file_handler.setFormatter(log_formatter)
+        root_logger.addHandler(file_handler)
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(log_formatter)
+        root_logger.addHandler(console_handler)
+
 def run_subprocess(command_list, worker_prefix):
     """
     Runs a command, streaming its output, and allows Ctrl+C to pass through.
@@ -46,11 +65,11 @@ def run_subprocess(command_list, worker_prefix):
     def stream_output(pipe, prefix):
         try:
             for line in iter(pipe.readline, ''):
-                print(f"{prefix} {line.strip()}", flush=True)
+                logging.info(f"{prefix} {line.strip()}")
         finally:
             pipe.close()
 
-    print(f"{worker_prefix} Starting command: {' '.join(map(str, command_list))}", flush=True)
+    logging.info(f"{worker_prefix} Starting command: {' '.join(map(str, command_list))}")
 
     child_env = os.environ.copy()
     child_env['PYTHONUTF8'] = '1'
@@ -73,7 +92,7 @@ def run_subprocess(command_list, worker_prefix):
     try:
         return_code = process.wait()
     except KeyboardInterrupt:
-        print(f"{worker_prefix} Interrupted by user. Terminating child process...", flush=True)
+        logging.warning(f"{worker_prefix} Interrupted by user. Terminating child process...")
         process.terminate()
         process.wait()
         raise
@@ -81,15 +100,16 @@ def run_subprocess(command_list, worker_prefix):
     output_thread.join()
 
     if return_code == 0:
-        print(f"{worker_prefix} Command finished successfully.", flush=True)
+        logging.info(f"{worker_prefix} Command finished successfully.")
     else:
-        print(f"{worker_prefix} Command finished with a non-zero exit code: {return_code}.", flush=True)
+        logging.error(f"{worker_prefix} Command finished with a non-zero exit code: {return_code}.")
 
     return return_code
 
 
-def extract_worker(demo_path, datadir):
+def extract_worker(demo_path, datadir, log_filename):
     """Worker function for the extraction phase."""
+    setup_worker_logging(log_filename)
     worker_id = os.getpid()
     prefix = f"[EXTRACT-WORKER-{worker_id}]"
     try:
@@ -99,27 +119,28 @@ def extract_worker(demo_path, datadir):
     except KeyboardInterrupt:
         return
     except Exception as e:
-        print(f"{prefix} Worker error on demo {demo_path.name}: {e}", flush=True)
+        logging.error(f"{prefix} Worker error on demo {demo_path.name}: {e}")
 
 def extract_worker_wrapper(args):
     return extract_worker(*args)
 
 
-def record_worker(task_queue, datadir, recdir, override_level, client_id):
+def record_worker(task_queue, datadir, recdir, override_level, client_id, log_filename):
     """Worker function for the recording phase."""
+    setup_worker_logging(log_filename)
     prefix = f"[RECORD-WORKER-ID-{client_id}]"
     while True:
         try:
             demo_path = task_queue.get_nowait()
         except queue.Empty:
-            print(f"{prefix} No more tasks. Worker exiting.", flush=True)
+            logging.info(f"{prefix} No more tasks. Worker exiting.")
             break
         except (KeyboardInterrupt, SystemExit):
             break
 
         try:
             db_path = datadir / (demo_path.stem + '.db')
-            print(f"{prefix} Processing demo: {demo_path.name}", flush=True)
+            logging.info(f"{prefix} Processing demo: {demo_path.name}")
             command = [
                 sys.executable, str(RECORD_SCRIPT_PATH), "--id", str(client_id),
                 "--demofile", str(demo_path), "--sql", str(db_path),
@@ -127,14 +148,15 @@ def record_worker(task_queue, datadir, recdir, override_level, client_id):
             ]
             run_subprocess(command, prefix)
         except KeyboardInterrupt:
-            print(f"{prefix} Interrupted during task. Worker exiting.", flush=True)
+            logging.warning(f"{prefix} Interrupted during task. Worker exiting.")
             break
         except Exception as e:
-            print(f"{prefix} Unhandled error processing {demo_path.name}: {e}", flush=True)
+            logging.error(f"{prefix} Unhandled error processing {demo_path.name}: {e}")
 
 
-def injection_mold_worker(demo_path, args):
+def injection_mold_worker(demo_path, args, log_filename):
     """Worker function for the LMDB generation phase."""
+    setup_worker_logging(log_filename)
     worker_id = os.getpid()
     prefix = f"[INJECT-WORKER-{worker_id}]"
     demo_name = demo_path.stem
@@ -149,21 +171,17 @@ def injection_mold_worker(demo_path, args):
             "--recdir", str(recdir_path),
             "--dbfile", str(db_path),
             "--outlmdb", str(lmdb_out_path),
-            "--workers", str(args.lmdbworkers),
-            "--quality", str(args.lmdbquality)
         ]
         if args.lmdboverwrite:
             command.append("--overwrite")
         if args.lmdboverridesql:
             command.append("--overridesql")
-        if args.lmdbblockfile:
-            command.extend(["--blockfile", str(args.lmdbblockfile)])
 
         run_subprocess(command, prefix)
     except KeyboardInterrupt:
         return
     except Exception as e:
-        print(f"{prefix} Worker error on demo {demo_name}: {e}", flush=True)
+        logging.error(f"{prefix} Worker error on demo {demo_name}: {e}")
 
 def injection_mold_worker_wrapper(args):
     return injection_mold_worker(*args)
@@ -172,17 +190,17 @@ def injection_mold_worker_wrapper(args):
 def get_available_clients():
     """Queries the HTTP server to get a list of available recording client IDs."""
     try:
-        print(f"\n> Querying recording server at {HTTP_SERVER_URL}/list for available clients...")
+        logging.info(f"\n> Querying recording server at {HTTP_SERVER_URL}/list for available clients...")
         response = requests.get(f"{HTTP_SERVER_URL}/list", timeout=5)
         response.raise_for_status()
         clients = response.json()
         if not isinstance(clients, list) or not clients:
-            print("! ERROR: Server responded, but no available clients found.", file=sys.stderr)
+            logging.error("! ERROR: Server responded, but no available clients found.")
             return []
-        print(f"> Found {len(clients)} available recording clients: {clients}")
+        logging.info(f"> Found {len(clients)} available recording clients: {clients}")
         return clients
     except requests.exceptions.RequestException as e:
-        print(f"! ERROR: Could not connect to the recording server at {HTTP_SERVER_URL}. Details: {e}", file=sys.stderr)
+        logging.error(f"! ERROR: Could not connect to the recording server at {HTTP_SERVER_URL}. Details: {e}")
         return []
 
 
@@ -206,98 +224,101 @@ def main():
     lmdb_group = parser.add_argument_group('Phase 3: LMDB Generation Parameters')
     lmdb_group.add_argument("--lmdbpath", type=Path, help="Directory to store final LMDB folders. Required for step 3.")
     lmdb_group.add_argument("--step3workers", type=int, default=1, help="Number of parallel injection_mold.py processes to run.")
-    lmdb_group.add_argument("--lmdbworkers", type=int, default=5, help="Number of workers for each injection_mold.py instance.")
-    lmdb_group.add_argument("--lmdbquality", type=int, default=85, help="JPEG quality for injection_mold.py.")
-    lmdb_group.add_argument("--lmdbblockfile", type=Path, help="Path to blockfile for injection_mold.py.")
     lmdb_group.add_argument("--lmdboverwrite", action="store_true", help="Pass --overwrite to injection_mold.py.")
     lmdb_group.add_argument("--lmdboverridesql", action="store_true", help="Pass --overridesql to injection_mold.py.")
 
     args = parser.parse_args()
 
+    # --- Logging Setup ---
+    log_dir = SCRIPT_DIR / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    log_filename = log_dir / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    setup_worker_logging(log_filename)
+
     # --- Script and Path Validation ---
     if not EXTRACT_SCRIPT_PATH.is_file():
-        print(f"FATAL: `extract.py` not found at: {EXTRACT_SCRIPT_PATH}", file=sys.stderr); sys.exit(1)
+        logging.critical(f"FATAL: `extract.py` not found at: {EXTRACT_SCRIPT_PATH}"); sys.exit(1)
     if not RECORD_SCRIPT_PATH.is_file():
-        print(f"FATAL: `record2.py` not found at: {RECORD_SCRIPT_PATH}", file=sys.stderr); sys.exit(1)
+        logging.critical(f"FATAL: `record2.py` not found at: {RECORD_SCRIPT_PATH}"); sys.exit(1)
     if '3' in args.runsteps and not INJECTION_MOLD_SCRIPT_PATH.is_file():
-        print(f"FATAL: `injection_mold.py` not found at: {INJECTION_MOLD_SCRIPT_PATH}", file=sys.stderr); sys.exit(1)
+        logging.critical(f"FATAL: `injection_mold.py` not found at: {INJECTION_MOLD_SCRIPT_PATH}"); sys.exit(1)
     if '3' in args.runsteps and not args.lmdbpath:
-        print("FATAL: --lmdbpath is required when running step 3.", file=sys.stderr); sys.exit(1)
+        logging.critical("FATAL: --lmdbpath is required when running step 3."); sys.exit(1)
 
     args.demodir.mkdir(exist_ok=True)
     args.datadir.mkdir(exist_ok=True)
     args.recdir.mkdir(exist_ok=True)
     if args.lmdbpath: args.lmdbpath.mkdir(exist_ok=True)
 
-    print(f"Project Directory: {SCRIPT_DIR}\nExtractor Script:  {EXTRACT_SCRIPT_PATH}\nRecorder Script:   {RECORD_SCRIPT_PATH}\nInjector Script:   {INJECTION_MOLD_SCRIPT_PATH}")
+    logging.info(f"Project Directory: {SCRIPT_DIR}\nExtractor Script:  {EXTRACT_SCRIPT_PATH}\nRecorder Script:   {RECORD_SCRIPT_PATH}\nInjector Script:   {INJECTION_MOLD_SCRIPT_PATH}")
 
     all_demo_files = sorted(list(args.demodir.glob("*.dem")))
     if not all_demo_files:
-        print(f"No .dem files found in {args.demodir}. Exiting."); return
+        logging.warning(f"No .dem files found in {args.demodir}. Exiting."); return
 
     # --- PHASE 1: DATA GENERATION ---
     if '1' in args.runsteps:
-        print("\n" + "="*50 + "\n### PHASE 1: DATA GENERATION ###\n" + "="*50)
+        logging.info("\n" + "="*50 + "\n### PHASE 1: DATA GENERATION ###\n" + "="*50)
         demos_to_extract = [p for p in all_demo_files if not (args.datadir / (p.stem + '.db')).exists()]
         if not demos_to_extract:
-            print("> All demos already have a .db file.")
+            logging.info("> All demos already have a .db file.")
         else:
-            print(f"> Queuing {len(demos_to_extract)} demos for data extraction.")
-            tasks = [(demo, args.datadir) for demo in demos_to_extract]
+            logging.info(f"> Queuing {len(demos_to_extract)} demos for data extraction.")
+            tasks = [(demo, args.datadir, log_filename) for demo in demos_to_extract]
             try:
                 with Pool(processes=args.extractworkers) as pool:
                     for _ in pool.imap_unordered(extract_worker_wrapper, tasks): pass
             except KeyboardInterrupt:
-                print("\n! CTRL+C: Terminating data extraction...", file=sys.stderr); sys.exit(1)
-        print("\n### PHASE 1 COMPLETE ###")
+                logging.critical("\n! CTRL+C: Terminating data extraction..."); sys.exit(1)
+        logging.info("\n### PHASE 1 COMPLETE ###")
 
     # --- PHASE 2: VIDEO RECORDING ---
     if '2' in args.runsteps:
-        print("\n" + "="*50 + "\n### PHASE 2: VIDEO RECORDING ###\n" + "="*50)
+        logging.info("\n" + "="*50 + "\n### PHASE 2: VIDEO RECORDING ###\n" + "="*50)
         available_clients = get_available_clients()
         if not available_clients: sys.exit(1)
 
         demos_to_record = [p for p in all_demo_files if (args.datadir / (p.stem + '.db')).exists()]
         if not demos_to_record:
-            print("> No demos with .db files found to record.")
+            logging.info("> No demos with .db files found to record.")
         else:
-            print(f"> Queuing {len(demos_to_record)} demos for recording across {len(available_clients)} clients.")
+            logging.info(f"> Queuing {len(demos_to_record)} demos for recording across {len(available_clients)} clients.")
             processes = []
             try:
                 with Manager() as manager:
                     task_queue = manager.Queue()
                     for demo in demos_to_record: task_queue.put(demo)
                     for client_id in available_clients:
-                        proc = Process(target=record_worker, args=(task_queue, args.datadir, args.recdir, args.override, client_id))
+                        proc_args = (task_queue, args.datadir, args.recdir, args.override, client_id, log_filename)
+                        proc = Process(target=record_worker, args=proc_args)
                         processes.append(proc); proc.start()
                     for p in processes: p.join()
             except KeyboardInterrupt:
-                print("\n! CTRL+C: Terminating recording workers...", file=sys.stderr)
+                logging.critical("\n! CTRL+C: Terminating recording workers...")
                 for p in processes:
                     if p.is_alive(): p.terminate()
                 for p in processes: p.join()
                 sys.exit(1)
-        print("\n### PHASE 2 COMPLETE ###")
+        logging.info("\n### PHASE 2 COMPLETE ###")
 
     # --- PHASE 3: LMDB GENERATION ---
     if '3' in args.runsteps:
-        print("\n" + "="*50 + "\n### PHASE 3: LMDB GENERATION ###\n" + "="*50)
-        # A demo is ready for injection if its .db and recording folder exist
+        logging.info("\n" + "="*50 + "\n### PHASE 3: LMDB GENERATION ###\n" + "="*50)
         demos_to_inject = [p for p in all_demo_files if (args.datadir / (p.stem + '.db')).exists() and (args.recdir / p.stem).is_dir()]
         if not demos_to_inject:
-            print("> No demos with required .db and recording folders found.")
+            logging.info("> No demos with required .db and recording folders found.")
         else:
-            print(f"> Queuing {len(demos_to_inject)} demos for LMDB generation.")
-            tasks = [(demo, args) for demo in demos_to_inject]
+            logging.info(f"> Queuing {len(demos_to_inject)} demos for LMDB generation.")
+            tasks = [(demo, args, log_filename) for demo in demos_to_inject]
             try:
                 with Pool(processes=args.step3workers) as pool:
                     for _ in pool.imap_unordered(injection_mold_worker_wrapper, tasks): pass
             except KeyboardInterrupt:
-                print("\n! CTRL+C: Terminating LMDB generation...", file=sys.stderr); sys.exit(1)
-        print("\n### PHASE 3 COMPLETE ###")
+                logging.critical("\n! CTRL+C: Terminating LMDB generation..."); sys.exit(1)
+        logging.info("\n### PHASE 3 COMPLETE ###")
 
 
-    print("\n" + "="*50 + "\n>>> Orchestration finished successfully. <<<\n" + "="*50)
+    logging.info("\n" + "="*50 + "\n>>> Orchestration finished successfully. <<<\n" + "="*50)
 
 if __name__ == '__main__':
     from multiprocessing import set_start_method

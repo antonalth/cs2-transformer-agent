@@ -16,6 +16,22 @@ except ImportError:
     print("Error: 'requests' library not found. Please install it using 'pip install requests'")
     sys.exit(1)
 
+import re
+
+def sanitize_player_name(player_name: str) -> str:
+    """
+    Sanitizes a player name to make it safe for use in filenames.
+    - Replaces spaces with underscores.
+    - Removes any character that is NOT an alphanumeric character, underscore, or hyphen.
+    - Strips leading/trailing whitespace.
+    """
+    if not player_name:
+        return "unknown_player"
+    
+    name = player_name.replace(' ', '_')
+    sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '', name)
+    return sanitized_name.strip()
+
 # --- Globals for Script Instance ---
 # These are set in main() after parsing arguments.
 ARGS = None
@@ -148,45 +164,96 @@ def process_recordings(demo_file: Path, output_dir: Path):
     cursor.execute("SELECT * FROM RECORDING")
     all_db_entries = cursor.fetchall()
     
-    entries_to_process = []
-    if ARGS.override == 2:
-        LOG.info("Override level 2: All entries will be re-recorded.")
-        entries_to_process = all_db_entries
-    else:
-        for entry in all_db_entries:
-            is_recorded = entry['is_recorded']
-            filepath = entry['recording_filepath']
-            
-            if not is_recorded:
-                entries_to_process.append(entry)
-            elif ARGS.override == 1 and is_recorded:
-                if not filepath or not Path(filepath).resolve().exists():
-                    LOG.info(f"Entry for round {entry['roundnumber']} marked as recorded but file is missing. Queuing for re-recording.")
-                    entries_to_process.append(entry)
-
-    if not entries_to_process:
-        LOG.info("No entries to record based on current criteria. Check --override options if you want to re-record.")
-        return
-
-    LOG.info(f"Found {len(all_db_entries)} total entries in DB. Selected {len(entries_to_process)} for processing with --override {ARGS.override}.")
+    entries_to_record_queue = []
+    skipped_due_to_exist_count = 0
+    skipped_due_to_db_recorded_count = 0
+    updated_db_consistency_count = 0
 
     demo_name = demo_file.stem
     final_output_dir = output_dir / demo_name
     final_output_dir.mkdir(parents=True, exist_ok=True)
     LOG.info(f"Final recordings will be saved to: {final_output_dir}")
 
-    for entry in entries_to_process:
+    for entry in all_db_entries:
+        round_num = entry['roundnumber']
+        start_tick = entry['starttick']
+        stop_tick = entry['stoptick']
+        player_name = entry['playername']
+        team = entry['team']
+        db_is_recorded = entry['is_recorded']
+        db_filepath = entry['recording_filepath']
+
+        # Construct potential output paths
+        new_filename_base = f"{round_num:02d}_{team}_{sanitize_player_name(player_name)}_{start_tick}_{stop_tick}"
+        dest_mp4_path = final_output_dir / f"{new_filename_base}.mp4"
+        dest_wav_path = final_output_dir / f"{new_filename_base}.wav"
+
+        # Check if output files already exist on disk
+        file_exists_on_disk = dest_mp4_path.exists() and dest_wav_path.exists()
+        
+        if ARGS.override == 2:
+            # Override 2: Always re-record
+            entries_to_record_queue.append(entry)
+            LOG.debug(f"Queuing R{round_num}, P:{player_name} (Override 2: always re-record).")
+        elif ARGS.override == 1:
+            # Override 1: Re-record if DB says recorded but file missing OR not recorded.
+            # If file exists on disk, DB says recorded, and the DB's recorded_filepath also points to an existing file, then skip.
+            db_recorded_filepath_exists = db_filepath and Path(db_filepath).resolve().exists()
+            if db_is_recorded and file_exists_on_disk and db_recorded_filepath_exists:
+                LOG.debug(f"Skipping R{round_num}, P:{player_name}. Already recorded and file(s) exist (--override 1).")
+                skipped_due_to_db_recorded_count += 1
+            else:
+                entries_to_record_queue.append(entry)
+                LOG.debug(f"Queuing R{round_num}, P:{player_name} (Override 1: file missing or DB not recorded).")
+        else: # ARGS.override == 0 (Default behavior)
+            # Default (0): Only record if DB says not recorded AND output file(s) don't exist.
+            if db_is_recorded:
+                LOG.debug(f"Skipping R{round_num}, P:{player_name}. Already marked recorded in DB (--override 0).")
+                skipped_due_to_db_recorded_count += 1
+            elif file_exists_on_disk:
+                LOG.info(f"Skipping R{round_num}, P:{player_name}. Output file(s) already exist (--override 0).")
+                skipped_due_to_exist_count += 1
+                # If DB says not recorded but file(s) exist on disk, update DB for consistency
+                LOG.info(f"  -> Updating DB: marking R{round_num}, P:{player_name} as recorded (file exists).")
+                DB_CONN.execute(
+                    "UPDATE RECORDING SET is_recorded = ?, recording_filepath = ? WHERE starttick = ? AND stoptick = ? AND playername = ?",
+                    (True, str(dest_mp4_path.resolve()), start_tick, stop_tick, player_name)
+                )
+                updated_db_consistency_count += 1
+            else:
+                entries_to_record_queue.append(entry)
+                LOG.debug(f"Queuing R{round_num}, P:{player_name} (DB not recorded, file(s) missing).")
+
+    # Commit any DB updates made during the filtering process (for consistency)
+    if updated_db_consistency_count > 0:
+        DB_CONN.commit()
+        LOG.info(f"Committed {updated_db_consistency_count} database updates (marking existing files as recorded).")
+
+    if not entries_to_record_queue:
+        LOG.info("No entries to record based on current criteria. Check --override options if you want to re-record.")
+        return
+
+    LOG.info(f"Found {len(all_db_entries)} total entries in DB.")
+    LOG.info(f"Selected {len(entries_to_record_queue)} entries for recording.")
+    if skipped_due_to_exist_count > 0:
+        LOG.info(f"Skipped {skipped_due_to_exist_count} entries because files already existed and --override 0 was set.")
+    if skipped_due_to_db_recorded_count > 0:
+        LOG.info(f"Skipped {skipped_due_to_db_recorded_count} entries because they were already recorded according to DB/files and --override 0 or 1 was set.")
+
+
+    # Now iterate over the queue and perform actual recording
+    for entry in entries_to_record_queue:
         round_num = entry['roundnumber']
         start_tick = entry['starttick']
         stop_tick = entry['stoptick']
         player_name = entry['playername']
         team = entry['team']
         
-        LOG.info(f"--- Starting recording for Round {round_num}, Player: {player_name} ---")
+        LOG.info(f"--- Starting recording for Round {round_num}, Player: {player_name} (Team: {team}) ---") # Added team to log
         
         send_command("mirv_cmd clear", wait_after=2)
         send_command(f"demo_gototick {start_tick}", wait_after=10)
-        send_command(f"spec_player {player_name}", wait_after=2)
+        send_command(f"spec_player \"{player_name}\"", wait_after=2)
         
         stop_command = f'mirv_cmd addAtTick {stop_tick} "mirv_streams record end; demo_pause"'
         send_command(stop_command, wait_after=2)
@@ -196,8 +263,11 @@ def process_recordings(demo_file: Path, output_dir: Path):
         wait_for_ffmpeg_to_finish()
         
         LOG.info("Processing recorded files...")
-        new_filename_base = f"{round_num:02d}_{team}_{player_name}_{start_tick}_{stop_tick}"
-        
+        # Re-calculate filename base and dest paths. This is safe even if `entry` were mutable.
+        new_filename_base = f"{round_num:02d}_{team}_{sanitize_player_name(player_name)}_{start_tick}_{stop_tick}"
+        dest_mp4_path = final_output_dir / f"{new_filename_base}.mp4"
+        dest_wav_path = final_output_dir / f"{new_filename_base}.wav"
+
         try:
             take_dirs = [d for d in TEMP_RECORD_DIR.iterdir() if d.is_dir() and d.name.startswith("take")]
             if not take_dirs:
@@ -216,14 +286,13 @@ def process_recordings(demo_file: Path, output_dir: Path):
             source_mp4 = mp4_files[0]
             source_wav = wav_files[0]
             
-            dest_mp4_path = final_output_dir / f"{new_filename_base}.mp4"
-            dest_wav_path = final_output_dir / f"{new_filename_base}.wav"
-
+            # These checks ensure that if we decide to re-record (e.g., override 1 or 2),
+            # existing files are explicitly removed before moving new ones.
             if dest_mp4_path.exists():
-                LOG.warning(f"Destination file exists, will be overwritten: {dest_mp4_path}")
+                LOG.warning(f"Destination MP4 file exists, will be overwritten: {dest_mp4_path}")
                 dest_mp4_path.unlink()
             if dest_wav_path.exists():
-                LOG.warning(f"Destination file exists, will be overwritten: {dest_wav_path}")
+                LOG.warning(f"Destination WAV file exists, will be overwritten: {dest_wav_path}")
                 dest_wav_path.unlink()
             
             shutil.move(str(source_mp4), str(dest_mp4_path))
@@ -242,11 +311,11 @@ def process_recordings(demo_file: Path, output_dir: Path):
             LOG.info("Database updated successfully.")
             
         except FileNotFoundError as e:
-            LOG.error(f"File handling failed: {e}. Skipping database update.")
+            LOG.error(f"File handling failed for R{round_num}, P:{player_name}: {e}. Skipping database update for this entry.")
         except Exception as e:
-            LOG.error(f"An unexpected error occurred during file processing: {e}", exc_info=ARGS.debug)
+            LOG.error(f"An unexpected error occurred during file processing for R{round_num}, P:{player_name}: {e}", exc_info=ARGS.debug)
 
-        LOG.info(f"--- Finished recording for Round {round_num}, Player: {player_name} ---")
+        LOG.info(f"--- Finished processing R{round_num}, P:{player_name} ---")
 
 def cleanup(signum=None, frame=None):
     """Cleans up resources. Can be called by 'finally' or signal handler."""
@@ -285,8 +354,10 @@ def main():
         choices=[0, 1, 2],
         default=0,
         help="Set the re-recording behavior:\n"
-             "0: (Default) Record only entries not marked as recorded in the DB.\n"
-             "1: Record entries from (0) AND entries marked as recorded but where the video file is missing.\n"
+             "0: (Default) Record only entries not marked as recorded in the DB AND where output files do not exist.\n"
+             "   If a file exists but DB says not recorded, DB is updated and file is SKIPPED.\n"
+             "1: Record entries from (0) AND entries marked as recorded but where the video file in DB or target is missing.\n"
+             "   If DB says recorded AND target files exist AND DB's filepath exists, it will be SKIPPED.\n"
              "2: Re-record all entries in the DB, overwriting any existing files."
     )
     

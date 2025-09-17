@@ -4,6 +4,7 @@ services:
     working_dir: /workspace
     volumes:
       - ./:/workspace
+      - /mnt/trainingdata/data_testing/:/workspace/data
       - pip-cache:/root/.cache/pip
 
       # Unified cache for Hugging Face
@@ -17,7 +18,7 @@ services:
     shm_size: "16gb"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
 
