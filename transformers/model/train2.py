@@ -291,7 +291,7 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
                     break
             if not all_media_paths_exist:
                 continue
-            
+
             tr = TeamRound(
                 demoname=demoname, lmdb_path=os.path.abspath(lmdb_path),
                 round_num=int(r["round_num"]), team=str(r["team"]).upper(),
@@ -800,7 +800,7 @@ def get_ddp_info() -> Tuple[int, int]:
 @dataclass
 class DataArgs:
     data_root: str; manifest: str; split: str = "train"; run_dir: str = "runs/exp1"
-    T_frames: int = 64; height: int = 480; width: int = 640
+    T_frames: int = 128; height: int = 480; width: int = 640
     batch_size: int = 1; seed: int = 42; dali_threads: int = 4
 
 def build_data_iter(args: DataArgs):
@@ -836,7 +836,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     data_root = os.environ.get("DATA_ROOT", "data")
     manifest_path = os.path.join(data_root, "manifest.json")
-    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2, T_frames=32)
+    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2, T_frames=128)
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
@@ -857,7 +857,7 @@ if __name__ == "__main__":
             loss_fn = CompositeLoss(weights=loss_weights).to(device)
             # --- END SMOKE TEST SETUP ---
 
-            for i in range(5):
+            for i in range(20):
                 try:
                     with Timer("dali_fetch") as t:
                         batch_raw = next(iter(dali_iter))
