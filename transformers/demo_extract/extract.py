@@ -58,11 +58,20 @@ if _AWPY_VERSION.startswith("2"):
 
 # --- From keyboard_location.py ---
 WEAPON_CATEGORIES = {
-    "AK-47": "SWITCH_1", "M4A4": "SWITCH_1", "M4A1-S": "SWITCH_1", "Galil AR": "SWITCH_1", "FAMAS": "SWITCH_1", "AUG": "SWITCH_1", "SG 553": "SWITCH_1", "AWP": "SWITCH_1", "SSG 08": "SWITCH_1", "G3SG1": "SWITCH_1", "SCAR-20": "SWITCH_1", "MP9": "SWITCH_1", "MAC-10": "SWITCH_1", "MP7": "SWITCH_1", "MP5-SD": "SWITCH_1", "UMP-45": "SWITCH_1", "P90": "SWITCH_1", "PP-Bizon": "SWITCH_1", "Nova": "SWITCH_1", "XM1014": "SWITCH_1", "MAG-7": "SWITCH_1", "Sawed-Off": "SWITCH_1", "M249": "SWITCH_1", "Negev": "SWITCH_1",
-    "Glock-18": "SWITCH_2", "USP-S": "SWITCH_2", "P250": "SWITCH_2", "P2000": "SWITCH_2", "Dual Berettas": "SWITCH_2", "Five-SeveN": "SWITCH_2", "Tec-9": "SWITCH_2", "CZ75-Auto": "SWITCH_2", "R8 Revolver": "SWITCH_2",
-    "knife":"SWITCH_3","knife_ct": "SWITCH_3", "knife_t": "SWITCH_3", "Bayonet": "SWITCH_3", "Flip Knife": "SWITCH_3", "Gut Knife": "SWITCH_3", "Karambit": "SWITCH_3", "M9 Bayonet": "SWITCH_3", "Huntsman Knife": "SWITCH_3", "Falchion Knife": "SWITCH_3", "Bowie Knife": "SWITCH_3", "Butterfly Knife": "SWITCH_3", "Shadow Daggers": "SWITCH_3", "Ursus Knife": "SWITCH_3", "Navaja Knife": "SWITCH_3", "Stiletto Knife": "SWITCH_3", "Talon Knife": "SWITCH_3", "Classic Knife": "SWITCH_3", "Paracord Knife": "SWITCH_3", "Survival Knife": "SWITCH_3", "Nomad Knife": "SWITCH_3", "Skeleton Knife": "SWITCH_3",
-    "High Explosive Grenade": "SWITCH_4", "Flashbang": "SWITCH_4", "Smoke Grenade": "SWITCH_4", "Molotov": "SWITCH_4", "Incendiary Grenade": "SWITCH_4", "Decoy Grenade": "SWITCH_4",
-    "C4 Explosive": "SWITCH_5", "Defuse Kit": "SWITCH_5", "Zeus x27": "SWITCH_3","Desert Eagle":"SWITCH_2"
+    "Desert Eagle": "SWITCH_2", "Dual Berettas": "SWITCH_2", "Five-SeveN": "SWITCH_2", "Glock-18": "SWITCH_2", "AK-47": "SWITCH_1",
+    "AUG": "SWITCH_1", "AWP": "SWITCH_1", "FAMAS": "SWITCH_1", "G3SG1": "SWITCH_1", "Galil AR": "SWITCH_1", "M249": "SWITCH_1", "M4A4": "SWITCH_1", "MAC-10": "SWITCH_1",
+    "P90": "SWITCH_1", "MP5-SD": "SWITCH_1", "UMP-45": "SWITCH_1", "XM1014": "SWITCH_1", "PP-Bizon": "SWITCH_1", "MAG-7": "SWITCH_1", "Negev": "SWITCH_1",
+    "Sawed-Off": "SWITCH_1", "Tec-9": "SWITCH_2", "Zeus x27": "SWITCH_3", "P2000": "SWITCH_2", "MP7": "SWITCH_1", "MP9": "SWITCH_1", "Nova": "SWITCH_1",
+    "P250": "SWITCH_2", "SCAR-20": "SWITCH_1", "SG 553": "SWITCH_1", "SSG 08": "SWITCH_1", "Knife": "SWITCH_3", "knife": "SWITCH_3", "Flashbang": "SWITCH_4",
+    "High Explosive Grenade": "SWITCH_4", "Smoke Grenade": "SWITCH_4", "Molotov": "SWITCH_4", "Decoy Grenade": "SWITCH_4",
+    "Incendiary Grenade": "SWITCH_4", "C4 Explosive": "SWITCH_5", "Kevlar Vest": "SWITCH_1", "Kevlar & Helmet": "SWITCH_1",
+    "Heavy Assault Suit": "SWITCH_1", "item_nvg": "SWITCH_1", "Defuse Kit": "SWITCH_1", "Rescue Kit": "SWITCH_1",
+    "Medi-Shot": "SWITCH_3", "knife_t": "SWITCH_3", "M4A1-S": "SWITCH_1", "USP-S": "SWITCH_2", "Trade Up Contract": "SWITCH_1",
+    "CZ75-Auto": "SWITCH_2", "R8 Revolver": "SWITCH_2", "Charm Detachments": "SWITCH_1", "Bayonet": "SWITCH_3", "Classic Knife": "SWITCH_3",
+    "Flip Knife": "SWITCH_3", "Gut Knife": "SWITCH_3", "Karambit": "SWITCH_3", "M9 Bayonet": "SWITCH_3", "Huntsman Knife": "SWITCH_3",
+    "Falchion Knife": "SWITCH_3", "Bowie Knife": "SWITCH_3", "Butterfly Knife": "SWITCH_3", "Shadow Daggers": "SWITCH_3",
+    "Paracord Knife": "SWITCH_3", "Survival Knife": "SWITCH_3", "Ursus Knife": "SWITCH_3", "Navaja Knife": "SWITCH_3",
+    "Nomad Knife": "SWITCH_3", "Stiletto Knife": "SWITCH_3", "Talon Knife": "SWITCH_3", "Skeleton Knife": "SWITCH_3", "Kukri Knife": "SWITCH_3"
 }
 KEY_MAPPING = {
     "IN_ATTACK": 1<<0, "IN_JUMP": 1<<1, "IN_DUCK": 1<<2, "IN_FORWARD": 1<<3, "IN_BACK": 1<<4, "IN_USE": 1<<5, "IN_CANCEL": 1<<6, "IN_TURNLEFT": 1<<7, "IN_TURNRIGHT": 1<<8, "IN_MOVELEFT": 1<<9, "IN_MOVERIGHT": 1<<10, "IN_ATTACK2": 1<<11, "IN_RELOAD": 1<<13, "IN_ALT1": 1<<14, "IN_ALT2": 1<<15, "IN_SPEED": 1<<16, "IN_WALK": 1<<17, "IN_ZOOM": 1<<18, "IN_WEAPON1": 1<<19, "IN_WEAPON2": 1<<20, "IN_BULLRUSH": 1<<21, "IN_GRENADE1": 1<<22, "IN_GRENADE2": 1<<23, "IN_ATTACK3": 1<<24, "IN_SCORE": 1<<33, "IN_INSPECT": 1<<35,

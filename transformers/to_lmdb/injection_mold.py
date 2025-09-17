@@ -179,7 +179,9 @@ def get_bitmask(actions, mapping, name):
     mask = 0
     if not actions: return mask
     for a in actions:
-        if a not in mapping: raise ValueError(f"Unknown action '{a}' in '{name}'")
+        if a not in mapping: 
+            LOG.warning(f"Unknown action '{a}' in '{name}' - skipping.")
+            continue
         mask |= (1 << mapping[a])
     return mask
 
@@ -188,7 +190,9 @@ def get_bitmask_array(actions, mapping, name):
     mask = np.zeros(4, dtype=np.uint64)
     if not actions: return mask
     for a in actions:
-        if a not in mapping: raise ValueError(f"Unknown action '{a}' in '{name}'")
+        if a not in mapping: 
+            LOG.warning(f"Unknown action '{a}' in '{name}' - skipping.")
+            continue
         idx, pi = mapping[a] // 64, mapping[a] % 64
         if idx < 4: mask[idx] |= (np.uint64(1) << np.uint64(pi))
     return mask
@@ -199,7 +203,9 @@ def get_inventory_bitmasks(inv_json, weapon, mapping):
     def set_bit(m, item):
         if not isinstance(item, str): return
         bp = mapping.get(item)
-        if bp is None: raise ValueError(f"Unknown item '{item}'")
+        if bp is None: 
+            LOG.warning(f"Unknown item '{item}' - skipping.")
+            return
         idx, pi = bp // 64, bp % 64
         if idx < 2: m[idx] |= (np.uint64(1) << np.uint64(pi))
     if weapon: set_bit(wm, weapon)
