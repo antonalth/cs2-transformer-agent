@@ -218,8 +218,15 @@ class CS2Config:
     training_use_frame_block_causal: bool = False #like above but reverse
 
     # Vision
-    vit_name_timm: str = "vit_base_patch14_dinov2.lvd142m" #preferred if available
+    vit_name_timm: str = "vit_base_patch14_dinov2.lvd142m" #old vit code (timm)
     vit_channels_last: bool = True
+
+    # Vision (HF / DINOv3)
+    vision_backend: Literal["timm", "hf"] = "hf"
+    hf_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    hf_use_processor: bool = True     # True = preprocess inside encoder with HF image processor
+    hf_channels_last: bool = True     # same perf hint you used for timm
+    vit_frozen: bool = True           # reuse your flag for freeze/unfreeze stage training
 
     # Audio
     mel_bins: int = 128
@@ -376,8 +383,92 @@ def _GN3d(c: int) -> torch.nn.GroupNorm:
 # -----------------------------------------------------------------------------
 # 2) Submodules — Encoders & Token Fusion
 # -----------------------------------------------------------------------------
+class DINOv3VisualEncoder(nn.Module):
+    """
+    Hugging Face DINOv3 encoder.
 
-class ViTVisualEncoder(nn.Module):
+    Contract matches ViTVisualEncoder:
+      - Input:  [B, T, P, 3, H, W]  (float in [0,1] or [0,255]); if hf_use_processor=False,
+                                     then MUST already be resized & normalized for this model.
+      - Output: [B, T, P, d_model]
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.d_model = int(cfg.d_model)
+        self.use_channels_last = bool(getattr(cfg, "hf_channels_last", True))
+        self.use_processor = bool(getattr(cfg, "hf_use_processor", True))
+        self.model_name = getattr(cfg, "hf_model_name", "facebook/dinov3-vitb16-pretrain-lvd1689m")
+
+        try:
+            from transformers import AutoModel, AutoImageProcessor
+        except Exception as e:
+            raise RuntimeError(
+                "The DINOv3VisualEncoder requires 'transformers'. "
+                "Install it (pip install transformers accelerate) or set vision_backend='timm'.\n"
+                f"Original import error: {e}"
+            )
+
+        # Image processor gives us the right resize/normalize for this backbone.
+        self.processor = None
+        if self.use_processor:
+            try:
+                self.processor = AutoImageProcessor.from_pretrained(self.model_name)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load AutoImageProcessor for '{self.model_name}': {e}")
+
+        try:
+            self.backbone = AutoModel.from_pretrained(self.model_name)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load DINOv3 model '{self.model_name}': {e}")
+
+        # Hidden size → project into your transformer width
+        self.hidden = int(getattr(self.backbone.config, "hidden_size", 768))
+        self.proj = nn.Linear(self.hidden, self.d_model)
+
+        # Optional freezing (your two-stage plan still applies)
+        if bool(getattr(cfg, "vit_frozen", False)):
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.backbone.eval()
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # Expect [B, T, P, C, H, W] with C==3
+        if images.dim() != 6:
+            raise ValueError(f"Expected 6D tensor [B,T,P,C,H,W], got {images.shape}")
+        B, T, P, C, H, W = images.shape
+        if C != 3:
+            raise ValueError(f"Expected 3 channels, got {C}")
+
+        N = B * T * P
+        x = images.reshape(N, C, H, W)
+        if self.use_channels_last:
+            x = x.to(memory_format=torch.channels_last)
+
+        # Prepare inputs:
+        # - If using the HF processor, it will resize/normalize as the model expects
+        #   (DINOv3 uses patch size 16; it accepts sizes multiple of 16; processor handles it).
+        # - If NOT using processor, assume upstream already resized & normalized; pass as-is.
+        inputs = {}
+        if self.processor is not None:
+            # AutoImageProcessor accepts torch tensors [C,H,W] in a batch
+            inputs = self.processor(images=x, return_tensors="pt")
+            inputs = {k: v.to(x.device) for k, v in inputs.items()}
+        else:
+            inputs = {"pixel_values": x}
+
+        # If frozen, skip grad to save memory/compute
+        need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in self.backbone.parameters())
+        ctx = nullcontext() if need_grad else torch.no_grad()
+        with ctx:
+            outputs = self.backbone(**inputs)
+            # HF model card demonstrates using pooled_output
+            feats = outputs.pooler_output  # [N, hidden]
+
+        vis = self.proj(feats).to(images.dtype)  # match surrounding dtype
+        return vis.view(B, T, P, self.d_model)
+
+class ViTVisualEncoder(nn.Module): #old vit code, todo remove later
     """
     Single-Image ViT encoder that assumes *externally* pre-processed input.
 
@@ -1153,7 +1244,13 @@ class CS2Transformer(nn.Module):
                     return torch.randn(B, T, P, self.d_model, device=images.device, dtype=torch.bfloat16)
             self.visual_encoder = DummyVisualEncoder(d)
         else:
-            self.visual_encoder = ViTVisualEncoder(cfg)
+            backend = getattr(self.cfg, "vision_backend", "hf")
+            if backend == "hf":
+                self.visual_encoder = DINOv3VisualEncoder(cfg)
+            elif backend == "timm":
+                self.visual_encoder = ViTVisualEncoder(cfg)
+            else:
+                raise ValueError(f"Unknown vision_backend: {backend}")
         self.audio_encoder = AudioCNN(cfg)
         # Special tokens & embeddings
         self.token_game_strategy = nn.Parameter(torch.randn(1, 1, d) * 0.02)
@@ -1567,7 +1664,7 @@ def main():
         model.eval()
 
         single_frame_batch: CS2Batch = {
-            "images": torch.randn(B, T, P, 3, 518, 518, device=device, dtype=precision),
+            "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
             "mel_spectrogram": torch.randn(B, 1, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
             "alive_mask": torch.randint(0, 2, (B, 1, P), device=device, dtype=torch.bool),
         }

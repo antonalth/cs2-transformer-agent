@@ -369,7 +369,7 @@ class FilelistWriter:
 
 @dataclass
 class DaliConfig:
-    height: int = 480; width: int = 640; sequence_length: int = 512
+    height: int = 480; width: int = 640; sequence_length: int = 128
     mean: Tuple[float,...] = (0.0, 0.0, 0.0); std: Tuple[float,...] = (1.0, 1.0, 1.0)
     fps: float = 32.0; sample_rate: float = 24000.0; n_mels: int = 128
     n_fft: int = 1024; win_length: int = 1024; hop_length: int = 750
