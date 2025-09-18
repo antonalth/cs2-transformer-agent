@@ -369,8 +369,7 @@ class FilelistWriter:
 
 @dataclass
 class DaliConfig:
-    height: int = 480; width: int = 640; sequence_length: int = 128
-    mean: Tuple[float,...] = (0.0, 0.0, 0.0); std: Tuple[float,...] = (1.0, 1.0, 1.0)
+    sequence_length: int = 128
     fps: float = 32.0; sample_rate: float = 24000.0; n_mels: int = 128
     n_fft: int = 1024; win_length: int = 1024; hop_length: int = 750
     batch_size: int = 1; num_threads: int = 4; device_id: int = 0
@@ -413,8 +412,8 @@ class DaliInputPipeline:
                     file_list_frame_num=True, 
                     file_list_include_preceding_frame=True,
                 )
-                frames = fn.crop_mirror_normalize(fn.resize(video, resize_x=cfg.width, resize_y=cfg.height), device="gpu", dtype=types.FLOAT16, output_layout="FCHW", mean=cfg.mean, std=cfg.std)
-                
+                frames = fn.transpose(video, perm=[0, 3, 1, 2])  # -> [F, C, H, W], dtype=UINT8
+
                 audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle)
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
                 sample_id_i64 = packed_i64 // LABEL_SCALE
@@ -641,7 +640,7 @@ class BatchAssembler:
         # 4) Assemble final batch dictionary
         batch = {
             "images": images.to(self.device),
-            "mel_spectrogram": mel.to(self.device, dtype=images.dtype),
+            "mel_spectrogram": mel.to(self.device),
             "alive_mask": gt_tensors.pop("alive_mask").bool(),
             "meta": meta,
         }
@@ -800,8 +799,7 @@ def get_ddp_info() -> Tuple[int, int]:
 @dataclass
 class DataArgs:
     data_root: str; manifest: str; split: str = "train"; run_dir: str = "runs/exp1"
-    T_frames: int = 64; height: int = 480; width: int = 640
-    batch_size: int = 1; seed: int = 42; dali_threads: int = 4
+    T_frames: int = 64; batch_size: int = 1; seed: int = 42; dali_threads: int = 4
 
 def build_data_iter(args: DataArgs):
     """Convenience function that wires Steps 1→8 and returns (dali_iter, assembler)."""
@@ -817,7 +815,7 @@ def build_data_iter(args: DataArgs):
     # Step 5: DALI
     shard_id, num_shards = get_ddp_info()
     dali_cfg = DaliConfig(
-        height=args.height, width=args.width, sequence_length=args.T_frames,
+        sequence_length=args.T_frames,
         batch_size=args.batch_size, num_threads=args.dali_threads,
         device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
         shard_id=shard_id, num_shards=num_shards,

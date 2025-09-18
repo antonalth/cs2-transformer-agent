@@ -217,15 +217,10 @@ class CS2Config:
     inference_use_standard_causal: bool = True
     training_use_frame_block_causal: bool = False #like above but reverse
 
-    # Vision
-    vit_name_timm: str = "vit_base_patch14_dinov2.lvd142m" #old vit code (timm)
-    vit_channels_last: bool = True
-
     # Vision (HF / DINOv3)
-    vision_backend: Literal["timm", "hf"] = "hf"
     hf_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     hf_use_processor: bool = True     # True = preprocess inside encoder with HF image processor
-    hf_channels_last: bool = True     # same perf hint you used for timm
+    hf_channels_last: bool = True     # same perf
     vit_frozen: bool = True           # reuse your flag for freeze/unfreeze stage training
 
     # Audio
@@ -255,46 +250,6 @@ class KVCache:
     key: torch.Tensor    # [B, L, H_kv, Hd]
     value: torch.Tensor  # [B, L, H_kv, Hd]
     pos_end: int         # absolute position *after* last cached token
-
-# ---------------------------------------------------------------------------------
-# Helper: resolve ViT preprocessing (mean/std and input size) from timm by model name
-# ---------------------------------------------------------------------------------
-def resolve_vit_preprocess(vit_name: str) -> dict:
-    """
-    Returns a dict with:
-      - mean: Tuple[float, float, float] in [0,1] range
-      - std:  Tuple[float, float, float] in [0,1] range
-      - height: int
-      - width:  int
-
-    Uses timm to instantiate the model and read its pretrained data config.
-    Falls back to ImageNet defaults (224,224, mean/std) if unavailable.
-    """
-    try:
-        import timm
-        m = timm.create_model(vit_name, pretrained=True, num_classes=0)
-        # Try modern API first
-        mean = std = input_size = None
-        try:
-            from timm.data import resolve_model_data_config
-            data_cfg = resolve_model_data_config(m)
-            mean = tuple(map(float, data_cfg.get("mean", (0.485, 0.456, 0.406))))
-            std = tuple(map(float, data_cfg.get("std", (0.229, 0.224, 0.225))))
-            input_size = data_cfg.get("input_size", (3, 224, 224))
-        except Exception:
-            pass
-        if mean is None or std is None or input_size is None:
-            # Fallback to model attrs in older timm
-            cfg = getattr(m, "pretrained_cfg", None) or getattr(m, "default_cfg", {}) or {}
-            mean = tuple(map(float, cfg.get("mean", (0.485, 0.456, 0.406))))
-            std = tuple(map(float, cfg.get("std", (0.229, 0.224, 0.225))))
-            input_size = cfg.get("input_size", (3, 224, 224))
-        h, w = int(input_size[-2]), int(input_size[-1])
-        return {"mean": mean, "std": std, "height": h, "width": w}
-    except Exception:
-        # Last resort
-        return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225), "height": 224, "width": 224}
-
 
 def print_dataclass(dc: Any, indent: int = 0):
     """Recursively print a dataclass and its attributes."""
@@ -467,72 +422,6 @@ class DINOv3VisualEncoder(nn.Module):
 
         vis = self.proj(feats).to(images.dtype)  # match surrounding dtype
         return vis.view(B, T, P, self.d_model)
-
-class ViTVisualEncoder(nn.Module): #old vit code, todo remove later
-    """
-    Single-Image ViT encoder that assumes *externally* pre-processed input.
-
-    - Expects input already resized/letterboxed/padded and normalized for the chosen ViT.
-    - Input:  [B, T, P, 3, H, W]  (float tensor; normalized; correct HxW for the ViT)
-    - Output: [B, T, P, d_model]
-    """
-    def __init__(self, cfg):
-        try:
-            import timm
-        except Exception as e:
-            raise RuntimeError(
-                "The ViTVisualEncoder requires 'timm'. Install it or pass --dummy-vit.\n"
-                f"Original import error: {e}"
-            )
-
-        super().__init__()
-        self.cfg = cfg
-        self.d_model = int(cfg.d_model)
-        self.use_channels_last = bool(getattr(cfg, "vit_channels_last", True))
-
-        model_name = getattr(cfg, "vit_name_timm", "vit_base_patch14_dinov2.lvd142m")
-        try:
-            # num_classes=0 -> feature extractor returning (N, num_features)
-            self.vit = timm.create_model(model_name, pretrained=True, num_classes=0)
-            self.vit_hidden = self.vit.num_features
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize timm model '{model_name}': {e}")
-
-        # Optionally freeze the backbone if configured
-        freeze_vit = bool(getattr(cfg, "vit_frozen", False))
-        if freeze_vit:
-            for p in self.vit.parameters():
-                p.requires_grad = False
-            # Disable dropout, etc., if we’re not training the backbone
-            self.vit.eval()
-
-        self.proj = nn.Linear(self.vit_hidden, self.d_model)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        # Expect [B, T, P, C, H, W] with C==3, already normalized & sized correctly.
-        if images.dim() != 6:
-            raise ValueError(f"Expected 6D tensor [B,T,P,C,H,W], got {images.shape}")
-        B, T, P, C, H, W = images.shape
-        if C != 3:
-            raise ValueError(f"Expected 3 channels, got {C}")
-
-        N = B * T * P
-        x = images.reshape(N, C, H, W)
-
-        # No resizing/letterboxing/normalization here—done upstream in train.py.
-        if self.use_channels_last:
-            # keep device and dtype; only change memory format
-            x = x.to(memory_format=torch.channels_last)
-
-        # Run backbone (optionally without grad if it’s frozen)
-        need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in self.vit.parameters())
-        ctx = nullcontext() if need_grad else torch.no_grad()
-        with ctx:
-            feats = self.vit(x)          # (N, vit_hidden)
-
-        vis = self.proj(feats)           # (N, d_model)
-        return vis.view(B, T, P, self.d_model)
-
 
 class AudioCNN(nn.Module):
     """Small 2D-CNN over Mel-spectrograms → [B, T, P, d_model].
@@ -1244,13 +1133,7 @@ class CS2Transformer(nn.Module):
                     return torch.randn(B, T, P, self.d_model, device=images.device, dtype=torch.bfloat16)
             self.visual_encoder = DummyVisualEncoder(d)
         else:
-            backend = getattr(self.cfg, "vision_backend", "hf")
-            if backend == "hf":
-                self.visual_encoder = DINOv3VisualEncoder(cfg)
-            elif backend == "timm":
-                self.visual_encoder = ViTVisualEncoder(cfg)
-            else:
-                raise ValueError(f"Unknown vision_backend: {backend}")
+            self.visual_encoder = DINOv3VisualEncoder(cfg)
         self.audio_encoder = AudioCNN(cfg)
         # Special tokens & embeddings
         self.token_game_strategy = nn.Parameter(torch.randn(1, 1, d) * 0.02)
@@ -1314,7 +1197,7 @@ class CS2Transformer(nn.Module):
         )
         with autocast_ctx:
             images = batch["images"]               # [B, T, 5, 3, H, W]
-            mel    = batch["mel_spectrogram"]      # [B, T, 5, 1, 128, ~6]
+            mel    = batch["mel_spectrogram"]      # [B, T, 5, 2, 128, mel_t]
             alive  = batch["alive_mask"].bool()    # [B, T, 5]
 
             dev = next(self.parameters()).device
@@ -1721,8 +1604,6 @@ if __name__ == "__main__":
     # To run standard benchmark: python model.py --benchmark --compile
     # To run autoregressive benchmark: python model.py --autoregressive 100 --compile
     main()
-
-
 
 __all__ = [
     "CS2Config",
