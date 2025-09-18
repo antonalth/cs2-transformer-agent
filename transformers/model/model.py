@@ -221,7 +221,7 @@ class CS2Config:
     hf_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     hf_use_processor: bool = True     # True = preprocess inside encoder with HF image processor
     hf_channels_last: bool = True     # same perf
-    vit_frozen: bool = True           # reuse your flag for freeze/unfreeze stage training
+    vit_frozen: bool = True           # will probably stay frozen for entire training since dinov3
 
     # Audio
     mel_bins: int = 128

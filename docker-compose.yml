@@ -4,7 +4,8 @@ services:
     working_dir: /workspace
     volumes:
       - ./:/workspace
-      - /mnt/trainingdata/dataset0/:/workspace/data
+      - /mnt/trainingdata/dataset0/:/workspace/dataset0
+      - /mnt/trainingdata/sampledata/:/workspace/data
       - pip-cache:/root/.cache/pip
 
       # Unified cache for Hugging Face
