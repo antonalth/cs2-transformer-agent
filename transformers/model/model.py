@@ -1591,14 +1591,21 @@ def main():
     # Using 480x640 as the representative input size
     dummy_batch: CS2Batch = {
         "images": torch.randn(B, T, P, 3, 518, 518, device=device, dtype=precision),
-        "mel_spectrogram": torch.randn(B, T, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
+        "mel_spectrogram": torch.randn(B, T, P, 2, cfg.mel_bins, cfg.mel_t, device=device, dtype=precision),
         "alive_mask": torch.ones(B, T, P, device=device, dtype=torch.float32),
     }
 
     # --- Run Shape Test ---
     print("\n[PHASE 1] Running Shape Test & Initial Compilation...")
+    # For shape test, we only need to predict the last frame's outputs
+    # so we can slice the predictions.
     with torch.no_grad():
-        predictions = model(dummy_batch)
+        full_preds = model(dummy_batch)
+        
+    predictions: Predictions = {
+        "player": [{k: v[:, -1] for k, v in p.items()} for p in full_preds["player"]],
+        "game_strategy": {k: v[:, -1] for k, v in full_preds["game_strategy"].items()}
+    }
 
     # Player predictions
     assert isinstance(predictions["player"], list) and len(predictions["player"]) == P, "Player predictions must be a list of length num_players"
@@ -1664,8 +1671,8 @@ def main():
         model.eval()
 
         single_frame_batch: CS2Batch = {
-            "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
-            "mel_spectrogram": torch.randn(B, 1, P, 1, cfg.mel_bins, cfg.mel_t, device=device),
+            "images": torch.randn(B, 1, P, 3, 480, 640, device=device, dtype=precision),
+            "mel_spectrogram": torch.randn(B, 1, P, 2, cfg.mel_bins, cfg.mel_t, device=device, dtype=precision),
             "alive_mask": torch.randint(0, 2, (B, 1, P), device=device, dtype=torch.bool),
         }
 
