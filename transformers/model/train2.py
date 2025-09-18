@@ -371,7 +371,7 @@ class FilelistWriter:
 class DaliConfig:
     sequence_length: int = 128
     fps: float = 32.0; sample_rate: float = 24000.0; n_mels: int = 128
-    n_fft: int = 1024; win_length: int = 1024; hop_length: int = 750
+    n_fft: int = 1024; win_length: int = 750; hop_length: int = 750
     batch_size: int = 1; num_threads: int = 4; device_id: int = 0
     shard_id: int = 0; num_shards: int = 1; seed: int = 42
     # DALI aliases and runtime params

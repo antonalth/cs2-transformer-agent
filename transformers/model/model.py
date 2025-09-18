@@ -182,7 +182,7 @@ class Predictions(TypedDict):
 class CS2Batch(TypedDict, total=True):
     # Shapes are illustrative; align with your datapipe
     images: torch.Tensor                   # [B, T, 5, 3, 480, 640]
-    mel_spectrogram: torch.Tensor          # [B, T, 5, 1, 128, ~6]
+    mel_spectrogram: torch.Tensor          # [B, T, 5, 2, 128, 1]  # stereo, one frame
     alive_mask: torch.Tensor               # [B, T, 5] bool
 
 
@@ -225,8 +225,9 @@ class CS2Config:
 
     # Audio
     mel_bins: int = 128
-    mel_t: int = 6
+    mel_t: int = 1
     audio_cnn_channels: Tuple[int, int, int] = (32, 64, 128)
+    # mel_spectrogram: [B, T, 5, 2, 128, 1]  # stereo, one frame
 
     # Heads
     keyboard_dim: int = 31
@@ -1473,7 +1474,7 @@ def main():
     B, T, P = args.batch_size, cfg.context_frames, cfg.num_players
     # Using 480x640 as the representative input size
     dummy_batch: CS2Batch = {
-        "images": torch.randn(B, T, P, 3, 518, 518, device=device, dtype=precision),
+        "images": torch.randn(B, T, P, 3, 480, 640, device=device, dtype=precision),
         "mel_spectrogram": torch.randn(B, T, P, 2, cfg.mel_bins, cfg.mel_t, device=device, dtype=precision),
         "alive_mask": torch.ones(B, T, P, device=device, dtype=torch.float32),
     }
