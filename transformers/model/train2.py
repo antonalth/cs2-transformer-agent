@@ -30,6 +30,8 @@ import math
 import time
 import random
 import logging
+import argparse
+import contextlib # <-- FIX: Added missing import for FilelistWriter
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Any
@@ -43,6 +45,7 @@ import msgpack_numpy as mpnp  # pip install msgpack-numpy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import profile, record_function, ProfilerActivity # <-- PROFILER: Added imports
 
 # --- Try to import DALI; provide a friendly message if missing ---
 try:
@@ -803,12 +806,7 @@ def get_ddp_info() -> Tuple[int, int]:
 # Optional: minimal driver for sanity
 # -------------------------------
 
-@dataclass
-class DataArgs:
-    data_root: str; manifest: str; split: str = "train"; run_dir: str = "runs/exp1"
-    T_frames: int = 64; batch_size: int = 1; seed: int = 42; dali_threads: int = 4
-
-def build_data_iter(args: DataArgs):
+def build_data_iter(args):
     """Convenience function that wires Steps 1→8 and returns (dali_iter, assembler)."""
     # Steps 1-4: Discover rounds, sample windows, write filelists
     manifest = Manifest(args.data_root, args.manifest)
@@ -821,73 +819,126 @@ def build_data_iter(args: DataArgs):
     
     # Step 5: DALI
     shard_id, num_shards = get_ddp_info()
+    device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     dali_cfg = DaliConfig(
         sequence_length=args.T_frames,
         batch_size=args.batch_size, num_threads=args.dali_threads,
-        device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
+        device_id=device_id,
         shard_id=shard_id, num_shards=num_shards,
     )
     dali_iter = DaliInputPipeline(video_lists, audio_lists, dali_cfg)
 
     # Step 7-8: Metadata Fetcher and Assembler
     fetcher = LmdbMetaFetcher(store)
-    assembler = BatchAssembler(id_map, fetcher, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    assembler_device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+    assembler = BatchAssembler(id_map, fetcher, device=assembler_device)
     return dali_iter, assembler
 
-if __name__ == "__main__":
-    import contextlib
-    from model import CS2Transformer, CS2Config
+
+def get_args():
+    """Parses command-line arguments for the smoke test driver."""
+    parser = argparse.ArgumentParser(description="train2.py Data Loader and Loss Calculation Smoke Test")
+    parser.add_argument("--data-root", type=str, default=os.environ.get("DATA_ROOT", "data"), help="Root directory for the dataset.")
+    parser.add_argument("--manifest", type=str, default=None, help="Path to manifest.json. Defaults to <data-root>/manifest.json.")
+    parser.add_argument("--split", type=str, default="train", help="Data split to use (e.g., 'train', 'val').")
+    parser.add_argument("--run-dir", type=str, default="runs/exp1", help="Directory for logs and outputs.")
+    parser.add_argument("--T-frames", type=int, default=64, help="Number of frames per sequence.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--dali-threads", type=int, default=4, help="Number of threads for DALI.")
+    parser.add_argument("--num-steps", type=int, default=20, help="Number of iterations for the smoke test.")
+    parser.add_argument("--profile", action='store_true', help="Enable torch.profiler and save trace to TensorBoard.")
     
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-    data_root = os.environ.get("DATA_ROOT", "data")
-    manifest_path = os.path.join(data_root, "manifest.json")
-    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=1, T_frames=64)
+    args = parser.parse_args()
+    if args.manifest is None:
+        args.manifest = os.path.join(args.data_root, "manifest.json")
+    return args
+
+
+def run_step(dali_iter, assembler, model, loss_fn):
+    """Encapsulates one iteration of the smoke test."""
+    try:
+        with record_function("dali_fetch"), Timer("dali_fetch") as t:
+            batch_raw = next(iter(dali_iter))
+        logging.info("DALI fetched video+audio in %.3fs", t.dt)
+        
+        with record_function("assemble_batch"), Timer("assemble") as t2:
+            batch = assembler.assemble(batch_raw)
+        logging.info("Assembled batch in %.3fs", t2.dt)
+        
+        with record_function("forward_pass"), Timer("forward_pass") as t3, torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+            predictions = model(batch)
+        logging.info("Forward pass in %.3fs", t3.dt)
+        
+        with record_function("loss_calculation"), Timer("loss_calc") as t4:
+            total_loss = loss_fn(predictions, batch['targets'], batch['alive_mask'])
+        logging.info("Calculated loss in %.3fs -> Total Loss: %.4f", t4.dt, total_loss.item())
+        
+        assert total_loss.requires_grad, "Loss must require gradients"
+        logging.info("✅ Smoke assertion passed: Loss requires grad.")
+        return True
+    except StopIteration:
+        logging.info("Finished iterator.")
+        return False
+
+
+def main(args):
+    """Main driver for the data loader smoke test."""
+    # These imports are specific to the driver and model
+    from model import CS2Transformer, CS2Config
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
-    else:
-        try:
-            dali_iter, assembler = build_data_iter(args)
-            
-            # --- SMOKE TEST SETUP ---
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model_cfg = CS2Config(context_frames=args.T_frames)
-            model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device) # Use dummy vision for speed
-            
-            loss_weights = {
-                'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
-                'inventory': 0.5, 'weapon': 1.0, 'round_number': 0.1,
-                'round_state': 1.0, 'pos_heatmap': 2.0, 'enemy_heatmap': 2.0
-            }
-            loss_fn = CompositeLoss(weights=loss_weights).to(device)
-            # --- END SMOKE TEST SETUP ---
+        return
 
-            for i in range(20):
-                try:
-                    with Timer("dali_fetch") as t:
-                        batch_raw = next(iter(dali_iter))
-                    logging.info("DALI fetched video+audio in %.3fs", t.dt)
-                    
-                    with Timer("assemble") as t2:
-                        batch = assembler.assemble(batch_raw)
-                    logging.info("Assembled batch in %.3fs", t2.dt)
-                    
-                    # --- SMOKE TEST FORWARD PASS AND LOSS CALCULATION ---
-                    with Timer("forward_pass") as t3, torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-                        predictions = model(batch)
-                    logging.info("Forward pass in %.3fs", t3.dt)
-                    
-                    with Timer("loss_calc") as t4:
-                        total_loss = loss_fn(predictions, batch['targets'], batch['alive_mask'])
-                    logging.info("Calculated loss in %.3fs -> Total Loss: %.4f", t4.dt, total_loss.item())
-                    
-                    # Smoke assertion
-                    assert total_loss.requires_grad, "Loss must require gradients"
-                    logging.info("✅ Smoke assertion passed: Loss requires grad.")
+    try:
+        dali_iter, assembler = build_data_iter(args)
+        
+        # --- SMOKE TEST SETUP ---
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_cfg = CS2Config(context_frames=args.T_frames)
+        model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device)
+        
+        loss_weights = {
+            'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
+            'inventory': 0.5, 'weapon': 1.0, 'round_number': 0.1,
+            'round_state': 1.0, 'pos_heatmap': 2.0, 'enemy_heatmap': 2.0
+        }
+        loss_fn = CompositeLoss(weights=loss_weights).to(device)
+        # --- END SMOKE TEST SETUP ---
 
-                except StopIteration:
-                    logging.info("Finished iterator.")
+        if args.profile:
+            profile_dir = os.path.join(args.run_dir, "profiler_logs")
+            os.makedirs(profile_dir, exist_ok=True)
+            logging.info(f"Profiler enabled. Traces will be saved to: {profile_dir}")
+            logging.info(f"To view, run: tensorboard --logdir {profile_dir}")
+            
+            # Schedule: wait 1 step, warmup 1 step, then actively record for 3 steps.
+            schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)
+            trace_handler = torch.profiler.tensorboard_trace_handler(profile_dir)
+
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule,
+                on_trace_ready=trace_handler,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            ) as prof:
+                for i in range(args.num_steps):
+                    if not run_step(dali_iter, assembler, model, loss_fn):
+                        break
+                    prof.step() # Signal profiler that a step is complete
+        else:
+            for i in range(args.num_steps):
+                if not run_step(dali_iter, assembler, model, loss_fn):
                     break
-        except Exception as e:
-            logging.exception("Data loader smoke test failed.")
-            logging.error("Failed with error: %s", e)
+
+    except Exception as e:
+        logging.exception("Data loader smoke test failed.")
+        logging.error("Failed with error: %s", e)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    cli_args = get_args()
+    main(cli_args)
