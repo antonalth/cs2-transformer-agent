@@ -45,13 +45,14 @@ audio data streams.
   - Input: A SINGLE game screen tensor per player (e.g., 480x640 resolution).
   - Preprocessing: The input image undergoes aspect-ratio-preserving resizing (letterboxing)
     to match the native input size of the vision encoder (e.g., 448x448).
-  - Encoder: A SINGLE, SHARED-WEIGHT Vision Transformer (ViT) model, processes the image.
+  - Encoder: A SINGLE, SHARED-WEIGHT, and PERMANENTLY FROZEN Vision Transformer (ViT) model,
+    processes the image. Its weights are not trained.
   - Projection: A final linear layer projects the ViT's output feature vector to the model's
     native `[1, 2048]` dimension, creating the final visual embedding.
 
 [B] AUDIO STREAM:
   - Input: A `[128, ~6]` Mel Spectrogram tensor derived from the player's in-game audio.
-  - Encoder: A small 2D CNN (`AudioCNN`) extracts features from the spectrogram.
+  - Encoder: a small 2D CNN (`AudioCNN`) extracts features from the spectrogram.
   - Projection: A linear layer projects the flattened CNN features to a `[1, 2048]` audio embedding.
 
 [C] TOKEN FUSION:
@@ -130,13 +131,10 @@ predictions for the next frame.
 - Objective: The model is trained on a Next-Frame Prediction task using a composite loss
   function to predict the ground-truth data for frame `t+1` given frames `1...t`.
 
-- ViT Fine-Tuning (Two-Stage):
-  1. Freeze: Initially, the weights of the single pre-trained ViT encoder are frozen
-     (`requires_grad=False`). The rest of the model learns to interpret its powerful,
-     off-the-shelf features.
-  2. Finetune: After the main model has stabilized, the ViT is unfrozen. The entire model is
-     then trained end-to-end using DIFFERENTIAL LEARNING RATES, where the ViT uses a
-     learning rate 10-100x smaller than the rest of the model to prevent catastrophic forgetting.
+- ViT as a Fixed Feature Extractor: The pre-trained DINOv3 Vision Transformer is used as a
+  powerful, off-the-shelf feature extractor. Its weights are permanently frozen
+  (`requires_grad=False`) and are not updated during training. This saves significant
+  computational resources and VRAM, while leveraging a state-of-the-art visual backbone.
 """
 from __future__ import annotations
 
@@ -221,7 +219,6 @@ class CS2Config:
     hf_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     hf_use_processor: bool = False     # True = preprocess inside encoder with HF image processor
     hf_channels_last: bool = True     # same perf
-    vit_frozen: bool = True           # will probably stay frozen for entire training since dinov3
 
     # Audio
     mel_bins: int = 128
@@ -417,11 +414,10 @@ class DINOv3VisualEncoder(nn.Module):
         self.hidden = int(getattr(self.backbone.config, "hidden_size", 768))
         self.proj = nn.Linear(self.hidden, self.d_model)
 
-        # Optional freezing
-        if bool(getattr(cfg, "vit_frozen", False)):
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-            self.backbone.eval()
+        # The ViT backbone is always frozen.
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        self.backbone.eval()
 
     @torch.no_grad()
     def _maybe_channels_last(self, x: torch.Tensor) -> torch.Tensor:
@@ -1276,23 +1272,16 @@ class CS2Transformer(nn.Module):
         self.amp_dtype = dtype_map[getattr(self.cfg,"compute_dtype", "bf16")]
 
     # --------------------------- utility methods --------------------------- #
-    def set_vit_frozen(self, frozen: bool) -> None:
-        for p in self.visual_encoder.parameters():
-            p.requires_grad = not frozen
-
     def parameter_groups(self) -> List[Dict[str, object]]:
-        vit_params = list(self.visual_encoder.parameters())
+        """Returns the model's trainable parameters in a group for the optimizer."""
+        # The visual encoder (ViT) is frozen, so its parameters are not included.
         core_modules = [self.audio_encoder, self.player_fuser, self.backbone, self.player_head, self.strategy_head]
-        rest = [p for m in core_modules for p in m.parameters()]
-        rest += [
+        trainable_params = [p for m in core_modules for p in m.parameters()]
+        trainable_params += [
             self.token_game_strategy, self.token_scratch, self.dead_embedding,
             *self.player_slot_embed.parameters(),
         ]
-        #todo make sure optimizer uses lr_scale
-        return [
-            {"params": vit_params, "name": "vit", "lr_scale": 0.1},
-            {"params": rest, "name": "core", "lr_scale": 1.0},
-        ]
+        return [{"params": trainable_params, "name": "core", "lr_scale": 1.0}]
 
 
     def forward(self, batch: CS2Batch) -> Predictions:
@@ -1500,7 +1489,6 @@ def main():
     parser.add_argument("--tensorrt", action="store_true", help="Use torch_tensorrt backend when --compile is enabled.")
     parser.add_argument("--trt-debug", action="store_true",
                         help="Enable verbose TensorRT logging and debug during torch_tensorrt compilation.")
-    parser.add_argument("--freeze-vit", action="store_true", help="Freeze the ViT encoder weights.")
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of just a shape test.")
     parser.add_argument("--autoregressive", type=int, metavar="N_FRAMES", help="Run autoregressive KV-cached benchmark for N frames.")
     parser.add_argument("--warmup-steps", type=int, default=5, help="Number of warmup steps for benchmark.")
@@ -1546,9 +1534,6 @@ def main():
     )
     #print_dataclass(cfg)
     model = CS2Transformer(cfg, args.dummy_vit).to(device).eval()
-
-    if args.freeze_vit:
-        model.set_vit_frozen(True)
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     precision = dtype_map[args.dtype]
