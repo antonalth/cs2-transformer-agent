@@ -487,17 +487,6 @@ class PlayerTokenFuser(nn.Module):
         self.slot_embed = player_slot_embed
         self.dead_embedding = dead_embedding
 
-    @torch.no_grad()
-    def _assert_shapes(self, vis: torch.Tensor):
-        # Lightweight runtime guard; remove if you prefer.
-        B, T, P, d = vis.shape
-        assert P == self.cfg.num_players, f"P={P} must equal cfg.num_players={self.cfg.num_players}"
-        assert self.dead_embedding.shape == (1, 1, 1, d), \
-            f"dead_embedding must be [1,1,1,{d}] but is {tuple(self.dead_embedding.shape)}"
-        # slot_ids_buf: [1,1,P]
-        assert self.slot_ids_buf.shape == (1, 1, P), \
-            f"slot_ids_buf must be [1,1,{P}] but is {tuple(self.slot_ids_buf.shape)}"
-
     def forward(
     self,
     vis: torch.Tensor,
