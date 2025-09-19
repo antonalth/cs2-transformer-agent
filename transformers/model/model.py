@@ -218,6 +218,9 @@ class CS2Config:
     # Vision (HF / DINOv3)
     hf_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     hf_use_processor: bool = False     # True = preprocess inside encoder with HF image processor
+    hf_forward_chunk: int = 64 
+    hf_norm_chunk: int = 64
+    hf_compute_dtype: Literal["fp32", "fp16", "bf16"]  = "fp16"
     hf_channels_last: bool = True     # same perf
 
     # Audio
@@ -349,17 +352,30 @@ def _GN3d(c: int) -> torch.nn.GroupNorm:
 import torch
 import torch.nn as nn
 from contextlib import nullcontext
+import torch
+import torch.nn as nn
+from contextlib import nullcontext
 
 class DINOv3VisualEncoder(nn.Module):
     """
-    Hugging Face DINOv3 encoder with chunked, just-in-time normalization.
+    Hugging Face DINOv3 encoder with chunked, just-in-time normalization and
+    chunked backbone forward to reduce peak VRAM.
 
     Contract matches ViTVisualEncoder:
       - Input:  [B, T, P, 3, H, W]
-        * If hf_use_processor=True  -> we delegate resize/normalize to HF (no chunked norm).
-        * If hf_use_processor=False -> we expect *raw frames* (uint8 or float in [0,1])
-                                      and normalize on-GPU in temporal chunks before forward.
+        * If hf_use_processor=True  -> delegate resize/normalize to HF, STILL CHUNKED over T.
+        * If hf_use_processor=False -> expect raw frames (uint8 or float in [0,1]) and
+                                      normalize + forward on-GPU in temporal chunks.
       - Output: [B, T, P, d_model]
+
+    Config knobs (attributes on cfg):
+      - hf_model_name:      str, HF repo (default 'facebook/dinov3-vitb16-pretrain-lvd1689m')
+      - hf_use_processor:   bool, use HF AutoImageProcessor (default True)
+      - hf_channels_last:   bool, convert inputs to channels_last (default True)
+      - hf_norm_chunk:      int, frames per normalization chunk (default 64)
+      - hf_forward_chunk:   int, frames per FORWARD chunk; defaults to hf_norm_chunk
+      - hf_compute_dtype:   'bf16' | 'fp16' | 'fp32' (default 'bf16')
+      - d_model:            int, projection output width (required)
     """
     def __init__(self, cfg):
         super().__init__()
@@ -369,8 +385,11 @@ class DINOv3VisualEncoder(nn.Module):
         self.use_processor = bool(getattr(cfg, "hf_use_processor", True))
         self.model_name = getattr(cfg, "hf_model_name", "facebook/dinov3-vitb16-pretrain-lvd1689m")
 
-        # Chunking / dtype knobs
-        self.norm_chunk = int(getattr(cfg, "hf_norm_chunk", 64))  # frames per chunk along T
+        # Chunking knobs
+        self.norm_chunk = int(getattr(cfg, "hf_norm_chunk", 64))
+        self.forward_chunk = int(getattr(cfg, "hf_forward_chunk", self.norm_chunk))
+
+        # Compute dtype
         compute_dtype = str(getattr(cfg, "hf_compute_dtype", "bf16")).lower()
         if compute_dtype in ("bf16", "bfloat16"):
             self.compute_dtype = torch.bfloat16
@@ -379,12 +398,12 @@ class DINOv3VisualEncoder(nn.Module):
         else:
             self.compute_dtype = torch.float32  # fallback
 
-        # ImageNet normalization used by DINOv3 "web" weights
+        # ImageNet normalization stats used by DINOv3 web weights
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        # Register as buffers so they follow the module to CUDA and dtypes cheaply
-        self.register_buffer("img_mean", mean.to(torch.float16), persistent=False)  # or bf16
-        self.register_buffer("img_std",  std.to(torch.float16),  persistent=False)
+        # Keep in compute dtype so we don't upcast the activations
+        self.register_buffer("img_mean", mean.to(self.compute_dtype), persistent=False)
+        self.register_buffer("img_std",  std.to(self.compute_dtype),  persistent=False)
 
         try:
             from transformers import AutoModel, AutoImageProcessor
@@ -414,12 +433,11 @@ class DINOv3VisualEncoder(nn.Module):
         self.hidden = int(getattr(self.backbone.config, "hidden_size", 768))
         self.proj = nn.Linear(self.hidden, self.d_model)
 
-        # The ViT backbone is always frozen.
+        # The ViT backbone is always frozen (we'll run it under no_grad to save VRAM).
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
 
-    @torch.no_grad()
     def _maybe_channels_last(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_channels_last and not x.is_contiguous(memory_format=torch.channels_last):
             return x.contiguous(memory_format=torch.channels_last)
@@ -434,11 +452,29 @@ class DINOv3VisualEncoder(nn.Module):
         if from_uint8:
             x = x.to(self.compute_dtype)
             x.mul_(1.0 / 255.0)
-        # Ensure mean/std share dtype+device without reallocating every call
-        mean = self.img_mean.to(device=x.device, dtype=self.compute_dtype)
-        std = self.img_std.to(device=x.device, dtype=self.compute_dtype)
+        else:
+            # ensure dtype without extra allocation if possible
+            if x.dtype != self.compute_dtype:
+                x = x.to(self.compute_dtype)
+
+        # Ensure mean/std on the right device; dtype is already compute dtype
+        mean = self.img_mean.to(device=x.device, non_blocking=True)
+        std = self.img_std.to(device=x.device, non_blocking=True)
         x.sub_(mean).div_(std)
         return self._maybe_channels_last(x)
+
+    def _forward_backbone_no_grad(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Run frozen backbone under no_grad + autocast, return pooled features [N, hidden].
+        pixel_values should already be on the correct device.
+        """
+        # Autocast reduces activation footprint inside the backbone (esp. for fp32 weights).
+        # We keep grads for the projection outside of this block.
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=(pixel_values.is_cuda and self.compute_dtype != torch.float32)):
+                outputs = self.backbone(pixel_values=pixel_values)
+                feats = outputs.pooler_output  # [N, hidden]
+        return feats  # requires_grad=False
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         # Expect [B, T, P, C, H, W] with C==3
@@ -448,57 +484,71 @@ class DINOv3VisualEncoder(nn.Module):
         if C != 3:
             raise ValueError(f"Expected 3 channels, got {C}")
 
-        # If using HF processor, delegate (no chunked normalization here)
-        if self.processor is not None:
-            N = B * T * P
-            x = images.reshape(N, C, H, W)
-            # Processor expects CPU/GPU tensors; we keep it simple and let it handle normalization/resize
-            inputs = self.processor(images=x, return_tensors="pt")
-            inputs = {k: v.to(x.device) for k, v in inputs.items()}
-
-            need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in self.backbone.parameters())
-            ctx = nullcontext() if need_grad else torch.no_grad()
-            with ctx:
-                outputs = self.backbone(**inputs)
-                feats = outputs.pooler_output  # [N, hidden]
-            vis = self.proj(feats)
-            return vis.view(B, T, P, self.d_model)
-
-        # --------- Chunked path: normalize 64-wise along T and forward the backbone per chunk ---------
-        # Inputs can be uint8 (preferred from DALI) or float in [0,1]. We detect uint8 for scaling.
+        device = images.device
         from_uint8 = images.dtype == torch.uint8
 
-        # We iterate over T in slices of self.norm_chunk
+        # Choose temporal chunk for forward; default ties to normalization chunk.
+        t_chunk = self.forward_chunk
+
         chunks = []
-        need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in self.backbone.parameters())
-        ctx = nullcontext() if need_grad else torch.no_grad()
 
-        for t0 in range(0, T, self.norm_chunk):
-            t1 = min(T, t0 + self.norm_chunk)
+        if self.processor is not None:
+            # Chunk the processor + backbone path to avoid building a huge [B*T*P] batch.
+            for t0 in range(0, T, t_chunk):
+                t1 = min(T, t0 + t_chunk)
 
-            # [B, t, P, 3, H, W] → [N_chunk, 3, H, W]
-            img_chunk = images[:, t0:t1]  # keeps uint8/float compact in memory
-            N_chunk = B * (t1 - t0) * P
-            x = img_chunk.reshape(N_chunk, C, H, W)
+                # [B, t, P, 3, H, W] → [N_chunk, 3, H, W]
+                img_chunk = images[:, t0:t1]  # keeps storage compact
+                N_chunk = B * (t1 - t0) * P
+                x = img_chunk.reshape(N_chunk, C, H, W)
 
-            # Normalize just-in-time on GPU
-            x = self._normalize_chunk(x, from_uint8=from_uint8)
+                # Let the HF processor handle resize/normalize; it returns CPU tensors by default.
+                inputs = self.processor(images=x, return_tensors="pt")
+                # Move to device and (optionally) channels_last
+                pixel_values = inputs["pixel_values"].to(device, non_blocking=True)
+                if self.use_channels_last:
+                    pixel_values = pixel_values.to(memory_format=torch.channels_last)
 
-            # Prepare inputs for backbone
-            inputs = {"pixel_values": x}
+                # Backbone under no_grad + autocast
+                feats = self._forward_backbone_no_grad(pixel_values)
 
-            # Forward backbone on this chunk
-            with ctx:
-                outputs = self.backbone(**inputs)
-                feats = outputs.pooler_output  # [N_chunk, hidden]
+                # Project with grads enabled (use autocast for lower VRAM if mixed precision)
+                with torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=(device.type == "cuda" and self.compute_dtype != torch.float32)):
+                    vis_chunk = self.proj(feats).view(B, (t1 - t0), P, self.d_model)
 
-            vis_chunk = self.proj(feats).view(B, (t1 - t0), P, self.d_model)
-            chunks.append(vis_chunk)
-            # Free ASAP
-            del x, img_chunk, feats, vis_chunk
+                chunks.append(vis_chunk)
+
+                # Free ASAP
+                del x, img_chunk, inputs, pixel_values, feats, vis_chunk
+
+        else:
+            # Chunked path: normalize + forward the backbone per temporal slice.
+            for t0 in range(0, T, t_chunk):
+                t1 = min(T, t0 + t_chunk)
+
+                # [B, t, P, 3, H, W] → [N_chunk, 3, H, W]
+                img_chunk = images[:, t0:t1]
+                N_chunk = B * (t1 - t0) * P
+                x = img_chunk.reshape(N_chunk, C, H, W)
+
+                # Normalize just-in-time on GPU
+                x = self._normalize_chunk(x, from_uint8=from_uint8)
+
+                # Backbone under no_grad + autocast
+                feats = self._forward_backbone_no_grad(x)
+
+                # Project with grads (small footprint compared to backbone)
+                with torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=(device.type == "cuda" and self.compute_dtype != torch.float32)):
+                    vis_chunk = self.proj(feats).view(B, (t1 - t0), P, self.d_model)
+
+                chunks.append(vis_chunk)
+
+                # Free ASAP
+                del x, img_chunk, feats, vis_chunk
 
         vis = torch.cat(chunks, dim=1)  # concat along T
         return vis
+
 
 
 class AudioCNN(nn.Module):
