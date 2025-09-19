@@ -1004,7 +1004,7 @@ def main(args):
         # --- SMOKE TEST SETUP ---
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_cfg = CS2Config(context_frames=args.T_frames)
-        model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device)
+        model = CS2Transformer(model_cfg, use_dummy_vision=False).to(device)
         
         loss_weights = {
             'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
