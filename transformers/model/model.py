@@ -218,8 +218,8 @@ class CS2Config:
     # Vision (HF / DINOv3)
     hf_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     hf_use_processor: bool = False     # True = preprocess inside encoder with HF image processor
-    hf_forward_chunk: int = 64 
-    hf_norm_chunk: int = 64
+    hf_forward_chunk: int = 16
+    hf_norm_chunk: int = 16
     hf_compute_dtype: Literal["fp32", "fp16", "bf16"]  = "fp16"
     hf_channels_last: bool = True     # same perf
 
