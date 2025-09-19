@@ -1237,17 +1237,13 @@ class CS2Transformer(nn.Module):
             if self.training and self.cfg.enable_cached_training:
                 # --- Cached Training (TBPTT) Path ---
                 chunk_T = self.cfg.cached_chunk_T
-                warmup_T = self.cfg.cached_warmup_T
-                
+                # When carrying a running KV cache, do NOT re-feed warmup tokens.
                 kv_cache_list = [None] * self.cfg.n_layers
-                outputs_no_warmup = []
+                outputs = []
 
                 for t_start in range(0, T, chunk_T):
                     t_end = min(t_start + chunk_T, T)
-                    
-                    warmup_start = max(0, t_start - warmup_T)
-                    
-                    token_slice_start = warmup_start * Lpf
+                    token_slice_start = t_start * Lpf
                     token_slice_end = t_end * Lpf
                     seq_slice = seq[:, token_slice_start:token_slice_end]
 
@@ -1258,13 +1254,9 @@ class CS2Transformer(nn.Module):
 
                     h_slice, updated_kv_cache = self.backbone(seq_slice, attn_mask=None, kv_cache_list=kv_cache_list)
                     kv_cache_list = updated_kv_cache
-
-                    warmup_len_frames = t_start - warmup_start
-                    warmup_len_tokens = warmup_len_frames * Lpf
-                    
-                    outputs_no_warmup.append(h_slice[:, warmup_len_tokens:])
+                    outputs.append(h_slice)
                 
-                h = torch.cat(outputs_no_warmup, dim=1)
+                h = torch.cat(outputs, dim=1)
             else:
                 # --- Standard Single-Shot Path ---
                 h, _ = self.backbone(seq, attn_mask=None, kv_cache_list=None)
@@ -1297,6 +1289,9 @@ class CS2Transformer(nn.Module):
         Processes a SINGLE frame of data for efficient autoregressive inference.
         """
         assert not self.training, "autoregressive_step should be called in eval mode"
+        # Initialize caches on first call so the backbone builds them.
+        if past_kv_cache is None:
+            past_kv_cache = [None] * self.cfg.n_layers
         # --- MODIFIED: Check the new 'images' key ---
         assert single_frame_batch["images"].shape[1] == 1, "Input for autoregressive_step must have T=1"
 
@@ -1349,6 +1344,8 @@ class CS2Transformer(nn.Module):
 
                 # --- Backbone call with cache ---
                 h, updated_kv_cache = self.backbone(seq, attn_mask=None, kv_cache_list=past_kv_cache)
+                if updated_kv_cache is None:
+                    updated_kv_cache = [None] * self.cfg.n_layers
 
                 # --- Prediction Heads ---
                 last = h
@@ -1361,7 +1358,7 @@ class CS2Transformer(nn.Module):
 
                 predictions = {"player": player_preds, "game_strategy": strategy_preds}
 
-                return predictions, updated_kv_cache   
+                return predictions, updated_kv_cache
 # If this file is imported, users can create and compile as follows:
 #   model = CS2Transformer(CS2Config())
 #   model = torch.compile(model)  # outside this module
