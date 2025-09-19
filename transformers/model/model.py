@@ -1339,7 +1339,7 @@ class CS2Transformer(nn.Module):
 
                 tok_gs = self.token_game_strategy.expand(B, T, d).to(target_dtype)
                 tok_sc = self.token_scratch.expand(B, T, d).to(target_dtype)
-                frame_tokens = torch.cat([player_tokens.squeeze(1), tok_gs, tok_sc], dim=1)
+                frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2) # Concat on dim 2
 
                 seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
 
