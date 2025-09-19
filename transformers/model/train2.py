@@ -610,15 +610,9 @@ class BatchAssembler:
 
     def assemble(self, dali_batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         """Assembles the final batch dictionary, including ground truth targets."""
-        # 1) Stack DALI outputs.
-        #    OPTIMIZATION: DALI's output tensors are already on the correct GPU.
-        #    Calling .to(self.device) on them is redundant and was causing a
-        #    massive memory copy (~13GB), as identified by the profiler.
-        #    We now use the tensors directly without an extra copy.
+
         images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
 
-        # The mel spectrograms now have a stereo channel dimension. We must stack
-        # and permute them correctly to match the model's expected input shape.
         mels_list = [dali_batch[f"mel{k}"] for k in range(5)]
 
         # mel_k shape: [B, 2, T, Mels] (Batch, Channels, Time, Mel Bins)
@@ -649,14 +643,10 @@ class BatchAssembler:
             for key, value in gt_result.__dict__.items():
                 gt_lists[key].append(torch.from_numpy(value))
 
-        # 3) Stack all ground truth lists into batch tensors and move them to the GPU.
-        #    This is a necessary data transfer from CPU to GPU.
-        #    Using non_blocking=True can help overlap compute and data transfer.
         gt_tensors = {k: torch.stack(v, dim=0).to(self.device, non_blocking=True) for k, v in gt_lists.items()}
 
         # 4) Assemble final batch dictionary
         batch = {
-            # MODIFICATION: Removed .to(self.device) from these two lines.
             "images": images,
             "mel_spectrogram": mel,
             "alive_mask": gt_tensors.pop("alive_mask").bool(),

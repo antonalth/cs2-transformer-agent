@@ -335,8 +335,8 @@ def _update_cache(old: Optional[KVCache],
     if not (cat_k.requires_grad or cat_v.requires_grad):
         cat_k = cat_k.detach()
         cat_v = cat_v.detach()
-    return KVCache(key=cat_k.contiguous(),
-                   value=cat_v.contiguous(),
+    return KVCache(key=cat_k,
+                   value=cat_v,
                    pos_end=pos_end)
 
 
@@ -435,7 +435,7 @@ class DINOv3VisualEncoder(nn.Module):
             # HF model card demonstrates using pooled_output
             feats = outputs.pooler_output  # [N, hidden]
 
-        vis = self.proj(feats).to(images.dtype)  # match surrounding dtype
+        vis = self.proj(feats)
         return vis.view(B, T, P, self.d_model)
 
 class AudioCNN(nn.Module):
@@ -970,7 +970,7 @@ class PlayerHeads(nn.Module):
         # New target shape for the position heatmap
         self.pos_shape = (8, 64, 64) # (Z, Y, X)
         
-        self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
+        self.vol_feats = 64  # Latent channels for the deconv stem (tunable)
         
         # 1. New, smaller seed layer. Projects 2048 -> 1024. (~2.1M params)
         # We will create a tiny 2x2x2 seed volume.
@@ -992,17 +992,18 @@ class PlayerHeads(nn.Module):
         class Up2x2(nn.Module):
             def __init__(self, cin, cout):
                 super().__init__()
-                self.reduce = nn.Conv3d(cin, cout, kernel_size=1, bias=False)   # drop C early
+                self.reduce = nn.Conv3d(cin, cout, kernel_size=1, bias=False)
                 self.norm   = _GN3d(cout)
                 self.act    = nn.GELU()
                 self.conv   = nn.Conv3d(cout, cout, kernel_size=3, padding=1, bias=False)
+                self.ups    = nn.ConvTranspose3d(cout, cout, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1), bias=False)
             def forward(self, x):
-                # Only upsample Y,X; keep Z the same
-                x = F.interpolate(x, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
-                x = self.reduce(x)
+                x = self.reduce(x)           # lower C before spatial growth
+                x = self.ups(x)              # cheap XY upsample without huge temp
                 x = self.norm(x); x = self.act(x)
                 x = self.conv(x)
                 return x
+
 
         # Start with fewer channels ASAP and step them down each stage
         self.pos_deconv = nn.Sequential(
@@ -1071,14 +1072,14 @@ class StrategyHead(nn.Module):
         class Up2x2(nn.Module):
             def __init__(self, cin, cout):
                 super().__init__()
-                self.reduce = nn.Conv3d(cin, cout, kernel_size=1, bias=False)   # drop C early
+                self.reduce = nn.Conv3d(cin, cout, kernel_size=1, bias=False)
                 self.norm   = _GN3d(cout)
                 self.act    = nn.GELU()
                 self.conv   = nn.Conv3d(cout, cout, kernel_size=3, padding=1, bias=False)
+                self.ups    = nn.ConvTranspose3d(cout, cout, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1), bias=False)
             def forward(self, x):
-                # Only upsample Y,X; keep Z the same
-                x = F.interpolate(x, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
-                x = self.reduce(x)
+                x = self.reduce(x)           # lower C before spatial growth
+                x = self.ups(x)              # cheap XY upsample without huge temp
                 x = self.norm(x); x = self.act(x)
                 x = self.conv(x)
                 return x
