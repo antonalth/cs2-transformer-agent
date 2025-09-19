@@ -332,8 +332,11 @@ def _update_cache(old: Optional[KVCache],
         cat_k = cat_k[:, -max_cache_len_tokens:]
         cat_v = cat_v[:, -max_cache_len_tokens:]
 
-    return KVCache(key=cat_k.contiguous().detach(),
-                   value=cat_v.contiguous().detach(),
+    if not (cat_k.requires_grad or cat_v.requires_grad):
+        cat_k = cat_k.detach()
+        cat_v = cat_v.detach()
+    return KVCache(key=cat_k.contiguous(),
+                   value=cat_v.contiguous(),
                    pos_end=pos_end)
 
 
@@ -885,16 +888,12 @@ class CS2TransformerEncoderLayer(nn.Module):
         if use_checkpoint:
             # --- Gradient Checkpointing Path ---
             
-            def attn_block(x_in, mask, t_pos, s_pos):
-                # The attention module returns (output, updated_cache).
-                # Since kv_cache is None here, updated_cache will also be None.
-                attn_out, _ = self.attn(self.ln1(x_in), mask, t_pos, s_pos, kv_cache=None)
+            def attn_block(x_in):
+                attn_out, _ = self.attn(self.ln1(x_in), attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=None)
                 return attn_out
 
-            attn_output = checkpoint(
-                attn_block, x, attn_mask, temporal_pos_ids, structural_pos_ids,
-                use_reentrant=self.cfg.grad_ckpt_use_reentrant
-            )
+            attn_output = checkpoint(attn_block, x, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
+
             x = x + attn_output
             
             def ff_block(x_in):
