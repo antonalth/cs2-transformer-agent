@@ -151,7 +151,7 @@ from torch.utils.checkpoint import checkpoint
 from contextlib import nullcontext
 
 torch.backends.cuda.enable_flash_sdp(True)
-#torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
 
 # -----------------------------------------------------------------------------
