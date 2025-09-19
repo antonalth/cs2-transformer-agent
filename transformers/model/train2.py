@@ -404,13 +404,6 @@ class DaliInputPipeline:
 
     def _build_pipeline(self, vlists, alists, cfg):
 
-        # ImageNet stats for DINOv3 LVD-1689M (web) weights
-        DINOV3_WEB_MEAN = [0.485, 0.456, 0.406]
-        DINOV3_WEB_STD  = [0.229, 0.224, 0.225]
-        # If you ever switch to SAT-493M (satellite) weights, use:
-        # DINOV3_SAT_MEAN = [0.430, 0.411, 0.296]
-        # DINOV3_SAT_STD  = [0.213, 0.156, 0.143]
-
         @pipeline_def(
             enable_memory_stats=True,
             batch_size=cfg.batch_size,
@@ -439,19 +432,8 @@ class DaliInputPipeline:
                 )
                 # video: [F, H, W, C] uint8 -> [F, C, H, W]
                 frames_uint8 = fn.transpose(video, perm=[0, 3, 1, 2])
-
-                # Normalize for DINOv3 (no resize/crop unless you explicitly add it)
-                # This yields float32 in FCHW layout with Imagenet normalization.
-                frames = fn.crop_mirror_normalize(
-                    frames_uint8,
-                    dtype=types.FLOAT16,          # if tight on memory, you can use types.FLOAT16
-                    output_layout="FCHW",
-                    mean=DINOV3_WEB_MEAN,       # 0..1 stats; we apply scale below
-                    std=DINOV3_WEB_STD,
-                    scale=1.0 / 255.0,          # convert uint8 -> [0,1] before normalize
-                    # no crop args, so we don't change spatial size
-                )
-
+                frames_uint8 = fn.reinterpret(frames_uint8, layout="FCHW")
+                
                 # ---- AUDIO ----
                 audio_raw, label_cpu = fn.readers.file(
                     name=f"A{k}",
@@ -503,7 +485,7 @@ class DaliInputPipeline:
                 mel_db_right = to_mel_db(right)
                 mel_db = fn.stack(mel_db_left, mel_db_right, axis=0)  # [2, time, n_mels]
 
-                outputs.extend([frames, sample_id_i32, mel_db])
+                outputs.extend([frames_uint8, sample_id_i32, mel_db])
             return tuple(outputs)
 
         p = pipe()
