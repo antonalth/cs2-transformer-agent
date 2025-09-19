@@ -388,7 +388,7 @@ class DINOv3VisualEncoder(nn.Module):
         # Register as buffers so they follow the module to CUDA and dtypes cheaply
         self.register_buffer("img_mean", mean.to(torch.float16), persistent=False)  # or bf16
         self.register_buffer("img_std",  std.to(torch.float16),  persistent=False)
-        
+
         try:
             from transformers import AutoModel, AutoImageProcessor
         except Exception as e:
@@ -738,7 +738,23 @@ class RoPEPositionalEncoding(nn.Module):
         rotated_k = torch.cat([k_t_rot, k_s_rot, k_pass], dim=-1)
 
         return rotated_q, rotated_k
-        
+    
+class SwiGLUFFN(nn.Module):
+    """
+    SwiGLU MLP with parameter parity to GELU-4d when ffn_mult=4.
+    hidden = (2/3) * ffn_mult * d_model
+    """
+    def __init__(self, d_model: int, ffn_mult: int):
+        super().__init__()
+        hidden = int(round((2.0 / 3.0) * ffn_mult * d_model))
+        self.in_proj  = nn.Linear(d_model, 2 * hidden)
+        self.out_proj = nn.Linear(hidden, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u, v = self.in_proj(x).chunk(2, dim=-1)   # [*, hidden] each
+        x = F.silu(u) * v                          # SwiGLU = SiLU(u) * v
+        return self.out_proj(x)
+
 
 class CS2GQAAttention(nn.Module):
     """Grouped-Query Attention with FlashAttention-2.
@@ -927,11 +943,7 @@ class CS2TransformerEncoderLayer(nn.Module):
         self.ln1 = nn.LayerNorm(cfg.d_model)
         self.attn = CS2GQAAttention(cfg, rope)
         self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model * cfg.ffn_mult),
-            nn.GELU(),
-            nn.Linear(cfg.d_model * cfg.ffn_mult, cfg.d_model),
-        )
+        self.ff = SwiGLUFFN(cfg.d_model, cfg.ffn_mult)
 
     def forward(
         self,
