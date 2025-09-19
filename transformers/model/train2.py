@@ -395,7 +395,7 @@ class DaliInputPipeline:
         self.iterator = DALIGenericIterator([self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
     def _build_pipeline(self, vlists, alists, cfg):
-        @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=1,)
+        @pipeline_def(enable_memory_stats=True, batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=1,)
         def pipe():
             outputs = []
             for k in range(5):
@@ -411,7 +411,6 @@ class DaliInputPipeline:
                     dtype=types.UINT8,
                     file_list_frame_num=True, 
                     file_list_include_preceding_frame=True,
-                    enable_memory_stats=True,
                     initial_fill=256,
                     additional_decode_surfaces=2
                 )
