@@ -725,102 +725,179 @@ class BatchAssembler:
 # =============================================================================
 
 class CompositeLoss(nn.Module):
-    """Calculates the composite, masked loss across all model prediction heads."""
-    def __init__(self, weights: dict):
+    """
+    Calculates the composite, masked loss across all model prediction heads.
+
+    Efficiency improvements added:
+    - Cache 1-D coordinate axes (xs, ys, zs) as buffers and reuse them each step.
+    - Generate Gaussian heatmaps via separable 1-D Gaussians (no gigantic [Z,Y,X,3] grid).
+    - Create targets under torch.no_grad() to avoid autograd bookkeeping.
+    - Avoid unsqueeze+expand for enemy heatmaps; use advanced indexing instead.
+    - Keep BCE in AMP when global autocast is enabled.
+    """
+    def __init__(self, weights: dict, grid_dims: tuple[int,int,int]=(64,64,8), sigma: float = 1.5):
         super().__init__()
         self.weights = weights
-        self.coord_mapper = CoordinateMapper(grid_dims=(64, 64, 8))
-        
-        # Initialize loss functions with no reduction to allow for manual masking
+        self.coord_mapper = CoordinateMapper(grid_dims=grid_dims)
+
+        # Loss fns with no reduction for manual masking
         self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=-1)
+        self.ce_loss  = nn.CrossEntropyLoss(reduction='none', ignore_index=-1)
 
-    def _scalar_loss(self, unmasked_loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Applies a mask and reduces the loss to a scalar."""
-        masked_loss = unmasked_loss * mask
-        return masked_loss.sum() / mask.sum().clamp(min=1.0)
+        # Cache axes for separable Gaussian target generation
+        X, Y, Z = grid_dims
+        # Registered as buffers so they follow .to(device)/.cuda()
+        self.register_buffer('xs', torch.arange(X, dtype=torch.float32), persistent=False)
+        self.register_buffer('ys', torch.arange(Y, dtype=torch.float32), persistent=False)
+        self.register_buffer('zs', torch.arange(Z, dtype=torch.float32), persistent=False)
+        self.grid_dims = grid_dims
+        self.sigma = float(sigma)
 
-    def forward(self, predictions: Dict, targets: Dict, alive_mask: torch.Tensor) -> torch.Tensor:
-        total_loss = torch.tensor(0.0, device=alive_mask.device)
-        B, T, _ = alive_mask.shape
+    @staticmethod
+    def _scalar_loss(unmasked_loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Apply mask and reduce to a single scalar."""
+        masked = unmasked_loss * mask
+        return masked.sum() / mask.sum().clamp(min=1.0)
 
-        # --- Player Losses (No changes here) ---
+    def _gaussian_heatmaps_from_indices(self, centers_xyz_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Build smooth 3-D heatmaps for N centers using separable 1-D Gaussians.
+        centers_xyz_idx: Long/float tensor [N, 3] with (x_idx, y_idx, z_idx).
+        Returns: Float tensor [N, Z, Y, X].
+        """
+        if centers_xyz_idx.numel() == 0:
+            Z, Y, X = self.grid_dims[2], self.grid_dims[1], self.grid_dims[0]
+            return torch.empty((0, Z, Y, X), device=self.xs.device, dtype=torch.float32)
+
+        centers = centers_xyz_idx.to(dtype=torch.float32)
+        gx, gy, gz = centers[:, 0], centers[:, 1], centers[:, 2]  # [N]
+
+        xs, ys, zs = self.xs, self.ys, self.zs
+        s2 = 2.0 * (self.sigma ** 2)
+
+        # [N, X], [N, Y], [N, Z]
+        hx = torch.exp(-((xs.unsqueeze(0) - gx.unsqueeze(1)) ** 2) / s2)
+        hy = torch.exp(-((ys.unsqueeze(0) - gy.unsqueeze(1)) ** 2) / s2)
+        hz = torch.exp(-((zs.unsqueeze(0) - gz.unsqueeze(1)) ** 2) / s2)
+
+        # [N, Z, Y, X] without creating a big [Z,Y,X,3] coord grid
+        return hz[:, :, None, None] * hy[:, None, :, None] * hx[:, None, None, :]
+
+    def _build_targets_heatmaps(self, world_xyz: torch.Tensor) -> torch.Tensor:
+        """
+        Convert world coordinates [N, 3] to grid indices then to heatmaps [N, Z, Y, X].
+        Computed under no_grad to avoid autograd overhead.
+        """
+        with torch.no_grad():
+            grid_idx = self.coord_mapper.discretize_world_to_grid(world_xyz)  # [N,3] long
+            return self._gaussian_heatmaps_from_indices(grid_idx)
+
+    def forward(self, predictions: dict, targets: dict) -> torch.Tensor:
+        """
+        Args:
+            predictions: dict with keys:
+                - "player": list of 5 dicts with keys:
+                    "stats", "mouse_delta_deg", "keyboard_logits",
+                    "eco_logits", "inventory_logits", "active_weapon_logits",
+                    "pos_heatmap_logits"  (shape [B,T,Z,Y,X])
+                - "game_strategy": dict:
+                    "round_number" (shape [B,T,1]),
+                    "round_state_logits" (multi-label, [B,T,K]),
+                    "enemy_pos_heatmap_logits" (shape [B,T,Z,Y,X])
+            targets: dict mirroring above, plus:
+                - "player"[i]["pos_coords"]               ([B,T,3] world coords)
+                - "game_strategy"]["enemy_pos_coords"]    ([B,T,5,3])
+            Also expect "alive_mask": [B,T,5] bool.
+        """
+        total_loss = torch.tensor(0.0, device=self.xs.device)
+        B, T = predictions['player'][0]['stats'].shape[:2]
+        alive_mask: torch.Tensor = targets["alive_mask"]  # [B, T, 5] bool
+
+        # ----------------------------
+        # Player heads (MSE/BCE/CE)
+        # ----------------------------
         for i in range(5):
             p_pred = predictions["player"][i]
             p_targ = targets["player"][i]
-            player_alive_mask = alive_mask[:, :, i].float()
+            player_alive_mask = alive_mask[:, :, i].float()  # [B,T]
 
-            loss_stats = self.mse_loss(p_pred["stats"], p_targ["stats"]).mean(dim=-1)
+            # Stats (MSE)
+            loss_stats = self.mse_loss(p_pred["stats"], p_targ["stats"]).mean(dim=-1)  # [B,T]
             total_loss += self.weights['stats'] * self._scalar_loss(loss_stats, player_alive_mask)
-            loss_mouse = self.mse_loss(p_pred["mouse_delta_deg"], p_targ["mouse_delta_deg"]).mean(dim=-1)
+
+            # Mouse (MSE)
+            loss_mouse = self.mse_loss(p_pred["mouse_delta_deg"], p_targ["mouse_delta_deg"]).mean(dim=-1)  # [B,T]
             total_loss += self.weights['mouse'] * self._scalar_loss(loss_mouse, player_alive_mask)
+
+            # Multi-label BCE heads
             for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
-                loss_bce = self.bce_loss(p_pred[key], p_targ[key]).mean(dim=-1)
+                loss_bce = self.bce_loss(p_pred[key], p_targ[key]).mean(dim=-1)  # [B,T]
                 total_loss += self.weights[key.replace('_logits','')] * self._scalar_loss(loss_bce, player_alive_mask)
+
+            # Active weapon (CE), flatten B*T
             pred_flat = p_pred["active_weapon_logits"].view(B * T, -1)
             targ_flat = p_targ["active_weapon_logits"].view(B * T)
-            loss_weapon_unmasked = self.ce_loss(pred_flat, targ_flat)
-            total_loss += self.weights['weapon'] * self._scalar_loss(loss_weapon_unmasked, player_alive_mask.view(B * T))
+            loss_weapon_unmasked = self.ce_loss(pred_flat, targ_flat)  # [B*T]
+            total_loss += self.weights['weapon'] * self._scalar_loss(
+                loss_weapon_unmasked, player_alive_mask.view(B * T)
+            )
 
-        # --- Game Strategy Losses ---
+        # ----------------------------
+        # Game strategy scalar heads
+        # ----------------------------
         gs_pred = predictions["game_strategy"]
         gs_targ = targets["game_strategy"]
-        frame_mask = alive_mask.any(dim=-1).float()
-        loss_round_num = self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1)
+
+        frame_mask = alive_mask.any(dim=-1).float()  # [B,T]
+
+        # Round number (MSE)
+        loss_round_num = self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1)  # [B,T]
         total_loss += self.weights['round_number'] * self._scalar_loss(loss_round_num, frame_mask)
-        
-        # Round State (BCE)
-        loss_round_state = self.bce_loss(gs_pred["round_state_logits"], gs_targ["round_state_logits"]).mean(dim=-1)
+
+        # Round state (BCE)
+        loss_round_state = self.bce_loss(gs_pred["round_state_logits"], gs_targ["round_state_logits"]).mean(dim=-1)  # [B,T]
         total_loss += self.weights['round_state'] * self._scalar_loss(loss_round_state, frame_mask)
 
-        # --- Heatmap Losses (BCE with smooth targets) ---
-        # Player Position
-        # Stack predictions and targets from the list of players into single tensors
-        pred_pos_heatmaps = torch.stack([p["pos_heatmap_logits"] for p in predictions["player"]], dim=2) # Shape: [B, T, 5, Z, Y, X]
-        targ_pos_coords = torch.stack([p["pos_coords"] for p in targets["player"]], dim=2)             # Shape: [B, T, 5, 3]
+        # ----------------------------
+        # Heatmap heads (efficient targets & indexing)
+        # ----------------------------
+        # Player position
+        pred_pos_heatmaps = torch.stack([p["pos_heatmap_logits"] for p in predictions["player"]], dim=2)  # [B,T,5,Z,Y,X]
+        targ_pos_coords   = torch.stack([p["pos_coords"]         for p in targets["player"]],     dim=2)  # [B,T,5,3]
 
-        # Use the boolean alive_mask to select only the valid entries.
         if alive_mask.any():
-            # Flatten the batch, time, and player dimensions to get a simple list
-            alive_mask_flat = alive_mask.view(-1)
-            
-            # Select the predictions and targets for alive players, preserving the heatmap shape
-            pred_pos_logits_alive = pred_pos_heatmaps.view(-1, *pred_pos_heatmaps.shape[3:])[alive_mask_flat]
-            targ_pos_coords_alive = targ_pos_coords.view(-1, 3)[alive_mask_flat]
+            alive_flat   = alive_mask.view(-1)  # [B*T*5]
+            pred_alive   = pred_pos_heatmaps.view(-1, *pred_pos_heatmaps.shape[3:])[alive_flat]  # [N,Z,Y,X]
+            coord_alive  = targ_pos_coords.view(-1, 3)[alive_flat]  # [N,3]
 
-            # Generate the target heatmap, which will have shape [num_alive, Z, Y, X]
-            target_grid_indices = self.coord_mapper.discretize_world_to_grid(targ_pos_coords_alive)
-            target_heatmap = create_gaussian_heatmap_target(target_grid_indices, grid_dims=(64, 64, 8), sigma=1.5)
-            
-            loss_pos = self.bce_loss(pred_pos_logits_alive, target_heatmap).mean()
+            target_heatmap = self._build_targets_heatmaps(coord_alive).to(dtype=pred_alive.dtype)
+
+            from torch.cuda.amp import autocast
+            with autocast(enabled=torch.is_autocast_enabled()):
+                loss_pos = self.bce_loss(pred_alive, target_heatmap).mean()
             total_loss += self.weights['pos_heatmap'] * loss_pos
 
-        # Enemy Position
-        targ_enemy_coords = gs_targ["enemy_pos_coords"] # Shape: [B, T, 5, 3]
-        pred_enemy_heatmaps = gs_pred["enemy_pos_heatmap_logits"] # Shape: [B, T, Z, Y, X]
-        
-        # Filter out invalid target positions (often all zeros for dead/unseen enemies)
-        valid_enemy_mask = targ_enemy_coords.abs().sum(dim=-1) > 0 # Shape: [B, T, 5]
-        
-        if valid_enemy_mask.any():
-            # Select the valid ground truth coordinates
-            valid_targ_coords = targ_enemy_coords[valid_enemy_mask] # Shape: [num_valid_enemies, 3]
+        # Enemy position (one predicted heatmap per frame; up to 5 valid targets)
+        pred_enemy_heatmaps = gs_pred["enemy_pos_heatmap_logits"]           # [B,T,Z,Y,X]
+        targ_enemy_coords   = gs_targ["enemy_pos_coords"]                   # [B,T,5,3]
+        valid_enemy_mask    = (targ_enemy_coords[..., 0] >= 0)              # [B,T,5] (assumes x<0 means 'no enemy')
 
-            # Expand the single predicted heatmap to match the 5 potential enemy targets
-            # then select only the predictions corresponding to valid targets
-            expanded_preds = pred_enemy_heatmaps.unsqueeze(2).expand(-1, -1, 5, -1, -1, -1) # Shape: [B, T, 5, Z, Y, X]
-            valid_pred_logits = expanded_preds[valid_enemy_mask] # Shape: [num_valid_enemies, Z, Y, X]
-            
-            # Generate target heatmaps
-            target_grid_indices = self.coord_mapper.discretize_world_to_grid(valid_targ_coords)
-            target_heatmap = create_gaussian_heatmap_target(target_grid_indices, grid_dims=(64, 64, 8), sigma=1.5)
-            
-            # The shapes now match: both are [num_valid_enemies, 8, 64, 64]
-            loss_enemy_pos = self.bce_loss(valid_pred_logits, target_heatmap).mean()
+        if valid_enemy_mask.any():
+            # Gather (b,t) for each valid enemy and pick predictions without expand
+            b_idx, t_idx, p_idx = valid_enemy_mask.nonzero(as_tuple=True)   # each [N]
+            pred_sel  = pred_enemy_heatmaps[b_idx, t_idx]                    # [N,Z,Y,X]
+            coord_sel = targ_enemy_coords[b_idx, t_idx, p_idx]               # [N,3]
+
+            target_heatmap = self._build_targets_heatmaps(coord_sel).to(dtype=pred_sel.dtype)
+
+            from torch.cuda.amp import autocast
+            with autocast(enabled=torch.is_autocast_enabled()):
+                loss_enemy_pos = self.bce_loss(pred_sel, target_heatmap).mean()
             total_loss += self.weights['enemy_heatmap'] * loss_enemy_pos
-            
+
         return total_loss
+
 # -------------------------------
 # Step 9: Determinism, DDP helpers, instrumentation
 # -------------------------------
