@@ -417,7 +417,7 @@ class DaliInputPipeline:
             num_threads=cfg.num_threads,
             device_id=cfg.device_id,
             seed=cfg.seed,
-            prefetch_queue_depth=2,
+            prefetch_queue_depth={ "cpu_size": 2, "gpu_size": 1 },
         )
         def pipe():
             outputs = []
