@@ -245,17 +245,13 @@ class CS2Config:
     # {"type": "linear", "factor": 2.0}                   # 2× context
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
     
-    # --- START: Cached Training / TBPTT ---
     enable_cached_training: bool = True
     cached_chunk_T: int = 32
     cached_warmup_T: int = 8
     cached_detach: bool = True
-    # --- END: Cached Training / TBPTT ---
     
-    # --- START: Gradient Checkpointing ---
     enable_grad_checkpoint: bool = True
     grad_ckpt_use_reentrant: bool = False
-    # --- END: Gradient Checkpointing ---
 
 @dataclass
 class KVCache:
@@ -1355,7 +1351,11 @@ class CS2Transformer(nn.Module):
                 preds_seq = {k: v.reshape(B, T, *v.shape[1:]) for k, v in preds_flat.items()}
                 player_preds.append(preds_seq)
 
-            strat_preds_flat = self.strategy_head(strat_tok_all_frames.reshape(B * T, d))
+            strat_tok_flat = strat_tok_all_frames.reshape(B * T, d)
+            if self.training and self.cfg.enable_grad_checkpoint:
+                strat_preds_flat = checkpoint(self.strategy_head, strat_tok_flat, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
+            else:
+                strat_preds_flat = self.strategy_head(strat_tok_all_frames.reshape(B * T, d))
             strategy_preds = {k: v.reshape(B, T, *v.shape[1:]) for k, v in strat_preds_flat.items()}
 
             return {"player": player_preds, "game_strategy": strategy_preds}

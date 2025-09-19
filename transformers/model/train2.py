@@ -600,16 +600,12 @@ class LmdbMetaFetcher:
                 round_state_mask[f] = gs_data['round_state']
                 enemy_positions[f] = gs_data['enemy_pos']
 
-                # --- START MODIFICATION ---
-                # Reconstruct correct player indices from the alive bitmask
-                # and map them to the sparse player_data list.
                 pdl = payload.get("player_data")
                 if pdl:
                     alive_indices = [i for i in range(5) if (mask_bits >> i) & 1]
                     
                     # Sanity check: the number of alive players must match the data list length
                     if len(alive_indices) != len(pdl):
-                        # This can happen if data is corrupt, log and skip frame.
                         continue
                         
                     for p_idx, p_data_arr in zip(alive_indices, pdl):
@@ -622,7 +618,6 @@ class LmdbMetaFetcher:
                             eco_mask[f, p_idx] = p_data['eco_bitmask']
                             inventory_mask[f, p_idx] = p_data['inventory_bitmask']
                             active_weapon_idx[f, p_idx] = self._bitmask_to_weapon_index(p_data['active_weapon_bitmask'])
-                # --- END MODIFICATION ---
 
         return MetaFetchResult(
             alive_mask=alive_mask, stats=stats, mouse_delta=mouse_delta, position=position,
