@@ -947,11 +947,6 @@ def main(args):
             # Print top 10 operators by CUDA memory usage
             print("\n--- Top 10 Operators by CUDA Memory Usage ---")
             print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
-            
-            # For even more detail, you can export the chrome trace and analyze later if needed
-            trace_path = os.path.join(args.run_dir, "profiler_trace.json")
-            prof.export_chrome_trace(trace_path)
-            logging.info(f"Full trace saved to {trace_path}")
         else:
             for i in range(args.num_steps):
                 if not run_step(dali_iter, assembler, model, loss_fn):
