@@ -199,6 +199,7 @@ class CS2Config:
     n_q_heads: int = 32
     n_kv_heads: int = 8
     ffn_mult: int = 4
+    ffn_activation: Literal["gelu", "swiglu"] = "swiglu"
     attn_dropout: float = 0.0
 
     # Sequence
@@ -247,7 +248,6 @@ class CS2Config:
     
     enable_cached_training: bool = True
     cached_chunk_T: int = 32
-    cached_warmup_T: int = 8
     cached_detach: bool = True
     
     enable_grad_checkpoint: bool = True
@@ -943,7 +943,14 @@ class CS2TransformerEncoderLayer(nn.Module):
         self.ln1 = nn.LayerNorm(cfg.d_model)
         self.attn = CS2GQAAttention(cfg, rope)
         self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.ff = SwiGLUFFN(cfg.d_model, cfg.ffn_mult)
+        if cfg.ffn_activation == "swiglu":
+            self.ff = SwiGLUFFN(cfg.d_model, cfg.ffn_mult)
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(cfg.d_model, cfg.d_model * cfg.ffn_mult),
+                nn.GELU(),
+                nn.Linear(cfg.d_model * cfg.ffn_mult, cfg.d_model),
+            )
 
     def forward(
         self,
@@ -1050,18 +1057,16 @@ class PlayerHeads(nn.Module):
         
         self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
         
-        # 1. New, smaller seed layer. Projects 2048 -> 1024. (~2.1M params)
+        # 1. New, smaller seed layer.
         # We will create a tiny 2x2x2 seed volume.
         self.pos_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
 
         # 2. Seed Upsampler block. This grows the seed from 2x2x2 to 8x8x8.
         self.seed_upsampler = nn.Sequential(
-            # Input: [B, 128, 2, 2, 2] -> Output: [B, 128, 4, 4, 4]
             nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
             _GN3d(self.vol_feats),
             nn.GELU(),
             
-            # Input: [B, 128, 4, 4, 4] -> Output: [B, 128, 8, 8, 8]
             nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
             _GN3d(self.vol_feats),
             nn.GELU(),
@@ -1085,9 +1090,9 @@ class PlayerHeads(nn.Module):
 
         # Start with fewer channels ASAP and step them down each stage
         self.pos_deconv = nn.Sequential(
-            Up2x2(self.vol_feats,       self.vol_feats // 2),   # 128 -> 64
-            Up2x2(self.vol_feats // 2,  self.vol_feats // 4),   # 64  -> 32
-            Up2x2(self.vol_feats // 4,  self.vol_feats // 8),   # 32  -> 16
+            Up2x2(self.vol_feats,       self.vol_feats // 2),
+            Up2x2(self.vol_feats // 2,  self.vol_feats // 4),
+            Up2x2(self.vol_feats // 4,  self.vol_feats // 8),
         )
         
         # 3. Final Projection: Reduce feature channels to a single logit channel
@@ -1102,10 +1107,10 @@ class PlayerHeads(nn.Module):
         # 2. Reshape into a tiny 3D volume
         tiny_seed_vol = tiny_seed_vec.reshape(B, self.vol_feats, 2, 2, 2)
         # 3. Pass through the learned upsampling network to get the final seed
-        seed = self.seed_upsampler(tiny_seed_vol) # Shape: [B, 128, 8, 8, 8]
+        seed = self.seed_upsampler(tiny_seed_vol)
         # Sanity check to ensure the output shape of our upsampler is correct
         assert seed.shape == (B, self.vol_feats, 8, 8, 8)
-        # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
+        # Pass through the learned upsampling network -> [B, C_final, 8, 64, 64]
         upsampled_vol = self.pos_deconv(seed)
         # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
         heatmap_vol = self.pos_final_conv(upsampled_vol)
@@ -1131,7 +1136,9 @@ class StrategyHead(nn.Module):
         d = cfg.d_model
         self.enemy_shape = (cfg.pos_z, cfg.pos_y, cfg.pos_x)
         
-        # --- Corrected 3D Deconvolutional Head for Enemy Positions ---
+        # --- MEMORY FIX: Reduced feature channels from 128 to 48 ---
+        # This was the primary cause of high memory usage in conv layers.
+        # It reduces VRAM usage in this section by ~62.5%
         self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
         
         self.enemy_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
@@ -1164,9 +1171,9 @@ class StrategyHead(nn.Module):
 
         # Start with fewer channels ASAP and step them down each stage
         self.enemy_deconv = nn.Sequential(
-            Up2x2(self.vol_feats,       self.vol_feats // 2),   # 128 -> 64
-            Up2x2(self.vol_feats // 2,  self.vol_feats // 4),   # 64  -> 32
-            Up2x2(self.vol_feats // 4,  self.vol_feats // 8),   # 32  -> 16
+            Up2x2(self.vol_feats,       self.vol_feats // 2),
+            Up2x2(self.vol_feats // 2,  self.vol_feats // 4),
+            Up2x2(self.vol_feats // 4,  self.vol_feats // 8),
         )
         
         # 3. Final Projection: Reduce feature channels to a single logit channel
@@ -1182,7 +1189,7 @@ class StrategyHead(nn.Module):
         tiny_seed_vec = self.enemy_seed_projector(token)
         tiny_seed_vol = tiny_seed_vec.reshape(B, self.vol_feats, 2, 2, 2)
         seed = self.seed_upsampler(tiny_seed_vol)
-        # Pass through the learned upsampling network -> [B, 16, 8, 64, 64]
+        # Pass through the learned upsampling network -> [B, C_final, 8, 64, 64]
         upsampled_vol = self.enemy_deconv(seed)
         # Project to the final single-channel logit map -> [B, 1, 8, 64, 64]
         heatmap_vol = self.enemy_final_conv(upsampled_vol)
