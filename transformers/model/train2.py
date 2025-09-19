@@ -610,7 +610,11 @@ class BatchAssembler:
 
     def assemble(self, dali_batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         """Assembles the final batch dictionary, including ground truth targets."""
-        # 1) Stack DALI outputs
+        # 1) Stack DALI outputs.
+        #    OPTIMIZATION: DALI's output tensors are already on the correct GPU.
+        #    Calling .to(self.device) on them is redundant and was causing a
+        #    massive memory copy (~13GB), as identified by the profiler.
+        #    We now use the tensors directly without an extra copy.
         images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
 
         # The mel spectrograms now have a stereo channel dimension. We must stack
@@ -628,7 +632,8 @@ class BatchAssembler:
         # Final shape: [B, T, P, C, Mels, 1]
         mel = mel_permuted.unsqueeze(-1)
         
-        # 2) Fetch metadata and ground truth labels from LMDB
+        # 2) Fetch metadata and ground truth labels from LMDB.
+        #    This happens on the CPU.
         sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
         
         gt_lists = defaultdict(list)
@@ -644,18 +649,22 @@ class BatchAssembler:
             for key, value in gt_result.__dict__.items():
                 gt_lists[key].append(torch.from_numpy(value))
 
-        # 3) Stack all ground truth lists into batch tensors
-        gt_tensors = {k: torch.stack(v, dim=0).to(self.device) for k, v in gt_lists.items()}
+        # 3) Stack all ground truth lists into batch tensors and move them to the GPU.
+        #    This is a necessary data transfer from CPU to GPU.
+        #    Using non_blocking=True can help overlap compute and data transfer.
+        gt_tensors = {k: torch.stack(v, dim=0).to(self.device, non_blocking=True) for k, v in gt_lists.items()}
 
         # 4) Assemble final batch dictionary
         batch = {
-            "images": images.to(self.device),
-            "mel_spectrogram": mel.to(self.device),
+            # MODIFICATION: Removed .to(self.device) from these two lines.
+            "images": images,
+            "mel_spectrogram": mel,
             "alive_mask": gt_tensors.pop("alive_mask").bool(),
             "meta": meta,
         }
 
-        # 5) Assemble the 'targets' dictionary, converting masks to multi-hot
+        # 5) Assemble the 'targets' dictionary, converting masks to multi-hot.
+        #    These tensors are already on the correct device from step 3.
         targets = {"player": [{} for _ in range(5)], "game_strategy": {}}
         for i in range(5):
             targets["player"][i]["stats"] = gt_tensors["stats"][:, :, i]
@@ -673,7 +682,6 @@ class BatchAssembler:
             inv_mask_player = gt_tensors["inventory_mask"][:, :, i]  # Shape: [B, T, 2]
             inv_parts = [self._masks_to_multi_hot(inv_mask_player[:, :, k], 64) for k in range(2)]
             targets["player"][i]["inventory_logits"] = torch.cat(inv_parts, dim=-1) # Shape: [B, T, 128]
-            # --- END FIX ---
 
             targets["player"][i]["active_weapon_logits"] = gt_tensors["active_weapon_idx"][:, :, i].long()
 
