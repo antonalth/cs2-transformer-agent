@@ -973,7 +973,7 @@ def run_step(dali_iter, assembler, model, loss_fn):
             batch = assembler.assemble(batch_raw)
         logging.info("Assembled batch in %.3fs", t2.dt)
         
-        with record_function("forward_pass"), Timer("forward_pass") as t3:
+        with record_function("forward_pass"), Timer("forward_pass") as t3, torch.inference_mode():
             predictions = model(batch)
         logging.info("Forward pass in %.3fs", t3.dt)
         
@@ -1005,6 +1005,7 @@ def main(args):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_cfg = CS2Config(context_frames=args.T_frames)
         model = CS2Transformer(model_cfg, use_dummy_vision=False).to(device)
+        model.eval()
         
         loss_weights = {
             'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
@@ -1046,6 +1047,7 @@ def main(args):
             # Print top 10 operators by CUDA memory usage
             print("\n--- Top 10 Operators by CUDA Memory Usage ---")
             print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+            print(torch.cuda.max_memory_allocated() / 1024**3, "GiB peak")
         else:
             for i in range(args.num_steps):
                 if not run_step(dali_iter, assembler, model, loss_fn):
