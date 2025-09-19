@@ -973,7 +973,7 @@ def run_step(dali_iter, assembler, model, loss_fn):
             batch = assembler.assemble(batch_raw)
         logging.info("Assembled batch in %.3fs", t2.dt)
         
-        with record_function("forward_pass"), Timer("forward_pass") as t3, torch.inference_mode():
+        with record_function("forward_pass"), Timer("forward_pass") as t3:
             predictions = model(batch)
         logging.info("Forward pass in %.3fs", t3.dt)
         
@@ -981,7 +981,7 @@ def run_step(dali_iter, assembler, model, loss_fn):
             total_loss = loss_fn(predictions, batch['targets'], batch['alive_mask'])
         logging.info("Calculated loss in %.3fs -> Total Loss: %.4f", t4.dt, total_loss.item())
         
-        #assert total_loss.requires_grad, "Loss must require gradients"
+        assert total_loss.requires_grad, "Loss must require gradients"
         logging.info("✅ Smoke assertion passed: Loss requires grad.")
         return True
     except StopIteration:
@@ -1005,7 +1005,6 @@ def main(args):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_cfg = CS2Config(context_frames=args.T_frames)
         model = CS2Transformer(model_cfg, use_dummy_vision=False).to(device)
-        model.eval()
         
         loss_weights = {
             'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
