@@ -444,7 +444,7 @@ class DaliInputPipeline:
                 # This yields float32 in FCHW layout with Imagenet normalization.
                 frames = fn.crop_mirror_normalize(
                     frames_uint8,
-                    dtype=types.FLOAT,          # if tight on memory, you can use types.FLOAT16
+                    dtype=types.FLOAT16,          # if tight on memory, you can use types.FLOAT16
                     output_layout="FCHW",
                     mean=DINOV3_WEB_MEAN,       # 0..1 stats; we apply scale below
                     std=DINOV3_WEB_STD,
