@@ -403,10 +403,26 @@ class DaliInputPipeline:
             )
 
     def _build_pipeline(self, vlists, alists, cfg):
-        @pipeline_def(enable_memory_stats=True, batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=2,)
+
+        # ImageNet stats for DINOv3 LVD-1689M (web) weights
+        DINOV3_WEB_MEAN = [0.485, 0.456, 0.406]
+        DINOV3_WEB_STD  = [0.229, 0.224, 0.225]
+        # If you ever switch to SAT-493M (satellite) weights, use:
+        # DINOV3_SAT_MEAN = [0.430, 0.411, 0.296]
+        # DINOV3_SAT_STD  = [0.213, 0.156, 0.143]
+
+        @pipeline_def(
+            enable_memory_stats=True,
+            batch_size=cfg.batch_size,
+            num_threads=cfg.num_threads,
+            device_id=cfg.device_id,
+            seed=cfg.seed,
+            prefetch_queue_depth=2,
+        )
         def pipe():
             outputs = []
             for k in range(5):
+                # ---- VIDEO ----
                 video, _ = fn.readers.video(
                     name=f"V{k}",
                     device="gpu",
@@ -417,50 +433,83 @@ class DaliInputPipeline:
                     num_shards=cfg.num_shards,
                     random_shuffle=cfg.shuffle,
                     dtype=types.UINT8,
-                    file_list_frame_num=True, 
+                    file_list_frame_num=True,
                     file_list_include_preceding_frame=True,
-                    additional_decode_surfaces=2
+                    additional_decode_surfaces=2,
                 )
-                frames = fn.transpose(video, perm=[0, 3, 1, 2])  # -> [F, C, H, W], dtype=UINT8
+                # video: [F, H, W, C] uint8 -> [F, C, H, W]
+                frames_uint8 = fn.transpose(video, perm=[0, 3, 1, 2])
 
-                audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle)
+                # Normalize for DINOv3 (no resize/crop unless you explicitly add it)
+                # This yields float32 in FCHW layout with Imagenet normalization.
+                frames = fn.crop_mirror_normalize(
+                    frames_uint8,
+                    dtype=types.FLOAT,          # if tight on memory, you can use types.FLOAT16
+                    output_layout="FCHW",
+                    mean=DINOV3_WEB_MEAN,       # 0..1 stats; we apply scale below
+                    std=DINOV3_WEB_STD,
+                    scale=1.0 / 255.0,          # convert uint8 -> [0,1] before normalize
+                    # no crop args, so we don't change spatial size
+                )
+
+                # ---- AUDIO ----
+                audio_raw, label_cpu = fn.readers.file(
+                    name=f"A{k}",
+                    file_list=alists[k],
+                    shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards,
+                    random_shuffle=cfg.shuffle,
+                )
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
                 sample_id_i64 = packed_i64 // LABEL_SCALE
                 start_f_i64 = packed_i64 - sample_id_i64 * LABEL_SCALE
 
-                # Cast to the final desired dtypes
                 sample_id_i32 = fn.cast(sample_id_i64, dtype=types.INT32)
                 start_f_f32 = fn.cast(start_f_i64, dtype=types.FLOAT)
 
-                # 1. Decode audio to stereo [length, 2]
                 decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=False)
                 start_s = start_f_f32 / cfg.fps
                 shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
-                sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=int(shape_samples), axes=[0], out_of_bounds_policy="pad")
-                
-                # 2. Use slicing syntax (which calls fn.slice) to separate the channels.
-                # This is the correct DALI idiom.
+                sliced = fn.slice(
+                    decoded.gpu(),
+                    start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32),
+                    shape=int(shape_samples),
+                    axes=[0],
+                    out_of_bounds_policy="pad",
+                )
+
                 left = sliced[:, 0]
                 right = sliced[:, 1]
 
-                # 3. Process each 1D channel separately
                 def to_mel_db(channel_1d):
-                    # The channel is already 1D, so the squeeze is no longer needed.
-                    spec = fn.spectrogram(channel_1d, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length, center_windows=False)
-                    mel = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
+                    spec = fn.spectrogram(
+                        channel_1d,
+                        nfft=cfg.nfft,
+                        window_length=cfg.window_length,
+                        window_step=cfg.hop_length,
+                        center_windows=False,
+                    )
+                    mel = fn.mel_filter_bank(
+                        spec,
+                        sample_rate=cfg.sample_rate,
+                        nfilter=cfg.mel_bins,
+                        freq_high=cfg.mel_fmax,
+                    )
                     db = fn.to_decibels(mel, cutoff_db=cfg.db_cutoff)
-                    db = fn.cast(db, dtype=types.FLOAT16) #todo check correct
-                    return fn.transpose(db, perm=[1, 0]) # Transpose to [time, n_mels]
+                    db = fn.cast(db, dtype=types.FLOAT16)  # keep small, matches your TODO
+                    return fn.transpose(db, perm=[1, 0])   # -> [time, n_mels]
 
                 mel_db_left = to_mel_db(left)
                 mel_db_right = to_mel_db(right)
-
-                # 4. Stack the results back together on a new channel axis
-                mel_db = fn.stack(mel_db_left, mel_db_right, axis=0) # [2, time, n_mels]
+                mel_db = fn.stack(mel_db_left, mel_db_right, axis=0)  # [2, time, n_mels]
 
                 outputs.extend([frames, sample_id_i32, mel_db])
             return tuple(outputs)
-        p = pipe(); p.build(); return p
+
+        p = pipe()
+        p.build()
+        return p
+
     
     def __iter__(self): return self
     def __next__(self): return next(self.iterator)[0]
