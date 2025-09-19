@@ -530,7 +530,7 @@ class AudioCNN(nn.Module):
         if is_batched:
             # Training/batch path: Reshape 6D to 4D
             B, T, P, C, H, W = mel.shape
-            x = mel.view(B * T * P, C, H, W)
+            x = mel.reshape(B * T * P, C, H, W)
         elif mel.dim() == 4:
             # Inference/packed path: Use 4D tensor directly
             x = mel
