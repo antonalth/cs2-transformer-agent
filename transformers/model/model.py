@@ -191,7 +191,7 @@ class CS2Batch(TypedDict, total=True):
 
 @dataclass
 class CS2Config:
-    compute_dtype: Literal["fp32", "fp16", "bf16"]  = "bf16"
+    compute_dtype: Literal["fp32", "fp16", "bf16"]  = "fp16"
     amp_autocast: bool = True
     # Model dims
     d_model: int = 2048

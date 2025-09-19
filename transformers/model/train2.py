@@ -906,7 +906,7 @@ def run_step(dali_iter, assembler, model, loss_fn):
             batch = assembler.assemble(batch_raw)
         logging.info("Assembled batch in %.3fs", t2.dt)
         
-        with record_function("forward_pass"), Timer("forward_pass") as t3, torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+        with record_function("forward_pass"), Timer("forward_pass") as t3:
             predictions = model(batch)
         logging.info("Forward pass in %.3fs", t3.dt)
         
