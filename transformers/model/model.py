@@ -246,14 +246,14 @@ class CS2Config:
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
     
     # --- START: Cached Training / TBPTT ---
-    enable_cached_training: bool = False
+    enable_cached_training: bool = True
     cached_chunk_T: int = 32
     cached_warmup_T: int = 8
     cached_detach: bool = True
     # --- END: Cached Training / TBPTT ---
     
     # --- START: Gradient Checkpointing ---
-    enable_grad_checkpoint: bool = False
+    enable_grad_checkpoint: bool = True
     grad_ckpt_use_reentrant: bool = False
     # --- END: Gradient Checkpointing ---
 
@@ -412,8 +412,8 @@ class DINOv3VisualEncoder(nn.Module):
 
         N = B * T * P
         x = images.reshape(N, C, H, W)
-        if self.use_channels_last:
-            x = x.to(memory_format=torch.channels_last)
+        if self.use_channels_last and not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.contiguous(memory_format=torch.channels_last)
 
         # Prepare inputs:
         # - If using the HF processor, it will resize/normalize as the model expects
@@ -608,8 +608,8 @@ class RoPEPositionalEncoding(nn.Module):
         
         x_pair = x.reshape(B, L, H, rd_slice // 2, 2)
         half_dim = rd_slice // 2
-        cos = cos.reshape(1, L, 1, half_dim).to(x.dtype)
-        sin = sin.reshape(1, L, 1, half_dim).to(x.dtype)
+        cos = cos.reshape(1, L, 1, half_dim)
+        sin = sin.reshape(1, L, 1, half_dim)
 
         x1 = x_pair[..., 0]
         x2 = x_pair[..., 1]
@@ -989,24 +989,26 @@ class PlayerHeads(nn.Module):
             nn.GELU(),
         )
         
-        # 2. Deconvolution path: Upsample the Y and X dimensions by 8x (2^3)
-        # We use anisotropic strides (1, 2, 2) to only upsample Y and X.
-        self.pos_deconv = nn.Sequential(
-            # Input: [B, 128, 8, 8, 8]
-            # Block 1 -> [B, 64, 8, 16, 16]
-            nn.ConvTranspose3d(self.vol_feats, self.vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(self.vol_feats // 2),
-            nn.GELU(),
-            
-            # Block 2 -> [B, 32, 8, 32, 32]
-            nn.ConvTranspose3d(self.vol_feats // 2, self.vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(self.vol_feats // 4),
-            nn.GELU(),
+        class Up2x2(nn.Module):
+            def __init__(self, cin, cout):
+                super().__init__()
+                self.reduce = nn.Conv3d(cin, cout, kernel_size=1, bias=False)   # drop C early
+                self.norm   = _GN3d(cout)
+                self.act    = nn.GELU()
+                self.conv   = nn.Conv3d(cout, cout, kernel_size=3, padding=1, bias=False)
+            def forward(self, x):
+                # Only upsample Y,X; keep Z the same
+                x = F.interpolate(x, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+                x = self.reduce(x)
+                x = self.norm(x); x = self.act(x)
+                x = self.conv(x)
+                return x
 
-            # Block 3 -> [B, 16, 8, 64, 64]
-            nn.ConvTranspose3d(self.vol_feats // 4, self.vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d(self.vol_feats // 8),
-            nn.GELU(),
+        # Start with fewer channels ASAP and step them down each stage
+        self.pos_deconv = nn.Sequential(
+            Up2x2(self.vol_feats,       self.vol_feats // 2),   # 128 -> 64
+            Up2x2(self.vol_feats // 2,  self.vol_feats // 4),   # 64  -> 32
+            Up2x2(self.vol_feats // 4,  self.vol_feats // 8),   # 32  -> 16
         )
         
         # 3. Final Projection: Reduce feature channels to a single logit channel
@@ -1066,21 +1068,26 @@ class StrategyHead(nn.Module):
         # 2. Deconvolution path: Upsample Y and X dimensions by 8x (2^3) using
         #    anisotropic strides to preserve the Z dimension. This architecture
         #    is modeled directly on the working PlayerHeads implementation.
-        self.enemy_deconv = nn.Sequential(
-            # Input: [B, 128, 8, 8, 8] -> [B, 64, 8, 16, 16]
-            nn.ConvTranspose3d( self.vol_feats,  self.vol_feats // 2, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d( self.vol_feats // 2),
-            nn.GELU(),
-            
-            # Block 2 -> [B, 32, 8, 32, 32]
-            nn.ConvTranspose3d( self.vol_feats // 2,  self.vol_feats // 4, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d( self.vol_feats // 4),
-            nn.GELU(),
+        class Up2x2(nn.Module):
+            def __init__(self, cin, cout):
+                super().__init__()
+                self.reduce = nn.Conv3d(cin, cout, kernel_size=1, bias=False)   # drop C early
+                self.norm   = _GN3d(cout)
+                self.act    = nn.GELU()
+                self.conv   = nn.Conv3d(cout, cout, kernel_size=3, padding=1, bias=False)
+            def forward(self, x):
+                # Only upsample Y,X; keep Z the same
+                x = F.interpolate(x, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+                x = self.reduce(x)
+                x = self.norm(x); x = self.act(x)
+                x = self.conv(x)
+                return x
 
-            # Block 3 -> [B, 16, 8, 64, 64]
-            nn.ConvTranspose3d( self.vol_feats // 4,  self.vol_feats // 8, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
-            _GN3d( self.vol_feats // 8),
-            nn.GELU(),
+        # Start with fewer channels ASAP and step them down each stage
+        self.enemy_deconv = nn.Sequential(
+            Up2x2(self.vol_feats,       self.vol_feats // 2),   # 128 -> 64
+            Up2x2(self.vol_feats // 2,  self.vol_feats // 4),   # 64  -> 32
+            Up2x2(self.vol_feats // 4,  self.vol_feats // 8),   # 32  -> 16
         )
         
         # 3. Final Projection: Reduce feature channels to a single logit channel
@@ -1211,9 +1218,14 @@ class CS2Transformer(nn.Module):
                 alive_images = images[alive]
                 num_alive = alive_images.shape[0]
                 packed_vis_out = self.visual_encoder(alive_images.reshape(num_alive, 1, 1, C, H, W))
-                vis[alive] = packed_vis_out.squeeze(1).squeeze(1).to(target_dtype)
+                packed = packed_vis_out.squeeze(1).squeeze(1)
+                if packed.dtype != target_dtype:
+                    packed = packed.to(target_dtype)
+                vis[alive] = packed
 
-            aud = self.audio_encoder(mel).to(target_dtype)
+            aud = self.audio_encoder(mel)
+            if aud.dtype != target_dtype:
+                aud = aud.to(target_dtype)
             player_tokens = self.player_fuser(vis, aud, alive)
             
             tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
