@@ -1203,11 +1203,9 @@ class CS2Transformer(nn.Module):
             alive  = batch["alive_mask"].bool()
             
             dev = next(self.parameters()).device
-            images, mel, alive = (
-                images.to(dev, non_blocking=True),
-                mel.to(dev, non_blocking=True),
-                alive.to(dev, non_blocking=True),
-            )
+            if images.device != dev: images = images.to(dev, non_blocking=True)
+            if mel.device    != dev: mel    = mel.to(dev, non_blocking=True)
+            if alive.device  != dev: alive  = alive.to(dev, non_blocking=True)
             B, T, P, C, H, W = images.shape
             d = self.cfg.d_model
             Lpf = self.cfg.tokens_per_frame
@@ -1229,8 +1227,12 @@ class CS2Transformer(nn.Module):
                 aud = aud.to(target_dtype)
             player_tokens = self.player_fuser(vis, aud, alive)
             
-            tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
-            tok_sc = self.token_scratch .unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
+            tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d)
+            if tok_gs.dtype != target_dtype:
+                tok_gs = tok_gs.to(target_dtype)
+            tok_sc = self.token_scratch .unsqueeze(2).expand(B, T, 1, d)
+            if tok_sc.dtype != target_dtype:
+                tok_sc = tok_sc.to(target_dtype)
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
             seq = frame_tokens.reshape(B, T * Lpf, d)
 
@@ -1337,7 +1339,14 @@ class CS2Transformer(nn.Module):
                     vis[alive] = packed_vis_out.squeeze(1).squeeze(1).to(target_dtype)  # [num_alive, d]
 
                 # Audio: cheap enough to run for all
-                aud = self.audio_encoder(mel).to(target_dtype)  # [B, 1, P, d]
+                aud = torch.empty(B, T, P, d, device=dev, dtype=target_dtype)
+                if torch.count_nonzero(alive):
+                    aud_alive = self.audio_encoder(mel[alive])
+                    if aud_alive.dtype != target_dtype: aud_alive = aud_alive.to(target_dtype)
+                    aud[alive] = aud_alive
+                else:
+                    aud.zero_()  # or leave uninitialized if fully masked downstream
+
 
                 # Fuse
                 player_tokens = self.player_fuser(vis, aud, alive)
