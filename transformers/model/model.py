@@ -386,9 +386,9 @@ class DINOv3VisualEncoder(nn.Module):
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         # Register as buffers so they follow the module to CUDA and dtypes cheaply
-        self.register_buffer("img_mean", mean, persistent=False)
-        self.register_buffer("img_std", std, persistent=False)
-
+        self.register_buffer("img_mean", mean.to(torch.float16), persistent=False)  # or bf16
+        self.register_buffer("img_std",  std.to(torch.float16),  persistent=False)
+        
         try:
             from transformers import AutoModel, AutoImageProcessor
         except Exception as e:
@@ -435,8 +435,6 @@ class DINOv3VisualEncoder(nn.Module):
         from_uint8: if True, scale by 1/255 first; otherwise assume x in [0,1]
         Returns normalized tensor in self.compute_dtype, channels_last if enabled.
         """
-        # Cast once to target compute dtype
-        x = x.to(self.compute_dtype)
         if from_uint8:
             x.mul_(1.0 / 255.0)
         # Ensure mean/std share dtype+device without reallocating every call
