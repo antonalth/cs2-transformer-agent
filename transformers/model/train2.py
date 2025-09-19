@@ -145,23 +145,35 @@ def create_gaussian_heatmap_target(
     grid_dims: tuple[int, int, int],
     sigma: float = 1.5
 ) -> torch.Tensor:
-    """Creates a batch of smooth target heatmaps using a Gaussian kernel."""
+    """Creates a batch of smooth target heatmaps using a Gaussian kernel. (Memory-Efficient Version)"""
     X, Y, Z = grid_dims
     device = grid_indices.device
+    num_targets = grid_indices.shape[0]
     
+    # Create the coordinate grid once
     zz, yy, xx = torch.meshgrid(
         torch.arange(Z, device=device),
         torch.arange(Y, device=device),
         torch.arange(X, device=device),
         indexing='ij'
     )
-    grid_coords = torch.stack((xx, yy, zz), dim=-1).float()
+    grid_coords = torch.stack((xx, yy, zz), dim=-1).float() # Shape: [Z, Y, X, 3]
     
-    target_indices = grid_indices.float().view(-1, 1, 1, 1, 3)
-    distance_sq = torch.sum((grid_coords.unsqueeze(0) - target_indices)**2, dim=-1)
-    heatmap = torch.exp(-distance_sq / (2 * sigma**2))
+    heatmaps = []
+    # Loop over each target instead of broadcasting all at once
+    for i in range(num_targets):
+        target_idx = grid_indices[i].float() # Shape: [3]
+        
+        # Broadcasting here is cheap, as the temp tensor is only [Z, Y, X, 3]
+        distance_sq = torch.sum((grid_coords - target_idx)**2, dim=-1) # Shape: [Z, Y, X]
+        heatmap = torch.exp(-distance_sq / (2 * sigma**2))
+        heatmaps.append(heatmap)
     
-    return heatmap # Unnormalized for BCEWithLogitsLoss is fine
+    if not heatmaps:
+        # Handle the edge case where there are no targets
+        return torch.empty(0, Z, Y, X, device=device)
+        
+    return torch.stack(heatmaps, dim=0) # Shape: [num_targets, Z, Y, X]
 
 # =============================================================================
 
