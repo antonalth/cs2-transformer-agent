@@ -508,7 +508,7 @@ class AudioCNN(nn.Module):
     """Small 2D-CNN over Mel-spectrograms → [B, T, P, d_model].
 
     This version accepts a 2-channel (Stereo) spectrogram.
-    Input mel: [B, T, P, 2, mel_bins, mel_t]
+    Input mel: [B, T, P, 2, mel_bins, mel_t] or [N, 2, mel_bins, mel_t]
     """
     def __init__(self, cfg: CS2Config):
         super().__init__()
@@ -523,16 +523,33 @@ class AudioCNN(nn.Module):
         self.head = nn.Linear(c3 * 4 * 4, cfg.d_model)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        # mel: [B, T, P, 2, mel_bins, mel_t] -> pack to [B*T*P, 2, mel_bins, mel_t]
-        B, T, P = mel.shape[:3]
-        x = mel.reshape(B * T * P, mel.shape[3], mel.shape[4], mel.shape[5])
+        # This forward pass is robust to two input shapes:
+        # 1. Batched (training): [B, T, P, C, H, W]
+        # 2. Packed (inference): [N, C, H, W]
+        is_batched = mel.dim() == 6
+        if is_batched:
+            # Training/batch path: Reshape 6D to 4D
+            B, T, P, C, H, W = mel.shape
+            x = mel.view(B * T * P, C, H, W)
+        elif mel.dim() == 4:
+            # Inference/packed path: Use 4D tensor directly
+            x = mel
+        else:
+            raise ValueError(f"AudioCNN expects a 4D or 6D tensor, but got {mel.dim()}D with shape {mel.shape}")
+
+        # Common CNN processing path for the 4D tensor
         x = F.gelu(self.gn1(self.conv1(x)))
         x = F.gelu(self.gn2(self.conv2(x)))
         x = F.gelu(self.gn3(self.conv3(x)))
         x = self.pool(x)
         x = torch.flatten(x, 1)
-        x = self.head(x)  # [N, d_model]
-        x = x.reshape(B, T, P, -1)
+        x = self.head(x)  # Output shape: [N, d_model]
+
+        if is_batched:
+            # If we started with a 6D tensor, reshape the output back
+            x = x.view(B, T, P, -1)
+        
+        # If input was 4D, the 2D output is what's expected by the caller.
         return x #das ist mein roter buntstift, habe ich ganz alleine gemalt. (mithilfe von chef gpt)
     
 class PlayerTokenFuser(nn.Module):
@@ -1055,6 +1072,9 @@ class PlayerHeads(nn.Module):
         # New target shape for the position heatmap
         self.pos_shape = (8, 64, 64) # (Z, Y, X)
         
+        # --- MEMORY FIX: Reduced feature channels from 128 to 48 ---
+        # This was the primary cause of high memory usage in conv layers.
+        # It reduces VRAM usage in this section by ~62.5%
         self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
         
         # 1. New, smaller seed layer.
@@ -1430,13 +1450,13 @@ class CS2Transformer(nn.Module):
                 # Audio: cheap enough to run for all
                 aud = torch.empty(B, T, P, d, device=dev, dtype=target_dtype)
                 if torch.count_nonzero(alive):
+                    # The `mel[alive]` slice creates a 4D tensor [num_alive, C, H, W],
+                    # which our corrected AudioCNN can now handle.
                     aud_alive = self.audio_encoder(mel[alive])
-                    if aud_alive.dtype != target_dtype: aud_alive = aud_alive.to(target_dtype)
+                    if aud_alive.dtype != target_dtype:
+                        aud_alive = aud_alive.to(target_dtype)
                     aud[alive] = aud_alive
-                else:
-                    aud.zero_()  # or leave uninitialized if fully masked downstream
-
-
+                
                 # Fuse
                 player_tokens = self.player_fuser(vis, aud, alive)
 
