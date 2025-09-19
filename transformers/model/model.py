@@ -814,8 +814,12 @@ class CS2GQAAttention(nn.Module):
         elif (not self.training) and not getattr(self.cfg, "inference_use_standard_causal", True):
             # INFERENCE: frame-block causal mask
             G = self.cfg.tokens_per_frame
-            abs_end = new_cache.pos_end
-            abs_start = abs_end - L_tot
+            if use_kv_cache:
+                abs_end = new_cache.pos_end
+                abs_start = abs_end - L_tot
+            else:
+                abs_start = 0
+                abs_end   = L_tot
 
             pos_k = torch.arange(L_tot, device=x.device)
             frame_id_k = (abs_start + pos_k) // G
@@ -1223,8 +1227,8 @@ class CS2Transformer(nn.Module):
             aud = self.audio_encoder(mel).to(target_dtype)
             player_tokens = self.player_fuser(vis, aud, alive)
             
-            tok_gs = self.token_game_strategy.expand(B, T, 1, d).to(target_dtype)
-            tok_sc = self.token_scratch.expand(B, T, 1, d).to(target_dtype)
+            tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
+            tok_sc = self.token_scratch .unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
             seq = frame_tokens.reshape(B, T * Lpf, d)
 
@@ -1337,8 +1341,8 @@ class CS2Transformer(nn.Module):
                 # Fuse
                 player_tokens = self.player_fuser(vis, aud, alive)
 
-                tok_gs = self.token_game_strategy.expand(B, T, 1, d).to(target_dtype)
-                tok_sc = self.token_scratch.expand(B, T, 1, d).to(target_dtype)
+                tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
+                tok_sc = self.token_scratch .unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
                 frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2) # Concat on dim 2
 
                 seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
