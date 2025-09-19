@@ -436,6 +436,7 @@ class DINOv3VisualEncoder(nn.Module):
         Returns normalized tensor in self.compute_dtype, channels_last if enabled.
         """
         if from_uint8:
+            x = x.to(self.compute_dtype)
             x.mul_(1.0 / 255.0)
         # Ensure mean/std share dtype+device without reallocating every call
         mean = self.img_mean.to(device=x.device, dtype=self.compute_dtype)
@@ -978,34 +979,31 @@ class CS2TransformerEncoderLayer(nn.Module):
         kv_cache: Optional[KVCache] = None
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         
-        use_checkpoint = self.training and self.cfg.enable_grad_checkpoint and kv_cache is None
+        use_checkpoint = self.training and self.cfg.enable_grad_checkpoint
         
-        if use_checkpoint:
-            # --- Gradient Checkpointing Path ---
-            
+        if use_checkpoint and kv_cache is None:
+            # full checkpoint path (no cache)
             def attn_block(x_in):
                 attn_out, _ = self.attn(self.ln1(x_in), attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=None)
                 return attn_out
-
             attn_output = checkpoint(attn_block, x, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
-
             x = x + attn_output
-            
             def ff_block(x_in):
                 return self.ff(self.ln2(x_in))
-                
             ff_output = checkpoint(ff_block, x, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
             x = x + ff_output
-            
-            return x, None # No cache is updated in this path
-            
+            return x, None
         else:
-            # --- Standard Path ---
-            attn_output, updated_cache = self.attn(
-                self.ln1(x), attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=kv_cache
-            )
+            # normal attention (updates kv_cache), but still checkpoint the FFN
+            attn_output, updated_cache = self.attn(self.ln1(x), attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=kv_cache)
             x = x + attn_output
-            x = x + self.ff(self.ln2(x))
+            if use_checkpoint:
+                def ff_block(x_in):
+                    return self.ff(self.ln2(x_in))
+                ff_output = checkpoint(ff_block, x, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
+            else:
+                ff_output = self.ff(self.ln2(x))
+            x = x + ff_output
             return x, updated_cache
 
 
