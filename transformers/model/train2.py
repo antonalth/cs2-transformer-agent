@@ -397,7 +397,6 @@ class DaliInputPipeline:
             out_map, 
             auto_reset=True, 
             last_batch_policy=LastBatchPolicy.DROP,
-            prefetch_queue_depth=1
             )
 
     def _build_pipeline(self, vlists, alists, cfg):
@@ -417,7 +416,7 @@ class DaliInputPipeline:
                     dtype=types.UINT8,
                     file_list_frame_num=True, 
                     file_list_include_preceding_frame=True,
-                    initial_fill=256,
+                    initial_fill=16,
                     additional_decode_surfaces=2
                 )
                 frames = fn.transpose(video, perm=[0, 3, 1, 2])  # -> [F, C, H, W], dtype=UINT8
