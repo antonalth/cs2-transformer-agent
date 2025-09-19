@@ -970,7 +970,7 @@ class PlayerHeads(nn.Module):
         # New target shape for the position heatmap
         self.pos_shape = (8, 64, 64) # (Z, Y, X)
         
-        self.vol_feats = 64  # Latent channels for the deconv stem (tunable)
+        self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
         
         # 1. New, smaller seed layer. Projects 2048 -> 1024. (~2.1M params)
         # We will create a tiny 2x2x2 seed volume.
@@ -1054,7 +1054,7 @@ class StrategyHead(nn.Module):
         self.enemy_shape = (cfg.pos_z, cfg.pos_y, cfg.pos_x)
         
         # --- Corrected 3D Deconvolutional Head for Enemy Positions ---
-        self.vol_feats = 128  # Latent channels for the deconv stem (tunable)
+        self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
         
         self.enemy_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
         self.seed_upsampler = nn.Sequential(
@@ -1273,7 +1273,11 @@ class CS2Transformer(nn.Module):
             player_preds: List[PlayerPredictions] = []
             for i in range(num_players):
                 p_tok_flat = player_tok_all_frames[:, :, i, :].reshape(B * T, d)
-                preds_flat = self.player_head(p_tok_flat)
+                # Only checkpoint during training, and when it's enabled in the config
+                if self.training and self.cfg.enable_grad_checkpoint:
+                    preds_flat = checkpoint(self.player_head, p_tok_flat, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
+                else:
+                    preds_flat = self.player_head(p_tok_flat)
                 preds_seq = {k: v.reshape(B, T, *v.shape[1:]) for k, v in preds_flat.items()}
                 player_preds.append(preds_seq)
 
