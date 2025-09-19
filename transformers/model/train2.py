@@ -395,7 +395,7 @@ class DaliInputPipeline:
         self.iterator = DALIGenericIterator([self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP)
 
     def _build_pipeline(self, vlists, alists, cfg):
-        @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed)
+        @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=1,)
         def pipe():
             outputs = []
             for k in range(5):
@@ -411,6 +411,9 @@ class DaliInputPipeline:
                     dtype=types.UINT8,
                     file_list_frame_num=True, 
                     file_list_include_preceding_frame=True,
+                    enable_memory_stats=True,
+                    initial_fill=256,
+                    additional_decode_surfaces=2
                 )
                 frames = fn.transpose(video, perm=[0, 3, 1, 2])  # -> [F, C, H, W], dtype=UINT8
 
@@ -834,7 +837,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     data_root = os.environ.get("DATA_ROOT", "data")
     manifest_path = os.path.join(data_root, "manifest.json")
-    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=2, T_frames=64)
+    args = DataArgs(data_root=data_root, manifest=manifest_path, batch_size=1, T_frames=64)
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
