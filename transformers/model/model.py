@@ -1213,7 +1213,7 @@ class CS2Transformer(nn.Module):
                 def forward(self, images): # Takes a single 'images' tensor
                     B, T, P = images.shape[:3]
                     # Instantly return a correctly-shaped random tensor
-                    return torch.randn(B, T, P, self.d_model, device=images.device, dtype=torch.bfloat16)
+                    return torch.randn(B, T, P, self.d_model, device=images.device, dtype=torch.float16)
             self.visual_encoder = DummyVisualEncoder(d)
         else:
             self.visual_encoder = DINOv3VisualEncoder(cfg)
@@ -1460,7 +1460,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for the test.")
     parser.add_argument("--context-frames", type=int, default=1, help="Sequence length (time dimension) for the test.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
-    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="bf16", help="Compute data type.")
+    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="fp16", help="Compute data type.")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile() for the model.")
     parser.add_argument("--tensorrt", action="store_true", help="Use torch_tensorrt backend when --compile is enabled.")
     parser.add_argument("--trt-debug", action="store_true",
