@@ -222,7 +222,7 @@ class CS2Config:
     hf_norm_chunk: int = 16
     hf_compute_dtype: Literal["fp32", "fp16", "bf16"]  = "fp16"
     hf_channels_last: bool = True     # same perf
-
+    vision_backbone_hidden_size: int = 768
     # Audio
     mel_bins: int = 128
     mel_t: int = 1
