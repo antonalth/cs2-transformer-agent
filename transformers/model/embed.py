@@ -103,13 +103,12 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
         logging.warning(f"[GPU {gpu_id}] Video file not found: {video_path}")
         return None
 
-    @pipeline_def(batch_size=1, num_threads=4, device_id=gpu_id) # Batch size here is for sequences, always 1
+    @pipeline_def(batch_size=1, num_threads=4, device_id=gpu_id)
     def create_video_pipeline():
-        """DALI pipeline to decode a full video at 32 FPS."""
         video = fn.readers.video(
             device="gpu",
             filenames=[str(video_path)],
-            sequence_length=batch_size, # This is frames per sequence
+            sequence_length=batch_size,
             step=batch_size,
             normalized=False,
             image_type=types.RGB,
@@ -123,25 +122,20 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
     pipe.build()
 
     dali_iter = DALIGenericIterator(
-        [pipe],
-        ['frames'],
-        reader_name=f"VideoReader_{video_path.name}",
-        auto_reset=True,
-        last_batch_policy=LastBatchPolicy.PARTIAL
+        [pipe], ['frames'], reader_name=f"VideoReader_{video_path.name}",
+        auto_reset=True, last_batch_policy=LastBatchPolicy.PARTIAL
     )
 
     all_features = []
     try:
         with torch.no_grad():
             for batch in dali_iter:
-                # --- FIX: Squeeze the outer (NumSequences=1) dimension ---
-                # DALI returns [1, Frames, H, W, C], we need [Frames, H, W, C]
-                frames_4d = batch[0]['frames'].squeeze(0)
+                frames_5d = batch[0]['frames']
+                if frames_5d.shape[0] == 0: continue
+                frames_4d = frames_5d.squeeze(0)
                 if frames_4d.shape[0] == 0: continue
 
-                # DINOv3 encoder expects [Frames, C, H, W]
                 frames_for_model = frames_4d.permute(0, 3, 1, 2)
-
                 x = model._normalize_chunk(frames_for_model, from_uint8=True)
                 feats = model._forward_backbone_no_grad(x)
                 all_features.append(feats.cpu())
@@ -149,7 +143,7 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
         logging.error(f"[GPU {gpu_id}] Failed processing video {video_path}: {e}")
         return None
     finally:
-        dali_iter.reset()
+        # --- FIX: Remove unnecessary reset call ---
         del pipe, dali_iter
 
     if not all_features:
@@ -170,12 +164,9 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
 
     @pipeline_def(batch_size=1, num_threads=2, device_id=gpu_id)
     def create_audio_pipeline():
-        """DALI pipeline to convert a full .wav file to a stereo mel spectrogram."""
         audio_raw, _ = fn.readers.file(files=[str(wav_path)], name=f"AudioReader_{wav_path.name}")
         decoded, _ = fn.decoders.audio(audio_raw, sample_rate=dali_cfg.sample_rate, downmix=False)
-
-        left = decoded[:, 0]
-        right = decoded[:, 1]
+        left, right = decoded[:, 0], decoded[:, 1]
 
         def to_mel_db(channel_1d):
             spec = fn.spectrogram(
@@ -190,8 +181,7 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
             db = fn.to_decibels(mel, cutoff_db=dali_cfg.db_cutoff)
             return fn.transpose(db, perm=[1, 0])
 
-        mel_left = to_mel_db(left)
-        mel_right = to_mel_db(right)
+        mel_left, mel_right = to_mel_db(left), to_mel_db(right)
         mel_stereo = fn.stack(mel_left, mel_right, axis=0)
         return mel_stereo.gpu()
 
@@ -211,7 +201,7 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
         logging.error(f"[GPU {gpu_id}] Failed processing audio {wav_path}: {e}")
         return None
     finally:
-        dali_iter.reset()
+        # --- FIX: Remove unnecessary reset call ---
         del pipe, dali_iter
 
     return mel_tensor
@@ -266,8 +256,11 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
                 T_final = min(T_vid, T_aud)
 
                 if T_final > 0:
-                    atomic_save_npy(video_out_path, video_tensor[:T_final].numpy())
-                    atomic_save_npy(audio_out_path, audio_tensor[:T_final].numpy())
+                    # --- FIX: Move tensors to CPU before calling .numpy() ---
+                    video_np = video_tensor[:T_final].cpu().numpy()
+                    audio_np = audio_tensor[:T_final].cpu().numpy()
+                    atomic_save_npy(video_out_path, video_np)
+                    atomic_save_npy(audio_out_path, audio_np)
                     stats['completed'] += 1
                     logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={T_final} in {time.time()-start_time:.2f}s")
                 else:
@@ -275,12 +268,14 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
                     stats['failed'] += 1
 
             elif args.mode == "video":
-                atomic_save_npy(video_out_path, video_tensor.numpy())
+                video_np = video_tensor.cpu().numpy()
+                atomic_save_npy(video_out_path, video_np)
                 stats['completed'] += 1
                 logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={video_tensor.shape[0]} in {time.time()-start_time:.2f}s")
 
             elif args.mode == "audio":
-                atomic_save_npy(audio_out_path, audio_tensor.numpy())
+                audio_np = audio_tensor.cpu().numpy()
+                atomic_save_npy(audio_out_path, audio_np)
                 stats['completed'] += 1
                 logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={audio_tensor.shape[0]} in {time.time()-start_time:.2f}s")
 
