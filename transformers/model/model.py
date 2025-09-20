@@ -163,7 +163,7 @@ class PlayerPredictions(TypedDict):
     keyboard_logits: torch.Tensor            # [B, 31]
     eco_logits: torch.Tensor                 # [B, 224]
     inventory_logits: torch.Tensor           # [B, 128]
-    active_weapon_logits: torch.Tensor       # [B, 128]
+    active_weapon_idx: torch.Tensor       # [B, 128]
 
 class GameStrategyPredictions(TypedDict):
     enemy_pos_heatmap_logits: torch.Tensor   # [B, 8, 64, 64]
@@ -1097,7 +1097,7 @@ class PlayerHeads(nn.Module):
             "keyboard_logits": self.keyboard(token),
             "eco_logits": self.eco(token),
             "inventory_logits": self.inventory(token),
-            "active_weapon_logits": self.active_weapon(token),
+            "active_weapon_idx": self.active_weapon(token),
         }
 class StrategyHead(nn.Module):
     def __init__(self, cfg: CS2Config):
@@ -1565,7 +1565,7 @@ def main():
         assert p_pred["keyboard_logits"].shape == (B, cfg.keyboard_dim), f"Player {i} keyboard_logits shape is wrong"
         assert p_pred["eco_logits"].shape == (B, cfg.eco_dim), f"Player {i} eco_logits shape is wrong"
         assert p_pred["inventory_logits"].shape == (B, cfg.inventory_dim), f"Player {i} inventory_logits shape is wrong"
-        assert p_pred["active_weapon_logits"].shape == (B, cfg.weapon_dim), f"Player {i} active_weapon_logits shape is wrong"
+        assert p_pred["active_weapon_idx"].shape == (B, cfg.weapon_dim), f"Player {i} active_weapon_idx shape is wrong"
 
     # Strategy predictions
     strat_pred = predictions["game_strategy"]
