@@ -97,36 +97,32 @@ def atomic_save_npy(path: Path, array: np.ndarray):
 # Video Processing
 # ---------------------------
 
-@pipeline_def
-def create_video_pipeline(video_path: str, batch_size: int, device_id: int):
-    """DALI pipeline to decode a full video at 32 FPS."""
-    # DALI's video reader is powerful. By giving it a single file and a sequence_length
-    # equal to the batch_size, it will iterate through the video in chunks.
-    video, _ = fn.readers.video(
-        device="gpu",
-        filenames=[video_path],
-        sequence_length=batch_size,
-        step=batch_size, # Advance by a full batch each time
-        normalized=False,
-        image_type=types.RGB,
-        dtype=types.UINT8,
-        pad_last_batch=True, # Ensure the last partial batch is processed
-        name=f"VideoReader_{os.path.basename(video_path)}",
-    )
-    return video
-
 def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int, gpu_id: int) -> Optional[torch.Tensor]:
     """Processes a single video file and returns raw DINOv3 features."""
     if not video_path.exists():
         logging.warning(f"[GPU {gpu_id}] Video file not found: {video_path}")
         return None
 
-    pipe = create_video_pipeline(
-        video_path=str(video_path),
-        device_id=gpu_id,
-        batch_size=batch_size,
-        num_threads=4,
-    )
+    # --- FIX: Pass config arguments to the decorator, not the function ---
+    @pipeline_def(batch_size=batch_size, num_threads=4, device_id=gpu_id)
+    def create_video_pipeline():
+        """DALI pipeline to decode a full video at 32 FPS."""
+        # --- FIX: fn.readers.video returns a single DataNode here ---
+        video = fn.readers.video(
+            device="gpu",
+            filenames=[str(video_path)],
+            sequence_length=batch_size,
+            step=batch_size,
+            normalized=False,
+            image_type=types.RGB,
+            dtype=types.UINT8,
+            pad_last_batch=True,
+            name=f"VideoReader_{video_path.name}",
+        )
+        return video
+
+    # Instantiate the pipeline defined above
+    pipe = create_video_pipeline()
     pipe.build()
 
     dali_iter = DALIGenericIterator(
@@ -147,9 +143,6 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
                 # DINOv3 encoder expects [B, C, H, W]
                 frames_uint8 = frames_uint8.permute(0, 3, 1, 2)
 
-                # --- Extract RAW backbone features (pre-projection) ---
-                # This logic is adapted from DINOv3VisualEncoder.forward to get
-                # intermediate results without modifying the original class.
                 x = model._normalize_chunk(frames_uint8, from_uint8=True)
                 feats = model._forward_backbone_no_grad(x) # [B, D_raw]
                 all_features.append(feats.cpu())
@@ -165,37 +158,10 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
 
     return torch.cat(all_features, dim=0)
 
+
 # ---------------------------
 # Audio Processing
 # ---------------------------
-
-@pipeline_def
-def create_audio_pipeline(wav_path: str, dali_cfg: DaliConfig, device_id: int):
-    """DALI pipeline to convert a full .wav file to a stereo mel spectrogram."""
-    audio_raw, _ = fn.readers.file(files=[wav_path], name=f"AudioReader_{os.path.basename(wav_path)}")
-    decoded, _ = fn.decoders.audio(audio_raw, sample_rate=dali_cfg.sample_rate, downmix=False)
-
-    left = decoded[:, 0]
-    right = decoded[:, 1]
-
-    def to_mel_db(channel_1d):
-        spec = fn.spectrogram(
-            channel_1d, nfft=dali_cfg.nfft,
-            window_length=dali_cfg.window_length, window_step=dali_cfg.hop_length,
-            center_windows=False
-        )
-        mel = fn.mel_filter_bank(
-            spec, sample_rate=dali_cfg.sample_rate,
-            nfilter=dali_cfg.mel_bins, freq_high=dali_cfg.mel_fmax
-        )
-        db = fn.to_decibels(mel, cutoff_db=dali_cfg.db_cutoff)
-        return fn.transpose(db, perm=[1, 0]) # -> [time, n_mels]
-
-    mel_left = to_mel_db(left)
-    mel_right = to_mel_db(right)
-    # Stack to [2, time, n_mels] to match training pipeline intermediate shape
-    mel_stereo = fn.stack(mel_left, mel_right, axis=0)
-    return mel_stereo.gpu()
 
 def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional[torch.Tensor]:
     """Processes a single audio file and returns a stereo mel spectrogram."""
@@ -203,13 +169,35 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
         logging.warning(f"[GPU {gpu_id}] Audio file not found: {wav_path}")
         return None
 
-    pipe = create_audio_pipeline(
-        wav_path=str(wav_path),
-        dali_cfg=dali_cfg,
-        device_id=gpu_id,
-        batch_size=1, # One file at a time
-        num_threads=2,
-    )
+    # --- FIX: Pass config arguments to the decorator ---
+    @pipeline_def(batch_size=1, num_threads=2, device_id=gpu_id)
+    def create_audio_pipeline():
+        """DALI pipeline to convert a full .wav file to a stereo mel spectrogram."""
+        audio_raw, _ = fn.readers.file(files=[str(wav_path)], name=f"AudioReader_{wav_path.name}")
+        decoded, _ = fn.decoders.audio(audio_raw, sample_rate=dali_cfg.sample_rate, downmix=False)
+
+        left = decoded[:, 0]
+        right = decoded[:, 1]
+
+        def to_mel_db(channel_1d):
+            spec = fn.spectrogram(
+                channel_1d, nfft=dali_cfg.nfft,
+                window_length=dali_cfg.window_length, window_step=dali_cfg.hop_length,
+                center_windows=False
+            )
+            mel = fn.mel_filter_bank(
+                spec, sample_rate=dali_cfg.sample_rate,
+                nfilter=dali_cfg.mel_bins, freq_high=dali_cfg.mel_fmax
+            )
+            db = fn.to_decibels(mel, cutoff_db=dali_cfg.db_cutoff)
+            return fn.transpose(db, perm=[1, 0])
+
+        mel_left = to_mel_db(left)
+        mel_right = to_mel_db(right)
+        mel_stereo = fn.stack(mel_left, mel_right, axis=0)
+        return mel_stereo.gpu()
+
+    pipe = create_audio_pipeline()
     pipe.build()
 
     dali_iter = DALIGenericIterator(
@@ -218,11 +206,9 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
     )
 
     try:
-        # The pipeline processes the entire file and returns one item
         mel_batch = next(iter(dali_iter))
         mel_tensor = mel_batch[0]['mel'].squeeze(0) # [2, T, Mels]
-        # Permute to spec: [T, Mels, 2] for [T, n_mels, channels]
-        mel_tensor = mel_tensor.permute(1, 2, 0)
+        mel_tensor = mel_tensor.permute(1, 2, 0) # [T, Mels, 2]
     except Exception as e:
         logging.error(f"[GPU {gpu_id}] Failed processing audio {wav_path}: {e}")
         return None
@@ -241,7 +227,6 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
     gpu_id = rank
     torch.cuda.set_device(gpu_id)
     
-    # --- Setup models and configs once per worker ---
     dali_cfg = DaliConfig(fps=FPS)
     cs2_cfg = CS2Config()
     
@@ -254,7 +239,6 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
             logging.error(f"[GPU {gpu_id}] Failed to initialize DINOv3 model: {e}")
             return
 
-    # Process assigned jobs
     num_jobs = len(jobs)
     for i in range(rank, num_jobs, world_size):
         job = jobs[i]
@@ -265,11 +249,9 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
         try:
             video_tensor, audio_tensor = None, None
             
-            # --- Process Video ---
             if args.mode in ["video", "both"]:
                 video_tensor = process_video(video_in_path, video_model, args.batch_size, gpu_id)
             
-            # --- Process Audio ---
             if args.mode in ["audio", "both"]:
                 audio_tensor = process_audio(audio_in_path, dali_cfg, gpu_id)
 
@@ -280,7 +262,6 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
                 stats['failed'] += 1
                 continue
 
-            # --- Align and Save ---
             if args.mode == "both":
                 T_vid = video_tensor.shape[0]
                 T_aud = audio_tensor.shape[0]
@@ -306,7 +287,7 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
                 logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={audio_tensor.shape[0]} in {time.time()-start_time:.2f}s")
 
         except Exception as e:
-            logging.error(f"[GPU {gpu_id}] Unhandled error on job {md5}/{name}: {e}", exc_info=True)
+            logging.error(f"[GPU {gpu_id}] Unhandled error on job {md5}/{name}: {e}", exc_info=False) # exc_info=False to reduce noise
             stats['failed'] += 1
 
 def main():
@@ -328,10 +309,10 @@ def main():
         logging.error(f"Recordings directory not found at: {recordings_dir}")
         return
 
-    # --- 1. Discover all potential jobs ---
     logging.info("Discovering media files...")
     all_files = defaultdict(dict)
-    for p in tqdm(list(recordings_dir.rglob("*.mp4")) + list(recordings_dir.rglob("*.wav"))):
+    media_files = list(recordings_dir.rglob("*.mp4")) + list(recordings_dir.rglob("*.wav"))
+    for p in tqdm(media_files, desc="Scanning files"):
         md5 = p.parent.name
         name = p.stem
         key = (md5, name)
@@ -340,7 +321,6 @@ def main():
         elif p.suffix == '.wav':
             all_files[key]['audio'] = p
     
-    # --- 2. Create and filter job list ---
     jobs = []
     skipped_count = 0
     for (md5, name), paths in all_files.items():
@@ -349,15 +329,13 @@ def main():
         video_out = vit_embed_dir / md5 / f"{name}.npy"
         audio_out = aud_embed_dir / md5 / f"{name}.npy"
 
-        # Check if job should be skipped
         if not args.overwrite:
-            video_done = (args.mode != "video" and args.mode != "both") or video_out.exists()
-            audio_done = (args.mode != "audio" and args.mode != "both") or audio_out.exists()
+            video_done = (args.mode not in ["video", "both"]) or video_out.exists()
+            audio_done = (args.mode not in ["audio", "both"]) or audio_out.exists()
             if video_done and audio_done:
                 skipped_count += 1
                 continue
         
-        # Check if required source files exist for the mode
         if args.mode in ["video", "both"] and not video_in:
             continue
         if args.mode in ["audio", "both"] and not audio_in:
@@ -373,7 +351,6 @@ def main():
         logging.info("Nothing to do.")
         return
 
-    # --- 3. Spawn workers ---
     num_gpus = torch.cuda.device_count()
     world_size = args.num_workers if args.num_workers is not None else num_gpus
     if world_size == 0:
@@ -385,7 +362,6 @@ def main():
     with mp.Manager() as manager:
         stats = manager.dict({'completed': 0, 'failed': 0})
         
-        # Use spawn context for CUDA safety
         mp.set_start_method("spawn", force=True)
         processes = []
         for rank in range(world_size):
@@ -393,7 +369,6 @@ def main():
             p.start()
             processes.append(p)
 
-        # Monitor progress with tqdm
         with tqdm(total=len(jobs), desc="Processing files") as pbar:
             completed_last = 0
             failed_last = 0
@@ -405,11 +380,9 @@ def main():
                 failed_last = failed_now
                 time.sleep(1)
             
-            # Final update
             completed_now = stats['completed']
             failed_now = stats['failed']
             pbar.update((completed_now - completed_last) + (failed_now - failed_last))
-
 
         for p in processes:
             p.join()
