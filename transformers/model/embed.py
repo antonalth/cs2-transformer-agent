@@ -45,7 +45,7 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 
 # Reuse components from the training scripts
-from train2 import DaliConfig, TICK_RATE, FPS
+from train2 import DaliConfig, FPS
 from model import CS2Config, DINOv3VisualEncoder
 
 # --- Try to import DALI ---
@@ -87,7 +87,6 @@ def atomic_save_npy(path: Path, array: np.ndarray):
     with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, delete=False) as f:
         np.save(f, array)
         temp_path = f.name
-    # Ensure data is written to disk before renaming
     if hasattr(os, 'fsync'):
         with open(temp_path, 'rb') as f:
             os.fsync(f.fileno())
@@ -114,96 +113,70 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
             image_type=types.RGB,
             dtype=types.UINT8,
             pad_last_batch=True,
+            # --- FIX: Explicitly set parameter to silence future-proofing warning ---
+            file_list_include_preceding_frame=False,
             name=f"VideoReader_{video_path.name}",
         )
         return video
 
     pipe = create_video_pipeline()
     pipe.build()
-
     dali_iter = DALIGenericIterator(
         [pipe], ['frames'], reader_name=f"VideoReader_{video_path.name}",
         auto_reset=True, last_batch_policy=LastBatchPolicy.PARTIAL
     )
-
     all_features = []
     try:
         with torch.no_grad():
             for batch in dali_iter:
                 frames_5d = batch[0]['frames']
-                if frames_5d.shape[0] == 0: continue
+                if frames_5d.nelement() == 0: continue
                 frames_4d = frames_5d.squeeze(0)
-                if frames_4d.shape[0] == 0: continue
-
+                if frames_4d.nelement() == 0: continue
                 frames_for_model = frames_4d.permute(0, 3, 1, 2)
                 x = model._normalize_chunk(frames_for_model, from_uint8=True)
                 feats = model._forward_backbone_no_grad(x)
                 all_features.append(feats.cpu())
     except Exception as e:
-        logging.error(f"[GPU {gpu_id}] Failed processing video {video_path}: {e}")
+        logging.error(f"[GPU {gpu_id}] Failed processing video {video_path}: {e}", exc_info=True)
         return None
     finally:
-        # --- FIX: Remove unnecessary reset call ---
         del pipe, dali_iter
-
-    if not all_features:
-        return None
-
+    if not all_features: return None
     return torch.cat(all_features, dim=0)
-
 
 # ---------------------------
 # Audio Processing
 # ---------------------------
 
 def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional[torch.Tensor]:
-    """Processes a single audio file and returns a stereo mel spectrogram."""
     if not wav_path.exists():
         logging.warning(f"[GPU {gpu_id}] Audio file not found: {wav_path}")
         return None
-
     @pipeline_def(batch_size=1, num_threads=2, device_id=gpu_id)
     def create_audio_pipeline():
         audio_raw, _ = fn.readers.file(files=[str(wav_path)], name=f"AudioReader_{wav_path.name}")
         decoded, _ = fn.decoders.audio(audio_raw, sample_rate=dali_cfg.sample_rate, downmix=False)
         left, right = decoded[:, 0], decoded[:, 1]
-
         def to_mel_db(channel_1d):
-            spec = fn.spectrogram(
-                channel_1d, nfft=dali_cfg.nfft,
-                window_length=dali_cfg.window_length, window_step=dali_cfg.hop_length,
-                center_windows=False
-            )
-            mel = fn.mel_filter_bank(
-                spec, sample_rate=dali_cfg.sample_rate,
-                nfilter=dali_cfg.mel_bins, freq_high=dali_cfg.mel_fmax
-            )
+            spec = fn.spectrogram(channel_1d, nfft=dali_cfg.nfft, window_length=dali_cfg.window_length, window_step=dali_cfg.hop_length, center_windows=False)
+            mel = fn.mel_filter_bank(spec, sample_rate=dali_cfg.sample_rate, nfilter=dali_cfg.mel_bins, freq_high=dali_cfg.mel_fmax)
             db = fn.to_decibels(mel, cutoff_db=dali_cfg.db_cutoff)
             return fn.transpose(db, perm=[1, 0])
-
         mel_left, mel_right = to_mel_db(left), to_mel_db(right)
         mel_stereo = fn.stack(mel_left, mel_right, axis=0)
         return mel_stereo.gpu()
-
     pipe = create_audio_pipeline()
     pipe.build()
-
-    dali_iter = DALIGenericIterator(
-        [pipe], ['mel'], reader_name=f"AudioReader_{wav_path.name}",
-        auto_reset=True, last_batch_policy=LastBatchPolicy.FILL
-    )
-
+    dali_iter = DALIGenericIterator([pipe], ['mel'], reader_name=f"AudioReader_{wav_path.name}", auto_reset=True, last_batch_policy=LastBatchPolicy.FILL)
     try:
         mel_batch = next(iter(dali_iter))
-        mel_tensor = mel_batch[0]['mel'].squeeze(0)
-        mel_tensor = mel_tensor.permute(1, 2, 0)
+        mel_tensor = mel_batch[0]['mel'].squeeze(0).permute(1, 2, 0)
     except Exception as e:
-        logging.error(f"[GPU {gpu_id}] Failed processing audio {wav_path}: {e}")
+        logging.error(f"[GPU {gpu_id}] Failed processing audio {wav_path}: {e}", exc_info=True)
         return None
     finally:
-        # --- FIX: Remove unnecessary reset call ---
         del pipe, dali_iter
-
     return mel_tensor
 
 # ---------------------------
@@ -211,93 +184,69 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
 # ---------------------------
 
 def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict):
-    """The main worker process function, assigned to a specific GPU."""
     gpu_id = rank
     torch.cuda.set_device(gpu_id)
-
     dali_cfg = DaliConfig(fps=FPS)
     cs2_cfg = CS2Config()
-
     video_model = None
     if args.mode in ["video", "both"]:
         try:
-            video_model = DINOv3VisualEncoder(cs2_cfg)
-            video_model.to(torch.bfloat16).to(gpu_id).eval()
+            video_model = DINOv3VisualEncoder(cs2_cfg).to(torch.bfloat16).to(gpu_id).eval()
         except Exception as e:
             logging.error(f"[GPU {gpu_id}] Failed to initialize DINOv3 model: {e}")
             return
-
-    num_jobs = len(jobs)
-    for i in range(rank, num_jobs, world_size):
-        job = jobs[i]
-        md5, name, video_in_path, audio_in_path, video_out_path, audio_out_path = job
-
+    for i in range(rank, len(jobs), world_size):
+        md5, name, video_in_path, audio_in_path, video_out_path, audio_out_path = jobs[i]
         start_time = time.time()
-
         try:
+            logging.info(f"[GPU {gpu_id}] Starting job {md5}/{name}...")
             video_tensor, audio_tensor = None, None
-
             if args.mode in ["video", "both"]:
                 video_tensor = process_video(video_in_path, video_model, args.batch_size, gpu_id)
-
+                if video_tensor is not None:
+                    logging.info(f"[GPU {gpu_id}] -> Video processed for {name} (T={video_tensor.shape[0]})")
             if args.mode in ["audio", "both"]:
                 audio_tensor = process_audio(audio_in_path, dali_cfg, gpu_id)
+                if audio_tensor is not None:
+                    logging.info(f"[GPU {gpu_id}] -> Audio processed for {name} (T={audio_tensor.shape[0]})")
 
-            if video_tensor is None and args.mode in ["video", "both"]:
-                stats['failed'] += 1
-                continue
-            if audio_tensor is None and args.mode in ["audio", "both"]:
+            if (video_tensor is None and args.mode in ["video", "both"]) or \
+               (audio_tensor is None and args.mode in ["audio", "both"]):
                 stats['failed'] += 1
                 continue
 
             if args.mode == "both":
-                T_vid = video_tensor.shape[0]
-                T_aud = audio_tensor.shape[0]
+                T_vid, T_aud = video_tensor.shape[0], audio_tensor.shape[0]
                 T_final = min(T_vid, T_aud)
-
                 if T_final > 0:
-                    # --- FIX: Move tensors to CPU before calling .numpy() ---
-                    video_np = video_tensor[:T_final].cpu().numpy()
-                    audio_np = audio_tensor[:T_final].cpu().numpy()
-                    atomic_save_npy(video_out_path, video_np)
-                    atomic_save_npy(audio_out_path, audio_np)
-                    stats['completed'] += 1
-                    logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={T_final} in {time.time()-start_time:.2f}s")
+                    logging.info(f"[GPU {gpu_id}] -> Writing aligned (T={T_final}) outputs for {name}...")
+                    atomic_save_npy(video_out_path, video_tensor[:T_final].cpu().numpy())
+                    atomic_save_npy(audio_out_path, audio_tensor[:T_final].cpu().numpy())
                 else:
-                    logging.warning(f"[GPU {gpu_id}] Skipped {md5}/{name} due to zero-length output.")
+                    logging.warning(f"[GPU {gpu_id}] Skipped {md5}/{name} due to zero-length aligned output.")
                     stats['failed'] += 1
-
+                    continue
             elif args.mode == "video":
-                video_np = video_tensor.cpu().numpy()
-                atomic_save_npy(video_out_path, video_np)
-                stats['completed'] += 1
-                logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={video_tensor.shape[0]} in {time.time()-start_time:.2f}s")
-
+                logging.info(f"[GPU {gpu_id}] -> Writing video output for {name}...")
+                atomic_save_npy(video_out_path, video_tensor.cpu().numpy())
             elif args.mode == "audio":
-                audio_np = audio_tensor.cpu().numpy()
-                atomic_save_npy(audio_out_path, audio_np)
-                stats['completed'] += 1
-                logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={audio_tensor.shape[0]} in {time.time()-start_time:.2f}s")
-
+                logging.info(f"[GPU {gpu_id}] -> Writing audio output for {name}...")
+                atomic_save_npy(audio_out_path, audio_tensor.cpu().numpy())
+            
+            stats['completed'] += 1
+            logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} in {time.time()-start_time:.2f}s")
         except Exception as e:
             logging.error(f"[GPU {gpu_id}] Unhandled error on job {md5}/{name}: {e}", exc_info=False)
             stats['failed'] += 1
 
 def main():
-    """Main function to discover files and spawn worker processes."""
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
     if not DALI_AVAILABLE:
-        logging.error("NVIDIA DALI is not available or failed to import. This script cannot run.")
-        logging.error(f"Import Error: {DALI_IMPORT_ERROR}")
+        logging.error("NVIDIA DALI not available. This script cannot run. Error: %s", DALI_IMPORT_ERROR)
         return
-
-    data_root = Path(args.data_root)
-    recordings_dir = data_root / "recordings"
-    vit_embed_dir = data_root / "vit_embed"
-    aud_embed_dir = data_root / "aud_embed"
-
+    data_root, recordings_dir = Path(args.data_root), Path(args.data_root) / "recordings"
+    vit_embed_dir, aud_embed_dir = data_root / "vit_embed", data_root / "aud_embed"
     if not recordings_dir.is_dir():
         logging.error(f"Recordings directory not found at: {recordings_dir}")
         return
@@ -306,85 +255,54 @@ def main():
     all_files = defaultdict(dict)
     media_files = list(recordings_dir.rglob("*.mp4")) + list(recordings_dir.rglob("*.wav"))
     for p in tqdm(media_files, desc="Scanning files"):
-        md5 = p.parent.name
-        name = p.stem
-        key = (md5, name)
-        if p.suffix == '.mp4':
-            all_files[key]['video'] = p
-        elif p.suffix == '.wav':
-            all_files[key]['audio'] = p
+        md5, name = p.parent.name, p.stem
+        all_files[(md5, name)]['video' if p.suffix == '.mp4' else 'audio'] = p
 
-    jobs = []
-    skipped_count = 0
+    jobs, skipped_count = [], 0
     for (md5, name), paths in all_files.items():
-        video_in = paths.get('video')
-        audio_in = paths.get('audio')
-        video_out = vit_embed_dir / md5 / f"{name}.npy"
-        audio_out = aud_embed_dir / md5 / f"{name}.npy"
-
+        video_in, audio_in = paths.get('video'), paths.get('audio')
+        video_out, audio_out = vit_embed_dir / md5 / f"{name}.npy", aud_embed_dir / md5 / f"{name}.npy"
         if not args.overwrite:
             video_done = (args.mode not in ["video", "both"]) or video_out.exists()
             audio_done = (args.mode not in ["audio", "both"]) or audio_out.exists()
             if video_done and audio_done:
                 skipped_count += 1
                 continue
-
-        if args.mode in ["video", "both"] and not video_in:
+        if (args.mode in ["video", "both"] and not video_in) or \
+           (args.mode in ["audio", "both"] and not audio_in):
             continue
-        if args.mode in ["audio", "both"] and not audio_in:
-            continue
-
         jobs.append((md5, name, video_in, audio_in, video_out, audio_out))
-
-    if args.limit:
-        jobs = jobs[:args.limit]
-
+    if args.limit: jobs = jobs[:args.limit]
+    
     logging.info(f"Found {len(jobs)} jobs to process. Skipped {skipped_count} already completed jobs.")
     if not jobs:
         logging.info("Nothing to do.")
         return
 
-    num_gpus = torch.cuda.device_count()
-    world_size = args.num_workers if args.num_workers is not None else num_gpus
+    world_size = args.num_workers if args.num_workers is not None else torch.cuda.device_count()
     if world_size == 0:
         logging.error("No CUDA-enabled GPUs found.")
         return
-
     logging.info(f"Spawning {world_size} worker processes...")
-
     with mp.Manager() as manager:
         stats = manager.dict({'completed': 0, 'failed': 0})
-
         mp.set_start_method("spawn", force=True)
-        processes = []
-        for rank in range(world_size):
-            p = mp.Process(target=worker, args=(rank, world_size, jobs, args, stats))
-            p.start()
-            processes.append(p)
-
+        processes = [mp.Process(target=worker, args=(rank, world_size, jobs, args, stats)) for rank in range(world_size)]
+        for p in processes: p.start()
         with tqdm(total=len(jobs), desc="Processing files") as pbar:
-            completed_last = 0
-            failed_last = 0
+            completed_last, failed_last = 0, 0
             while any(p.is_alive() for p in processes):
-                completed_now = stats['completed']
-                failed_now = stats['failed']
+                completed_now, failed_now = stats['completed'], stats['failed']
                 pbar.update((completed_now - completed_last) + (failed_now - failed_last))
-                completed_last = completed_now
-                failed_last = failed_now
+                completed_last, failed_last = completed_now, failed_now
                 time.sleep(1)
-
-            completed_now = stats['completed']
-            failed_now = stats['failed']
+            completed_now, failed_now = stats['completed'], stats['failed']
             pbar.update((completed_now - completed_last) + (failed_now - failed_last))
-
-        for p in processes:
-            p.join()
-
+        for p in processes: p.join()
         logging.info("--- Processing Complete ---")
         logging.info(f"Successfully processed: {stats['completed']} items")
         logging.info(f"Failed to process: {stats['failed']} items")
         logging.info(f"Skipped (pre-existing): {skipped_count} items")
-
 
 if __name__ == "__main__":
     main()
