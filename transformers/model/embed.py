@@ -38,6 +38,7 @@ import tempfile
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -97,12 +98,12 @@ def atomic_save_npy(path: Path, array: np.ndarray):
 # ---------------------------
 
 def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int, gpu_id: int) -> Optional[torch.Tensor]:
-    """Processes a single video file and returns raw DINOv3 features."""
     if not video_path.exists():
         logging.warning(f"[GPU {gpu_id}] Video file not found: {video_path}")
         return None
 
-    @pipeline_def(batch_size=1, num_threads=4, device_id=gpu_id)
+    # --- OPTIMIZATION: Increase prefetch queue depth ---
+    @pipeline_def(batch_size=1, num_threads=4, device_id=gpu_id, prefetch_queue_depth=3)
     def create_video_pipeline():
         video = fn.readers.video(
             device="gpu",
@@ -135,7 +136,7 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
                 frames_for_model = frames_4d.permute(0, 3, 1, 2)
                 x = model._normalize_chunk(frames_for_model, from_uint8=True)
                 feats = model._forward_backbone_no_grad(x)
-                all_features.append(feats.cpu())
+                all_features.append(feats) # Keep features on GPU for now
     except Exception as e:
         logging.error(f"[GPU {gpu_id}] Failed processing video {video_path}: {e}", exc_info=True)
         return None
@@ -152,7 +153,9 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
     if not wav_path.exists():
         logging.warning(f"[GPU {gpu_id}] Audio file not found: {wav_path}")
         return None
-    @pipeline_def(batch_size=1, num_threads=2, device_id=gpu_id)
+        
+    # --- OPTIMIZATION: Increase prefetch queue depth ---
+    @pipeline_def(batch_size=1, num_threads=2, device_id=gpu_id, prefetch_queue_depth=3)
     def create_audio_pipeline():
         audio_raw, _ = fn.readers.file(files=[str(wav_path)], name=f"AudioReader_{wav_path.name}")
         decoded, _ = fn.decoders.audio(audio_raw, sample_rate=dali_cfg.sample_rate, downmix=False)
@@ -165,6 +168,7 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
         mel_left, mel_right = to_mel_db(left), to_mel_db(right)
         mel_stereo = fn.stack(mel_left, mel_right, axis=0)
         return mel_stereo.gpu()
+        
     pipe = create_audio_pipeline()
     pipe.build()
     dali_iter = DALIGenericIterator([pipe], ['mel'], reader_name=f"AudioReader_{wav_path.name}", auto_reset=True, last_batch_policy=LastBatchPolicy.FILL)
@@ -182,14 +186,18 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
 # Worker & Main Logic
 # ---------------------------
 
-def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict):
-    # --- FIX: Configure logging for each spawned worker process ---
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def save_results_background(future):
+    """Callback to check for exceptions in the background save thread."""
+    try:
+        future.result()
+    except Exception as e:
+        logging.error(f"Error during background save: {e}", exc_info=True)
 
+def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict):
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     gpu_id = rank
     torch.cuda.set_device(gpu_id)
-    dali_cfg = DaliConfig(fps=FPS)
-    cs2_cfg = CS2Config()
+    dali_cfg, cs2_cfg = DaliConfig(fps=FPS), CS2Config()
     video_model = None
     if args.mode in ["video", "both"]:
         try:
@@ -197,60 +205,69 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
         except Exception as e:
             logging.error(f"[GPU {gpu_id}] Failed to initialize DINOv3 model: {e}")
             return
-    for i in range(rank, len(jobs), world_size):
-        md5, name, video_in_path, audio_in_path, video_out_path, audio_out_path = jobs[i]
-        start_time = time.time()
-        try:
-            logging.info(f"[GPU {gpu_id}] Starting job {md5}/{name}...")
-            video_tensor, audio_tensor = None, None
-            if args.mode in ["video", "both"]:
-                video_tensor = process_video(video_in_path, video_model, args.batch_size, gpu_id)
-                if video_tensor is not None:
-                    logging.info(f"[GPU {gpu_id}] -> Video processed for {name} (T={video_tensor.shape[0]})")
-            if args.mode in ["audio", "both"]:
-                audio_tensor = process_audio(audio_in_path, dali_cfg, gpu_id)
-                if audio_tensor is not None:
-                    logging.info(f"[GPU {gpu_id}] -> Audio processed for {name} (T={audio_tensor.shape[0]})")
 
-            if (video_tensor is None and args.mode in ["video", "both"]) or \
-               (audio_tensor is None and args.mode in ["audio", "both"]):
-                stats['failed'] += 1
-                continue
+    # --- OPTIMIZATION: Thread pool for overlapping CPU-bound saving ---
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = None
+        for i in range(rank, len(jobs), world_size):
+            md5, name, video_in_path, audio_in_path, video_out_path, audio_out_path = jobs[i]
+            
+            # Before starting new work, ensure the previous save job is finished
+            if future:
+                future.result() # Wait for the last save to complete
 
-            if args.mode == "both":
-                T_vid, T_aud = video_tensor.shape[0], audio_tensor.shape[0]
-                T_final = min(T_vid, T_aud)
-                if T_final > 0:
-                    logging.info(f"[GPU {gpu_id}] -> Writing aligned (T={T_final}) outputs for {name}...")
-                    atomic_save_npy(video_out_path, video_tensor[:T_final].cpu().numpy())
-                    atomic_save_npy(audio_out_path, audio_tensor[:T_final].cpu().numpy())
-                else:
-                    logging.warning(f"[GPU {gpu_id}] Skipped {md5}/{name} due to zero-length aligned output.")
+            start_time = time.time()
+            try:
+                logging.info(f"[GPU {gpu_id}] Starting job {md5}/{name}...")
+                video_tensor, audio_tensor = None, None
+                if args.mode in ["video", "both"]: video_tensor = process_video(video_in_path, video_model, args.batch_size, gpu_id)
+                if args.mode in ["audio", "both"]: audio_tensor = process_audio(audio_in_path, dali_cfg, gpu_id)
+                
+                if (video_tensor is None and args.mode in ["video", "both"]) or \
+                   (audio_tensor is None and args.mode in ["audio", "both"]):
                     stats['failed'] += 1
                     continue
-            elif args.mode == "video":
-                logging.info(f"[GPU {gpu_id}] -> Writing video output for {name}...")
-                atomic_save_npy(video_out_path, video_tensor.cpu().numpy())
-            elif args.mode == "audio":
-                logging.info(f"[GPU {gpu_id}] -> Writing audio output for {name}...")
-                atomic_save_npy(audio_out_path, audio_tensor.cpu().numpy())
-            
-            stats['completed'] += 1
-            logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} in {time.time()-start_time:.2f}s")
-        except Exception as e:
-            logging.error(f"[GPU {gpu_id}] Unhandled error on job {md5}/{name}: {e}", exc_info=False)
-            stats['failed'] += 1
+                
+                # --- Submit save job to background thread ---
+                def save_job():
+                    if args.mode == "both":
+                        T_final = min(video_tensor.shape[0], audio_tensor.shape[0])
+                        if T_final > 0:
+                            atomic_save_npy(video_out_path, video_tensor[:T_final].cpu().numpy())
+                            atomic_save_npy(audio_out_path, audio_tensor[:T_final].cpu().numpy())
+                        else:
+                            logging.warning(f"[GPU {gpu_id}] Skipped {name} due to zero-length output.")
+                            # This path doesn't increment stats to avoid double counting
+                            return
+                    elif args.mode == "video":
+                        atomic_save_npy(video_out_path, video_tensor.cpu().numpy())
+                    elif args.mode == "audio":
+                        atomic_save_npy(audio_out_path, audio_tensor.cpu().numpy())
+                    
+                    stats['completed'] += 1
+                    logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} in {time.time()-start_time:.2f}s")
+                
+                future = executor.submit(save_job)
+                future.add_done_callback(save_results_background)
+
+            except Exception as e:
+                logging.error(f"[GPU {gpu_id}] Unhandled error on job {md5}/{name}: {e}", exc_info=False)
+                stats['failed'] += 1
+        
+        # Wait for the very last job to finish saving
+        if future:
+            future.result()
 
 def main():
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     if not DALI_AVAILABLE:
-        logging.error("NVIDIA DALI not available. This script cannot run. Error: %s", DALI_IMPORT_ERROR)
+        logging.error("NVIDIA DALI not available. Error: %s", DALI_IMPORT_ERROR)
         return
     data_root, recordings_dir = Path(args.data_root), Path(args.data_root) / "recordings"
     vit_embed_dir, aud_embed_dir = data_root / "vit_embed", data_root / "aud_embed"
     if not recordings_dir.is_dir():
-        logging.error(f"Recordings directory not found at: {recordings_dir}")
+        logging.error(f"Recordings directory not found: {recordings_dir}")
         return
 
     logging.info("Discovering media files...")
