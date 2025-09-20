@@ -447,9 +447,9 @@ class DaliInputPipeline:
             outputs = []
             for k in range(5):
                 # Video Embeddings from NPY
-                # FIX: Replaced fn.readers.numpy with fn.numpy_reader
-                vid_embed_raw, packed_label = fn.numpy_reader(
-                    name=f"VidNpy{k}", file_list=vlists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle
+                vid_embed_raw, packed_label = fn.readers.numpy(
+                    name=f"VidNpy{k}", file_list=vlists[k], shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards, random_shuffle=cfg.shuffle, stick_to_shard=True
                 )
                 packed_i64 = fn.cast(packed_label, dtype=types.INT64)
                 sample_id_i64 = packed_i64 // LABEL_SCALE
@@ -463,10 +463,11 @@ class DaliInputPipeline:
                 )
 
                 # Audio Embeddings (Spectrograms) from NPY
-                # FIX: Replaced fn.readers.numpy with fn.numpy_reader
-                aud_embed_raw, _ = fn.numpy_reader(
-                    name=f"AudNpy{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle
+                aud_embed_raw, _ = fn.readers.numpy(
+                    name=f"AudNpy{k}", file_list=alists[k], shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards, random_shuffle=cfg.shuffle, stick_to_shard=True
                 )
+
                 audio_embed = fn.slice(
                     aud_embed_raw.gpu(), start=slice_start, shape=[cfg.sequence_length],
                     axes=[0], out_of_bounds_policy="pad", fill_values=0.0
