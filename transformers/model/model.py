@@ -246,11 +246,11 @@ class CS2Config:
     # {"type": "linear", "factor": 2.0}                   # 2× context
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
     
-    enable_cached_training: bool = True
+    enable_cached_training: bool = False
     cached_chunk_T: int = 32
     cached_detach: bool = True
     
-    enable_grad_checkpoint: bool = True
+    enable_grad_checkpoint: bool = False
     grad_ckpt_use_reentrant: bool = False
 
 @dataclass
