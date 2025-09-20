@@ -174,6 +174,7 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
     dali_iter = DALIGenericIterator([pipe], ['mel'], reader_name=f"AudioReader_{wav_path.name}", auto_reset=True, last_batch_policy=LastBatchPolicy.FILL)
     try:
         mel_batch = next(iter(dali_iter))
+        # Original shape [1, C, T, Mel] -> Squeeze to [C, T, Mel] -> Permute to [T, Mel, C] for saving
         mel_tensor = mel_batch[0]['mel'].squeeze(0).permute(1, 2, 0)
     except Exception as e:
         logging.error(f"[GPU {gpu_id}] Failed processing audio {wav_path}: {e}", exc_info=True)
@@ -233,16 +234,23 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
                     if args.mode == "both":
                         T_final = min(video_tensor.shape[0], audio_tensor.shape[0])
                         if T_final > 0:
-                            atomic_save_npy(video_out_path, video_tensor[:T_final].cpu().numpy())
-                            atomic_save_npy(audio_out_path, audio_tensor[:T_final].cpu().numpy())
+                            # FIX: Cast to float16 for smaller files and DALI compatibility
+                            video_np = video_tensor[:T_final].cpu().to(torch.float16).numpy()
+                            audio_np = audio_tensor[:T_final].cpu().to(torch.float16).numpy()
+                            atomic_save_npy(video_out_path, video_np)
+                            atomic_save_npy(audio_out_path, audio_np)
                         else:
                             logging.warning(f"[GPU {gpu_id}] Skipped {name} due to zero-length output.")
                             # This path doesn't increment stats to avoid double counting
                             return
                     elif args.mode == "video":
-                        atomic_save_npy(video_out_path, video_tensor.cpu().numpy())
+                        # FIX: Cast to float16
+                        video_np = video_tensor.cpu().to(torch.float16).numpy()
+                        atomic_save_npy(video_out_path, video_np)
                     elif args.mode == "audio":
-                        atomic_save_npy(audio_out_path, audio_tensor.cpu().numpy())
+                        # FIX: Cast to float16
+                        audio_np = audio_tensor.cpu().to(torch.float16).numpy()
+                        atomic_save_npy(audio_out_path, audio_np)
                     
                     stats['completed'] += 1
                     logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} in {time.time()-start_time:.2f}s")

@@ -370,15 +370,14 @@ class FilelistWriter:
             for rec in records:
                 if self.use_precomputed:
                     # PATH 1: Pre-computed .npy files
-                    # The filename is based on the round, not the individual POV.
-                    base_name = os.path.splitext(os.path.basename(rec.pov_videos[0]))[0]
-                    vid_npy_path = os.path.join(self.data_root, "vit_embed", rec.demoname, f"{base_name}.npy")
-                    aud_npy_path = os.path.join(self.data_root, "aud_embed", rec.demoname, f"{base_name}.npy")
-
                     # Label encodes sample_id and the start frame for slicing in DALI
                     packed_label = rec.sample_id * LABEL_SCALE + rec.start_f
-                    
                     for k in range(5):
+                        # FIX: Use the specific filename stem for each POV's video and audio
+                        vid_base = os.path.splitext(os.path.basename(rec.pov_videos[k]))[0]
+                        aud_base = os.path.splitext(os.path.basename(rec.pov_audio[k]))[0]
+                        vid_npy_path = os.path.join(self.data_root, "vit_embed", rec.demoname, f"{vid_base}.npy")
+                        aud_npy_path = os.path.join(self.data_root, "aud_embed", rec.demoname, f"{aud_base}.npy")
                         vid_files[k].write(f"{vid_npy_path} {packed_label}\n")
                         aud_files[k].write(f"{aud_npy_path} {packed_label}\n")
                 else:
@@ -389,7 +388,9 @@ class FilelistWriter:
                         if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
                         pov_start_tick, pov_end_tick = ticks
                         start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
-                        vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
+                        # FIX: DALI's file_list_frame_num=True expects: filename label start_frame frame_count
+                        frame_num = max(0, end_exclusive - start)
+                        vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {frame_num}\n")
                         
                         packed_audio_label = rec.sample_id * LABEL_SCALE + start
                         aud_files[k].write(f"{rec.pov_audio[k]} {packed_audio_label}\n")
@@ -449,7 +450,7 @@ class DaliInputPipeline:
         """
         Builds a DALI pipeline for pre-computed .npy files with a focus on
         perfect multi-GPU synchronization. This is achieved by:
-        1. Using pre-shuffled, per-epoch file lists.
+        1. Using file lists with a fixed, deterministic order for each epoch.
         2. Disabling DALI's internal shuffling (`random_shuffle=False`).
         3. Using identical DDP sharding settings for all readers.
         4. Using `stick_to_shard=True`.
@@ -478,11 +479,11 @@ class DaliInputPipeline:
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     stick_to_shard=True,
-                    random_shuffle=False,      # Rely on offline shuffling
+                    random_shuffle=False,      # Rely on external, per-epoch shuffling of the filelist
                     shuffle_after_epoch=False, #
                     read_ahead=True,
                 )
-                arr = fn.decoders.numpy(bytes_i)
+                arr = fn.decoders.numpy(bytes_i, dtype=types.FLOAT16)
                 return arr, packed_label
 
             # Read all 10 views (5 video, 5 audio). The filelists are aligned,
@@ -548,7 +549,7 @@ class DaliInputPipeline:
             outputs = []
             for k in range(5):
                 # ---- VIDEO ----
-                video, _ = fn.readers.video(
+                video, label_vid = fn.readers.video(
                     name=f"V{k}",
                     device="gpu",
                     file_list=vlists[k],
@@ -556,7 +557,9 @@ class DaliInputPipeline:
                     pad_sequences=True,
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
+                    stick_to_shard=True,              # FIX: For DDP determinism
                     random_shuffle=cfg.shuffle,
+                    shuffle_after_epoch=False,        # FIX: For DDP determinism
                     dtype=types.UINT8,
                     file_list_frame_num=True,
                     file_list_include_preceding_frame=True,
@@ -572,7 +575,9 @@ class DaliInputPipeline:
                     file_list=alists[k],
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
+                    stick_to_shard=True,              # FIX: For DDP determinism
                     random_shuffle=cfg.shuffle,
+                    shuffle_after_epoch=False,        # FIX: For DDP determinism
                 )
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
                 sample_id_i64 = packed_i64 // LABEL_SCALE
@@ -617,7 +622,7 @@ class DaliInputPipeline:
                 mel_db_right = to_mel_db(right)
                 mel_db = fn.stack(mel_db_left, mel_db_right, axis=0)  # [2, time, n_mels]
 
-                outputs.extend([frames_uint8, sample_id_i32, mel_db])
+                outputs.extend([frames_uint8, label_vid, mel_db])
             return tuple(outputs)
 
         p = pipe()
@@ -769,18 +774,20 @@ class BatchAssembler:
 
         if use_precomputed:
             # PATH 1: Pre-computed embeddings
+            # Video: DALI returns [B, T, D_raw] -> Stack to [B, T, 5, D_raw]
             video_embeddings = torch.stack([dali_batch[f"video_embed{k}"] for k in range(5)], dim=2)
             
-            # aud_embed from DALI is [B, T, Mel, 1, Chan]
-            audio_embed_list = [dali_batch[f"audio_embed{k}"] for k in range(5)]
-            audio_embed_stacked = torch.stack(audio_embed_list, dim=2) # [B, T, 5, Mel, 1, Chan]
-            # Permute to model's expected [B, T, P, C, Mel, 1]
-            audio_embeddings = audio_embed_stacked.permute(0, 1, 2, 5, 3, 4)
+            # Audio: DALI returns [B, T, Mel, 2] from [T, Mel, 2] npy file.
+            # We need to assemble this into the model's expected [B, T, P, C, Mel, 1] shape.
+            audio_embed_list = [dali_batch[f"audio_embed{k}"] for k in range(5)] # List of 5x [B, T, Mel, 2]
+            audio_stacked = torch.stack(audio_embed_list, dim=2)      # [B, T, 5, Mel, 2]
+            audio_permuted = audio_stacked.permute(0, 1, 2, 4, 3)     # [B, T, 5, 2, Mel]
+            mel_spectrogram = audio_permuted.unsqueeze(-1)            # [B, T, 5, 2, Mel, 1]
             
             sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
             batch = {
                 "video_embeddings": video_embeddings,
-                "audio_embeddings": audio_embeddings,
+                "mel_spectrogram": mel_spectrogram, # FIX: Use the key the model expects
             }
         else:
             # PATH 2: On-the-fly processing
@@ -1127,7 +1134,6 @@ def main(args):
         logging.info(f"Configuring model for pre-computed embeddings: {args.use_precomputed_embeddings}")
         # This config is now passed to the model, but the model's forward pass
         # makes the final decision based on the batch keys. This is for consistency.
-        model_cfg.use_precomputed_embeddings = args.use_precomputed_embeddings
         model = CS2Transformer(model_cfg, use_dummy_vision=False).to(device)
         
         loss_weights = {
