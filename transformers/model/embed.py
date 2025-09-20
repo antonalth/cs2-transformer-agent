@@ -267,8 +267,7 @@ class DINOv3VisualEncoder(nn.Module):
         B, T, P, C, H, W = images.shape
         from_uint8 = images.dtype == torch.uint8
 
-        if self.channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
+        # NOTE: channels_last only applies to 4D tensors. We'll set it on the flattened [N,3,H,W] tensor below.
 
         chunks = []
         t_chunk = int(self.forward_chunk)
@@ -277,6 +276,10 @@ class DINOv3VisualEncoder(nn.Module):
             img_chunk = images[:, t0:t1]  # [B, t, P, 3, H, W]
             N_chunk = B * (t1 - t0) * P
             x = img_chunk.reshape(N_chunk, C, H, W)
+
+            # If requested, convert to channels_last on the 4D tensor.
+            if self.channels_last and x.ndim == 4:
+                x = x.contiguous(memory_format=torch.channels_last)
 
             # Normalize
             x = self._normalize_chunk(x, from_uint8=from_uint8)
