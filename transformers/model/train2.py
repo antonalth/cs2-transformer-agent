@@ -438,7 +438,7 @@ class DaliInputPipeline:
             [self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP
         )
 
-    def _build_npy_pipeline(self, vlists, alists, cfg):
+     def _build_npy_pipeline(self, vlists, alists, cfg):
         @pipeline_def(
             enable_memory_stats=True, batch_size=cfg.batch_size, num_threads=cfg.num_threads,
             device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=2
@@ -447,7 +447,8 @@ class DaliInputPipeline:
             outputs = []
             for k in range(5):
                 # Video Embeddings from NPY
-                vid_embed_raw, packed_label = fn.readers.numpy(
+                # FIX: Replaced fn.readers.numpy with fn.numpy_reader
+                vid_embed_raw, packed_label = fn.numpy_reader(
                     name=f"VidNpy{k}", file_list=vlists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle
                 )
                 packed_i64 = fn.cast(packed_label, dtype=types.INT64)
@@ -462,7 +463,8 @@ class DaliInputPipeline:
                 )
 
                 # Audio Embeddings (Spectrograms) from NPY
-                aud_embed_raw, _ = fn.readers.numpy(
+                # FIX: Replaced fn.readers.numpy with fn.numpy_reader
+                aud_embed_raw, _ = fn.numpy_reader(
                     name=f"AudNpy{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle
                 )
                 audio_embed = fn.slice(
