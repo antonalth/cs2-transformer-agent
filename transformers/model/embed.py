@@ -4,21 +4,26 @@
 embed.py — Offline precompute of ViT frame embeddings + stereo log-mels (32 Hz), multi-GPU.
 
 Outputs
-  vit_embed/<md5>/<name>.npy  -> float16 [T, D]  (D = backbone hidden, e.g. 768)
+  vit_embed/<md5>/<name>.npy  -> float16 [T, D]  (D = backbone hidden, e.g., 768)
   aud_embed/<md5>/<name>.npy  -> float16 [T, n_mels, 2]
 
-Design
-- EXACT 32 fps for both modalities.
-- ViT code mirrors your model.py backbone path (HF AutoModel + optional AutoImageProcessor),
-  chunked forward, frozen weights. We SAVE THE BACKBONE FEATURES (pre-projection).
-- Robustness:
-  * If DINOv3 is missing in transformers, fallback to 'google/vit-base-patch16-224-in21k'.
-  * If the HF processor cannot be loaded, fall back to manual center-crop+resize+normalize.
-- Multi-GPU with per-GPU workers, atomic .npy writes, Ctrl-C safe.
+Highlights
+- EXACT 32 fps alignment for video & audio (audio: 24 kHz, hop = win = 750 → 32 steps/sec).
+- ViT backbone mirrors your model.py style (HF AutoModel, frozen, pooled features).
+- Robust HF import even if your project path is named `transformers/` (no shadowing).
+- If requested model (e.g., DINOv3) isn’t available, fallback to `google/vit-base-patch16-224-in21k`.
+- Manual center-crop → bilinear resize → ImageNet normalize (no processor dependency).
+- Atomic writes; multi-GPU; Ctrl-C safe.
+
+Run
+  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  python embed.py --data-root data \
+    --gpus all --workers-per-gpu 1 \
+    --batch-frames 256 --dtype fp16 --shuffle
 """
 
 from __future__ import annotations
-import os, math, argparse, logging, traceback, tempfile
+import os, sys, math, argparse, logging, traceback, tempfile
 from typing import List, Tuple, Optional
 import numpy as np
 
@@ -51,13 +56,6 @@ try:
 except Exception:
     DEC_AVAILABLE = False
 
-# ---------- HF Transformers ----------
-try:
-    from transformers import AutoModel, AutoImageProcessor
-except Exception:
-    AutoModel = None
-    AutoImageProcessor = None
-
 
 # =========================
 # CLI
@@ -65,7 +63,7 @@ except Exception:
 def get_args():
     p = argparse.ArgumentParser(description="Precompute ViT + audio (multi-GPU).")
     p.add_argument("--data-root", required=True, type=str,
-                   help="Root that contains recordings/, vit_embed/, aud_embed/, ...")
+                   help="Root containing recordings/, vit_embed/, aud_embed/, ...")
     p.add_argument("--gpus", type=str, default="all",
                    help="'all' or comma-separated GPU indices (e.g., '0,1,2,3').")
     p.add_argument("--workers-per-gpu", type=int, default=1,
@@ -75,7 +73,6 @@ def get_args():
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--only", type=str, default="both", choices=["both", "video", "audio"])
     p.add_argument("--verbose", action="store_true")
-    # Use your model.py default; fallback handled inside the encoder
     p.add_argument("--model-name", type=str,
                    default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     p.add_argument("--target-fps", type=float, default=32.0)
@@ -83,7 +80,7 @@ def get_args():
     # Audio params (24k / 750 hop => 32 steps/sec)
     p.add_argument("--audio-sr", type=int, default=24000)
     p.add_argument("--n-mels", type=int, default=128)
-    p.add_argument("--n-fft", type=int, default=1024)
+    # IMPORTANT: n_fft == win_length to get exactly T frames
     p.add_argument("--win-length", type=int, default=750)
     p.add_argument("--hop-length", type=int, default=750)
     p.add_argument("--db-cutoff", type=float, default=80.0)
@@ -96,15 +93,9 @@ def get_args():
 # Utils
 # =========================
 def atomic_save_npy(final_path: str, array: np.ndarray):
-    """
-    Robust atomic .npy write:
-    - create parent dir
-    - write via NamedTemporaryFile (so NumPy won't append another '.npy')
-    - fsync, then os.replace
-    """
+    """Atomic .npy write using a real temp file; avoids '.npy.tmp.npy' bug."""
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     dirpath = os.path.dirname(final_path) or "."
-    # Create a unique temp file in the same directory
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".npy.tmp", dir=dirpath, delete=False) as tmpf:
         tmp_path = tmpf.name
         np.save(tmpf, array)
@@ -120,15 +111,12 @@ def list_recordings(root: str) -> Tuple[List[Tuple[str, str, str]], List[Tuple[s
         return mp4s, wavs
     for md5 in sorted(os.listdir(rec_dir)):
         d = os.path.join(rec_dir, md5)
-        if not os.path.isdir(d):
-            continue
+        if not os.path.isdir(d): continue
         for fname in sorted(os.listdir(d)):
             stem, ext = os.path.splitext(fname)
             fpath = os.path.join(d, fname)
-            if ext.lower() == ".mp4":
-                mp4s.append((md5, stem, fpath))
-            elif ext.lower() == ".wav":
-                wavs.append((md5, stem, fpath))
+            if ext.lower() == ".mp4": mp4s.append((md5, stem, fpath))
+            elif ext.lower() == ".wav": wavs.append((md5, stem, fpath))
     return mp4s, wavs
 
 
@@ -162,104 +150,107 @@ def parse_gpu_list(arg: str) -> List[int]:
     out, seen = [], set()
     for tok in arg.split(","):
         tok = tok.strip()
-        if not tok:
-            continue
+        if not tok: continue
         i = int(tok)
         if i < 0 or i >= torch.cuda.device_count():
             raise ValueError(f"GPU index {i} out of range (0..{torch.cuda.device_count()-1})")
         if i not in seen:
-            out.append(i)
-            seen.add(i)
+            out.append(i); seen.add(i)
     return out
 
 
 # =========================
-# ViT backbone (mirrors model.py approach, w/ fallbacks)
+# Robust HF import (avoid local project shadowing)
+# =========================
+def import_hf_safely():
+    """
+    Force import the Hugging Face 'transformers' package from site-packages even if
+    a local project folder is also named 'transformers'.
+    """
+    import importlib, site
+    site_paths = []
+    try:
+        site_paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if user_site: site_paths.append(user_site)
+    except Exception:
+        pass
+    site_paths = [p for p in site_paths if p and os.path.isdir(p)]
+    # Prepend site-packages to sys.path to beat CWD/relative packages
+    for p in reversed(site_paths):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    # If a wrong 'transformers' is already imported, unload it
+    if "transformers" in sys.modules:
+        mod = sys.modules["transformers"]
+        mfile = getattr(mod, "__file__", "") or ""
+        if mfile and "site-packages" not in mfile and "dist-packages" not in mfile:
+            del sys.modules["transformers"]
+
+    tr = importlib.import_module("transformers")
+    AutoModel = getattr(tr, "AutoModel")
+    # AutoImageProcessor might not be present or needed
+    AutoImageProcessor = getattr(tr, "AutoImageProcessor", None)
+    return tr, AutoModel, AutoImageProcessor
+
+
+# =========================
+# ViT backbone (model.py style, manual preprocess)
 # =========================
 class VisualBackboneModelPy(nn.Module):
     """
-    Matches your model.py DINOv3VisualEncoder backbone logic:
-      - HF AutoModel (frozen) + optional AutoImageProcessor
-      - chunked forward
-      - export BACKBONE pooled features (pre-projection)
-
-    Robustness:
-      * If the requested model (e.g., DINOv3) isn't supported by this transformers build,
-        fallback to 'google/vit-base-patch16-224-in21k'.
-      * If the HF processor can't be loaded (no internet/cache), fall back to
-        manual center-crop + bilinear resize + ImageNet normalize on GPU.
+    Frozen ViT backbone (HF AutoModel), pooled features like model.py.
+    - Tries requested model (e.g., DINOv3); if unavailable, falls back to ViT-Base-16.
+    - Manual center-crop + bilinear resize to config.image_size.
+    - Manual ImageNet normalization on device.
     """
     def __init__(
         self,
         model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
         compute_dtype: torch.dtype = torch.bfloat16,
-        use_processor: bool = True,
         channels_last: bool = True,
     ):
         super().__init__()
-        if AutoModel is None:
-            raise RuntimeError("transformers required (pip install transformers accelerate).")
+        # Import HF safely inside worker
+        try:
+            _, AutoModel, _ = import_hf_safely()
+        except Exception as e:
+            raise RuntimeError(f"Could not import Hugging Face transformers from site-packages: {e}")
+
+        used = model_name
+        try:
+            bb = AutoModel.from_pretrained(model_name)
+        except Exception:
+            used = "google/vit-base-patch16-224-in21k"
+            bb = AutoModel.from_pretrained(used)
+
+        self.backbone = bb
+        self.hidden = int(getattr(self.backbone.config, "hidden_size", 768))
+        self.img_size = int(getattr(self.backbone.config, "image_size", 224))
+        self.used_model_name = used
 
         self.compute_dtype = compute_dtype
-        self.use_processor = bool(use_processor)
-        self.channels_last = bool(channels_last)
+        self.channels_last = channels_last
 
-        # ImageNet stats as in model.py
+        # ImageNet stats in compute dtype
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         self.register_buffer("img_mean", mean.to(self.compute_dtype), persistent=False)
         self.register_buffer("img_std",  std.to(self.compute_dtype),  persistent=False)
 
-        # Try user model; fallback to a standard ViT if unavailable
-        used = model_name
-        proc = None
-        try:
-            bb = AutoModel.from_pretrained(model_name)
-            if self.use_processor and AutoImageProcessor is not None:
-                try:
-                    proc = AutoImageProcessor.from_pretrained(model_name)
-                except Exception:
-                    proc = None
-        except Exception:
-            used = "google/vit-base-patch16-224-in21k"
-            bb = AutoModel.from_pretrained(used)
-            if self.use_processor and AutoImageProcessor is not None:
-                try:
-                    proc = AutoImageProcessor.from_pretrained(used)
-                except Exception:
-                    proc = None
-
-        self.backbone = bb
-        self.processor = proc  # may be None => manual preprocess
-        self.hidden = int(getattr(self.backbone.config, "hidden_size", 768))
-        self.img_size = int(getattr(self.backbone.config, "image_size", 224))
-        self.used_model_name = used
-
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
 
+    @torch.no_grad()
     def _maybe_channels_last(self, x: torch.Tensor) -> torch.Tensor:
         if self.channels_last and not x.is_contiguous(memory_format=torch.channels_last):
             return x.contiguous(memory_format=torch.channels_last)
         return x
-
-    @torch.no_grad()
-    def _normalize_on_gpu(self, x: torch.Tensor, from_uint8: bool) -> torch.Tensor:
-        """
-        Manual path when HF processor isn't available.
-        x: [N,3,H,W] on device; uint8 -> (0..1) -> normalize in compute_dtype
-        """
-        if from_uint8:
-            x = x.to(self.compute_dtype)
-            x.mul_(1.0 / 255.0)
-        else:
-            if x.dtype != self.compute_dtype:
-                x = x.to(self.compute_dtype)
-        mean = self.img_mean.to(x.device, non_blocking=True)
-        std  = self.img_std.to(x.device,  non_blocking=True)
-        x.sub_(mean).div_(std)
-        return self._maybe_channels_last(x)
 
     @torch.no_grad()
     def _center_crop_resize(self, x: torch.Tensor, size: int) -> torch.Tensor:
@@ -274,44 +265,37 @@ class VisualBackboneModelPy(nn.Module):
         return x
 
     @torch.no_grad()
-    def _forward_backbone(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(
-            device_type=("cuda" if pixel_values.is_cuda else "cpu"),
-            dtype=self.compute_dtype,
-            enabled=(pixel_values.is_cuda and self.compute_dtype != torch.float32),
-        ):
-            out = self.backbone(pixel_values=pixel_values)
-            feats = out.pooler_output  # [N, hidden]
-        return feats
+    def _normalize(self, x: torch.Tensor, from_uint8: bool) -> torch.Tensor:
+        if from_uint8:
+            x = x.to(self.compute_dtype)
+            x.mul_(1.0 / 255.0)
+        else:
+            if x.dtype != self.compute_dtype:
+                x = x.to(self.compute_dtype)
+        x = x.sub(self.img_mean.to(x.device)).div(self.img_std.to(x.device))
+        return self._maybe_channels_last(x)
 
     @torch.no_grad()
     def embed_nchw(self, images_nchw: torch.Tensor, device: torch.device, chunk: int = 256) -> torch.Tensor:
         """
-        images_nchw: [N,3,H,W] uint8 or float on CPU/CUDA.
-        returns: [N, hidden] (backbone pooled features, frozen)
+        images_nchw: [N,3,H,W] uint8/float on CPU/CUDA → pooled features [N, hidden]
         """
         if images_nchw.dim() != 4 or images_nchw.shape[1] != 3:
             raise ValueError(f"Expected [N,3,H,W], got {tuple(images_nchw.shape)}")
         N = images_nchw.shape[0]
-        out = []
+        outs = []
         for s in range(0, N, chunk):
             e = min(N, s + chunk)
-            x = images_nchw[s:e]
-            if self.processor is not None:
-                # HF processor path (CPU -> tensor)
-                inputs = self.processor(images=x, return_tensors="pt")
-                pix = inputs["pixel_values"].to(device, non_blocking=True)
-                if self.channels_last:
-                    pix = pix.to(memory_format=torch.channels_last)
-                feats = self._forward_backbone(pix)
-            else:
-                # Manual preprocess on device
-                x = x.to(device, non_blocking=True)
-                x = self._center_crop_resize(x, self.img_size)
-                x = self._normalize_on_gpu(x, from_uint8=(x.dtype == torch.uint8))
-                feats = self._forward_backbone(x)
-            out.append(feats.cpu())
-        return torch.cat(out, dim=0)  # [N, hidden]
+            x = images_nchw[s:e].to(device, non_blocking=True)
+            x = self._center_crop_resize(x, self.img_size)
+            x = self._normalize(x, from_uint8=(x.dtype == torch.uint8))
+            with torch.autocast(device_type=("cuda" if x.is_cuda else "cpu"),
+                                dtype=self.compute_dtype,
+                                enabled=(x.is_cuda and self.compute_dtype != torch.float32)):
+                out = self.backbone(pixel_values=x)
+                feats = out.pooler_output  # [b, hidden]
+            outs.append(feats.cpu())
+        return torch.cat(outs, dim=0)
 
 
 # =========================
@@ -332,9 +316,9 @@ def sample_indices_for_fps(n_src: int, fps_src: float, fps_tgt: float) -> np.nda
 
 
 def load_video_frames_32fps(path: str, target_fps: float) -> np.ndarray:
-    """Returns uint8 frames [T, H, W, 3] sampled to target_fps."""
+    """Return uint8 frames [T, H, W, 3] resampled to target_fps by index mapping."""
     if TV_AVAILABLE:
-        video, _, info = read_video(path, pts_unit="sec")  # [T_src, H, W, C] uint8
+        video, _, info = read_video(path, pts_unit="sec")
         fps_src = float(info.get("video_fps", 0.0) or 0.0)
         if fps_src <= 0 or video.numel() == 0:
             return np.zeros((0, 1, 1, 3), dtype=np.uint8)
@@ -351,7 +335,7 @@ def load_video_frames_32fps(path: str, target_fps: float) -> np.ndarray:
         idx = sample_indices_for_fps(T_src, fps_src, target_fps)
         if idx.size == 0:
             return np.zeros((0, 1, 1, 3), dtype=np.uint8)
-        frames = vr.get_batch(idx)  # [T, H, W, 3]
+        frames = vr.get_batch(idx)
         return frames.asnumpy()
     else:
         raise RuntimeError("No video decoder found. Install torchvision (preferred) or decord.")
@@ -365,35 +349,34 @@ def compute_vit_embeddings_for_video(
     batch_frames: int,
     target_fps: float = 32.0,
 ) -> Tuple[int, Tuple[int, int]]:
-    frames = load_video_frames_32fps(mp4_path, target_fps=target_fps)  # [T, H, W, 3] uint8
+    frames = load_video_frames_32fps(mp4_path, target_fps=target_fps)  # [T,H,W,3] uint8
     T = int(frames.shape[0])
     if T == 0:
         raise RuntimeError("No frames decoded or zero-length after resampling.")
 
-    feats_chunks = []
+    outs = []
     with torch.no_grad():
         for t0 in range(0, T, batch_frames):
             t1 = min(T, t0 + batch_frames)
-            chunk = frames[t0:t1]  # [b, H, W, 3]
+            chunk = frames[t0:t1]
             nchw = torch.from_numpy(chunk).permute(0, 3, 1, 2).contiguous()  # [b,3,H,W]
-            feats = backbone.embed_nchw(nchw, device=device, chunk=batch_frames)  # [b, hidden]
-            feats_chunks.append(feats.cpu())
+            feats = backbone.embed_nchw(nchw, device=device, chunk=batch_frames)
+            outs.append(feats.cpu())
 
-    feats_all = torch.cat(feats_chunks, dim=0)  # [T, D]
+    feats_all = torch.cat(outs, dim=0)  # [T, D]
     arr = feats_all.to(torch.float16).numpy()
     atomic_save_npy(out_path, arr)
     return T, arr.shape
 
 
 # =========================
-# Audio (24kHz / hop=750 -> 32 Hz)
+# Audio (24kHz / hop=win=750 -> exact 32 Hz)
 # =========================
 def compute_audio_mels_for_wav(
     wav_path: str,
     out_path: str,
     sr: int = 24000,
     n_mels: int = 128,
-    n_fft: int = 1024,
     win_length: int = 750,
     hop_length: int = 750,
     db_cutoff: float = 80.0,
@@ -404,7 +387,7 @@ def compute_audio_mels_for_wav(
 
     wav, orig_sr = torchaudio.load(wav_path)  # [C,N]
     if wav.dim() != 2:
-        raise RuntimeError("Expected [C,N] waveform.")
+        raise RuntimeError("Expected [C,N].")
     if wav.shape[0] == 1:
         wav = wav.repeat(2, 1)
 
@@ -417,6 +400,9 @@ def compute_audio_mels_for_wav(
         raise RuntimeError("Too-short audio.")
     N_use = T * hop_length
     wav = wav[:, :N_use]
+
+    # IMPORTANT: use n_fft == win_length so mel returns exactly T frames
+    n_fft = win_length
 
     dev = device if torch.cuda.is_available() else torch.device("cpu")
     mel = AT.MelSpectrogram(
@@ -459,10 +445,8 @@ def build_job_list(root: str, overwrite: bool, only: str, shuffle: bool) -> List
         jobs = []
         i = j = 0
         while i < len(vids) or j < len(auds):
-            if i < len(vids):
-                jobs.append(vids[i]); i += 1
-            if j < len(auds):
-                jobs.append(auds[j]); j += 1
+            if i < len(vids): jobs.append(vids[i]); i += 1
+            if j < len(auds): jobs.append(auds[j]); j += 1
     return jobs
 
 
@@ -490,7 +474,6 @@ def worker_main(rank: int, gpu_id: Optional[int], job_queue: mp.Queue, result_qu
     target_fps = args_dict["target_fps"]
     audio_sr = args_dict["audio_sr"]
     n_mels = args_dict["n_mels"]
-    n_fft = args_dict["n_fft"]
     win_length = args_dict["win_length"]
     hop_length = args_dict["hop_length"]
     db_cutoff = args_dict["db_cutoff"]
@@ -511,12 +494,10 @@ def worker_main(rank: int, gpu_id: Optional[int], job_queue: mp.Queue, result_qu
                     backbone = VisualBackboneModelPy(
                         model_name=model_name,
                         compute_dtype=compute_dtype,
-                        use_processor=True,
                         channels_last=True,
                     ).to(device)
                     backbone.eval()
-                    log("INFO", f"Using backbone: {backbone.used_model_name} "
-                                f"(processor={'yes' if backbone.processor is not None else 'no/manual'})")
+                    log("INFO", f"Using backbone: {backbone.used_model_name}")
                 log("INFO", f"VIDEO {src} -> {out}")
                 T, shape = compute_vit_embeddings_for_video(
                     mp4_path=src, out_path=out, backbone=backbone,
@@ -528,7 +509,7 @@ def worker_main(rank: int, gpu_id: Optional[int], job_queue: mp.Queue, result_qu
                 log("INFO", f"AUDIO {src} -> {out}")
                 T, shape = compute_audio_mels_for_wav(
                     wav_path=src, out_path=out,
-                    sr=audio_sr, n_mels=n_mels, n_fft=n_fft,
+                    sr=audio_sr, n_mels=n_mels,
                     win_length=win_length, hop_length=hop_length, db_cutoff=db_cutoff,
                     device=device
                 )
@@ -537,11 +518,10 @@ def worker_main(rank: int, gpu_id: Optional[int], job_queue: mp.Queue, result_qu
 
         except Exception as e:
             log("ERR", f"FAILED {jtype} {src}: {e}")
-            # best-effort cleanup of temp
+            # best-effort cleanup
             tmp = out + ".tmp"
             try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
+                if os.path.exists(tmp): os.remove(tmp)
             except Exception:
                 pass
             result_queue.put((f"{jtype}_fail", 1))
@@ -549,10 +529,8 @@ def worker_main(rank: int, gpu_id: Optional[int], job_queue: mp.Queue, result_qu
             job_queue.task_done()
 
     try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    except Exception: pass
     log("INFO", "Worker exiting.")
 
 
@@ -584,7 +562,7 @@ def multi_gpu_dispatch(args):
         logging.info("Using GPUs: %s (%d workers total)", ",".join(map(str, gpu_ids)), num_workers)
 
     ctx = mp.get_context("spawn")
-    job_queue = ctx.JoinableQueue(maxsize=0)  # unbounded to avoid feeder blocking
+    job_queue = ctx.JoinableQueue(maxsize=0)  # unbounded to avoid producer blocking
     result_queue = ctx.Queue()
 
     args_dict = {
@@ -594,7 +572,6 @@ def multi_gpu_dispatch(args):
         "target_fps": args.target_fps,
         "audio_sr": args.audio_sr,
         "n_mels": args.n_mels,
-        "n_fft": args.n_fft,
         "win_length": args.win_length,
         "hop_length": args.hop_length,
         "db_cutoff": args.db_cutoff,
@@ -624,10 +601,10 @@ def multi_gpu_dispatch(args):
         while remaining > 0:
             try:
                 key, val = result_queue.get(timeout=1.0)
-                if key in counts:
-                    counts[key] += val
+                if key in counts: counts[key] += val
                 remaining -= 1
             except Empty:
+                # If all workers died, bail out
                 if all(not p.is_alive() for p in procs):
                     break
 
@@ -640,19 +617,13 @@ def multi_gpu_dispatch(args):
 
     except KeyboardInterrupt:
         logging.warning("KeyboardInterrupt received — stopping workers...")
-        # push sentinels best-effort
         try:
-            for _ in range(num_workers):
-                job_queue.put_nowait(None)
-        except Exception:
-            pass
-        try:
-            job_queue.join()
-        except Exception:
-            pass
+            for _ in range(num_workers): job_queue.put_nowait(None)
+        except Exception: pass
+        try: job_queue.join()
+        except Exception: pass
         for p in procs:
-            if p.is_alive():
-                p.terminate()
+            if p.is_alive(): p.terminate()
         for p in procs:
             p.join(timeout=2.0)
         logging.info("Shutdown complete.")
