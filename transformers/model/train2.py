@@ -849,10 +849,18 @@ class BatchAssembler:
         batch["alive_mask"] = gt_tensors.pop("alive_mask").bool()
         batch["meta"] = meta
 
+        # Calculated from 258 game(s) with 154,378,951 merged data points.
+        MOUSE_DELTA_MEAN = torch.tensor([0.009522, -0.000312], device=self.device)
+        MOUSE_DELTA_STD = torch.tensor([3.305156, 0.649809], device=self.device)
+
         targets = {"player": [{} for _ in range(5)], "game_strategy": {}}
         for i in range(5):
             targets["player"][i]["stats"] = gt_tensors["stats"][:, :, i]
-            targets["player"][i]["mouse_delta_deg"] = gt_tensors["mouse_delta"][:, :, i]
+
+            raw_mouse_delta = gt_tensors["mouse_delta"][:, :, i]
+            normalized_mouse_delta = (raw_mouse_delta - MOUSE_DELTA_MEAN) / MOUSE_DELTA_STD
+            targets["player"][i]["mouse_delta_deg"] = normalized_mouse_delta
+
             targets["player"][i]["pos_coords"] = gt_tensors["position"][:, :, i] # Raw coords for loss fn
             targets["player"][i]["keyboard_logits"] = self._masks_to_multi_hot(gt_tensors["keyboard_mask"][:, :, i], 31)
 
@@ -867,7 +875,7 @@ class BatchAssembler:
             inv_parts = [self._masks_to_multi_hot(inv_mask_player[:, :, k], 64) for k in range(2)]
             targets["player"][i]["inventory_logits"] = torch.cat(inv_parts, dim=-1) # Shape: [B, T, 128]
 
-            targets["player"][i]["active_weapon_logits"] = gt_tensors["active_weapon_idx"][:, :, i].long()
+            targets["player"][i]["active_weapon_idx"] = gt_tensors["active_weapon_idx"][:, :, i].long()
 
         targets["game_strategy"]["enemy_pos_coords"] = gt_tensors["enemy_positions"]
         targets["game_strategy"]["round_state_logits"] = self._masks_to_multi_hot(gt_tensors["round_state_mask"], 5)
@@ -900,7 +908,7 @@ class CompositeLoss(nn.Module):
         # Loss fns with no reduction for manual masking
         self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
-        self.ce_loss  = nn.CrossEntropyLoss(reduction='none', ignore_index=-1)
+        self.ce_loss  = nn.CrossEntropyLoss(reduction='none', ignore_index=-1, label_smoothing=0.05)
 
         # Cache axes for separable Gaussian target generation
         X, Y, Z = grid_dims
@@ -1003,8 +1011,8 @@ class CompositeLoss(nn.Module):
                 detailed_losses[wkey] += loss_component
 
             # Active weapon (CE), flatten B*T
-            pred_flat = p_pred["active_weapon_logits"].view(B * T, -1)
-            targ_flat = p_targ["active_weapon_logits"].view(B * T)
+            pred_flat = p_pred["active_weapon_idx"].view(B * T, -1)
+            targ_flat = p_targ["active_weapon_idx"].view(B * T)
             loss_weapon_unmasked = self.ce_loss(pred_flat, targ_flat)  # [B*T]
             loss_component = self.weights['weapon'] * self._scalar_loss(
                 loss_weapon_unmasked, player_alive_mask.view(B * T)
@@ -1223,7 +1231,7 @@ def main(args):
         
         loss_weights = {
             'stats': 1.0, 'mouse': 1.0, 'keyboard': 1.0, 'eco': 1.0,
-            'inventory': 1.0, 'weapon': 1.0, 'round_number': 1.0,
+            'inventory': 1.0, 'weapon': 0.25, 'round_number': 1.0,
             'round_state': 1.0, 'pos_heatmap': 1.0, 'enemy_heatmap': 1.0
         }
         loss_fn = CompositeLoss(weights=loss_weights).to(device)
