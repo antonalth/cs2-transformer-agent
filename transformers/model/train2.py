@@ -475,15 +475,12 @@ class DaliInputPipeline:
             def read_and_decode(filelist: str, reader_name: str):
                 common_args = dict(
                     file_list=filelist,
-                    name=reader_name,  # will be suffixed for distinct ops below
-                    # --- DDP / sharding ---
+                    name=reader_name,  # this name must exist for DALIGenericIterator metadata
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     stick_to_shard=True,
-                    # --- we shuffle the filelist externally ---
                     random_shuffle=False,
                     shuffle_after_epoch=False,
-                    # --- I/O ---
                     read_ahead=True,
                 )
 
@@ -493,21 +490,19 @@ class DaliInputPipeline:
                     arr = fn.decoders.numpy(bytes_i, dtype=types.FLOAT16)
                     return arr, packed_label
 
-                # Fallback for older DALI:
-                # 1) Read array directly with readers.numpy (SINGLE output in this DALI)
-                # 2) Read labels from a *parallel* readers.file with identical params (lockstep)
-                try:
-                    arr = fn.readers.numpy(**{**common_args, "name": f"{reader_name}_NPY"})
-                except TypeError:
-                    # Older builds may not accept read_ahead -> retry without it
-                    np_args = dict(common_args)
-                    np_args.pop("read_ahead", None)
-                    arr = fn.readers.numpy(**{**np_args, "name": f"{reader_name}_NPY"})
+                # Fallback (older DALI):
+                # 1) Keep a readers.file with EXACTLY `reader_name` so iterator can fetch metadata.
+                # 2) Read the actual array with readers.numpy under a different op name.
+                #    (Same sharding params so both stay in lockstep.)
+                # Label stream (must keep the original name)
+                _, packed_label = fn.readers.file(**common_args)
 
-                # Parallel label reader (we ignore bytes, use label only)
-                _, packed_label = fn.readers.file(**{**common_args, "name": f"{reader_name}_LAB"})
+                # Data stream (distinct name, same params)
+                np_args = dict(common_args)
+                np_args["name"] = f"{reader_name}_NPY"   # different op name
+                arr = fn.readers.numpy(**np_args)
 
-                # Match downstream dtype expectations
+                # Ensure dtype matches downstream expectations
                 arr = fn.cast(arr, dtype=types.FLOAT16)
                 return arr, packed_label
 
