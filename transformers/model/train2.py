@@ -907,6 +907,12 @@ class CompositeLoss(nn.Module):
         self.register_buffer('xs', torch.arange(X, dtype=torch.float32), persistent=False)
         self.register_buffer('ys', torch.arange(Y, dtype=torch.float32), persistent=False)
         self.register_buffer('zs', torch.arange(Z, dtype=torch.float32), persistent=False)
+        self.register_buffer(
+            "stats_scale",
+            torch.tensor([1/100.0, 1/100.0, 1/16000.0], dtype=torch.float32),  # health, armor, money
+            persistent=False
+        )
+
         self.grid_dims = grid_dims
         self.sigma = float(sigma)
 
@@ -978,7 +984,9 @@ class CompositeLoss(nn.Module):
             player_alive_mask = alive_mask[:, :, i].float()  # [B,T]
 
             # Stats (MSE)
-            loss_stats = self.mse_loss(p_pred["stats"], p_targ["stats"]).mean(dim=-1)  # [B,T]
+            pred_stats_n = p_pred["stats"] * self.stats_scale
+            targ_stats_n = p_targ["stats"] * self.stats_scale
+            loss_stats = self.mse_loss(pred_stats_n, targ_stats_n).mean(dim=-1)
             loss_component = self.weights['stats'] * self._scalar_loss(loss_stats, player_alive_mask)
             detailed_losses['stats'] += loss_component
 
