@@ -356,31 +356,20 @@ import torch
 import torch.nn as nn
 from contextlib import nullcontext
 
+# In model.py
+
 class DINOv3VisualEncoder(nn.Module):
     """
-    Hugging Face DINOv3 encoder with chunked, just-in-time normalization and
-    chunked backbone forward to reduce peak VRAM.
+    MODIFIED: Hugging Face DINOv3 encoder that ONLY returns raw backbone features.
+    The final projection to d_model is handled by the main CS2Transformer.
 
-    Contract matches ViTVisualEncoder:
-      - Input:  [B, T, P, 3, H, W]
-        * If hf_use_processor=True  -> delegate resize/normalize to HF, STILL CHUNKED over T.
-        * If hf_use_processor=False -> expect raw frames (uint8 or float in [0,1]) and
-                                      normalize + forward on-GPU in temporal chunks.
-      - Output: [B, T, P, d_model]
-
-    Config knobs (attributes on cfg):
-      - hf_model_name:      str, HF repo (default 'facebook/dinov3-vitb16-pretrain-lvd1689m')
-      - hf_use_processor:   bool, use HF AutoImageProcessor (default True)
-      - hf_channels_last:   bool, convert inputs to channels_last (default True)
-      - hf_norm_chunk:      int, frames per normalization chunk (default 64)
-      - hf_forward_chunk:   int, frames per FORWARD chunk; defaults to hf_norm_chunk
-      - hf_compute_dtype:   'bf16' | 'fp16' | 'fp32' (default 'bf16')
-      - d_model:            int, projection output width (required)
+    - Input:  [B, T, P, 3, H, W] (or packed version)
+    - Output: [B, T, P, backbone_hidden_size] (e.g., [..., 768])
     """
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.d_model = int(cfg.d_model)
+        # REMOVED: No longer needs d_model, as projection is external.
         self.use_channels_last = bool(getattr(cfg, "hf_channels_last", True))
         self.use_processor = bool(getattr(cfg, "hf_use_processor", True))
         self.model_name = getattr(cfg, "hf_model_name", "facebook/dinov3-vitb16-pretrain-lvd1689m")
@@ -390,50 +379,27 @@ class DINOv3VisualEncoder(nn.Module):
         self.forward_chunk = int(getattr(cfg, "hf_forward_chunk", self.norm_chunk))
 
         # Compute dtype
-        compute_dtype = str(getattr(cfg, "hf_compute_dtype", "bf16")).lower()
-        if compute_dtype in ("bf16", "bfloat16"):
-            self.compute_dtype = torch.bfloat16
-        elif compute_dtype in ("fp16", "float16", "half"):
-            self.compute_dtype = torch.float16
-        else:
-            self.compute_dtype = torch.float32  # fallback
+        compute_dtype_str = str(getattr(cfg, "hf_compute_dtype", "bf16")).lower()
+        self.compute_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(compute_dtype_str, torch.float32)
 
-        # ImageNet normalization stats used by DINOv3 web weights
+        # ImageNet normalization stats
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        # Keep in compute dtype so we don't upcast the activations
         self.register_buffer("img_mean", mean.to(self.compute_dtype), persistent=False)
         self.register_buffer("img_std",  std.to(self.compute_dtype),  persistent=False)
 
         try:
             from transformers import AutoModel, AutoImageProcessor
         except Exception as e:
-            raise RuntimeError(
-                "The DINOv3VisualEncoder requires 'transformers'. "
-                "Install it (pip install transformers accelerate) or set vision_backend='timm'.\n"
-                f"Original import error: {e}"
-            )
+            raise RuntimeError(f"Transformers library not found. {e}")
 
-        # Image processor (optional)
-        self.processor = None
-        if self.use_processor:
-            try:
-                self.processor = AutoImageProcessor.from_pretrained(self.model_name)
-            except Exception as e:
-                raise RuntimeError(f"Failed to load AutoImageProcessor for '{self.model_name}': {e}")
-
-        # Backbone
-        try:
-            from transformers import AutoModel as _AutoModel
-            self.backbone = _AutoModel.from_pretrained(self.model_name)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load DINOv3 model '{self.model_name}': {e}")
-
-        # Hidden size → project into your transformer width
+        self.processor = AutoImageProcessor.from_pretrained(self.model_name) if self.use_processor else None
+        self.backbone = AutoModel.from_pretrained(self.model_name)
         self.hidden = int(getattr(self.backbone.config, "hidden_size", 768))
-        self.proj = nn.Linear(self.hidden, self.d_model)
 
-        # The ViT backbone is always frozen (we'll run it under no_grad to save VRAM).
+        # REMOVED: The projection layer self.proj = nn.Linear(self.hidden, self.d_model) is now in CS2Transformer
+
+        # Backbone is always frozen.
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
@@ -444,111 +410,50 @@ class DINOv3VisualEncoder(nn.Module):
         return x
 
     def _normalize_chunk(self, x: torch.Tensor, from_uint8: bool) -> torch.Tensor:
-        """
-        x: [N, 3, H, W] on CUDA
-        from_uint8: if True, scale by 1/255 first; otherwise assume x in [0,1]
-        Returns normalized tensor in self.compute_dtype, channels_last if enabled.
-        """
         if from_uint8:
+            x = x.to(self.compute_dtype).mul_(1.0 / 255.0)
+        elif x.dtype != self.compute_dtype:
             x = x.to(self.compute_dtype)
-            x.mul_(1.0 / 255.0)
-        else:
-            # ensure dtype without extra allocation if possible
-            if x.dtype != self.compute_dtype:
-                x = x.to(self.compute_dtype)
-
-        # Ensure mean/std on the right device; dtype is already compute dtype
         mean = self.img_mean.to(device=x.device, non_blocking=True)
         std = self.img_std.to(device=x.device, non_blocking=True)
         x.sub_(mean).div_(std)
         return self._maybe_channels_last(x)
 
     def _forward_backbone_no_grad(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Run frozen backbone under no_grad + autocast, return pooled features [N, hidden].
-        pixel_values should already be on the correct device.
-        """
-        # Autocast reduces activation footprint inside the backbone (esp. for fp32 weights).
-        # We keep grads for the projection outside of this block.
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=(pixel_values.is_cuda and self.compute_dtype != torch.float32)):
-                outputs = self.backbone(pixel_values=pixel_values)
-                feats = outputs.pooler_output  # [N, hidden]
-        return feats  # requires_grad=False
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=pixel_values.is_cuda):
+            return self.backbone(pixel_values=pixel_values).pooler_output
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         # Expect [B, T, P, C, H, W] with C==3
         if images.dim() != 6:
             raise ValueError(f"Expected 6D tensor [B,T,P,C,H,W], got {images.shape}")
         B, T, P, C, H, W = images.shape
-        if C != 3:
-            raise ValueError(f"Expected 3 channels, got {C}")
-
-        device = images.device
-        from_uint8 = images.dtype == torch.uint8
-
-        # Choose temporal chunk for forward; default ties to normalization chunk.
+        device, from_uint8 = images.device, (images.dtype == torch.uint8)
         t_chunk = self.forward_chunk
-
         chunks = []
 
-        if self.processor is not None:
-            # Chunk the processor + backbone path to avoid building a huge [B*T*P] batch.
-            for t0 in range(0, T, t_chunk):
-                t1 = min(T, t0 + t_chunk)
+        # This entire forward pass is now simplified to only return raw features
+        for t0 in range(0, T, t_chunk):
+            t1 = min(T, t0 + t_chunk)
+            img_chunk = images[:, t0:t1]
+            N_chunk = B * (t1 - t0) * P
+            x = img_chunk.reshape(N_chunk, C, H, W)
 
-                # [B, t, P, 3, H, W] → [N_chunk, 3, H, W]
-                img_chunk = images[:, t0:t1]  # keeps storage compact
-                N_chunk = B * (t1 - t0) * P
-                x = img_chunk.reshape(N_chunk, C, H, W)
-
-                # Let the HF processor handle resize/normalize; it returns CPU tensors by default.
+            if self.processor is not None:
                 inputs = self.processor(images=x, return_tensors="pt")
-                # Move to device and (optionally) channels_last
                 pixel_values = inputs["pixel_values"].to(device, non_blocking=True)
                 if self.use_channels_last:
                     pixel_values = pixel_values.to(memory_format=torch.channels_last)
+            else:
+                pixel_values = self._normalize_chunk(x, from_uint8=from_uint8)
 
-                # Backbone under no_grad + autocast
-                feats = self._forward_backbone_no_grad(pixel_values)
+            feats = self._forward_backbone_no_grad(pixel_values) # [N_chunk, hidden_size]
+            
+            # MODIFIED: Reshape raw features directly, DO NOT project.
+            vis_chunk = feats.view(B, (t1 - t0), P, self.hidden)
+            chunks.append(vis_chunk)
 
-                # Project with grads enabled (use autocast for lower VRAM if mixed precision)
-                with torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=(device.type == "cuda" and self.compute_dtype != torch.float32)):
-                    vis_chunk = self.proj(feats).view(B, (t1 - t0), P, self.d_model)
-
-                chunks.append(vis_chunk)
-
-                # Free ASAP
-                del x, img_chunk, inputs, pixel_values, feats, vis_chunk
-
-        else:
-            # Chunked path: normalize + forward the backbone per temporal slice.
-            for t0 in range(0, T, t_chunk):
-                t1 = min(T, t0 + t_chunk)
-
-                # [B, t, P, 3, H, W] → [N_chunk, 3, H, W]
-                img_chunk = images[:, t0:t1]
-                N_chunk = B * (t1 - t0) * P
-                x = img_chunk.reshape(N_chunk, C, H, W)
-
-                # Normalize just-in-time on GPU
-                x = self._normalize_chunk(x, from_uint8=from_uint8)
-
-                # Backbone under no_grad + autocast
-                feats = self._forward_backbone_no_grad(x)
-
-                # Project with grads (small footprint compared to backbone)
-                with torch.autocast(device_type="cuda", dtype=self.compute_dtype, enabled=(device.type == "cuda" and self.compute_dtype != torch.float32)):
-                    vis_chunk = self.proj(feats).view(B, (t1 - t0), P, self.d_model)
-
-                chunks.append(vis_chunk)
-
-                # Free ASAP
-                del x, img_chunk, feats, vis_chunk
-
-        vis = torch.cat(chunks, dim=1)  # concat along T
-        return vis
-
+        return torch.cat(chunks, dim=1)
 
 
 class AudioCNN(nn.Module):
@@ -1271,119 +1176,143 @@ class StrategyHead(nn.Module):
 # -----------------------------------------------------------------------------
 # 5) Top-level model
 # -----------------------------------------------------------------------------
-class CS2Transformer(nn.Module):
-    """Causal autoregressive multi-modal transformer for CS2.
+# In model.py
 
-    forward(batch) returns next-step predictions as per Appendix B.
+class CS2Transformer(nn.Module):
+    """
+    Causal autoregressive multi-modal transformer for CS2.
+
+    FINAL VERSION: This implementation includes a single, shared projection layer for
+    visual features (`self.vision_proj`). The forward() method dynamically dispatches
+    between two modes based on the input batch's contents:
+
+    1. On-the-fly: If the batch contains "images", it processes raw media through the
+       `visual_encoder` to get raw backbone features, then projects them using `vision_proj`.
+    2. Pre-computed: If the batch contains "video_embeddings", it uses these directly
+       as the raw backbone features, then projects them using the same `vision_proj`.
+
+    This ensures perfect consistency between training modes.
     """
     def __init__(self, cfg: CS2Config, use_dummy_vision: bool = False):
         super().__init__()
         self.cfg = cfg
         d = cfg.d_model
-        # Encoders
+
+        # --- Encoders and Projectors ---
         if use_dummy_vision:
-            # --- MODIFIED: Dummy encoder now has a single-image interface ---
             class DummyVisualEncoder(nn.Module):
-                def __init__(self, d_model):
+                def __init__(self, d_model, hidden_size):
                     super().__init__()
                     self.d_model = d_model
-                def forward(self, images): # Takes a single 'images' tensor
+                    self.hidden_size = hidden_size
+                def forward(self, images):
                     B, T, P = images.shape[:3]
-                    # Instantly return a correctly-shaped random tensor
-                    return torch.randn(B, T, P, self.d_model, device=images.device, dtype=torch.float16)
-            self.visual_encoder = DummyVisualEncoder(d)
+                    # Return raw "backbone" features, consistent with the real encoder
+                    return torch.randn(B, T, P, self.hidden_size, device=images.device, dtype=torch.float16)
+            self.visual_encoder = DummyVisualEncoder(d, cfg.vision_backbone_hidden_size)
         else:
+            # DINOv3 visual encoder now only extracts features, without projection.
             self.visual_encoder = DINOv3VisualEncoder(cfg)
+        # It lives here in the main model, not in the encoder.
+        self.vision_proj = nn.Linear(cfg.vision_backbone_hidden_size, d)
+
+        # The audio CNN is used in both modes and is always trained.
         self.audio_encoder = AudioCNN(cfg)
-        # Special tokens & embeddings
+
+        # --- Special tokens & embeddings ---
         self.token_game_strategy = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.token_scratch = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.dead_embedding = nn.Parameter(torch.randn(1, 1, 1, d) * 0.02)
         self.player_slot_embed = nn.Embedding(cfg.num_players, d)
-        # Fuser
-        self.player_fuser = PlayerTokenFuser(
-            cfg,
-            player_slot_embed=self.player_slot_embed,
-            dead_embedding=self.dead_embedding,
-        )
-        # Backbone
+
+        # --- Fuser, Backbone, and Heads ---
+        self.player_fuser = PlayerTokenFuser(cfg, self.player_slot_embed, self.dead_embedding)
         self.backbone = CS2Backbone(cfg)
-        # Heads
         self.player_head = PlayerHeads(cfg)
         self.strategy_head = StrategyHead(cfg)
 
-        # ---- autocast setup ----
+        # --- Autocast setup ---
         self.use_amp = (
-            getattr(self.cfg,"amp_autocast", True)
+            getattr(self.cfg, "amp_autocast", True)
             and torch.cuda.is_available()
-            and getattr(self.cfg,"compute_dtype", "bf16") != "fp32"
+            and getattr(self.cfg, "compute_dtype", "bf16") != "fp32"
         )
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-        self.amp_dtype = dtype_map[getattr(self.cfg,"compute_dtype", "bf16")]
+        self.amp_dtype = dtype_map[getattr(self.cfg, "compute_dtype", "bf16")]
 
-    # --------------------------- utility methods --------------------------- #
     def parameter_groups(self) -> List[Dict[str, object]]:
-        """Returns the model's trainable parameters in a group for the optimizer."""
-        # The visual encoder (ViT) is frozen, so its parameters are not included.
-        core_modules = [self.audio_encoder, self.player_fuser, self.backbone, self.player_head, self.strategy_head]
-        trainable_params = [p for m in core_modules for p in m.parameters()]
+        """Returns the model's trainable parameters for the optimizer."""
+        # The visual_encoder's DINOv3 backbone is frozen.
+        # The vision_proj layer IS trainable.
+        core_modules = [
+            self.vision_proj, self.audio_encoder, self.player_fuser,
+            self.backbone, self.player_head, self.strategy_head
+        ]
+        trainable_params = [p for m in core_modules for p in m.parameters() if p.requires_grad]
         trainable_params += [
             self.token_game_strategy, self.token_scratch, self.dead_embedding,
             *self.player_slot_embed.parameters(),
         ]
         return [{"params": trainable_params, "name": "core", "lr_scale": 1.0}]
 
-
     def forward(self, batch: CS2Batch) -> Predictions:
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=self.amp_dtype) if self.use_amp else nullcontext()
         )
         with autocast_ctx:
-            # --- Input processing & tokenization ---
-            images = batch["images"]
-            mel    = batch["mel_spectrogram"]
-            alive  = batch["alive_mask"].bool()
-            
+            # --- Common setup for both paths ---
             dev = next(self.parameters()).device
-            if images.device != dev: images = images.to(dev, non_blocking=True)
-            if mel.device    != dev: mel    = mel.to(dev, non_blocking=True)
-            if alive.device  != dev: alive  = alive.to(dev, non_blocking=True)
-            B, T, P, C, H, W = images.shape
-            d = self.cfg.d_model
-            Lpf = self.cfg.tokens_per_frame
-            param_dtype = next(self.parameters()).dtype
-            target_dtype = self.amp_dtype if self.use_amp else param_dtype
+            alive = batch["alive_mask"].bool().to(dev, non_blocking=True)
+            B, T, P = alive.shape
+            d, Lpf = self.cfg.d_model, self.cfg.tokens_per_frame
+            target_dtype = self.amp_dtype if self.use_amp else next(self.parameters()).dtype
 
-            vis = torch.zeros(B, T, P, d, device=dev, dtype=target_dtype)
-            if torch.count_nonzero(alive):
-                alive_images = images[alive]
-                num_alive = alive_images.shape[0]
-                packed_vis_out = self.visual_encoder(alive_images.reshape(num_alive, 1, 1, C, H, W))
-                packed = packed_vis_out.squeeze(1).squeeze(1)
-                if packed.dtype != target_dtype:
-                    packed = packed.to(target_dtype)
-                vis[alive] = packed
+            # --- Step 1: Prepare Raw Visual Features (`vis_raw`) ---
+            # This tensor will hold the [B, T, P, backbone_hidden_size] features.
+            if "video_embeddings" in batch:
+                # PATH 1: Pre-computed features are the raw backbone output.
+                vis_raw = batch["video_embeddings"].to(dev, non_blocking=True)
+            else:
+                # PATH 2: Run the on-the-fly encoder to get raw backbone output.
+                images = batch["images"].to(dev, non_blocking=True)
+                C, H, W = images.shape[-3:]
 
-            aud = self.audio_encoder(mel)
-            if aud.dtype != target_dtype:
-                aud = aud.to(target_dtype)
-            player_tokens = self.player_fuser(vis, aud, alive)
+                # Create a zero-tensor to hold the raw features for all players.
+                vis_raw = torch.zeros(
+                    B, T, P, self.cfg.vision_backbone_hidden_size,
+                    device=dev, dtype=target_dtype
+                )
+                
+                if torch.count_nonzero(alive):
+                    alive_images = images[alive]
+                    num_alive = alive_images.shape[0]
+                    # Get packed raw features from the modified encoder
+                    packed_vis_raw = self.visual_encoder(alive_images.reshape(num_alive, 1, 1, C, H, W))
+                    # Scatter the results back into the dense tensor
+                    vis_raw[alive] = packed_vis_raw.squeeze(1).squeeze(1)
+
+            # --- Step 2: Apply the SHARED Projection Layer ---
+            # Both paths converge here. `vis` is the final [B, T, P, d_model] tensor.
+            vis = self.vision_proj(vis_raw.to(target_dtype))
+
+            # --- Step 3: Process Audio and Fuse Tokens ---
+            # The audio path is simpler as the CNN is always trained.
+            aud_input = batch["mel_spectrogram"].to(dev, non_blocking=True)
             
-            tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d)
-            if tok_gs.dtype != target_dtype:
-                tok_gs = tok_gs.to(target_dtype)
-            tok_sc = self.token_scratch .unsqueeze(2).expand(B, T, 1, d)
-            if tok_sc.dtype != target_dtype:
-                tok_sc = tok_sc.to(target_dtype)
+            aud = self.audio_encoder(aud_input).to(target_dtype)
+            player_tokens = self.player_fuser(vis, aud, alive)
+
+            # --- Step 4: Assemble Sequence and Run Backbone ---
+            tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
+            tok_sc = self.token_scratch.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
             frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
             seq = frame_tokens.reshape(B, T * Lpf, d)
 
-            # --- Backbone Pass ---
+            # --- Step 5: Backbone Pass ---
             h = None
             if self.training and self.cfg.enable_cached_training:
-                # --- Cached Training (TBPTT) Path ---
+                # Cached Training (TBPTT) Path
                 chunk_T = self.cfg.cached_chunk_T
-                # When carrying a running KV cache, do NOT re-feed warmup tokens.
                 kv_cache_list = [None] * self.cfg.n_layers
                 outputs = []
 
@@ -1404,10 +1333,10 @@ class CS2Transformer(nn.Module):
                 
                 h = torch.cat(outputs, dim=1)
             else:
-                # --- Standard Single-Shot Path ---
+                # Standard Single-Shot Path
                 h, _ = self.backbone(seq, attn_mask=None, kv_cache_list=None)
 
-            # --- Prediction Heads ---
+            # --- Step 6: Prediction Heads ---
             h_frames = h.reshape(B, T, Lpf, d)
             num_players = self.cfg.num_players
             
@@ -1417,7 +1346,6 @@ class CS2Transformer(nn.Module):
             player_preds: List[PlayerPredictions] = []
             for i in range(num_players):
                 p_tok_flat = player_tok_all_frames[:, :, i, :].reshape(B * T, d)
-                # Only checkpoint during training, and when it's enabled in the config
                 if self.training and self.cfg.enable_grad_checkpoint:
                     preds_flat = checkpoint(self.player_head, p_tok_flat, use_reentrant=self.cfg.grad_ckpt_use_reentrant)
                 else:
@@ -1441,12 +1369,11 @@ class CS2Transformer(nn.Module):
     ) -> Tuple[Predictions, List[Optional[KVCache]]]:
         """
         Processes a SINGLE frame of data for efficient autoregressive inference.
+        This method assumes on-the-fly processing of raw media ('images').
         """
         assert not self.training, "autoregressive_step should be called in eval mode"
-        # Initialize caches on first call so the backbone builds them.
         if past_kv_cache is None:
             past_kv_cache = [None] * self.cfg.n_layers
-        # --- MODIFIED: Check the new 'images' key ---
         assert single_frame_batch["images"].shape[1] == 1, "Input for autoregressive_step must have T=1"
 
         autocast_ctx = (
@@ -1454,69 +1381,47 @@ class CS2Transformer(nn.Module):
         )
         with torch.inference_mode():
             with autocast_ctx:
-                # --- MODIFIED: Use the single 'images' tensor ---
                 images = single_frame_batch["images"]
                 mel = single_frame_batch["mel_spectrogram"]
                 alive = single_frame_batch["alive_mask"].bool()
-
                 
                 dev = next(self.parameters()).device
-                images = images.to(dev, non_blocking=True)
-                mel    = mel.to(dev,    non_blocking=True)
-                alive  = alive.to(dev,  non_blocking=True)
-
-                B, T, P = images.shape[:3]  # T==1
-                C, H, W = images.shape[-3:]
+                images, mel, alive = images.to(dev), mel.to(dev), alive.to(dev)
+                B, T, P, C, H, W = images.shape # T==1
                 d = self.cfg.d_model
+                target_dtype = self.amp_dtype if self.use_amp else next(self.parameters()).dtype
 
-                param_dtype = next(self.parameters()).dtype
-                target_dtype = self.amp_dtype if self.use_amp else param_dtype
-
-                vis = torch.zeros(B, T, P, d, device=dev, dtype=target_dtype)
+                # --- Step 1: Get Raw Visual Features ---
+                vis_raw = torch.zeros(
+                    B, T, P, self.cfg.vision_backbone_hidden_size, device=dev, dtype=target_dtype
+                )
                 if torch.count_nonzero(alive):
-                    alive_images = images[alive]  # [num_alive, 3, H, W] (non-contiguous)
+                    alive_images = images[alive]
                     num_alive = alive_images.shape[0]
+                    packed_vis_raw = self.visual_encoder(alive_images.reshape(num_alive, 1, 1, C, H, W))
+                    vis_raw[alive] = packed_vis_raw.squeeze(1).squeeze(1)
 
-                    # Re-wrap to the encoder’s expected 6D input
-                    packed_vis_out = self.visual_encoder(
-                        alive_images.reshape(num_alive, 1, 1, C, H, W)
-                    )  # [num_alive, 1, 1, d]
+                # --- Step 2: Apply Shared Projection ---
+                vis = self.vision_proj(vis_raw.to(target_dtype))
 
-                    vis[alive] = packed_vis_out.squeeze(1).squeeze(1).to(target_dtype)  # [num_alive, d]
-
-                # Audio: cheap enough to run for all
-                aud = torch.empty(B, T, P, d, device=dev, dtype=target_dtype)
-                if torch.count_nonzero(alive):
-                    # The `mel[alive]` slice creates a 4D tensor [num_alive, C, H, W],
-                    # which our corrected AudioCNN can now handle.
-                    aud_alive = self.audio_encoder(mel[alive])
-                    if aud_alive.dtype != target_dtype:
-                        aud_alive = aud_alive.to(target_dtype)
-                    aud[alive] = aud_alive
-                
-                # Fuse
+                # --- Step 3: Process Audio and Fuse ---
+                aud = self.audio_encoder(mel).to(target_dtype)
                 player_tokens = self.player_fuser(vis, aud, alive)
 
+                # --- Step 4: Assemble sequence and run backbone ---
                 tok_gs = self.token_game_strategy.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
-                tok_sc = self.token_scratch .unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
-                frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2) # Concat on dim 2
-
+                tok_sc = self.token_scratch.unsqueeze(2).expand(B, T, 1, d).to(target_dtype)
+                frame_tokens = torch.cat([player_tokens, tok_gs, tok_sc], dim=2)
                 seq = frame_tokens.reshape(B, self.cfg.tokens_per_frame, d)
 
-                # --- Backbone call with cache ---
                 h, updated_kv_cache = self.backbone(seq, attn_mask=None, kv_cache_list=past_kv_cache)
-                if updated_kv_cache is None:
-                    updated_kv_cache = [None] * self.cfg.n_layers
+                if updated_kv_cache is None: updated_kv_cache = [None] * self.cfg.n_layers
 
-                # --- Prediction Heads ---
-                last = h
-                num_players = self.cfg.num_players
-                player_tok = last[:, :num_players, :]
-                strat_tok  = last[:, num_players, :]
-
-                player_preds: List[PlayerPredictions] = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
+                # --- Step 5: Prediction Heads ---
+                last, num_players = h, self.cfg.num_players
+                player_tok, strat_tok  = last[:, :num_players, :], last[:, num_players, :]
+                player_preds = [self.player_head(player_tok[:, i, :]) for i in range(num_players)]
                 strategy_preds = self.strategy_head(strat_tok)
-
                 predictions = {"player": player_preds, "game_strategy": strategy_preds}
 
                 return predictions, updated_kv_cache

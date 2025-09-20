@@ -2,24 +2,22 @@
 """
 train2.py — Data loading and Loss Calculation (Steps 1–11)
 
-This file implements the end-to-end data input subsystem for training, focusing on:
-  1) Round discovery from each game's LMDB `_INFO` entry (including video and audio paths)
-  2) LMDB environment manager for metadata
-  3) Epoch index / window sampling (fixed-length frame windows)
-  4) Writing 10 aligned DALI filelists (one per POV for video and audio)
-  5) Building a single DALI pipeline with 10 branches (5 video, 5 audio)
-  6) Tick-vector generator (64-tick demos → 32 fps, 2 ticks per frame)
-  7) LMDB metadata fetch (ground truth for all prediction heads)
-  8) Batch assembler (fuse DALI outputs with LMDB features into model-ready batches)
-  9) Determinism, DDP sharding, and instrumentation
-  10) Ground truth target preparation, including smooth heatmaps
-  11) A composite loss function for multi-headed predictions
+MODIFIED: This version includes a dual-path data pipeline.
+It can be run in two modes, controlled by the `--use-precomputed-embeddings` flag:
 
-Notes:
-- This module defines the data preparation pipeline into a CS2Batch-like dict.
-- Mel spectrograms are now generated ON-THE-FLY by DALI from .wav files.
-- LMDB is used for all per-frame metadata and ground truth labels.
-- The training task is next-frame prediction: given frame `t`, predict frame `t+1`.
+1. On-the-fly (default):
+   - DALI reads raw .mp4 and .wav files.
+   - Video frames are decoded and audio is converted to mel spectrograms on the fly.
+
+2. Pre-computed (--use-precomputed-embeddings):
+   - `embed.py` must be run first to generate .npy feature files.
+   - DALI reads these .npy files (one for ViT features, one for spectrograms).
+   - DALI slices the required frame window from the full-round tensor on the GPU.
+   - This significantly reduces CPU/GPU load during training, allowing for
+     larger batch sizes or faster iteration.
+
+The BatchAssembler and downstream model logic are designed to handle both
+input types transparently.
 """
 from __future__ import annotations
 
@@ -31,7 +29,7 @@ import time
 import random
 import logging
 import argparse
-import contextlib # <-- FIX: Added missing import for FilelistWriter
+import contextlib
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Any
@@ -353,10 +351,14 @@ class EpochIndex:
 # -------------------------------
 
 class FilelistWriter:
-    """Writes ten aligned DALI filelists (five for video, five for audio)."""
-    def __init__(self, out_dir: str):
+    """Writes ten aligned DALI filelists, supporting both raw media and pre-computed .npy files."""
+    def __init__(self, out_dir: str, use_precomputed: bool = False, data_root: str = ""):
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
+        self.use_precomputed = use_precomputed
+        if use_precomputed and not data_root:
+            raise ValueError("data_root must be provided when use_precomputed is True.")
+        self.data_root = data_root
 
     def write(self, records: List[SampleRecord]) -> Tuple[List[str], List[str]]:
         vid_paths = [os.path.join(self.out_dir, f"pov{k}_video.txt") for k in range(5)]
@@ -366,16 +368,33 @@ class FilelistWriter:
             files = [stack.enter_context(open(p, "w", encoding="utf-8")) for p in vid_paths + aud_paths]
             vid_files, aud_files = files[:5], files[5:]
             for rec in records:
-                for k in range(5):
-                    pov_path = rec.pov_videos[k]
-                    ticks = ticks_from_filename(pov_path)
-                    if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
-                    pov_start_tick, pov_end_tick = ticks
-                    start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
-                    vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
-                    packed = rec.sample_id * LABEL_SCALE + start
-                    aud_files[k].write(f"{rec.pov_audio[k]} {packed}\n")
-        logging.info("Wrote DALI filelists to %s (N=%d)", self.out_dir, len(records))
+                if self.use_precomputed:
+                    # PATH 1: Pre-computed .npy files
+                    # The filename is based on the round, not the individual POV.
+                    base_name = os.path.splitext(os.path.basename(rec.pov_videos[0]))[0]
+                    vid_npy_path = os.path.join(self.data_root, "vit_embed", rec.demoname, f"{base_name}.npy")
+                    aud_npy_path = os.path.join(self.data_root, "aud_embed", rec.demoname, f"{base_name}.npy")
+
+                    # Label encodes sample_id and the start frame for slicing in DALI
+                    packed_label = rec.sample_id * LABEL_SCALE + rec.start_f
+                    
+                    for k in range(5):
+                        vid_files[k].write(f"{vid_npy_path} {packed_label}\n")
+                        aud_files[k].write(f"{aud_npy_path} {packed_label}\n")
+                else:
+                    # PATH 2: Original logic for raw media files
+                    for k in range(5):
+                        pov_path = rec.pov_videos[k]
+                        ticks = ticks_from_filename(pov_path)
+                        if not ticks: raise ValueError(f"Could not parse ticks from: {pov_path}")
+                        pov_start_tick, pov_end_tick = ticks
+                        start, end_exclusive = clamp_window_to_pov(rec.start_f, rec.T_frames, pov_start_tick, pov_end_tick)
+                        vid_files[k].write(f"{pov_path} {rec.sample_id} {start} {end_exclusive}\n")
+                        
+                        packed_audio_label = rec.sample_id * LABEL_SCALE + start
+                        aud_files[k].write(f"{rec.pov_audio[k]} {packed_audio_label}\n")
+
+        logging.info("Wrote DALI filelists to %s (N=%d, Precomputed=%s)", self.out_dir, len(records), self.use_precomputed)
         return vid_paths, aud_paths
 
 # -------------------------------
@@ -400,22 +419,67 @@ class DaliConfig:
 
 
 class DaliInputPipeline:
-    """Builds a single DALI pipeline with 5 video and 5 audio branches."""
-    def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig):
+    """Builds a DALI pipeline for either raw media or pre-computed .npy files."""
+    def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig, use_precomputed: bool):
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
-        self.pipeline = self._build_pipeline(video_filelists, audio_filelists, cfg)
-        out_map = []
-        for k in range(5):
-            out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
+        
+        if use_precomputed:
+            self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, cfg)
+            out_map = []
+            for k in range(5):
+                out_map.extend([f"video_embed{k}", f"audio_embed{k}", f"labels{k}"])
+        else:
+            self.pipeline = self._build_media_pipeline(video_filelists, audio_filelists, cfg)
+            out_map = []
+            for k in range(5):
+                out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
+
         self.iterator = DALIGenericIterator(
-            [self.pipeline], 
-            out_map, 
-            auto_reset=True, 
-            last_batch_policy=LastBatchPolicy.DROP,
-            )
+            [self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP
+        )
 
-    def _build_pipeline(self, vlists, alists, cfg):
+    def _build_npy_pipeline(self, vlists, alists, cfg):
+        @pipeline_def(
+            enable_memory_stats=True, batch_size=cfg.batch_size, num_threads=cfg.num_threads,
+            device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=2
+        )
+        def pipe():
+            outputs = []
+            for k in range(5):
+                # Video Embeddings from NPY
+                vid_embed_raw, packed_label = fn.readers.numpy(
+                    name=f"VidNpy{k}", file_list=vlists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle
+                )
+                packed_i64 = fn.cast(packed_label, dtype=types.INT64)
+                sample_id_i64 = packed_i64 // LABEL_SCALE
+                start_f_i64 = packed_i64 - sample_id_i64 * LABEL_SCALE
+                
+                slice_start = fn.cast(start_f_i64, dtype=types.INT32)
+                
+                video_embed = fn.slice(
+                    vid_embed_raw.gpu(), start=slice_start, shape=[cfg.sequence_length],
+                    axes=[0], out_of_bounds_policy="pad", fill_values=0.0
+                )
 
+                # Audio Embeddings (Spectrograms) from NPY
+                aud_embed_raw, _ = fn.readers.numpy(
+                    name=f"AudNpy{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards, random_shuffle=cfg.shuffle
+                )
+                audio_embed = fn.slice(
+                    aud_embed_raw.gpu(), start=slice_start, shape=[cfg.sequence_length],
+                    axes=[0], out_of_bounds_policy="pad", fill_values=0.0
+                )
+                
+                label_out = fn.cast(sample_id_i64, dtype=types.INT32)
+                outputs.extend([video_embed, audio_embed, label_out])
+            return tuple(outputs)
+        
+        p = pipe()
+        p.build()
+        return p
+
+    def _build_media_pipeline(self, vlists, alists, cfg):
+        # This is the original _build_pipeline method, unchanged.
         @pipeline_def(
             enable_memory_stats=True,
             batch_size=cfg.batch_size,
@@ -467,7 +531,7 @@ class DaliInputPipeline:
                 sliced = fn.slice(
                     decoded.gpu(),
                     start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32),
-                    shape=int(shape_samples),
+                    shape=[int(shape_samples)],
                     axes=[0],
                     out_of_bounds_policy="pad",
                 )
@@ -504,7 +568,6 @@ class DaliInputPipeline:
         p.build()
         return p
 
-    
     def __iter__(self): return self
     def __next__(self): return next(self.iterator)[0]
     def reset(self): self.iterator.reset()
@@ -645,53 +708,51 @@ class BatchAssembler:
         return ((safe_masks.unsqueeze(-1) >> powers) & 1).float()
 
 
-    def assemble(self, dali_batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        """Assembles the final batch dictionary, including ground truth targets."""
+    def assemble(self, dali_batch: Dict[str, torch.Tensor], use_precomputed: bool) -> Dict[str, Any]:
+        """Assembles the final batch dictionary, handling both data paths."""
 
-        images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
+        if use_precomputed:
+            # PATH 1: Pre-computed embeddings
+            video_embeddings = torch.stack([dali_batch[f"video_embed{k}"] for k in range(5)], dim=2)
+            
+            # aud_embed from DALI is [B, T, Mel, 1, Chan]
+            audio_embed_list = [dali_batch[f"audio_embed{k}"] for k in range(5)]
+            audio_embed_stacked = torch.stack(audio_embed_list, dim=2) # [B, T, 5, Mel, 1, Chan]
+            # Permute to model's expected [B, T, P, C, Mel, 1]
+            audio_embeddings = audio_embed_stacked.permute(0, 1, 2, 5, 3, 4)
+            
+            sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
+            batch = {
+                "video_embeddings": video_embeddings,
+                "audio_embeddings": audio_embeddings,
+            }
+        else:
+            # PATH 2: On-the-fly processing
+            images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
+            mels_list = [dali_batch[f"mel{k}"] for k in range(5)] # [B, 2, T, Mels]
+            mel_stacked = torch.stack(mels_list, dim=2) # [B, 2, 5, T, Mels]
+            mel_permuted = mel_stacked.permute(0, 3, 2, 1, 4) # [B, T, 5, 2, Mels]
+            mel = mel_permuted.unsqueeze(-1) # [B, T, P, C, Mels, 1]
+            
+            sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
+            batch = {"images": images, "mel_spectrogram": mel}
 
-        mels_list = [dali_batch[f"mel{k}"] for k in range(5)]
-
-        # mel_k shape: [B, 2, T, Mels] (Batch, Channels, Time, Mel Bins)
-        # Stack along the player dimension (P) -> [B, 2, 5, T, Mels]
-        mel_stacked = torch.stack(mels_list, dim=2)
-
-        # Permute to the model's expected order: [B, T, P, C, Mels]
-        mel_permuted = mel_stacked.permute(0, 3, 2, 1, 4)
-        
-        # Unsqueeze to add the final singleton dimension for the CNN filter.
-        # Final shape: [B, T, P, C, Mels, 1]
-        mel = mel_permuted.unsqueeze(-1)
-        
-        # 2) Fetch metadata and ground truth labels from LMDB.
-        #    This happens on the CPU.
-        sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
-        
+        # The rest of the assembly (metadata, targets) is IDENTICAL for both paths
         gt_lists = defaultdict(list)
         meta = {"sample_ids": sample_ids, "demonames": [], "round_nums": [], "teams": []}
-
         for sid in sample_ids:
             rec = self.id_to_sample[int(sid)]
             meta["demonames"].append(rec.demoname)
             meta["round_nums"].append(rec.round_num)
             meta["teams"].append(rec.team)
-            
             gt_result = self.fetcher.fetch(rec)
             for key, value in gt_result.__dict__.items():
                 gt_lists[key].append(torch.from_numpy(value))
 
         gt_tensors = {k: torch.stack(v, dim=0).to(self.device, non_blocking=True) for k, v in gt_lists.items()}
+        batch["alive_mask"] = gt_tensors.pop("alive_mask").bool()
+        batch["meta"] = meta
 
-        # 4) Assemble final batch dictionary
-        batch = {
-            "images": images,
-            "mel_spectrogram": mel,
-            "alive_mask": gt_tensors.pop("alive_mask").bool(),
-            "meta": meta,
-        }
-
-        # 5) Assemble the 'targets' dictionary, converting masks to multi-hot.
-        #    These tensors are already on the correct device from step 3.
         targets = {"player": [{} for _ in range(5)], "game_strategy": {}}
         for i in range(5):
             targets["player"][i]["stats"] = gt_tensors["stats"][:, :, i]
@@ -723,9 +784,6 @@ class BatchAssembler:
 # =============================================================================
 # STEP 11: Composite Loss Function
 # =============================================================================
-
-import torch
-import torch.nn as nn
 
 class CompositeLoss(nn.Module):
     """
@@ -914,32 +972,34 @@ def get_ddp_info() -> Tuple[int, int]:
 # -------------------------------
 
 def build_data_iter(args):
-    """Convenience function that wires Steps 1→8 and returns (dali_iter, assembler)."""
-    # Steps 1-4: Discover rounds, sample windows, write filelists
+    """Convenience function that wires Steps 1→8 and returns components."""
     manifest = Manifest(args.data_root, args.manifest)
     store = LmdbStore()
     team_rounds = build_team_rounds(args.data_root, manifest.get_games(args.split), store)
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
     records, id_map = index.build(team_rounds, epoch=0)
-    fl_dir = os.path.join(args.run_dir, "epoch_0")
-    video_lists, audio_lists = FilelistWriter(fl_dir).write(records)
     
-    # Step 5: DALI
+    fl_dir = os.path.join(args.run_dir, "epoch_0")
+    writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
+    video_lists, audio_lists = writer.write(records)
+    
     shard_id, num_shards = get_ddp_info()
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     dali_cfg = DaliConfig(
-        sequence_length=args.T_frames,
-        batch_size=args.batch_size, num_threads=args.dali_threads,
-        device_id=device_id,
-        shard_id=shard_id, num_shards=num_shards,
+        sequence_length=args.T_frames, batch_size=args.batch_size, num_threads=args.dali_threads,
+        device_id=device_id, shard_id=shard_id, num_shards=num_shards
     )
-    dali_iter = DaliInputPipeline(video_lists, audio_lists, dali_cfg)
+    dali_iter = DaliInputPipeline(video_lists, audio_lists, dali_cfg, use_precomputed=args.use_precomputed_embeddings)
 
-    # Step 7-8: Metadata Fetcher and Assembler
     fetcher = LmdbMetaFetcher(store)
     assembler_device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
     assembler = BatchAssembler(id_map, fetcher, device=assembler_device)
-    return dali_iter, assembler
+    
+    # Return a model config object to be used by the main script
+    from model import CS2Config
+    model_cfg = CS2Config(context_frames=args.T_frames)
+    
+    return dali_iter, assembler, model_cfg
 
 
 def get_args():
@@ -955,6 +1015,9 @@ def get_args():
     parser.add_argument("--dali-threads", type=int, default=4, help="Number of threads for DALI.")
     parser.add_argument("--num-steps", type=int, default=20, help="Number of iterations for the smoke test.")
     parser.add_argument("--profile", action='store_true', help="Enable torch.profiler and save trace to TensorBoard.")
+    # NEW ARGUMENT
+    parser.add_argument("--use-precomputed-embeddings", action='store_true',
+                        help="Load pre-computed .npy embeddings instead of processing media on-the-fly.")
     
     args = parser.parse_args()
     if args.manifest is None:
@@ -962,15 +1025,15 @@ def get_args():
     return args
 
 
-def run_step(dali_iter, assembler, model, loss_fn):
+def run_step(dali_iter, assembler, model, loss_fn, use_precomputed):
     """Encapsulates one iteration of the smoke test."""
     try:
         with record_function("dali_fetch"), Timer("dali_fetch") as t:
             batch_raw = next(iter(dali_iter))
-        logging.info("DALI fetched video+audio in %.3fs", t.dt)
+        logging.info("DALI fetched data in %.3fs", t.dt)
         
         with record_function("assemble_batch"), Timer("assemble") as t2:
-            batch = assembler.assemble(batch_raw)
+            batch = assembler.assemble(batch_raw, use_precomputed)
         logging.info("Assembled batch in %.3fs", t2.dt)
         
         with record_function("forward_pass"), Timer("forward_pass") as t3:
@@ -992,18 +1055,23 @@ def run_step(dali_iter, assembler, model, loss_fn):
 def main(args):
     """Main driver for the data loader smoke test."""
     # These imports are specific to the driver and model
-    from model import CS2Transformer, CS2Config
+    from model import CS2Transformer
 
     if not DALI_AVAILABLE:
         logging.error("DALI is not available: %s", _DALI_IMPORT_ERROR)
         return
 
     try:
-        dali_iter, assembler = build_data_iter(args)
+        dali_iter, assembler, model_cfg = build_data_iter(args)
         
         # --- SMOKE TEST SETUP ---
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_cfg = CS2Config(context_frames=args.T_frames)
+        
+        # Configure the model based on the data loading mode
+        logging.info(f"Configuring model for pre-computed embeddings: {args.use_precomputed_embeddings}")
+        # This config is now passed to the model, but the model's forward pass
+        # makes the final decision based on the batch keys. This is for consistency.
+        model_cfg.use_precomputed_embeddings = args.use_precomputed_embeddings
         model = CS2Transformer(model_cfg, use_dummy_vision=False).to(device)
         
         loss_weights = {
@@ -1033,7 +1101,7 @@ def main(args):
                 with_stack=True,
             ) as prof:
                 for i in range(args.num_steps):
-                    if not run_step(dali_iter, assembler, model, loss_fn):
+                    if not run_step(dali_iter, assembler, model, loss_fn, args.use_precomputed_embeddings):
                         break
                     prof.step() # Signal profiler that a step is complete
 
@@ -1049,7 +1117,7 @@ def main(args):
             print(torch.cuda.max_memory_allocated() / 1024**3, "GiB peak")
         else:
             for i in range(args.num_steps):
-                if not run_step(dali_iter, assembler, model, loss_fn):
+                if not run_step(dali_iter, assembler, model, loss_fn, args.use_precomputed_embeddings):
                     break
 
     except Exception as e:
