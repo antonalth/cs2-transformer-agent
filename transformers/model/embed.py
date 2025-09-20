@@ -1,504 +1,427 @@
 #!/usr/bin/env python3
 """
-embed.py — Offline Feature Precomputation
+embed.py — Offline Feature Pre-computation for Video and Audio
 
-Precomputes and caches training-ready features for all recordings to enable
-instantaneous data loading during training. This script processes raw video and
-audio files in parallel across multiple GPUs.
+This script processes the entire dataset of recordings to pre-compute and cache
+features, significantly accelerating the training data loading pipeline.
 
-- Video Features: Extracts raw, projection-less features from a DINOv3
-  backbone for each frame of a video.
-- Audio Features: Generates stereo log-mel spectrograms from raw .wav files.
+Features:
+  - Video Embeddings: Extracts raw, pre-projection features from the DINOv3
+    vision backbone for every frame of every video at a consistent 32 FPS.
+  - Audio Embeddings: Generates stereo log-mel spectrograms for every audio
+    file, perfectly aligned to the 32 FPS video time base.
+  - Multi-GPU Parallelism: Utilizes all available GPUs to process files in
+    parallel using `torch.multiprocessing`.
+  - Robust & Idempotent: Skips already processed files (resumable), writes
+    outputs atomically to prevent corruption, and handles errors gracefully.
+  - Consistency with Training: Reuses DALI pipelines, model configurations,
+    and processing logic directly from `train2.py` and `model.py` to
+    guarantee that cached features are identical to those generated on-the-fly
+    during training.
 
-All outputs are aligned to a common 32 fps time base and stored as memory-
-mappable NumPy (.npy) files, mirroring the input directory structure. The
-process is idempotent and can be resumed, skipping already-completed files.
+Workflow:
+  1. Discover all .mp4 and .wav files in the `recordings/` directory.
+  2. Filter out files that already have corresponding embeddings, unless
+     --overwrite is specified.
+  3. A pool of worker processes (one per GPU) pulls jobs (file pairs).
+  4. Each worker configures a DALI pipeline to read the full media file.
+  5. For video, frames are processed in batches through the DINOv3 backbone.
+  6. For audio, the full waveform is converted to a mel spectrogram on the GPU.
+  7. The resulting feature tensors are aligned to the same frame count (T)
+     and saved atomically as .npy files in `vit_embed/` and `aud_embed/`.
 """
-from __future__ import annotations
-
 import os
 import argparse
 import logging
 import time
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.distributed as dist
+import torch.multiprocessing as mp
 from tqdm import tqdm
 
-# Reuse components from training/model scripts
-from train2 import DaliConfig, FPS
+# Reuse components from the training scripts
+from train2 import DaliConfig, TICK_RATE, FPS
 from model import CS2Config, DINOv3VisualEncoder
 
-# DALI for video decoding
+# --- Try to import DALI ---
 try:
-    from nvidia.dali import pipeline_def, fn, types
-    from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+    from nvidia.dali import fn, pipeline_def, types
+    from nvidia.dali.plugin.pytorch import DALIGenericIterator
+    from nvidia.dali.plugin.base_iterator import LastBatchPolicy
     DALI_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     DALI_AVAILABLE = False
-
-# torchaudio for audio processing
-try:
-    import torchaudio
-    import torchaudio.transforms as T
-    TORCHAUDIO_AVAILABLE = True
-except ImportError:
-    TORCHAUDIO_AVAILABLE = False
-    
-# decord for fast video metadata
-try:
-    import decord
-    decord.bridge.set_bridge('torch')
-    DECORD_AVAILABLE = True
-except ImportError:
-    DECORD_AVAILABLE = False
-
-# --- Constants & Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s][%(levelname)s][Rank %(rank)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-# --- Helper Classes for Feature Extraction ---
-
-class RawDINOv3Extractor(nn.Module):
-    """
-    A wrapper around the DINOv3VisualEncoder from model.py to extract only the
-    raw, pre-projection features (e.g., CLS token) from the ViT backbone.
-    """
-    def __init__(self, cfg: CS2Config):
-        super().__init__()
-        # Instantiate the full encoder to leverage its weight loading,
-        # normalization constants, and processor.
-        self.encoder = DINOv3VisualEncoder(cfg)
-        
-        # We only need the backbone and its internal methods/buffers.
-        self.backbone = self.encoder.backbone
-        self.processor = self.encoder.processor
-        self.compute_dtype = self.encoder.compute_dtype
-        self.use_channels_last = self.encoder.use_channels_last
-
-        # The DINOv3VisualEncoder already freezes the backbone, so we just
-        # ensure the entire module is in eval mode.
-        self.eval()
-        for p in self.parameters():
-            p.requires_grad = False
-
-    @torch.no_grad()
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Processes a batch of raw image tensors and returns raw backbone features.
-        
-        Args:
-            images: Tensor of shape [N, 3, H, W], uint8 or float.
-        
-        Returns:
-            Tensor of shape [N, D_raw] where D_raw is the backbone's hidden dim.
-        """
-        # This forward pass is a simplified version of DINOv3VisualEncoder.forward,
-        # stopping before the final projection layer.
-        device = images.device
-        from_uint8 = images.dtype == torch.uint8
-        
-        if self.processor:
-            # The HF processor expects a list of PIL/numpy images or a tensor
-            # on the CPU. Move to CPU for processing.
-            processed = self.processor(images=images.cpu(), return_tensors="pt")
-            pixel_values = processed['pixel_values'].to(device)
-            if self.use_channels_last:
-                pixel_values = pixel_values.to(memory_format=torch.channels_last)
-        else:
-            pixel_values = self.encoder._normalize_chunk(images, from_uint8=from_uint8)
-        
-        # Run backbone under autocast for efficiency.
-        with torch.autocast(device_type="cuda", dtype=self.compute_dtype):
-            outputs = self.backbone(pixel_values=pixel_values)
-            # The raw feature is the output of the pooling layer (CLS token).
-            features = outputs.pooler_output
-        
-        return features.float() # Return as float32 for numpy saving
+    DALI_IMPORT_ERROR = e
 
 
-class AudioEmbedder(nn.Module):
-    """
-    Generates stereo log-mel spectrograms from .wav files, matching the
-    parameters used in the DALI training pipeline.
-    """
-    def __init__(self, cfg: DaliConfig, device: torch.device):
-        super().__init__()
-        self.target_sr = cfg.sample_rate
-        self.device = device
-        
-        self.mel_transform = T.MelSpectrogram(
-            sample_rate=self.target_sr,
-            n_fft=cfg.n_fft,
-            win_length=cfg.win_length,
-            hop_length=cfg.hop_length,
-            n_mels=cfg.n_mels,
-            center=False,
-            power=2.0
-        ).to(device)
+# ---------------------------
+# Core Utilities
+# ---------------------------
 
-        self.db_transform = T.AmplitudeToDB(
-            stype='power', top_db=cfg.db_cutoff
-        ).to(device)
+def get_args():
+    """Parses command-line arguments."""
+    parser = argparse.ArgumentParser(description="Pre-compute video and audio embeddings.")
+    parser.add_argument("--data-root", type=str, default=os.environ.get("DATA_ROOT", "data"),
+                        help="Root directory for the dataset containing recordings/, vit_embed/, etc.")
+    parser.add_argument("--mode", type=str, choices=["video", "audio", "both"], default="both",
+                        help="Which modality to process.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing embedding files.")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Number of video frames to process at a time in DALI/ViT.")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Number of GPUs to use. Defaults to all available GPUs.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit the number of files to process for debugging.")
+    args = parser.parse_args()
+    return args
 
-    @torch.no_grad()
-    def forward(self, wav_path: str) -> torch.Tensor:
-        """
-        Loads, processes, and converts a wav file to a stereo log-mel tensor.
-        
-        Returns:
-            Tensor of shape [T, n_mels, 2].
-        """
-        waveform, sr = torchaudio.load(wav_path)
-        waveform = waveform.to(self.device)
+def atomic_save_npy(path: Path, array: np.ndarray):
+    """Saves a NumPy array atomically to prevent corruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, delete=False) as f:
+        np.save(f, array)
+        temp_path = f.name
+    # Ensure data is written to disk before renaming
+    if hasattr(os, 'fsync'):
+        with open(temp_path, 'rb') as f:
+            os.fsync(f.fileno())
+    os.replace(temp_path, path)
 
-        if sr != self.target_sr:
-            resampler = T.Resample(sr, int(self.target_sr), dtype=waveform.dtype).to(self.device)
-            waveform = resampler(waveform)
+# ---------------------------
+# Video Processing
+# ---------------------------
 
-        if waveform.shape[0] == 1:
-            waveform = waveform.repeat(2, 1)
-        elif waveform.shape[0] != 2:
-            raise ValueError(f"Expected mono or stereo audio, found {waveform.shape[0]} channels in {wav_path}")
-
-        # Process each channel separately
-        mel_specs = [self.mel_transform(waveform[i]) for i in range(2)]
-        db_specs = [self.db_transform(mel) for mel in mel_specs]
-
-        # Transpose from [n_mels, T] to [T, n_mels] and stack
-        stereo_mel = torch.stack([db.transpose(0, 1) for db in db_specs], dim=-1)
-        
-        return stereo_mel
-
-
-# --- DALI Pipeline for Full Video Decoding ---
-
-def get_dali_pipeline(video_file: str, batch_size: int, num_threads: int, device_id: int):
-    """
-    Creates a DALI pipeline to decode an entire video file at 32 FPS.
-    """
-    @pipeline_def(batch_size=batch_size, num_threads=num_threads, device_id=device_id)
-    def video_pipe():
-        # DALI's video reader is fast but requires a file list.
-        video_frames = fn.readers.video(
-            device="gpu",
-            filenames=[video_file],
-            sequence_length=1, # Process one frame at a time to handle variable length videos easily
-            step=1, # No frame skipping
-            initial_fill=batch_size, # Buffer size
-            normalized=False,
-            image_type=types.RGB,
-            dtype=types.UINT8,
-            file_list_frame_num=False
-        )
-        return video_frames
-    
-    pipe = video_pipe()
-    pipe.build()
-    return pipe
-
-# --- Core Processing Functions ---
-
-def process_video(
-    job: Dict,
-    extractor: RawDINOv3Extractor,
-    dali_batch_size: int,
-    dali_threads: int,
-    device_id: int,
-) -> Tuple[int, int]:
-    """
-    Extracts features for a single video file using DALI and DINOv3.
-    """
-    video_in = job['video_in']
-    video_out = Path(job['video_out'])
-    target_T = job['target_T']
-    
-    if not os.path.exists(video_in):
-        log.error(f"Input video not found: {video_in}")
-        return 0, 0
-
-    video_out.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Setup DALI pipeline for this specific video
-    dali_pipe = get_dali_pipeline(video_in, dali_batch_size, dali_threads, device_id)
-    
-    # Use DALIGenericIterator to iterate through all frames
-    dali_iter = DALIGenericIterator(
-        [dali_pipe],
-        output_map=["frames"],
-        auto_reset=True,
-        last_batch_policy=LastBatchPolicy.PARTIAL,
-        dynamic_shape=True
+@pipeline_def
+def create_video_pipeline(video_path: str, batch_size: int, device_id: int):
+    """DALI pipeline to decode a full video at 32 FPS."""
+    # DALI's video reader is powerful. By giving it a single file and a sequence_length
+    # equal to the batch_size, it will iterate through the video in chunks.
+    video, _ = fn.readers.video(
+        device="gpu",
+        filenames=[video_path],
+        sequence_length=batch_size,
+        step=batch_size, # Advance by a full batch each time
+        normalized=False,
+        image_type=types.RGB,
+        dtype=types.UINT8,
+        pad_last_batch=True, # Ensure the last partial batch is processed
+        name=f"VideoReader_{os.path.basename(video_path)}",
     )
-    
+    return video
+
+def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int, gpu_id: int) -> Optional[torch.Tensor]:
+    """Processes a single video file and returns raw DINOv3 features."""
+    if not video_path.exists():
+        logging.warning(f"[GPU {gpu_id}] Video file not found: {video_path}")
+        return None
+
+    pipe = create_video_pipeline(
+        video_path=str(video_path),
+        batch_size=batch_size,
+        device_id=gpu_id,
+        batch_size=batch_size,
+        num_threads=4,
+        device_id=gpu_id,
+    )
+    pipe.build()
+
+    dali_iter = DALIGenericIterator(
+        [pipe],
+        ['frames'],
+        reader_name=f"VideoReader_{video_path.name}",
+        auto_reset=True,
+        last_batch_policy=LastBatchPolicy.PARTIAL
+    )
+
     all_features = []
     try:
-        for batch in dali_iter:
-            frames = batch[0]['frames'].squeeze(1) # DALI adds a time dimension
-            
-            # DALI gives [N, H, W, C], model expects [N, C, H, W]
-            frames_chw = frames.permute(0, 3, 1, 2)
-            features = extractor(frames_chw)
-            all_features.append(features.cpu())
-            
-        if not all_features:
-            log.warning(f"No features extracted from {video_in}")
-            return 0, 0
-            
-        features_np = torch.cat(all_features, dim=0).numpy()
-        
-        # Trim to target length for alignment
-        if features_np.shape[0] > target_T:
-            features_np = features_np[:target_T]
+        with torch.no_grad():
+            for batch in dali_iter:
+                frames_uint8 = batch[0]['frames'] # [B, H, W, C]
+                if frames_uint8.shape[0] == 0: continue
 
-        # Atomic write
-        with tempfile.NamedTemporaryFile(delete=False, dir=video_out.parent, suffix=".tmp") as tmp_file:
-            np.save(tmp_file, features_np)
-            tmp_path = tmp_file.name
-        os.replace(tmp_path, video_out)
-        
-        return features_np.shape[0], features_np.shape[1]
-    
-    finally:
-        # It's good practice to clean up the iterator and its resources
-        del dali_iter
-        del dali_pipe
+                # DINOv3 encoder expects [B, C, H, W]
+                frames_uint8 = frames_uint8.permute(0, 3, 1, 2)
 
-
-def process_audio(job: Dict, embedder: AudioEmbedder) -> int:
-    """
-    Extracts features for a single audio file.
-    """
-    audio_in = job['audio_in']
-    audio_out = Path(job['audio_out'])
-    target_T = job['target_T']
-    
-    if not os.path.exists(audio_in):
-        log.error(f"Input audio not found: {audio_in}")
-        return 0
-        
-    audio_out.parent.mkdir(parents=True, exist_ok=True)
-    
-    features = embedder(audio_in)
-    features_np = features.cpu().numpy()
-    
-    # Trim to target length
-    if features_np.shape[0] > target_T:
-        features_np = features_np[:target_T]
-
-    # Atomic write
-    with tempfile.NamedTemporaryFile(delete=False, dir=audio_out.parent, suffix=".tmp") as tmp_file:
-        np.save(tmp_file, features_np)
-        tmp_path = tmp_file.name
-    os.replace(tmp_path, audio_out)
-    
-    return features_np.shape[0]
-
-# --- DDP and Job Management ---
-
-def get_media_duration(path: str) -> float:
-    """Returns the duration of a media file in seconds."""
-    try:
-        if path.endswith('.wav'):
-            info = torchaudio.info(path)
-            return info.num_frames / info.sample_rate
-        elif path.endswith('.mp4'):
-            if not DECORD_AVAILABLE: return 0.0
-            vr = decord.VideoReader(path, ctx=decord.cpu(0))
-            return len(vr) / vr.get_avg_fps()
+                # --- Extract RAW backbone features (pre-projection) ---
+                # This logic is adapted from DINOv3VisualEncoder.forward to get
+                # intermediate results without modifying the original class.
+                x = model._normalize_chunk(frames_uint8, from_uint8=True)
+                feats = model._forward_backbone_no_grad(x) # [B, D_raw]
+                all_features.append(feats.cpu())
     except Exception as e:
-        log.warning(f"Could not get duration for {path}: {e}")
-    return 0.0
+        logging.error(f"[GPU {gpu_id}] Failed processing video {video_path}: {e}")
+        return None
+    finally:
+        dali_iter.reset() # Clean up DALI resources
+        del pipe, dali_iter
 
+    if not all_features:
+        return None
 
-def setup_ddp():
-    """Initializes the distributed process group."""
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    # Patch logger to include rank
-    global log
-    old_factory = logging.getLogRecordFactory()
-    def record_factory(*args, **kwargs):
-        record = old_factory(*args, **kwargs)
-        record.rank = rank
-        return record
-    logging.setLogRecordFactory(record_factory)
-    return rank, world_size, local_rank
+    return torch.cat(all_features, dim=0)
 
+# ---------------------------
+# Audio Processing
+# ---------------------------
 
-def main(args):
-    """Main script entry point."""
-    if not DALI_AVAILABLE:
-        raise RuntimeError("NVIDIA DALI is required for video processing.")
-    if not TORCHAUDIO_AVAILABLE:
-        raise RuntimeError("torchaudio is required for audio processing.")
-    if not DECORD_AVAILABLE and args.mode in ['all', 'video']:
-        raise RuntimeError("decord is required for video metadata.")
+@pipeline_def
+def create_audio_pipeline(wav_path: str, dali_cfg: DaliConfig, device_id: int):
+    """DALI pipeline to convert a full .wav file to a stereo mel spectrogram."""
+    audio_raw, _ = fn.readers.file(files=[wav_path], name=f"AudioReader_{os.path.basename(wav_path)}")
+    decoded, _ = fn.decoders.audio(audio_raw, sample_rate=dali_cfg.sample_rate, downmix=False)
 
-    rank, world_size, local_rank = setup_ddp()
-    device = torch.device(f"cuda:{local_rank}")
-    
-    jobs = []
-    if rank == 0:
-        log.info("Rank 0: Discovering and preparing jobs...")
-        data_root = Path(args.data_root)
-        rec_root = data_root / "recordings"
-        vid_root = data_root / "vit_embed"
-        aud_root = data_root / "aud_embed"
+    left = decoded[:, 0]
+    right = decoded[:, 1]
 
-        all_stems = set()
-        for root, _, files in os.walk(rec_root):
-            for f in files:
-                if f.endswith(('.mp4', '.wav')):
-                    p = Path(root) / f
-                    stem = p.relative_to(rec_root).with_suffix('')
-                    all_stems.add(str(stem))
+    def to_mel_db(channel_1d):
+        spec = fn.spectrogram(
+            channel_1d, nfft=dali_cfg.nfft,
+            window_length=dali_cfg.window_length, window_step=dali_cfg.hop_length,
+            center_windows=False
+        )
+        mel = fn.mel_filter_bank(
+            spec, sample_rate=dali_cfg.sample_rate,
+            nfilter=dali_cfg.mel_bins, freq_high=dali_cfg.mel_fmax
+        )
+        db = fn.to_decibels(mel, cutoff_db=dali_cfg.db_cutoff)
+        return fn.transpose(db, perm=[1, 0]) # -> [time, n_mels]
 
-        for stem_str in tqdm(sorted(list(all_stems)), desc="Scanning files"):
-            stem = Path(stem_str)
-            video_in = rec_root / stem.with_suffix(".mp4")
-            audio_in = rec_root / stem.with_suffix(".wav")
-            video_out = vid_root / stem.with_suffix(".npy")
-            audio_out = aud_root / stem.with_suffix(".npy")
-            
-            job = {"stem": stem_str}
-            
-            do_video = args.mode in ['all', 'video'] and video_in.exists()
-            do_audio = args.mode in ['all', 'audio'] and audio_in.exists()
+    mel_left = to_mel_db(left)
+    mel_right = to_mel_db(right)
+    # Stack to [2, time, n_mels] to match training pipeline intermediate shape
+    mel_stereo = fn.stack(mel_left, mel_right, axis=0)
+    return mel_stereo.gpu()
 
-            if not (do_video or do_audio):
-                continue
-            
-            # Skip if outputs exist and not overwriting
-            if not args.overwrite:
-                vid_exists = do_video and video_out.exists()
-                aud_exists = do_audio and audio_out.exists()
-                if (not do_video or vid_exists) and (not do_audio or aud_exists):
-                    continue
+def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional[torch.Tensor]:
+    """Processes a single audio file and returns a stereo mel spectrogram."""
+    if not wav_path.exists():
+        logging.warning(f"[GPU {gpu_id}] Audio file not found: {wav_path}")
+        return None
 
-            # Calculate target frame count for alignment
-            video_dur = get_media_duration(str(video_in)) if do_video else float('inf')
-            audio_dur = get_media_duration(str(audio_in)) if do_audio else float('inf')
-            min_dur = min(video_dur, audio_dur)
-
-            if min_dur == 0 or min_dur == float('inf'):
-                log.warning(f"Skipping {stem_str} due to zero or invalid duration.")
-                continue
-                
-            job['target_T'] = int(min_dur * FPS)
-            if do_video:
-                job['video_in'] = str(video_in)
-                job['video_out'] = str(video_out)
-            if do_audio:
-                job['audio_in'] = str(audio_in)
-                job['audio_out'] = str(audio_out)
-                
-            jobs.append(job)
-        
-        log.info(f"Found {len(jobs)} jobs to process.")
-
-    # Broadcast job list from rank 0 to all other ranks
-    dist.barrier()
-    # Use a list container so the object can be modified by broadcast_object_list
-    job_container = [jobs] 
-    dist.broadcast_object_list(job_container, src=0)
-    if rank != 0:
-        jobs = job_container[0]
-
-    # Each rank processes its slice of the jobs
-    my_jobs = jobs[rank::world_size]
-    
-    # Initialize models
-    video_extractor = None
-    if args.mode in ['all', 'video']:
-        model_cfg = CS2Config() # Use defaults from model.py
-        video_extractor = RawDINOv3Extractor(model_cfg).to(device)
-
-    audio_embedder = None
-    if args.mode in ['all', 'audio']:
-        dali_cfg = DaliConfig() # Use defaults from train2.py
-        audio_embedder = AudioEmbedder(dali_cfg, device)
-
-    stats = {"video_ok": 0, "video_fail": 0, "audio_ok": 0, "audio_fail": 0}
-    
-    progress_bar = tqdm(my_jobs, desc=f"Rank {rank} Processing", position=rank)
-    for job in progress_bar:
-        # --- Process Video ---
-        if 'video_in' in job and video_extractor:
-            try:
-                start_t = time.time()
-                t, d = process_video(
-                    job, video_extractor, args.dali_batch_size, args.dali_threads, local_rank
-                )
-                dt = time.time() - start_t
-                if t > 0:
-                    log.info(f"VIDEO OK: {job['stem']} -> [T={t}, D={d}] in {dt:.2f}s")
-                    stats['video_ok'] += 1
-                else:
-                    stats['video_fail'] += 1
-            except Exception as e:
-                log.exception(f"VIDEO FAIL: {job['stem']} with error: {e}")
-                stats['video_fail'] += 1
-        
-        # --- Process Audio ---
-        if 'audio_in' in job and audio_embedder:
-            try:
-                start_t = time.time()
-                t = process_audio(job, audio_embedder)
-                dt = time.time() - start_t
-                if t > 0:
-                    log.info(f"AUDIO OK: {job['stem']} -> [T={t}] in {dt:.2f}s")
-                    stats['audio_ok'] += 1
-                else:
-                    stats['audio_fail'] += 1
-            except Exception as e:
-                log.exception(f"AUDIO FAIL: {job['stem']} with error: {e}")
-                stats['audio_fail'] += 1
-    
-    # Synchronize and print summary
-    dist.barrier()
-    
-    stats_tensor = torch.tensor(
-        [stats['video_ok'], stats['video_fail'], stats['audio_ok'], stats['audio_fail']],
-        dtype=torch.int64,
-        device=device
+    pipe = create_audio_pipeline(
+        wav_path=str(wav_path),
+        dali_cfg=dali_cfg,
+        device_id=gpu_id,
+        batch_size=1, # One file at a time
+        num_threads=2,
+        device_id=gpu_id,
     )
-    dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
-    
-    if rank == 0:
-        total_stats = stats_tensor.cpu().tolist()
-        log.info("=" * 50)
-        log.info("               PROCESSING SUMMARY")
-        log.info("=" * 50)
-        log.info(f"Total initial jobs: {len(jobs)}")
-        log.info(f"Video Succeeded: {total_stats[0]}")
-        log.info(f"Video Failed:    {total_stats[1]}")
-        log.info(f"Audio Succeeded: {total_stats[2]}")
-        log.info(f"Audio Failed:    {total_stats[3]}")
-        log.info("=" * 50)
+    pipe.build()
 
-    dist.destroy_process_group()
+    dali_iter = DALIGenericIterator(
+        [pipe], ['mel'], reader_name=f"AudioReader_{wav_path.name}",
+        auto_reset=True, last_batch_policy=LastBatchPolicy.FILL
+    )
+
+    try:
+        # The pipeline processes the entire file and returns one item
+        mel_batch = next(iter(dali_iter))
+        mel_tensor = mel_batch[0]['mel'].squeeze(0) # [2, T, Mels]
+        # Permute to spec: [T, Mels, 2] for [T, n_mels, channels]
+        mel_tensor = mel_tensor.permute(1, 2, 0)
+    except Exception as e:
+        logging.error(f"[GPU {gpu_id}] Failed processing audio {wav_path}: {e}")
+        return None
+    finally:
+        dali_iter.reset()
+        del pipe, dali_iter
+
+    return mel_tensor
+
+# ---------------------------
+# Worker & Main Logic
+# ---------------------------
+
+def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict):
+    """The main worker process function, assigned to a specific GPU."""
+    gpu_id = rank
+    torch.cuda.set_device(gpu_id)
+    
+    # --- Setup models and configs once per worker ---
+    dali_cfg = DaliConfig(fps=FPS)
+    cs2_cfg = CS2Config()
+    
+    video_model = None
+    if args.mode in ["video", "both"]:
+        try:
+            video_model = DINOv3VisualEncoder(cs2_cfg)
+            video_model.to(torch.bfloat16).to(gpu_id).eval()
+        except Exception as e:
+            logging.error(f"[GPU {gpu_id}] Failed to initialize DINOv3 model: {e}")
+            return
+
+    # Process assigned jobs
+    num_jobs = len(jobs)
+    for i in range(rank, num_jobs, world_size):
+        job = jobs[i]
+        md5, name, video_in_path, audio_in_path, video_out_path, audio_out_path = job
+        
+        start_time = time.time()
+        
+        try:
+            video_tensor, audio_tensor = None, None
+            
+            # --- Process Video ---
+            if args.mode in ["video", "both"]:
+                video_tensor = process_video(video_in_path, video_model, args.batch_size, gpu_id)
+            
+            # --- Process Audio ---
+            if args.mode in ["audio", "both"]:
+                audio_tensor = process_audio(audio_in_path, dali_cfg, gpu_id)
+
+            if video_tensor is None and args.mode in ["video", "both"]:
+                stats['failed'] += 1
+                continue
+            if audio_tensor is None and args.mode in ["audio", "both"]:
+                stats['failed'] += 1
+                continue
+
+            # --- Align and Save ---
+            if args.mode == "both":
+                T_vid = video_tensor.shape[0]
+                T_aud = audio_tensor.shape[0]
+                T_final = min(T_vid, T_aud)
+                
+                if T_final > 0:
+                    atomic_save_npy(video_out_path, video_tensor[:T_final].numpy())
+                    atomic_save_npy(audio_out_path, audio_tensor[:T_final].numpy())
+                    stats['completed'] += 1
+                    logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={T_final} in {time.time()-start_time:.2f}s")
+                else:
+                    logging.warning(f"[GPU {gpu_id}] Skipped {md5}/{name} due to zero-length output.")
+                    stats['failed'] += 1
+
+            elif args.mode == "video":
+                atomic_save_npy(video_out_path, video_tensor.numpy())
+                stats['completed'] += 1
+                logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={video_tensor.shape[0]} in {time.time()-start_time:.2f}s")
+            
+            elif args.mode == "audio":
+                atomic_save_npy(audio_out_path, audio_tensor.numpy())
+                stats['completed'] += 1
+                logging.info(f"[GPU {gpu_id}] Completed {md5}/{name} -> T={audio_tensor.shape[0]} in {time.time()-start_time:.2f}s")
+
+        except Exception as e:
+            logging.error(f"[GPU {gpu_id}] Unhandled error on job {md5}/{name}: {e}", exc_info=True)
+            stats['failed'] += 1
+
+def main():
+    """Main function to discover files and spawn worker processes."""
+    args = get_args()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    if not DALI_AVAILABLE:
+        logging.error("NVIDIA DALI is not available or failed to import. This script cannot run.")
+        logging.error(f"Import Error: {DALI_IMPORT_ERROR}")
+        return
+
+    data_root = Path(args.data_root)
+    recordings_dir = data_root / "recordings"
+    vit_embed_dir = data_root / "vit_embed"
+    aud_embed_dir = data_root / "aud_embed"
+
+    if not recordings_dir.is_dir():
+        logging.error(f"Recordings directory not found at: {recordings_dir}")
+        return
+
+    # --- 1. Discover all potential jobs ---
+    logging.info("Discovering media files...")
+    all_files = defaultdict(dict)
+    for p in tqdm(list(recordings_dir.rglob("*.mp4")) + list(recordings_dir.rglob("*.wav"))):
+        md5 = p.parent.name
+        name = p.stem
+        key = (md5, name)
+        if p.suffix == '.mp4':
+            all_files[key]['video'] = p
+        elif p.suffix == '.wav':
+            all_files[key]['audio'] = p
+    
+    # --- 2. Create and filter job list ---
+    jobs = []
+    skipped_count = 0
+    for (md5, name), paths in all_files.items():
+        video_in = paths.get('video')
+        audio_in = paths.get('audio')
+        video_out = vit_embed_dir / md5 / f"{name}.npy"
+        audio_out = aud_embed_dir / md5 / f"{name}.npy"
+
+        # Check if job should be skipped
+        if not args.overwrite:
+            video_done = (args.mode != "video" and args.mode != "both") or video_out.exists()
+            audio_done = (args.mode != "audio" and args.mode != "both") or audio_out.exists()
+            if video_done and audio_done:
+                skipped_count += 1
+                continue
+        
+        # Check if required source files exist for the mode
+        if args.mode in ["video", "both"] and not video_in:
+            continue
+        if args.mode in ["audio", "both"] and not audio_in:
+            continue
+            
+        jobs.append((md5, name, video_in, audio_in, video_out, audio_out))
+
+    if args.limit:
+        jobs = jobs[:args.limit]
+    
+    logging.info(f"Found {len(jobs)} jobs to process. Skipped {skipped_count} already completed jobs.")
+    if not jobs:
+        logging.info("Nothing to do.")
+        return
+
+    # --- 3. Spawn workers ---
+    num_gpus = torch.cuda.device_count()
+    world_size = args.num_workers if args.num_workers is not None else num_gpus
+    if world_size == 0:
+        logging.error("No CUDA-enabled GPUs found.")
+        return
+        
+    logging.info(f"Spawning {world_size} worker processes...")
+
+    with mp.Manager() as manager:
+        stats = manager.dict({'completed': 0, 'failed': 0})
+        
+        # Use spawn context for CUDA safety
+        mp.set_start_method("spawn", force=True)
+        processes = []
+        for rank in range(world_size):
+            p = mp.Process(target=worker, args=(rank, world_size, jobs, args, stats))
+            p.start()
+            processes.append(p)
+
+        # Monitor progress with tqdm
+        with tqdm(total=len(jobs), desc="Processing files") as pbar:
+            completed_last = 0
+            failed_last = 0
+            while any(p.is_alive() for p in processes):
+                completed_now = stats['completed']
+                failed_now = stats['failed']
+                pbar.update((completed_now - completed_last) + (failed_now - failed_last))
+                completed_last = completed_now
+                failed_last = failed_now
+                time.sleep(1)
+            
+            # Final update
+            completed_now = stats['completed']
+            failed_now = stats['failed']
+            pbar.update((completed_now - completed_last) + (failed_now - failed_last))
+
+
+        for p in processes:
+            p.join()
+
+        logging.info("--- Processing Complete ---")
+        logging.info(f"Successfully processed: {stats['completed']} items")
+        logging.info(f"Failed to process: {stats['failed']} items")
+        logging.info(f"Skipped (pre-existing): {skipped_count} items")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Precompute video and audio embeddings.")
-    parser.add_argument("--data-root", type=str, required=True, help="Root directory of the dataset.")
-    parser.add_argument("--mode", choices=['all', 'video', 'audio'], default='all', help="Which modalities to process.")
-    parser.add_argument("--overwrite", action='store_true', help="Overwrite existing feature files.")
-    parser.add_argument("--dali-threads", type=int, default=4, help="Number of threads for DALI video decoder.")
-    parser.add_argument("--dali-batch-size", type=int, default=16, help="Batch size for DALI video decoding and ViT processing.")
-    
-    cli_args = parser.parse_args()
-    main(cli_args)
+    main()
