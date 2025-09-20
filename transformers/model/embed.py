@@ -126,7 +126,6 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
         device_id=gpu_id,
         batch_size=batch_size,
         num_threads=4,
-        device_id=gpu_id,
     )
     pipe.build()
 
