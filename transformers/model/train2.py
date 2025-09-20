@@ -444,12 +444,14 @@ class DaliConfig:
 
 class DaliInputPipeline:
     """Builds a DALI pipeline for either raw media or pre-computed .npy files."""
-    def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig, use_precomputed: bool):
+    def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig, use_precomputed: bool, video_pathlists: Optional[List[str]] = None, audio_pathlists: Optional[List[str]] = None):
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
         
         reader_name_for_iterator = None
         if use_precomputed:
-            self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, cfg)
+            if video_pathlists is None or audio_pathlists is None:
+                raise ValueError("video_pathlists and audio_pathlists must be provided for precomputed mode.")
+            self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, video_pathlists, audio_pathlists, cfg)
             # The output map must match the order of tensors returned by the pipeline.
             out_map = [f"video_embed{k}" for k in range(5)]
             out_map.extend([f"audio_embed{k}" for k in range(5)])
@@ -469,17 +471,13 @@ class DaliInputPipeline:
             last_batch_policy=LastBatchPolicy.DROP
         )
 
-    def _build_npy_pipeline(self, vlists, alists, cfg):
+    def _build_npy_pipeline(self, vlists, alists, vpaths, apaths, cfg):
         """
         Builds a DALI pipeline for pre-computed .npy files with a focus on
-        perfect multi-GPU synchronization. This is achieved by:
-        1. Using file lists with a fixed, deterministic order for each epoch.
-        2. Disabling DALI's internal shuffling (`random_shuffle=False`).
-        3. Using identical DDP sharding settings for all readers.
-        4. Using `stick_to_shard=True`.
-        Each rank processes a deterministic, non-overlapping block of the data.
+        robustness on older DALI builds and perfect multi-GPU synchronization.
         """
         assert len(vlists) == 5 and len(alists) == 5, "Need 5 video and 5 audio file lists"
+        assert len(vpaths) == 5 and len(apaths) == 5, "Need 5 video and 5 audio path-only lists"
 
         @pipeline_def(
             batch_size=cfg.batch_size,
@@ -492,13 +490,8 @@ class DaliInputPipeline:
             enable_memory_stats=True,
         )
         def pipe():
-            # Helper to read and decode a single .npy file stream.
-            # All readers will share the same DDP sharding and ordering parameters.
-
-            def read_and_decode(filelist: str, reader_name: str):
-                common_args = dict(
-                    file_list=filelist,
-                    name=reader_name,  # this name must exist for DALIGenericIterator metadata
+            def read_and_decode(filelist_lbl: str, filelist_paths: str, reader_name: str):
+                common = dict(
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     stick_to_shard=True,
@@ -507,26 +500,19 @@ class DaliInputPipeline:
                     read_ahead=True,
                 )
 
-                # Preferred path (newer DALI): file reader -> numpy decoder
+
+                _, packed_label = fn.readers.file(name=reader_name, file_list=filelist_lbl, **common)
+
+                # Preferred path on newer DALI: bytes -> decoders.numpy
                 if hasattr(fn, "decoders") and hasattr(fn.decoders, "numpy"):
-                    bytes_i, packed_label = fn.readers.file(**common_args)
+                    bytes_i, _ = fn.readers.file(name=f"{reader_name}_BYTES", file_list=filelist_paths, **common)
                     arr = fn.decoders.numpy(bytes_i, dtype=types.FLOAT16)
                     return arr, packed_label
 
-                # Fallback (older DALI):
-                # 1) Keep a readers.file with EXACTLY `reader_name` so iterator can fetch metadata.
-                # 2) Read the actual array with readers.numpy under a different op name.
-                #    (Same sharding params so both stay in lockstep.)
-                # Label stream (must keep the original name)
-                _, packed_label = fn.readers.file(**common_args)
-
-                # Data stream (distinct name, same params)
-                np_args = dict(common_args)
-                np_args["name"] = f"{reader_name}_NPY"   # different op name
+                # Fallback (older DALI): direct numpy reader from PATHS-ONLY list
+                np_args = dict(name=f"{reader_name}_NPY", file_list=filelist_paths, **common)
                 arr = fn.readers.numpy(**np_args)
-
-                # Ensure dtype matches downstream expectations
-                arr = fn.cast(arr, dtype=types.FLOAT16)
+                arr = fn.cast(arr, dtype=types.FLOAT16)  # match downstream expectations
                 return arr, packed_label
 
 
@@ -536,15 +522,15 @@ class DaliInputPipeline:
             audio_embeds_raw = []
 
             # Read the first video view to get the shared label
-            v0_raw, packed_label = read_and_decode(vlists[0], "VidReader0")
+            v0_raw, packed_label = read_and_decode(vlists[0], vpaths[0], "VidReader0")
             video_embeds_raw.append(v0_raw)
 
             # Read remaining views, ignoring their redundant labels
             for k in range(1, 5):
-                v_raw, _ = read_and_decode(vlists[k], f"VidReader{k}")
+                v_raw, _ = read_and_decode(vlists[k], vpaths[k], f"VidReader{k}")
                 video_embeds_raw.append(v_raw)
             for k in range(5):
-                a_raw, _ = read_and_decode(alists[k], f"AudReader{k}")
+                a_raw, _ = read_and_decode(alists[k], apaths[k], f"AudReader{k}")
                 audio_embeds_raw.append(a_raw)
 
             # --- Unpack label to get sample_id and start_frame ---
@@ -1090,14 +1076,33 @@ def build_data_iter(args):
     writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
     video_lists, audio_lists = writer.write(records)
     
+    video_path_lists, audio_path_lists = None, None
+    if args.use_precomputed_embeddings:
+        def make_paths_only_list(src_lst: str) -> str:
+            from pathlib import Path
+            dst = str(Path(src_lst).with_suffix(".paths"))
+            with open(src_lst, "r") as s, open(dst, "w") as d:
+                for line in s:
+                    d.write(line.rstrip("\n").split()[0] + "\n")
+            return dst
+        video_path_lists = [make_paths_only_list(p) for p in video_lists]
+        audio_path_lists = [make_paths_only_list(p) for p in audio_lists]
+
     shard_id, num_shards = get_ddp_info()
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     dali_cfg = DaliConfig(
         sequence_length=args.T_frames, batch_size=args.batch_size, num_threads=args.dali_threads,
         device_id=device_id, shard_id=shard_id, num_shards=num_shards
     )
-    dali_iter = DaliInputPipeline(video_lists, audio_lists, dali_cfg, use_precomputed=args.use_precomputed_embeddings)
-
+    dali_iter = DaliInputPipeline(
+        video_filelists=video_lists,
+        audio_filelists=audio_lists,
+        cfg=dali_cfg,
+        use_precomputed=args.use_precomputed_embeddings,
+        video_pathlists=video_path_lists,
+        audio_pathlists=audio_path_lists,
+    )
+    
     fetcher = LmdbMetaFetcher(store)
     assembler_device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
     assembler = BatchAssembler(id_map, fetcher, device=assembler_device)
@@ -1149,7 +1154,7 @@ def run_step(dali_iter, assembler, model, loss_fn, use_precomputed):
         
         with record_function("loss_calculation"), Timer("loss_calc") as t4:
             total_loss = loss_fn(predictions, batch['targets'], batch['alive_mask'])
-        logging.info("Calculated loss in %.3fs -> Total Loss: %.4f", t4.dt, total_loss.item())
+        logging.info("Calculated loss in %.4fs -> Total Loss: %.4f", t4.dt, total_loss.item())
         
         assert total_loss.requires_grad, "Loss must require gradients"
         logging.info("✅ Smoke assertion passed: Loss requires grad.")
