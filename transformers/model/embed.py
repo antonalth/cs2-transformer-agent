@@ -209,7 +209,6 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
         device_id=gpu_id,
         batch_size=1, # One file at a time
         num_threads=2,
-        device_id=gpu_id,
     )
     pipe.build()
 
