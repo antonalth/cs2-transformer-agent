@@ -949,22 +949,29 @@ class CompositeLoss(nn.Module):
             grid_idx = self.coord_mapper.discretize_world_to_grid(world_xyz).to(self.xs.device)  # [N,3] long
             return self._gaussian_heatmaps_from_indices(grid_idx)
 
-    def forward(self, predictions: dict, targets: dict, alive_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, predictions: dict, targets: dict, alive_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
             predictions: model outputs dict.
             targets: target tensors dict.
             alive_mask: [B, T, 5] bool tensor indicating alive players.
+        Returns:
+            A tuple of (total_loss_tensor, detailed_losses_dict).
         """
         device = self.xs.device
         total_loss = torch.tensor(0.0, device=device)
+        detailed_losses = {} # This will store the final weighted losses as tensors
 
         B, T = predictions['player'][0]['stats'].shape[:2]
-        alive_mask = alive_mask.to(device=device)  # [B,T,5] bool
+        alive_mask = alive_mask.to(device=device, non_blocking=True)  # [B,T,5] bool
 
         # ----------------------------
         # Player heads (MSE/BCE/CE)
         # ----------------------------
+        player_loss_keys = ['stats', 'mouse', 'keyboard', 'eco', 'inventory', 'weapon']
+        for key in player_loss_keys: # Initialize accumulators for player-specific losses
+            detailed_losses[key] = torch.tensor(0.0, device=device)
+
         for i in range(5):
             p_pred = predictions["player"][i]
             p_targ = targets["player"][i]
@@ -972,41 +979,52 @@ class CompositeLoss(nn.Module):
 
             # Stats (MSE)
             loss_stats = self.mse_loss(p_pred["stats"], p_targ["stats"]).mean(dim=-1)  # [B,T]
-            total_loss += self.weights['stats'] * self._scalar_loss(loss_stats, player_alive_mask)
+            loss_component = self.weights['stats'] * self._scalar_loss(loss_stats, player_alive_mask)
+            detailed_losses['stats'] += loss_component
 
             # Mouse (MSE)
             loss_mouse = self.mse_loss(p_pred["mouse_delta_deg"], p_targ["mouse_delta_deg"]).mean(dim=-1)  # [B,T]
-            total_loss += self.weights['mouse'] * self._scalar_loss(loss_mouse, player_alive_mask)
+            loss_component = self.weights['mouse'] * self._scalar_loss(loss_mouse, player_alive_mask)
+            detailed_losses['mouse'] += loss_component
 
             # Multi-label BCE heads
             for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
                 loss_bce = self.bce_loss(p_pred[key], p_targ[key]).mean(dim=-1)  # [B,T]
                 wkey = key.replace('_logits','')
-                total_loss += self.weights[wkey] * self._scalar_loss(loss_bce, player_alive_mask)
+                loss_component = self.weights[wkey] * self._scalar_loss(loss_bce, player_alive_mask)
+                detailed_losses[wkey] += loss_component
 
             # Active weapon (CE), flatten B*T
             pred_flat = p_pred["active_weapon_logits"].view(B * T, -1)
             targ_flat = p_targ["active_weapon_logits"].view(B * T)
             loss_weapon_unmasked = self.ce_loss(pred_flat, targ_flat)  # [B*T]
-            total_loss += self.weights['weapon'] * self._scalar_loss(
+            loss_component = self.weights['weapon'] * self._scalar_loss(
                 loss_weapon_unmasked, player_alive_mask.view(B * T)
             )
+            detailed_losses['weapon'] += loss_component
+
+        # Sum up all player-related losses
+        for key in player_loss_keys:
+            total_loss += detailed_losses[key]
 
         # ----------------------------
         # Game strategy scalar heads
         # ----------------------------
         gs_pred = predictions["game_strategy"]
         gs_targ = targets["game_strategy"]
-
         frame_mask = alive_mask.any(dim=-1).float()  # [B,T]
 
         # Round number (MSE)
         loss_round_num = self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1)  # [B,T]
-        total_loss += self.weights['round_number'] * self._scalar_loss(loss_round_num, frame_mask)
+        loss_component = self.weights['round_number'] * self._scalar_loss(loss_round_num, frame_mask)
+        detailed_losses['round_number'] = loss_component
+        total_loss += loss_component
 
         # Round state (BCE)
         loss_round_state = self.bce_loss(gs_pred["round_state_logits"], gs_targ["round_state_logits"]).mean(dim=-1)  # [B,T]
-        total_loss += self.weights['round_state'] * self._scalar_loss(loss_round_state, frame_mask)
+        loss_component = self.weights['round_state'] * self._scalar_loss(loss_round_state, frame_mask)
+        detailed_losses['round_state'] = loss_component
+        total_loss += loss_component
 
         # ----------------------------
         # Heatmap heads (efficient targets & indexing)
@@ -1019,32 +1037,32 @@ class CompositeLoss(nn.Module):
             alive_flat   = alive_mask.view(-1)  # [B*T*5]
             pred_alive   = pred_pos_heatmaps.view(-1, *pred_pos_heatmaps.shape[3:])[alive_flat]  # [N,Z,Y,X]
             coord_alive  = targ_pos_coords.view(-1, 3)[alive_flat]  # [N,3]
-
             target_heatmap = self._build_targets_heatmaps(coord_alive).to(dtype=pred_alive.dtype)
-
-            from torch.cuda.amp import autocast
-
             loss_pos = self.bce_loss(pred_alive, target_heatmap).mean()
-            total_loss += self.weights['pos_heatmap'] * loss_pos
+            loss_component = self.weights['pos_heatmap'] * loss_pos
+            detailed_losses['pos_heatmap'] = loss_component
+            total_loss += loss_component
+        else:
+            detailed_losses['pos_heatmap'] = torch.tensor(0.0, device=device)
 
         # Enemy position (one predicted heatmap per frame; up to 5 valid targets)
         pred_enemy_heatmaps = gs_pred["enemy_pos_heatmap_logits"]           # [B,T,Z,Y,X]
         targ_enemy_coords   = gs_targ["enemy_pos_coords"]                   # [B,T,5,3]
-        # Adjust this condition if your "no enemy" sentinel differs:
         valid_enemy_mask    = (targ_enemy_coords[..., 0] >= 0)              # [B,T,5]
 
         if valid_enemy_mask.any():
             b_idx, t_idx, p_idx = valid_enemy_mask.nonzero(as_tuple=True)   # each [N]
             pred_sel  = pred_enemy_heatmaps[b_idx, t_idx]                    # [N,Z,Y,X]
             coord_sel = targ_enemy_coords[b_idx, t_idx, p_idx]               # [N,3]
-
             target_heatmap = self._build_targets_heatmaps(coord_sel).to(dtype=pred_sel.dtype)
-
-            from torch.cuda.amp import autocast
             loss_enemy_pos = self.bce_loss(pred_sel, target_heatmap).mean()
-            total_loss += self.weights['enemy_heatmap'] * loss_enemy_pos
+            loss_component = self.weights['enemy_heatmap'] * loss_enemy_pos
+            detailed_losses['enemy_heatmap'] = loss_component
+            total_loss += loss_component
+        else:
+            detailed_losses['enemy_heatmap'] = torch.tensor(0.0, device=device)
 
-        return total_loss
+        return total_loss, {k: v.item() for k, v in detailed_losses.items()}
 
 
 # -------------------------------
@@ -1130,9 +1148,9 @@ def get_args():
     parser.add_argument("--dali-threads", type=int, default=4, help="Number of threads for DALI.")
     parser.add_argument("--num-steps", type=int, default=20, help="Number of iterations for the smoke test.")
     parser.add_argument("--profile", action='store_true', help="Enable torch.profiler and save trace to TensorBoard.")
-    # NEW ARGUMENT
     parser.add_argument("--use-precomputed-embeddings", action='store_true',
                         help="Load pre-computed .npy embeddings instead of processing media on-the-fly.")
+    parser.add_argument("--detailed-loss", action='store_true', help="Print a detailed breakdown of all loss components.")
     
     args = parser.parse_args()
     if args.manifest is None:
@@ -1140,7 +1158,7 @@ def get_args():
     return args
 
 
-def run_step(dali_iter, assembler, model, loss_fn, use_precomputed):
+def run_step(dali_iter, assembler, model, loss_fn, use_precomputed: bool, detailed_loss: bool):
     """Encapsulates one iteration of the smoke test."""
     try:
         with record_function("dali_fetch"), Timer("dali_fetch") as t:
@@ -1156,9 +1174,16 @@ def run_step(dali_iter, assembler, model, loss_fn, use_precomputed):
         logging.info("Forward pass in %.3fs", t3.dt)
         
         with record_function("loss_calculation"), Timer("loss_calc") as t4:
-            total_loss = loss_fn(predictions, batch['targets'], batch['alive_mask'])
+            total_loss, detailed_losses_dict = loss_fn(predictions, batch['targets'], batch['alive_mask'])
         logging.info("Calculated loss in %.4fs -> Total Loss: %.4f", t4.dt, total_loss.item())
         
+        if detailed_loss:
+            logging.info("--- Detailed Loss Breakdown ---")
+            max_key_len = max(len(k) for k in detailed_losses_dict.keys()) if detailed_losses_dict else 0
+            for name, value in sorted(detailed_losses_dict.items()):
+                logging.info(f"  - {name:<{max_key_len}}: {value:12.4f}")
+            logging.info("-----------------------------")
+
         assert total_loss.requires_grad, "Loss must require gradients"
         logging.info("✅ Smoke assertion passed: Loss requires grad.")
         return True
@@ -1215,7 +1240,7 @@ def main(args):
                 with_stack=True,
             ) as prof:
                 for i in range(args.num_steps):
-                    if not run_step(dali_iter, assembler, model, loss_fn, args.use_precomputed_embeddings):
+                    if not run_step(dali_iter, assembler, model, loss_fn, args.use_precomputed_embeddings, args.detailed_loss):
                         break
                     prof.step() # Signal profiler that a step is complete
 
@@ -1231,7 +1256,7 @@ def main(args):
             print(torch.cuda.max_memory_allocated() / 1024**3, "GiB peak")
         else:
             for i in range(args.num_steps):
-                if not run_step(dali_iter, assembler, model, loss_fn, args.use_precomputed_embeddings):
+                if not run_step(dali_iter, assembler, model, loss_fn, args.use_precomputed_embeddings, args.detailed_loss):
                     break
 
     except Exception as e:
