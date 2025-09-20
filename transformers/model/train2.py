@@ -33,6 +33,7 @@ import contextlib
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Any
+from pathlib import Path
 
 import lmdb  # pip install lmdb
 import msgpack  # pip install msgpack
@@ -351,6 +352,9 @@ class EpochIndex:
 # -------------------------------
 
 class FilelistWriter:
+
+
+
     """Writes ten aligned DALI filelists, supporting both raw media and pre-computed .npy files."""
     def __init__(self, out_dir: str, use_precomputed: bool = False, data_root: str = ""):
         self.out_dir = out_dir
@@ -363,6 +367,20 @@ class FilelistWriter:
     def write(self, records: List[SampleRecord]) -> Tuple[List[str], List[str]]:
         vid_paths = [os.path.join(self.out_dir, f"pov{k}_video.txt") for k in range(5)]
         aud_paths = [os.path.join(self.out_dir, f"pov{k}_audio.txt") for k in range(5)]
+
+        def _embed_path(kind: str, demo: str, base: str, data_root: str) -> Path:
+            """
+            kind: 'vit' or 'aud'
+            demo: e.g. '8dda4a92df5d014c57a64f6eba2937ff'
+            base: basename without extension used by your code, e.g. '01_CT_--Mokuj1n_4353_7897'
+            """
+            root = Path(data_root).resolve()
+            sub = "vit_embed" if kind == "vit" else "aud_embed"
+            return root / sub / demo / f"{base}.npy"
+
+        def _assert_exists(p: Path):
+            if not p.is_file():
+                raise FileNotFoundError(f"Missing precomputed embedding: {p}")
         
         with contextlib.ExitStack() as stack:
             files = [stack.enter_context(open(p, "w", encoding="utf-8")) for p in vid_paths + aud_paths]
@@ -376,8 +394,13 @@ class FilelistWriter:
                         # FIX: Use the specific filename stem for each POV's video and audio
                         vid_base = os.path.splitext(os.path.basename(rec.pov_videos[k]))[0]
                         aud_base = os.path.splitext(os.path.basename(rec.pov_audio[k]))[0]
-                        vid_npy_path = os.path.join(self.data_root, "vit_embed", rec.demoname, f"{vid_base}.npy")
-                        aud_npy_path = os.path.join(self.data_root, "aud_embed", rec.demoname, f"{aud_base}.npy")
+
+                        vid_npy_path = _embed_path("vit", rec.demoname, vid_base, self.data_root)
+                        aud_npy_path = _embed_path("aud", rec.demoname, aud_base, self.data_root)
+
+                        _assert_exists(vid_npy_path)
+                        _assert_exists(aud_npy_path)
+
                         vid_files[k].write(f"{vid_npy_path} {packed_label}\n")
                         aud_files[k].write(f"{aud_npy_path} {packed_label}\n")
                 else:
