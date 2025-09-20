@@ -534,16 +534,19 @@ class DaliInputPipeline:
                 audio_embeds_raw.append(a_raw)
 
             # --- Unpack label to get sample_id and start_frame ---
-            packed_i64 = fn.cast(packed_label, dtype=types.INT64)
+            packed_i64   = fn.cast(packed_label, dtype=types.INT64)
             sample_id_i64 = packed_i64 // LABEL_SCALE
-            start_f_i64 = packed_i64 - sample_id_i64 * LABEL_SCALE
+            start_f_i64   = packed_i64 - sample_id_i64 * LABEL_SCALE
+
+            # Match DALI's requirement: anchor and shape must share dtype (use INT32)
+            start_f_i32 = fn.cast(start_f_i64, dtype=types.INT32)
 
             # --- Slice the required window from the full tensor ---
             def slice_window(tensor_node):
                 return fn.slice(
                     tensor_node,
-                    start_f_i64,
-                    cfg.sequence_length,
+                    start_f_i32,                 # <-- now INT32
+                    cfg.sequence_length,         # DALI treats this as INT32
                     axes=[0],
                     out_of_bounds_policy="pad",
                     fill_values=0.0
