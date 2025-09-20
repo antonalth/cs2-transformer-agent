@@ -423,59 +423,112 @@ class DaliInputPipeline:
     def __init__(self, video_filelists: List[str], audio_filelists: List[str], cfg: DaliConfig, use_precomputed: bool):
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
         
+        reader_name_for_iterator = None
         if use_precomputed:
             self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, cfg)
-            out_map = []
-            for k in range(5):
-                out_map.extend([f"video_embed{k}", f"audio_embed{k}", f"labels{k}"])
+            # The output map must match the order of tensors returned by the pipeline.
+            out_map = [f"video_embed{k}" for k in range(5)]
+            out_map.extend([f"audio_embed{k}" for k in range(5)])
+            out_map.append("labels0") # Single shared label for the sample
+            reader_name_for_iterator = "VidReader0" # Name of one reader for epoch size
         else:
             self.pipeline = self._build_media_pipeline(video_filelists, audio_filelists, cfg)
             out_map = []
             for k in range(5):
                 out_map.extend([f"pov{k}", f"labels{k}", f"mel{k}"])
+            reader_name_for_iterator = "V0"
 
         self.iterator = DALIGenericIterator(
-            [self.pipeline], out_map, auto_reset=True, last_batch_policy=LastBatchPolicy.DROP
+            [self.pipeline], out_map,
+            reader_name=reader_name_for_iterator,
+            auto_reset=True,
+            last_batch_policy=LastBatchPolicy.DROP
         )
 
     def _build_npy_pipeline(self, vlists, alists, cfg):
+        """
+        Builds a DALI pipeline for pre-computed .npy files with a focus on
+        perfect multi-GPU synchronization. This is achieved by:
+        1. Using pre-shuffled, per-epoch file lists.
+        2. Disabling DALI's internal shuffling (`random_shuffle=False`).
+        3. Using identical DDP sharding settings for all readers.
+        4. Using `stick_to_shard=True`.
+        Each rank processes a deterministic, non-overlapping block of the data.
+        """
+        assert len(vlists) == 5 and len(alists) == 5, "Need 5 video and 5 audio file lists"
+
         @pipeline_def(
-            enable_memory_stats=True, batch_size=cfg.batch_size, num_threads=cfg.num_threads,
-            device_id=cfg.device_id, seed=cfg.seed, prefetch_queue_depth=2
+            batch_size=cfg.batch_size,
+            num_threads=cfg.num_threads,
+            device_id=cfg.device_id,
+            seed=cfg.seed,
+            exec_async=True,
+            exec_pipelined=True,
+            prefetch_queue_depth=2,
+            enable_memory_stats=True,
         )
         def pipe():
-            outputs = []
+            # Helper to read and decode a single .npy file stream.
+            # All readers will share the same DDP sharding and ordering parameters.
+            def read_and_decode(filelist: str, reader_name: str):
+                bytes_i, packed_label = fn.readers.file(
+                    name=reader_name,
+                    file_list=filelist,
+                    # --- DDP Synchronization Settings ---
+                    shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards,
+                    stick_to_shard=True,
+                    random_shuffle=False,      # Rely on offline shuffling
+                    shuffle_after_epoch=False, #
+                    read_ahead=True,
+                )
+                arr = fn.decoders.numpy(bytes_i)
+                return arr, packed_label
+
+            # Read all 10 views (5 video, 5 audio). The filelists are aligned,
+            # so we only need to extract the label from one of them.
+            video_embeds_raw = []
+            audio_embeds_raw = []
+
+            # Read the first video view to get the shared label
+            v0_raw, packed_label = read_and_decode(vlists[0], "VidReader0")
+            video_embeds_raw.append(v0_raw)
+
+            # Read remaining views, ignoring their redundant labels
+            for k in range(1, 5):
+                v_raw, _ = read_and_decode(vlists[k], f"VidReader{k}")
+                video_embeds_raw.append(v_raw)
             for k in range(5):
-                # Video Embeddings from NPY
-                vid_embed_raw, packed_label = fn.readers.numpy(
-                    name=f"VidNpy{k}", file_list=vlists[k], shard_id=cfg.shard_id,
-                    num_shards=cfg.num_shards, random_shuffle=cfg.shuffle, stick_to_shard=True
-                )
-                packed_i64 = fn.cast(packed_label, dtype=types.INT64)
-                sample_id_i64 = packed_i64 // LABEL_SCALE
-                start_f_i64 = packed_i64 - sample_id_i64 * LABEL_SCALE
-                
-                slice_start = fn.cast(start_f_i64, dtype=types.INT32)
-                
-                video_embed = fn.slice(
-                    vid_embed_raw.gpu(), start=slice_start, shape=[cfg.sequence_length],
-                    axes=[0], out_of_bounds_policy="pad", fill_values=0.0
+                a_raw, _ = read_and_decode(alists[k], f"AudReader{k}")
+                audio_embeds_raw.append(a_raw)
+
+            # --- Unpack label to get sample_id and start_frame ---
+            packed_i64 = fn.cast(packed_label, dtype=types.INT64)
+            sample_id_i64 = packed_i64 // LABEL_SCALE
+            start_f_i64 = packed_i64 - sample_id_i64 * LABEL_SCALE
+
+            # --- Slice the required window from the full tensor ---
+            def slice_window(tensor_node):
+                return fn.slice(
+                    tensor_node,
+                    start_f_i64,
+                    cfg.sequence_length,
+                    axes=[0],
+                    out_of_bounds_policy="pad",
+                    fill_values=0.0
                 )
 
-                # Audio Embeddings (Spectrograms) from NPY
-                aud_embed_raw, _ = fn.readers.numpy(
-                    name=f"AudNpy{k}", file_list=alists[k], shard_id=cfg.shard_id,
-                    num_shards=cfg.num_shards, random_shuffle=cfg.shuffle, stick_to_shard=True
-                )
+            video_embeds = [slice_window(v) for v in video_embeds_raw]
+            audio_embeds = [slice_window(a) for a in audio_embeds_raw]
 
-                audio_embed = fn.slice(
-                    aud_embed_raw.gpu(), start=slice_start, shape=[cfg.sequence_length],
-                    axes=[0], out_of_bounds_policy="pad", fill_values=0.0
-                )
-                
-                label_out = fn.cast(sample_id_i64, dtype=types.INT32)
-                outputs.extend([video_embed, audio_embed, label_out])
-            return tuple(outputs)
+            # --- Move data to GPU and finalize outputs ---
+            video_embeds_gpu = [v.gpu() for v in video_embeds]
+            audio_embeds_gpu = [a.gpu() for a in audio_embeds]
+
+            label_out = fn.cast(sample_id_i64, dtype=types.INT32)
+
+            # The final flattened tuple of outputs for the DALIGenericIterator
+            return (*video_embeds_gpu, *audio_embeds_gpu, label_out)
         
         p = pipe()
         p.build()
