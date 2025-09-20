@@ -250,7 +250,7 @@ class CS2Config:
     cached_chunk_T: int = 32
     cached_detach: bool = True
     
-    enable_grad_checkpoint: bool = False
+    enable_grad_checkpoint: bool = True
     grad_ckpt_use_reentrant: bool = False
 
 @dataclass
