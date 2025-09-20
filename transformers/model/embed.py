@@ -82,12 +82,17 @@ class Timer:
 # -------------------------------
 def atomic_save_npy(array: np.ndarray, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # IMPORTANT: When passing a Path ending with ".npy.tmp" to np.save, numpy will append
+    # another ".npy" unless we pass an open file handle. Use a file handle to avoid
+    # creating "*.npy.tmp.npy" and then failing os.replace.
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     try:
-        np.save(tmp, array)
+        with open(tmp, "wb") as f:
+            np.save(f, array)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, out_path)
     except Exception:
-        # clean up tmp if replace failed
         with contextlib.suppress(Exception):
             if tmp.exists(): tmp.unlink()
         raise
