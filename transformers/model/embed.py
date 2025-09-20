@@ -113,7 +113,6 @@ def process_video(video_path: Path, model: DINOv3VisualEncoder, batch_size: int,
             image_type=types.RGB,
             dtype=types.UINT8,
             pad_last_batch=True,
-            # --- FIX: Explicitly set parameter to silence future-proofing warning ---
             file_list_include_preceding_frame=False,
             name=f"VideoReader_{video_path.name}",
         )
@@ -184,6 +183,9 @@ def process_audio(wav_path: Path, dali_cfg: DaliConfig, gpu_id: int) -> Optional
 # ---------------------------
 
 def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict):
+    # --- FIX: Configure logging for each spawned worker process ---
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
     gpu_id = rank
     torch.cuda.set_device(gpu_id)
     dali_cfg = DaliConfig(fps=FPS)
