@@ -1222,9 +1222,9 @@ def main(args):
         model = CS2Transformer(model_cfg, use_dummy_vision=False).to(device)
         
         loss_weights = {
-            'stats': 1.0, 'mouse': 5.0, 'keyboard': 0.5, 'eco': 0.5,
-            'inventory': 0.5, 'weapon': 1.0, 'round_number': 0.1,
-            'round_state': 1.0, 'pos_heatmap': 2.0, 'enemy_heatmap': 2.0
+            'stats': 1.0, 'mouse': 1.0, 'keyboard': 1.0, 'eco': 1.0,
+            'inventory': 1.0, 'weapon': 1.0, 'round_number': 1.0,
+            'round_state': 1.0, 'pos_heatmap': 1.0, 'enemy_heatmap': 1.0
         }
         loss_fn = CompositeLoss(weights=loss_weights).to(device)
         # --- END SMOKE TEST SETUP ---
