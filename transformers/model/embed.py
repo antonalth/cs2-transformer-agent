@@ -541,9 +541,11 @@ def worker_main(
     except Exception:
         pass
     log("INFO", "Worker exiting.")
-
-
 def multi_gpu_dispatch(args):
+    import random, time
+    import multiprocessing as mp
+    from queue import Empty
+
     logging.basicConfig(
         level=(logging.DEBUG if args.verbose else logging.INFO),
         format="[%(levelname)s] %(message)s",
@@ -565,21 +567,13 @@ def multi_gpu_dispatch(args):
         gpu_map = [None]
     else:
         num_workers = max(1, args.workers_per_gpu) * len(gpu_ids)
-        # Round-robin assignment of GPUs to worker ranks
         gpu_map = [gpu_ids[i % len(gpu_ids)] for i in range(num_workers)]
         logging.info("Using GPUs: %s (%d workers total)", ",".join(map(str, gpu_ids)), num_workers)
 
-    # Build MP queues
+    # Use spawn (safer across libs) and an **unbounded** JoinableQueue
     ctx = mp.get_context("spawn")
-    job_queue = ctx.JoinableQueue(maxsize=min(1024, max(64, len(jobs))))
+    job_queue = ctx.JoinableQueue(maxsize=0)  # unbounded avoids feeder blocking
     result_queue = ctx.Queue()
-
-    # Enqueue jobs
-    for j in jobs:
-        job_queue.put(j)
-    # Sentinels
-    for _ in range(num_workers):
-        job_queue.put(None)
 
     args_dict = {
         "model_name": args.model_name,
@@ -595,7 +589,7 @@ def multi_gpu_dispatch(args):
         "db_cutoff": args.db_cutoff,
     }
 
-    # Spawn workers
+    # 1) Spawn workers **before** enqueuing any jobs/sentinels
     procs = []
     for rank in range(num_workers):
         p = ctx.Process(
@@ -606,29 +600,59 @@ def multi_gpu_dispatch(args):
         p.start()
         procs.append(p)
 
-    # Collect results while workers run
-    counts = {"video_ok": 0, "video_fail": 0, "audio_ok": 0, "audio_fail": 0}
-    remaining = len(jobs)
-    while remaining > 0:
+    # 2) Enqueue jobs (producer)
+    try:
+        for j in jobs:
+            job_queue.put(j)
+
+        # 3) Enqueue sentinels to stop workers after jobs drain
+        for _ in range(num_workers):
+            job_queue.put(None)
+
+        # Progress accounting
+        counts = {"video_ok": 0, "video_fail": 0, "audio_ok": 0, "audio_fail": 0}
+        remaining = len(jobs)
+
+        # 4) Collect results; tolerant to transient timeouts
+        while remaining > 0:
+            try:
+                key, val = result_queue.get(timeout=1.0)
+                if key in counts:
+                    counts[key] += val
+                remaining -= 1
+            except Empty:
+                # keep UI responsive; also break if all workers are gone unexpectedly
+                if all(not p.is_alive() for p in procs):
+                    break
+
+        # 5) Wait for queue drain + worker exit
+        job_queue.join()
+        for p in procs:
+            p.join(timeout=5.0)
+
+        logging.info("DONE. Video ok/failed: %d/%d, Audio ok/failed: %d/%d",
+                     counts["video_ok"], counts["video_fail"], counts["audio_ok"], counts["audio_fail"])
+
+    except KeyboardInterrupt:
+        logging.warning("KeyboardInterrupt received — stopping workers...")
+        # Push sentinels so workers break promptly (if not already pushed)
         try:
-            key, val = result_queue.get(timeout=1.0)
-            if key in counts:
-                counts[key] += val
-            remaining -= 1
+            for _ in range(num_workers):
+                job_queue.put_nowait(None)
         except Exception:
-            # Timeout; just loop to allow queue/task drain
-            if all(not p.is_alive() for p in procs):
-                break
-
-    # Wait for all tasks to complete
-    job_queue.join()
-
-    # Join workers
-    for p in procs:
-        p.join(timeout=2.0)
-
-    logging.info("DONE. Video ok/failed: %d/%d, Audio ok/failed: %d/%d",
-                 counts["video_ok"], counts["video_fail"], counts["audio_ok"], counts["audio_fail"])
+            pass
+        # Best-effort drain + join
+        try:
+            job_queue.join()
+        except Exception:
+            pass
+        # Terminate any stragglers
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=2.0)
+        logging.info("Shutdown complete.")
 
 
 # -----------------------------
