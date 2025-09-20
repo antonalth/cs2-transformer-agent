@@ -715,16 +715,18 @@ class BatchAssembler:
             # PATH 1: Pre-computed embeddings
             video_embeddings = torch.stack([dali_batch[f"video_embed{k}"] for k in range(5)], dim=2)
             
-            # aud_embed from DALI is [B, T, Mel, 1, Chan]
+            # DALI output per player is [B, T, Mels, C]
             audio_embed_list = [dali_batch[f"audio_embed{k}"] for k in range(5)]
-            audio_embed_stacked = torch.stack(audio_embed_list, dim=2) # [B, T, 5, Mel, 1, Chan]
-            # Permute to model's expected [B, T, P, C, Mel, 1]
-            audio_embeddings = audio_embed_stacked.permute(0, 1, 2, 5, 3, 4)
+            audio_embed_stacked = torch.stack(audio_embed_list, dim=2) # Shape: [B, T, P, Mels, C]
+            
+            # Permute to model's expected [B, T, P, C, Mels] and add final dim
+            audio_permuted = audio_embed_stacked.permute(0, 1, 2, 4, 3) # Shape: [B, T, P, C, Mels]
+            audio_final = audio_permuted.unsqueeze(-1) # Shape: [B, T, P, C, Mels, 1]
             
             sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
             batch = {
                 "video_embeddings": video_embeddings,
-                "audio_embeddings": audio_embeddings,
+                "mel_spectrogram": audio_final,  # Use the consistent key name
             }
         else:
             # PATH 2: On-the-fly processing
