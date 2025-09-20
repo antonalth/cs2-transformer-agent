@@ -471,19 +471,40 @@ class DaliInputPipeline:
         def pipe():
             # Helper to read and decode a single .npy file stream.
             # All readers will share the same DDP sharding and ordering parameters.
+
             def read_and_decode(filelist: str, reader_name: str):
-                bytes_i, packed_label = fn.readers.file(
+                common_reader_args = dict(
                     name=reader_name,
                     file_list=filelist,
                     # --- DDP Synchronization Settings ---
                     shard_id=cfg.shard_id,
                     num_shards=cfg.num_shards,
                     stick_to_shard=True,
-                    random_shuffle=False,      # Rely on external, per-epoch shuffling of the filelist
-                    shuffle_after_epoch=False, #
+                    # --- Shuffling Behavior (external per-epoch shuffle) ---
+                    random_shuffle=False,
+                    shuffle_after_epoch=False,
+                    # --- I/O ---
                     read_ahead=True,
                 )
-                arr = fn.decoders.numpy(bytes_i, dtype=types.FLOAT16)
+
+                # Preferred path: file reader -> numpy decoder (newer DALI builds)
+                if hasattr(fn, "decoders") and hasattr(fn.decoders, "numpy"):
+                    bytes_i, packed_label = fn.readers.file(**common_reader_args)
+                    arr = fn.decoders.numpy(bytes_i, dtype=types.FLOAT16)
+                    return arr, packed_label
+
+                # Fallback: read .npy directly (older DALI builds)
+                # Some older versions don't support `read_ahead` in readers.numpy, so try with it first, then without.
+                try:
+                    arr, packed_label = fn.readers.numpy(**common_reader_args, device="cpu")
+                except TypeError:
+                    # Remove params not supported by older readers.numpy
+                    common_np = dict(common_reader_args)
+                    common_np.pop("read_ahead", None)
+                    arr, packed_label = fn.readers.numpy(**common_np, device="cpu")
+
+                # Match dtype expected by the rest of the pipeline
+                arr = fn.cast(arr, dtype=types.FLOAT16)
                 return arr, packed_label
 
             # Read all 10 views (5 video, 5 audio). The filelists are aligned,
