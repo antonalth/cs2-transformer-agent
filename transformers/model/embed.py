@@ -33,8 +33,10 @@ Workflow:
 import os
 import argparse
 import logging
+import sys
 import time
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Tuple, Optional
@@ -59,6 +61,28 @@ except ImportError as e:
     DALI_AVAILABLE = False
     DALI_IMPORT_ERROR = e
 
+
+# --- Script Path Resolution ---
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# ---------------------------
+# Logging
+# ---------------------------
+
+def setup_logging(log_filename):
+    """Configures logging for the main process and workers."""
+    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        root_logger.setLevel(logging.INFO)
+        
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+        file_handler.setFormatter(log_formatter)
+        root_logger.addHandler(file_handler)
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(log_formatter)
+        root_logger.addHandler(console_handler)
 
 # ---------------------------
 # Core Utilities
@@ -194,8 +218,8 @@ def save_results_background(future):
     except Exception as e:
         logging.error(f"Error during background save: {e}", exc_info=True)
 
-def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict):
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespace, stats: dict, log_filename: str):
+    setup_logging(log_filename)
     gpu_id = rank
     torch.cuda.set_device(gpu_id)
     dali_cfg, cs2_cfg = DaliConfig(fps=FPS), CS2Config()
@@ -268,7 +292,13 @@ def worker(rank: int, world_size: int, jobs: List[Tuple], args: argparse.Namespa
 
 def main():
     args = get_args()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # --- Logging Setup ---
+    log_dir = SCRIPT_DIR / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    log_filename = log_dir / f"embed_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    setup_logging(log_filename)
+    
     if not DALI_AVAILABLE:
         logging.error("NVIDIA DALI not available. Error: %s", DALI_IMPORT_ERROR)
         return
@@ -314,7 +344,7 @@ def main():
     with mp.Manager() as manager:
         stats = manager.dict({'completed': 0, 'failed': 0})
         mp.set_start_method("spawn", force=True)
-        processes = [mp.Process(target=worker, args=(rank, world_size, jobs, args, stats)) for rank in range(world_size)]
+        processes = [mp.Process(target=worker, args=(rank, world_size, jobs, args, stats, log_filename)) for rank in range(world_size)]
         for p in processes: p.start()
         with tqdm(total=len(jobs), desc="Processing files") as pbar:
             completed_last, failed_last = 0, 0
