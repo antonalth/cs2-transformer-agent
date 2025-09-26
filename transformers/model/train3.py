@@ -316,7 +316,13 @@ class LmdbMetaFetcher:
     @staticmethod
     def _key(d, r, t, tick): return f"{d}_round_{r:03d}_team_{t}_tick_{tick:08d}".encode("utf-8")
     @staticmethod
-    def _bitmask_to_weapon_index(mask): return next((i for i in range(128) if (mask[i//64] >> np.uint64(i%64)) & 1), -1)
+    def _bitmask_to_weapon_index(mask: np.ndarray) -> int:
+        """Converts a [2] uint64 weapon bitmask to a single item index."""
+        if mask.sum() == 0: return -1
+        for i in range(128):
+            if (mask[i // 64] >> np.uint64(i % 64)) & np.uint64(1):
+                return i
+        return -1
     def fetch(self, rec: SampleRecord) -> MetaFetchResult:
         env, T = self.store.open(rec.lmdb_path), rec.T_frames
         alive = np.zeros((T, 5), np.uint8); stats = np.zeros((T, 5, 3), np.float32)
