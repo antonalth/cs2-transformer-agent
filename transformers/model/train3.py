@@ -188,8 +188,6 @@ class EpochIndex:
 class FilelistWriter:
     def __init__(self, out_dir: str, use_precomputed: bool = False, data_root: str = ""):
         self.out_dir, self.use_precomputed = out_dir, use_precomputed
-        # FIX: Convert the data_root to an absolute path immediately.
-        # This ensures that _embed_path will generate absolute paths, which DALI can find correctly.
         self.data_root = os.path.abspath(data_root) if data_root else ""
         os.makedirs(out_dir, exist_ok=True)
         if use_precomputed and not self.data_root:
@@ -199,7 +197,6 @@ class FilelistWriter:
         vid_paths = [os.path.join(self.out_dir, f"pov{k}_video.txt") for k in range(5)]
         aud_paths = [os.path.join(self.out_dir, f"pov{k}_audio.txt") for k in range(5)]
         def _embed_path(kind, demo, base):
-            # self.data_root is now guaranteed to be absolute
             p = Path(self.data_root) / ("vit_embed" if kind == "vit" else "aud_embed") / demo / f"{base}.npy"
             if not p.is_file(): raise FileNotFoundError(f"Missing precomputed embedding: {p}")
             return p
@@ -306,7 +303,7 @@ class DaliInputPipeline:
             return tuple(outputs)
         p = pipe(); p.build(); return p
     def __iter__(self): return self
-    def __next__(self): return next(self.iterator)[0]
+    def __next__(self): return next(self.iterator)
 
 @dataclass
 class MetaFetchResult:
@@ -605,7 +602,8 @@ def validate(dali_iter, assembler, model, loss_fn, args):
     totals = defaultdict(float); count = 0
     try:
         while True:
-            batch_raw = next(dali_iter)
+            # FIX: Unpack the list returned by the DALI iterator
+            batch_raw = next(dali_iter)[0]
             batch = assembler.assemble(batch_raw, args.use_precomputed_embeddings)
             preds = model(batch)
             loss, loss_dict = loss_fn(preds, batch["targets"], batch["alive_mask"])
@@ -663,7 +661,8 @@ def train(args, model_cfg):
         
         try:
             while True:
-                batch_raw = next(train_iter)
+                # FIX: Unpack the list returned by the DALI iterator to get the dictionary
+                batch_raw = next(train_iter)[0]
                 batch = train_asm.assemble(batch_raw, args.use_precomputed_embeddings)
                 
                 with torch.autocast("cuda", enabled=(model_cfg.compute_dtype in ["bf16", "fp16"]),
@@ -728,7 +727,8 @@ def smoke_test(args, model_cfg):
     loss_fn = CompositeLoss(weights=loss_weights).to(device)
     for i in range(args.num_steps):
         try:
-            batch_raw = next(dali_iter)
+            # FIX: Unpack the list returned by the DALI iterator
+            batch_raw = next(dali_iter)[0]
             batch = assembler.assemble(batch_raw, args.use_precomputed_embeddings)
             predictions = model(batch)
             total_loss, detailed_losses_dict = loss_fn(predictions, batch['targets'], batch['alive_mask'])
