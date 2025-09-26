@@ -187,13 +187,19 @@ class EpochIndex:
 
 class FilelistWriter:
     def __init__(self, out_dir: str, use_precomputed: bool = False, data_root: str = ""):
-        self.out_dir, self.use_precomputed, self.data_root = out_dir, use_precomputed, data_root
+        self.out_dir, self.use_precomputed = out_dir, use_precomputed
+        # FIX: Convert the data_root to an absolute path immediately.
+        # This ensures that _embed_path will generate absolute paths, which DALI can find correctly.
+        self.data_root = os.path.abspath(data_root) if data_root else ""
         os.makedirs(out_dir, exist_ok=True)
-        if use_precomputed and not data_root: raise ValueError("data_root required for precomputed mode.")
+        if use_precomputed and not self.data_root:
+            raise ValueError("data_root must be provided for precomputed mode.")
+
     def write(self, records: List[SampleRecord]) -> Tuple[List[str], List[str]]:
         vid_paths = [os.path.join(self.out_dir, f"pov{k}_video.txt") for k in range(5)]
         aud_paths = [os.path.join(self.out_dir, f"pov{k}_audio.txt") for k in range(5)]
         def _embed_path(kind, demo, base):
+            # self.data_root is now guaranteed to be absolute
             p = Path(self.data_root) / ("vit_embed" if kind == "vit" else "aud_embed") / demo / f"{base}.npy"
             if not p.is_file(): raise FileNotFoundError(f"Missing precomputed embedding: {p}")
             return p
@@ -255,21 +261,11 @@ class DaliInputPipeline:
                 v_raw = fn.readers.numpy(name=f"{reader_prefix}_VidNpyReader", file_list=vpath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
                 a_raw = fn.readers.numpy(name=f"{reader_prefix}_AudNpyReader", file_list=apath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
                 
-                # --- FIX FOR TypeError: unsupported operand type(s) for % ---
-                # The python modulo operator (%) cannot be used on a DALI DataNode.
-                # We must rewrite `a % n` as `a - n * (a // n)`.
                 packed_i64 = fn.cast(packed_label, dtype=types.INT64)
-                
-                # Step 1: Calculate sample_id using integer division (supported)
                 sample_id_i64 = packed_i64 // LABEL_SCALE
-                
-                # Step 2: Calculate start_f using equivalent arithmetic
                 start_f_i64 = packed_i64 - (sample_id_i64 * LABEL_SCALE)
-
-                # Step 3: Cast to final types
                 sample_id = fn.cast(sample_id_i64, dtype=types.INT32)
                 start_f = fn.cast(start_f_i64, dtype=types.INT32)
-                # --- END FIX ---
                 
                 v_slice = fn.slice(v_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
                 a_slice = fn.slice(a_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
@@ -369,8 +365,6 @@ class BatchAssembler:
             batch = {"video_embeddings": video_embeddings, "mel_spectrogram": audio}
         else:
             images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
-            # DALI mel is [B, C, T, Mels] -> stack(dim=2) -> [B, C, P, T, Mels]
-            # Permute to [B, T, P, C, Mels]
             mel_stacked = torch.stack([dali_batch[f"mel{k}"] for k in range(5)], dim=2)
             mel_permuted = mel_stacked.permute(0, 3, 2, 1, 4)
             mel = mel_permuted.unsqueeze(-1)
@@ -528,7 +522,6 @@ def build_optimizer_scheduler(model, args, total_steps):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     use_fp16 = getattr(model.module.cfg if hasattr(model, 'module') else model.cfg, "compute_dtype") == "fp16"
-    # FIX: Use torch.amp.GradScaler instead of the deprecated torch.cuda.amp.GradScaler
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     return optimizer, scheduler, scaler
 
