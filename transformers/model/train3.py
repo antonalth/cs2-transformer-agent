@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train2.py — A complete training script for the CS2Transformer model.
+train3.py — A complete training script for the CS2Transformer model.
 
 This script orchestrates the entire training process, including:
   - Distributed training with DDP.
@@ -117,9 +117,25 @@ class Manifest:
     def __init__(self, data_root: str, manifest_path: str):
         self.data_root = os.path.abspath(data_root)
         with open(manifest_path, "r", encoding="utf-8") as f: self._data = json.load(f)
+
     def get_games(self, split: str) -> List[Tuple[str, str]]:
-        return [(e["demoname"], os.path.abspath(os.path.join(self.data_root, "lmdb", f"{e['demoname']}.lmdb")))
-                for e in self._data.get(split, [])]
+        # FIX: Restored the more robust manifest parser from train2.py.
+        # This version handles both simple strings and dictionary entries.
+        entries = self._data.get(split, [])
+        out: List[Tuple[str, str]] = []
+        for e in entries:
+            if isinstance(e, str):
+                demoname = e
+                lmdb_path = os.path.join(self.data_root, "lmdb", f"{demoname}.lmdb")
+            elif isinstance(e, dict):
+                demoname = e.get("demoname") or e.get("name")
+                if demoname is None:
+                    raise ValueError(f"Manifest entry missing 'demoname': {e}")
+                lmdb_path = e.get("lmdb_path") or os.path.join(self.data_root, "lmdb", f"{demoname}.lmdb")
+            else:
+                raise ValueError(f"Unsupported manifest entry: {e}")
+            out.append((demoname, os.path.abspath(lmdb_path)))
+        return out
 
 class LmdbStore:
     def __init__(self, max_readers: int = 512):
@@ -154,6 +170,7 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
             team_rounds.append(TeamRound(demoname=demoname, lmdb_path=lmdb_path, round_num=int(r["round_num"]),
                                        team=str(r["team"]).upper(), start_tick=int(r["start_tick"]), end_tick=int(r["end_tick"]),
                                        pov_videos=videos, pov_audio=audio))
+    logging.info("Discovered %d team-rounds for split.", len(team_rounds))
     return team_rounds
 
 class EpochIndex:
@@ -218,13 +235,16 @@ class DaliInputPipeline:
     def __init__(self, video_filelists, audio_filelists, cfg, use_precomputed, video_pathlists=None, audio_pathlists=None, last_batch_policy="drop"):
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
         
-        reader_name = "VidReader0" if use_precomputed else "V0"
         if use_precomputed:
             self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, video_pathlists, audio_pathlists, cfg)
             out_map = [f"video_embed{k}" for k in range(5)] + [f"audio_embed{k}" for k in range(5)] + ["labels0"]
+            # FIX: Use a reader name that actually exists in the DALI graph. The label reader for the
+            # first POV is a safe choice for determining the dataset size.
+            reader_name = "P0_VidLblReader"
         else:
             self.pipeline = self._build_media_pipeline(video_filelists, audio_filelists, cfg)
             out_map = [item for k in range(5) for item in (f"pov{k}", f"labels{k}", f"mel{k}")]
+            reader_name = "V0"
 
         self.iterator = DALIGenericIterator(
             [self.pipeline], out_map, reader_name=reader_name, auto_reset=True,
@@ -337,7 +357,11 @@ class BatchAssembler:
             batch = {"video_embeddings": video_embeddings, "mel_spectrogram": audio}
         else:
             images = torch.stack([dali_batch[f"pov{k}"] for k in range(5)], dim=2)
-            mel = torch.stack([dali_batch[f"mel{k}"] for k in range(5)], dim=2).permute(0, 3, 2, 1, 4).unsqueeze(-1)
+            # DALI mel is [B, C, T, Mels] -> stack(dim=2) -> [B, C, P, T, Mels]
+            # Permute to [B, T, P, C, Mels]
+            mel_stacked = torch.stack([dali_batch[f"mel{k}"] for k in range(5)], dim=2)
+            mel_permuted = mel_stacked.permute(0, 3, 2, 1, 4)
+            mel = mel_permuted.unsqueeze(-1)
             sample_ids = dali_batch["labels0"].view(-1).cpu().tolist()
             batch = {"images": images, "mel_spectrogram": mel}
         gt_lists = defaultdict(list)
@@ -524,22 +548,27 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler, ema):
     logging.info(f"Resumed checkpoint from {path} at epoch {ckpt['epoch']}, step {ckpt['global_step']}")
     return ckpt["epoch"], ckpt["global_step"], ckpt.get("best_val", float("inf"))
 
-def build_epoch_loader(args, split: str, epoch: int, *, last_batch_policy="drop", rank=0, world_size=1):
+def build_epoch_loader(
+    args, epoch: int, store: LmdbStore, team_rounds: List[TeamRound], *,
+    last_batch_policy="drop", rank=0, world_size=1
+):
     """Builds the full data loading pipeline for a given epoch and split."""
-    manifest = Manifest(args.data_root, args.manifest)
-    store = LmdbStore()
-    team_rounds = build_team_rounds(args.data_root, manifest.get_games(split), store)
+    # FIX: This function no longer creates the store or builds team_rounds.
+    # It receives them as arguments for efficiency.
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
     records, id_map = index.build(team_rounds, epoch=epoch)
     
+    # Use split name from team_rounds for directory, assuming all rounds are from same split.
+    # A more robust solution might pass the split name explicitly.
+    split_name_for_dir = "val" if last_batch_policy == "partial" else "train"
+    fl_dir = os.path.join(args.run_dir, f"filelists_{split_name_for_dir}_e{epoch:04d}")
+
     if rank == 0:
-        fl_dir = os.path.join(args.run_dir, f"filelists_{split}_e{epoch:04d}")
         writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
         video_lists, audio_lists = writer.write(records)
     
     if world_size > 1: torch.distributed.barrier() # Ensure rank 0 writes lists first
     
-    fl_dir = os.path.join(args.run_dir, f"filelists_{split}_e{epoch:04d}")
     video_lists = [os.path.join(fl_dir, f"pov{k}_video.txt") for k in range(5)]
     audio_lists = [os.path.join(fl_dir, f"pov{k}_audio.txt") for k in range(5)]
 
@@ -595,7 +624,8 @@ def train(args, model_cfg):
     is_ddp, rank, world_size, local_rank = setup_distributed(args)
     set_seed_all(args.seed, rank)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.run_dir, exist_ok=True)
+    if rank == 0:
+        os.makedirs(args.run_dir, exist_ok=True)
     writer = SummaryWriter(args.run_dir) if rank == 0 else None
 
     # --- Build Model, Loss, Optimizer ---
@@ -607,7 +637,16 @@ def train(args, model_cfg):
                      'round_number': 0.2, 'round_state': 0.5, 'pos_heatmap': 1.0, 'enemy_heatmap': 1.0 }
     loss_fn = CompositeLoss(weights=loss_weights).to(device)
     
-    _, _, steps_per_epoch = build_epoch_loader(args, "train", 0, rank=rank, world_size=world_size)
+    # FIX: Perform expensive data indexing ONCE before the training loop
+    manifest = Manifest(args.data_root, args.manifest)
+    store = LmdbStore()
+    logging.info("Building training set index...")
+    train_team_rounds = build_team_rounds(args.data_root, manifest.get_games("train"), store)
+    logging.info("Building validation set index...")
+    val_team_rounds = build_team_rounds(args.data_root, manifest.get_games("val"), store)
+
+    # Estimate total steps based on the initial train set size
+    steps_per_epoch = (len(train_team_rounds) // world_size) // args.batch_size
     total_steps = steps_per_epoch * args.epochs
     optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_steps)
     ema = EMA(model, decay=args.ema_decay) if args.ema_decay and args.ema_decay > 0 else None
@@ -618,7 +657,9 @@ def train(args, model_cfg):
 
     # --- Main Training Loop ---
     for epoch in range(start_epoch, args.epochs):
-        train_iter, train_asm, _ = build_epoch_loader(args, "train", epoch, last_batch_policy="drop", rank=rank, world_size=world_size)
+        train_iter, train_asm, _ = build_epoch_loader(
+            args, epoch, store, train_team_rounds, last_batch_policy="drop", rank=rank, world_size=world_size
+        )
         model.train()
         
         try:
@@ -650,7 +691,10 @@ def train(args, model_cfg):
                     writer.add_scalar("opt/lr", optimizer.param_groups[0]['lr'], global_step)
 
                 if args.eval_every > 0 and (global_step > 0 and global_step % args.eval_every == 0):
-                    val_iter, val_asm, _ = build_epoch_loader(args, "val", 0, last_batch_policy="partial", rank=rank, world_size=world_size)
+                    # For validation, we typically use the same windowing strategy across epochs (epoch 0)
+                    val_iter, val_asm, _ = build_epoch_loader(
+                        args, 0, store, val_team_rounds, last_batch_policy="partial", rank=rank, world_size=world_size
+                    )
                     val_metrics = validate(val_iter, val_asm, model, loss_fn, args)
                     if writer:
                         writer.add_scalar("val/total_loss", val_metrics["total"], global_step)
@@ -674,7 +718,12 @@ def train(args, model_cfg):
 
 def smoke_test(args, model_cfg):
     """Original smoke test logic."""
-    dali_iter, assembler, _ = build_epoch_loader(args, args.split, 0)
+    # FIX: Perform one-time data indexing for the smoke test as well.
+    manifest = Manifest(args.data_root, args.manifest)
+    store = LmdbStore()
+    team_rounds = build_team_rounds(args.data_root, manifest.get_games(args.split), store)
+    dali_iter, assembler, _ = build_epoch_loader(args, 0, store, team_rounds)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CS2Transformer(model_cfg).to(device)
     loss_weights = { 'stats': 1.0, 'mouse': 1.0, 'keyboard': 1.0, 'eco': 1.0, 'inventory': 1.0, 'weapon': 0.25,
