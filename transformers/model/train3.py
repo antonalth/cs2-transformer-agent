@@ -119,8 +119,6 @@ class Manifest:
         with open(manifest_path, "r", encoding="utf-8") as f: self._data = json.load(f)
 
     def get_games(self, split: str) -> List[Tuple[str, str]]:
-        # FIX: Restored the more robust manifest parser from train2.py.
-        # This version handles both simple strings and dictionary entries.
         entries = self._data.get(split, [])
         out: List[Tuple[str, str]] = []
         for e in entries:
@@ -238,8 +236,6 @@ class DaliInputPipeline:
         if use_precomputed:
             self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, video_pathlists, audio_pathlists, cfg)
             out_map = [f"video_embed{k}" for k in range(5)] + [f"audio_embed{k}" for k in range(5)] + ["labels0"]
-            # FIX: Use a reader name that actually exists in the DALI graph. The label reader for the
-            # first POV is a safe choice for determining the dataset size.
             reader_name = "P0_VidLblReader"
         else:
             self.pipeline = self._build_media_pipeline(video_filelists, audio_filelists, cfg)
@@ -258,12 +254,27 @@ class DaliInputPipeline:
                 _, packed_label = fn.readers.file(name=f"{reader_prefix}_VidLblReader", file_list=vlist_lbl, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
                 v_raw = fn.readers.numpy(name=f"{reader_prefix}_VidNpyReader", file_list=vpath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
                 a_raw = fn.readers.numpy(name=f"{reader_prefix}_AudNpyReader", file_list=apath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
+                
+                # --- FIX FOR TypeError: unsupported operand type(s) for % ---
+                # The python modulo operator (%) cannot be used on a DALI DataNode.
+                # We must rewrite `a % n` as `a - n * (a // n)`.
                 packed_i64 = fn.cast(packed_label, dtype=types.INT64)
-                sample_id = fn.cast(packed_i64 // LABEL_SCALE, dtype=types.INT32)
-                start_f = fn.cast(packed_i64 % LABEL_SCALE, dtype=types.INT32)
+                
+                # Step 1: Calculate sample_id using integer division (supported)
+                sample_id_i64 = packed_i64 // LABEL_SCALE
+                
+                # Step 2: Calculate start_f using equivalent arithmetic
+                start_f_i64 = packed_i64 - (sample_id_i64 * LABEL_SCALE)
+
+                # Step 3: Cast to final types
+                sample_id = fn.cast(sample_id_i64, dtype=types.INT32)
+                start_f = fn.cast(start_f_i64, dtype=types.INT32)
+                # --- END FIX ---
+                
                 v_slice = fn.slice(v_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
                 a_slice = fn.slice(a_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
                 return v_slice.gpu(), a_slice.gpu(), sample_id
+
             v_embeds, a_embeds = [], []
             v0, a0, label0 = read_slice(vlists[0], vpaths[0], alists[0], apaths[0], "P0")
             v_embeds.append(v0); a_embeds.append(a0)
@@ -284,7 +295,8 @@ class DaliInputPipeline:
                 audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards,
                                                        stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False)
                 packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
-                start_f = fn.cast(packed_i64 % LABEL_SCALE, dtype=types.FLOAT)
+                start_f_i64 = packed_i64 - (packed_i64 // LABEL_SCALE * LABEL_SCALE)
+                start_f = fn.cast(start_f_i64, dtype=types.FLOAT)
                 decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=False)
                 start_s = start_f / cfg.fps
                 shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
@@ -502,11 +514,10 @@ def build_optimizer_scheduler(model, args, total_steps):
         return decay, no_decay
     
     base_lr, opt_groups = args.lr, []
-    for g in model.parameter_groups():
-        lr = base_lr * float(g.get("lr_scale", 1.0))
-        decay, no_decay = split_decay(g["params"])
-        if decay: opt_groups.append({"params": decay, "lr": lr, "weight_decay": args.weight_decay})
-        if no_decay: opt_groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+    model_params = model.module.parameters() if hasattr(model, 'module') else model.parameters()
+    decay, no_decay = split_decay(model_params)
+    opt_groups.append({"params": decay, "lr": base_lr, "weight_decay": args.weight_decay})
+    opt_groups.append({"params": no_decay, "lr": base_lr, "weight_decay": 0.0})
 
     optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.95), eps=1e-8)
     def lr_lambda(step):
@@ -517,7 +528,8 @@ def build_optimizer_scheduler(model, args, total_steps):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     use_fp16 = getattr(model.module.cfg if hasattr(model, 'module') else model.cfg, "compute_dtype") == "fp16"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    # FIX: Use torch.amp.GradScaler instead of the deprecated torch.cuda.amp.GradScaler
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     return optimizer, scheduler, scaler
 
 def save_checkpoint(run_dir, filename, epoch, step, best_val, model, optimizer, scheduler, scaler, ema, args):
@@ -553,13 +565,9 @@ def build_epoch_loader(
     last_batch_policy="drop", rank=0, world_size=1
 ):
     """Builds the full data loading pipeline for a given epoch and split."""
-    # FIX: This function no longer creates the store or builds team_rounds.
-    # It receives them as arguments for efficiency.
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
     records, id_map = index.build(team_rounds, epoch=epoch)
     
-    # Use split name from team_rounds for directory, assuming all rounds are from same split.
-    # A more robust solution might pass the split name explicitly.
     split_name_for_dir = "val" if last_batch_policy == "partial" else "train"
     fl_dir = os.path.join(args.run_dir, f"filelists_{split_name_for_dir}_e{epoch:04d}")
 
@@ -567,7 +575,7 @@ def build_epoch_loader(
         writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
         video_lists, audio_lists = writer.write(records)
     
-    if world_size > 1: torch.distributed.barrier() # Ensure rank 0 writes lists first
+    if world_size > 1: torch.distributed.barrier()
     
     video_lists = [os.path.join(fl_dir, f"pov{k}_video.txt") for k in range(5)]
     audio_lists = [os.path.join(fl_dir, f"pov{k}_audio.txt") for k in range(5)]
@@ -594,7 +602,7 @@ def build_epoch_loader(
     fetcher = LmdbMetaFetcher(store)
     device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
     assembler = BatchAssembler(id_map, fetcher, device=device)
-    steps_per_epoch = (len(records) // world_size) // args.batch_size
+    steps_per_epoch = (len(records) // (world_size * args.batch_size)) if len(records) > 0 else 0
     return dali_pipe.iterator, assembler, steps_per_epoch
 
 @torch.no_grad()
@@ -637,7 +645,6 @@ def train(args, model_cfg):
                      'round_number': 0.2, 'round_state': 0.5, 'pos_heatmap': 1.0, 'enemy_heatmap': 1.0 }
     loss_fn = CompositeLoss(weights=loss_weights).to(device)
     
-    # FIX: Perform expensive data indexing ONCE before the training loop
     manifest = Manifest(args.data_root, args.manifest)
     store = LmdbStore()
     logging.info("Building training set index...")
@@ -645,8 +652,7 @@ def train(args, model_cfg):
     logging.info("Building validation set index...")
     val_team_rounds = build_team_rounds(args.data_root, manifest.get_games("val"), store)
 
-    # Estimate total steps based on the initial train set size
-    steps_per_epoch = (len(train_team_rounds) // world_size) // args.batch_size
+    steps_per_epoch = (len(train_team_rounds) // (world_size * args.batch_size)) if train_team_rounds else 0
     total_steps = steps_per_epoch * args.epochs
     optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_steps)
     ema = EMA(model, decay=args.ema_decay) if args.ema_decay and args.ema_decay > 0 else None
@@ -690,8 +696,7 @@ def train(args, model_cfg):
                     for k, v in loss_dict.items(): writer.add_scalar(f"train_loss/{k}", v, global_step)
                     writer.add_scalar("opt/lr", optimizer.param_groups[0]['lr'], global_step)
 
-                if args.eval_every > 0 and (global_step > 0 and global_step % args.eval_every == 0):
-                    # For validation, we typically use the same windowing strategy across epochs (epoch 0)
+                if args.eval_every > 0 and (global_step > 0 and global_step % args.eval_every == 0) and val_team_rounds:
                     val_iter, val_asm, _ = build_epoch_loader(
                         args, 0, store, val_team_rounds, last_batch_policy="partial", rank=rank, world_size=world_size
                     )
@@ -718,7 +723,6 @@ def train(args, model_cfg):
 
 def smoke_test(args, model_cfg):
     """Original smoke test logic."""
-    # FIX: Perform one-time data indexing for the smoke test as well.
     manifest = Manifest(args.data_root, args.manifest)
     store = LmdbStore()
     team_rounds = build_team_rounds(args.data_root, manifest.get_games(args.split), store)
