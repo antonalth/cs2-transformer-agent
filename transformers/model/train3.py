@@ -194,32 +194,74 @@ class FilelistWriter:
             raise ValueError("data_root must be provided for precomputed mode.")
 
     def write(self, records: List[SampleRecord]) -> Tuple[List[str], List[str]]:
+        """
+        For precomputed mode:
+        - video filelists: label = sequential index (0..N-1)
+        - audio filelists: label = start_f (int frames)
+        - saves sidecar: {seq_id -> (sample_id, start_f)} as label_map.npz
+
+        For on-the-fly (raw media) mode:
+        - video filelists: path sample_id start frame_num  (unchanged)
+        - audio filelists: label = start_f  (was packed; now plain)
+        """
         vid_paths = [os.path.join(self.out_dir, f"pov{k}_video.txt") for k in range(5)]
         aud_paths = [os.path.join(self.out_dir, f"pov{k}_audio.txt") for k in range(5)]
+
         def _embed_path(kind, demo, base):
             p = Path(self.data_root) / ("vit_embed" if kind == "vit" else "aud_embed") / demo / f"{base}.npy"
-            if not p.is_file(): raise FileNotFoundError(f"Missing precomputed embedding: {p}")
+            if not p.is_file():
+                raise FileNotFoundError(f"Missing precomputed embedding: {p}")
             return p
+
+        # sidecar arrays (one row per record, in the same order)
+        sidecar_seq   = []
+        sidecar_sid   = []
+        sidecar_start = []
+
+        import contextlib
+        import numpy as np
+
         with contextlib.ExitStack() as stack:
             files = [stack.enter_context(open(p, "w")) for p in vid_paths + aud_paths]
             vid_fs, aud_fs = files[:5], files[5:]
-            for rec in records:
+
+            for seq_id, rec in enumerate(records):
+                # keep sidecar in the same order
+                sidecar_seq.append(seq_id)
+                sidecar_sid.append(rec.sample_id)
+                sidecar_start.append(rec.start_f)
+
                 if self.use_precomputed:
-                    packed_label = rec.sample_id * LABEL_SCALE + rec.start_f
+                    # Labels:
+                    #   - video label  = seq_id (0..N-1)
+                    #   - audio label  = start_f (frames)
                     for k in range(5):
                         vid_base = os.path.splitext(os.path.basename(rec.pov_videos[k]))[0]
                         aud_base = os.path.splitext(os.path.basename(rec.pov_audio[k]))[0]
-                        vid_fs[k].write(f"{_embed_path('vit', rec.demoname, vid_base)} {packed_label}\n")
-                        aud_fs[k].write(f"{_embed_path('aud', rec.demoname, aud_base)} {packed_label}\n")
+                        vid_fs[k].write(f"{_embed_path('vit', rec.demoname, vid_base)} {seq_id}\n")
+                        aud_fs[k].write(f"{_embed_path('aud', rec.demoname, aud_base)} {rec.start_f}\n")
                 else:
+                    # Video filelist line format stays: path sample_id start frame_num
                     for k in range(5):
-                        path, ticks = rec.pov_videos[k], ticks_from_filename(rec.pov_videos[k])
+                        path = rec.pov_videos[k]
+                        ticks = ticks_from_filename(path)
                         start, end_exc = clamp_window_to_pov(rec.start_f, rec.T_frames, ticks[0], ticks[1])
                         frame_num = max(0, end_exc - start)
                         vid_fs[k].write(f"{path} {rec.sample_id} {start} {frame_num}\n")
-                        packed_audio_label = rec.sample_id * LABEL_SCALE + start
-                        aud_fs[k].write(f"{rec.pov_audio[k]} {packed_audio_label}\n")
+
+                        # Audio label becomes plain start_f (no packing)
+                        aud_fs[k].write(f"{rec.pov_audio[k]} {start}\n")
+
+        # Save sidecar map for debugging / audits: seq_id -> (sample_id, start_f)
+        sidecar = {
+            "seq_id":   np.asarray(sidecar_seq,   dtype=np.int64),
+            "sample_id":np.asarray(sidecar_sid,   dtype=np.int64),
+            "start_f":  np.asarray(sidecar_start, dtype=np.int64),
+        }
+        np.savez(os.path.join(self.out_dir, "label_map.npz"), **sidecar)
+
         return vid_paths, aud_paths
+
 
 @dataclass
 class DaliConfig:
@@ -254,19 +296,47 @@ class DaliInputPipeline:
         @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed)
         def pipe():
             def read_slice(vlist_lbl, vpath_only, alist_lbl, apath_only, reader_prefix):
-                _, packed_label = fn.readers.file(name=f"{reader_prefix}_VidLblReader", file_list=vlist_lbl, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
-                v_raw = fn.readers.numpy(name=f"{reader_prefix}_VidNpyReader", file_list=vpath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
-                a_raw = fn.readers.numpy(name=f"{reader_prefix}_AudNpyReader", file_list=apath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
-                
-                packed_i64 = fn.cast(packed_label, dtype=types.INT64)
-                sample_id_i64 = packed_i64 // LABEL_SCALE
-                start_f_i64 = packed_i64 - (sample_id_i64 * LABEL_SCALE)
-                sample_id = fn.cast(sample_id_i64, dtype=types.INT32)
-                start_f = fn.cast(start_f_i64, dtype=types.INT32)
-                
+                # Read the sequential ID from the video label list
+                _, seq_label = fn.readers.file(
+                    name=f"{reader_prefix}_VidLblReader",
+                    file_list=vlist_lbl,
+                    shard_id=cfg.shard_id, num_shards=cfg.num_shards,
+                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                )
+
+                # Read start_f (frames) from the audio label list
+                _, start_label = fn.readers.file(
+                    name=f"{reader_prefix}_AudLblReader",
+                    file_list=alist_lbl,
+                    shard_id=cfg.shard_id, num_shards=cfg.num_shards,
+                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                )
+
+                # Load npy embeddings from path-only lists (keeps label IO separate)
+                v_raw = fn.readers.numpy(
+                    name=f"{reader_prefix}_VidEmbedReader",
+                    file_list=vpath_only,
+                    shard_id=cfg.shard_id, num_shards=cfg.num_shards,
+                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                )
+                a_raw = fn.readers.numpy(
+                    name=f"{reader_prefix}_AudEmbedReader",
+                    file_list=apath_only,
+                    shard_id=cfg.shard_id, num_shards=cfg.num_shards,
+                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                )
+
+                # Cast labels
+                seq_id  = fn.cast(seq_label,   dtype=types.INT32)
+                start_f = fn.cast(start_label, dtype=types.INT32)
+
+                # Slice the per-frame embeddings by window start
                 v_slice = fn.slice(v_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
                 a_slice = fn.slice(a_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
-                return v_slice.gpu(), a_slice.gpu(), sample_id
+
+                # Return slices + the seq_id (this is what lands in `labels0`)
+                return v_slice.gpu(), a_slice.gpu(), seq_id
+
 
             v_embeds, a_embeds = [], []
             v0, a0, label0 = read_slice(vlists[0], vpaths[0], alists[0], apaths[0], "P0")
@@ -282,18 +352,38 @@ class DaliInputPipeline:
         def pipe():
             outputs = []
             for k in range(5):
-                video, label_vid = fn.readers.video(name=f"V{k}", device="gpu", file_list=vlists[k], sequence_length=cfg.sequence_length, pad_sequences=True,
-                                                    shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False,
-                                                    dtype=types.UINT8, file_list_frame_num=True, file_list_include_preceding_frame=True)
-                audio_raw, label_cpu = fn.readers.file(name=f"A{k}", file_list=alists[k], shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                                                       stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False)
-                packed_i64 = fn.cast(label_cpu, dtype=types.INT64)
-                start_f_i64 = packed_i64 - (packed_i64 // LABEL_SCALE * LABEL_SCALE)
-                start_f = fn.cast(start_f_i64, dtype=types.FLOAT)
+                # existing readers
+                video, label_vid = fn.readers.video(
+                    name=f"V{k}", file_list=vlists[k], sequence_length=cfg.sequence_length, pad_sequences=True,
+                    shard_id=cfg.shard_id, num_shards=cfg.num_shards,
+                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False,
+                    dtype=types.UINT8, file_list_frame_num=True, file_list_include_preceding_frame=True
+                )
+                audio_raw, label_cpu = fn.readers.file(
+                    name=f"A{k}", file_list=alists[k],
+                    shard_id=cfg.shard_id, num_shards=cfg.num_shards,
+                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                )
+
+                # NEW: start_f comes straight from the audio label (no packing)
+                start_f = fn.cast(label_cpu, dtype=types.INT32)
+
                 decoded, _ = fn.decoders.audio(audio_raw, sample_rate=cfg.sample_rate, downmix=False)
-                start_s = start_f / cfg.fps
+
+                # Convert frame start to seconds for audio slicing
+                start_s = fn.cast(start_f, dtype=types.FLOAT) / cfg.fps
                 shape_samples = (cfg.sequence_length - 1) * cfg.hop_length + cfg.window_length
-                sliced = fn.slice(decoded.gpu(), start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32), shape=[int(shape_samples)], axes=[0], out_of_bounds_policy="pad")
+
+                sliced = fn.slice(
+                    decoded.gpu(),
+                    start=fn.cast(start_s * cfg.sample_rate, dtype=types.INT32),
+                    shape=[int(shape_samples)],
+                    axes=[0],
+                    out_of_bounds_policy="pad"
+                )
+
+                # ... mel construction unchanged ...
+
                 def to_mel_db(ch):
                     spec = fn.spectrogram(ch, nfft=cfg.nfft, window_length=cfg.window_length, window_step=cfg.hop_length, center_windows=False)
                     mel = fn.mel_filter_bank(spec, sample_rate=cfg.sample_rate, nfilter=cfg.mel_bins, freq_high=cfg.mel_fmax)
