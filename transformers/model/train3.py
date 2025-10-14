@@ -693,6 +693,7 @@ def train(args, model_cfg):
                     writer.add_scalar("train/total_loss", total_loss.item() * args.accum_steps, global_step)
                     for k, v in loss_dict.items(): writer.add_scalar(f"train_loss/{k}", v, global_step)
                     writer.add_scalar("opt/lr", optimizer.param_groups[0]['lr'], global_step)
+                    logging.info(f"Step: {global_step}, Loss: {total_loss.item() * args.accum_steps:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
 
                 if args.eval_every > 0 and (global_step > 0 and global_step % args.eval_every == 0) and val_team_rounds:
                     val_iter, val_asm, _ = build_epoch_loader(
