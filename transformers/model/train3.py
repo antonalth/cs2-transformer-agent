@@ -205,18 +205,18 @@ class FilelistWriter:
             vid_fs, aud_fs = files[:5], files[5:]
             for rec in records:
                 if self.use_precomputed:
-                    packed_label = rec.sample_id * LABEL_SCALE + rec.start_f
                     for k in range(5):
                         vid_base = os.path.splitext(os.path.basename(rec.pov_videos[k]))[0]
                         aud_base = os.path.splitext(os.path.basename(rec.pov_audio[k]))[0]
-                        vid_fs[k].write(f"{_embed_path('vit', rec.demoname, vid_base)} {packed_label}\n")
-                        aud_fs[k].write(f"{_embed_path('aud', rec.demoname, aud_base)} {packed_label}\n")
+                        vid_fs[k].write(f"{_embed_path('vit', rec.demoname, vid_base)} {rec.sample_id} {rec.start_f}\n")
+                        aud_fs[k].write(f"{_embed_path('aud', rec.demoname, aud_base)} {rec.sample_id} {rec.start_f}\n")
                 else:
                     for k in range(5):
                         path, ticks = rec.pov_videos[k], ticks_from_filename(rec.pov_videos[k])
                         start, end_exc = clamp_window_to_pov(rec.start_f, rec.T_frames, ticks[0], ticks[1])
                         frame_num = max(0, end_exc - start)
                         vid_fs[k].write(f"{path} {rec.sample_id} {start} {frame_num}\n")
+                        
                         packed_audio_label = rec.sample_id * LABEL_SCALE + start
                         aud_fs[k].write(f"{rec.pov_audio[k]} {packed_audio_label}\n")
         return vid_paths, aud_paths
@@ -254,16 +254,20 @@ class DaliInputPipeline:
         @pipeline_def(batch_size=cfg.batch_size, num_threads=cfg.num_threads, device_id=cfg.device_id, seed=cfg.seed)
         def pipe():
             def read_slice(vlist_lbl, vpath_only, alist_lbl, apath_only, reader_prefix):
-                _, packed_label = fn.readers.file(name=f"{reader_prefix}_VidLblReader", file_list=vlist_lbl, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
+                _, sample_id, start_f = fn.readers.file(
+                    name=f"{reader_prefix}_VidLblReader",
+                    file_list=vlist_lbl,
+                    num_labels=2,  
+                    shard_id=cfg.shard_id,
+                    num_shards=cfg.num_shards,
+                    stick_to_shard=True
+                )
                 v_raw = fn.readers.numpy(name=f"{reader_prefix}_VidNpyReader", file_list=vpath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
                 a_raw = fn.readers.numpy(name=f"{reader_prefix}_AudNpyReader", file_list=apath_only, shard_id=cfg.shard_id, num_shards=cfg.num_shards, stick_to_shard=True)
-                
-                packed_i64 = fn.cast(packed_label, dtype=types.INT64)
-                sample_id_i64 = packed_i64 // LABEL_SCALE
-                start_f_i64 = packed_i64 - (sample_id_i64 * LABEL_SCALE)
-                sample_id = fn.cast(sample_id_i64, dtype=types.INT32)
-                start_f = fn.cast(start_f_i64, dtype=types.INT32)
-                
+
+                sample_id = fn.cast(sample_id, dtype=types.INT32)
+                start_f = fn.cast(start_f, dtype=types.INT32)
+
                 v_slice = fn.slice(v_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
                 a_slice = fn.slice(a_raw, start_f, cfg.sequence_length, axes=[0], out_of_bounds_policy="pad", fill_values=0.0)
                 return v_slice.gpu(), a_slice.gpu(), sample_id
@@ -573,16 +577,16 @@ def build_epoch_loader(
     """Builds the full data loading pipeline for a given epoch and split."""
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
     records, id_map = index.build(team_rounds, epoch=epoch)
-    
+
     split_name_for_dir = "val" if last_batch_policy == "partial" else "train"
     fl_dir = os.path.join(args.run_dir, f"filelists_{split_name_for_dir}_e{epoch:04d}")
 
     if rank == 0:
         writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
         video_lists, audio_lists = writer.write(records)
-    
+
     if world_size > 1: torch.distributed.barrier()
-    
+
     video_lists = [os.path.join(fl_dir, f"pov{k}_video.txt") for k in range(5)]
     audio_lists = [os.path.join(fl_dir, f"pov{k}_audio.txt") for k in range(5)]
 
@@ -592,7 +596,7 @@ def build_epoch_loader(
             dst = str(Path(src_lst).with_suffix(".paths"))
             if rank == 0:
                 with open(src_lst, "r") as s, open(dst, "w") as d:
-                    for line in s: d.write(line.rstrip("\n").split()[0] + "\n")
+                    for line in s: d.write(line.strip().split()[0] + "\n")
             return dst
         video_path_lists = [make_paths_only_list(p) for p in video_lists]
         audio_path_lists = [make_paths_only_list(p) for p in audio_lists]
@@ -604,7 +608,7 @@ def build_epoch_loader(
     dali_pipe = DaliInputPipeline(video_filelists=video_lists, audio_filelists=audio_lists, cfg=dali_cfg,
                                   use_precomputed=args.use_precomputed_embeddings, video_pathlists=video_path_lists,
                                   audio_pathlists=audio_path_lists, last_batch_policy=last_batch_policy)
-    
+
     fetcher = LmdbMetaFetcher(store)
     device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
     assembler = BatchAssembler(id_map, fetcher, device=device)
