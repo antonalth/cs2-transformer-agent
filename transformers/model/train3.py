@@ -785,9 +785,9 @@ def train(args, model_cfg):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
-                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     if ema: ema.update(model)
+                    scheduler.step()
 
                 if rank == 0 and (global_step % args.log_every == 0):
                     writer.add_scalar("train/total_loss", total_loss.item() * args.accum_steps, global_step)
