@@ -445,23 +445,33 @@ class CompositeLoss(nn.Module):
         losses['round_number'] = self.weights['round_number'] * self._scalar_loss(self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1), frame_mask)
         losses['round_state'] = self.weights['round_state'] * self._scalar_loss(self.bce_loss(gs_pred["round_state_logits"], gs_targ["round_state_logits"]).mean(-1), frame_mask)
         total_loss += losses['round_number'] + losses['round_state']
+        # POS heatmap loss
         pred_pos = torch.stack([p["pos_heatmap_logits"] for p in predictions["player"]], 2)
         targ_pos = torch.stack([p["pos_coords"] for p in targets["player"]], 2)
-        if alive_mask.any():
-            alive_flat = alive_mask.view(-1)
+        alive_flat = alive_mask.view(-1)
+        if alive_flat.any():
             pred_alive = pred_pos.view(-1, *pred_pos.shape[3:])[alive_flat]
             coord_alive = targ_pos.view(-1, 3)[alive_flat]
             target_heatmap = self._build_targets_heatmaps(coord_alive).to(dtype=pred_alive.dtype)
             losses['pos_heatmap'] = self.weights['pos_heatmap'] * self.bce_loss(pred_alive, target_heatmap).mean()
-            total_loss += losses['pos_heatmap']
+        else:
+            # keep the computation graph connected without changing loss value
+            losses['pos_heatmap'] = 0.0 * pred_pos.mean()
+        total_loss += losses['pos_heatmap']
+
+        # ENEMY heatmap loss
         pred_enemy, targ_enemy = gs_pred["enemy_pos_heatmap_logits"], gs_targ["enemy_pos_coords"]
         valid_enemy = (targ_enemy[..., 0] >= 0)
         if valid_enemy.any():
             b_idx, t_idx, p_idx = valid_enemy.nonzero(as_tuple=True)
-            pred_sel = pred_enemy[b_idx, t_idx]; coord_sel = targ_enemy[b_idx, t_idx, p_idx]
+            pred_sel = pred_enemy[b_idx, t_idx]
+            coord_sel = targ_enemy[b_idx, t_idx, p_idx]
             target_heatmap = self._build_targets_heatmaps(coord_sel).to(dtype=pred_sel.dtype)
             losses['enemy_heatmap'] = self.weights['enemy_heatmap'] * self.bce_loss(pred_sel, target_heatmap).mean()
-            total_loss += losses['enemy_heatmap']
+        else:
+            losses['enemy_heatmap'] = 0.0 * pred_enemy.mean()
+        total_loss += losses['enemy_heatmap']
+
         return total_loss, {k: v.item() for k, v in losses.items() if v is not None}
 
 # =============================================================================
@@ -685,8 +695,8 @@ def train(args, model_cfg):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
                     scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
                     if ema: ema.update(model)
 
                 if rank == 0 and (global_step % args.log_every == 0):
