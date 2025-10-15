@@ -468,7 +468,34 @@ class BatchAssembler:
             gt_result = self.fetcher.fetch(self.id_to_sample[int(sid)])
             for key, value in gt_result.__dict__.items(): gt_lists[key].append(torch.from_numpy(value))
         gt = {k: torch.stack(v).to(self.device, non_blocking=True) for k,v in gt_lists.items()}
-        batch["alive_mask"] = gt.pop("alive_mask").bool()
+        # ---- robust alive_mask construction ----
+        alive = gt.pop("alive_mask", None)
+
+        if alive is None:
+            # Try to reconstruct from a per-frame team_alive bitmask if present.
+            team_alive_bits = None
+            if "team_alive" in gt:
+                team_alive_bits = gt["team_alive"]            # expected shape [B, T], int bitmask
+            elif "game_state" in gt and isinstance(gt["game_state"], dict) and "team_alive" in gt["game_state"]:
+                team_alive_bits = gt["game_state"]["team_alive"]
+
+            if team_alive_bits is not None:
+                tab = team_alive_bits.to(dtype=torch.long)
+                # Convert [B, T] bitmask into [B, T, 5] boolean mask (one slot per player)
+                ar = torch.arange(5, device=tab.device, dtype=torch.long)
+                alive = ((tab.unsqueeze(-1) >> ar) & 1).bool()
+            elif "stats" in gt:
+                # Fallback: infer alive from health in stats [B, T, 5, 3] (health, armor, money)
+                alive = (gt["stats"][..., 0] > 0)
+            else:
+                # Last-resort fallback: mark all frames alive (padding will be handled elsewhere)
+                some = next(v for v in gt.values() if torch.is_tensor(v))
+                B, T = some.shape[:2]
+                alive = torch.ones((B, T, 5), dtype=torch.bool, device=some.device)
+
+        batch["alive_mask"] = alive
+        # ---- end robust alive_mask construction ----
+
         targets = {"player": [{} for _ in range(5)], "game_strategy": {}}
         for i in range(5):
             targets["player"][i]["stats"] = gt["stats"][:, :, i]
