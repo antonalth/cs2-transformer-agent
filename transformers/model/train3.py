@@ -432,7 +432,7 @@ class LmdbMetaFetcher:
         return -1
     def fetch(self, rec: SampleRecord) -> MetaFetchResult:
         env, T = self.store.open(rec.lmdb_path), rec.T_frames
-        alive = np.zeros((T, 5), np.uint8); stats = np.zeros((T, 5, 3), np.float32)
+        alive = np.zeros((T, 5), dtype=np.bool_); stats = np.zeros((T, 5, 3), np.float32)
         mouse = np.zeros((T, 5, 2), np.float32); pos = np.zeros((T, 5, 3), np.float32)
         kbd = np.zeros((T, 5), np.uint32); eco = np.zeros((T, 5, 4), np.uint64)
         inv = np.zeros((T, 5, 2), np.uint64); wep = np.full((T, 5), -1, np.int32)
@@ -447,7 +447,7 @@ class LmdbMetaFetcher:
                 if not payload.get("game_state"): continue
                 gs = payload["game_state"][0]
                 alive_slots = [i for i in range(5) if (int(gs['team_alive']) >> i) & 1]
-                for slot in alive_slots: alive[f, slot] = 1
+                for slot in alive_slots: alive[f, slot] = True
                 rnd_state[f] = gs['round_state']; enemy_pos[f] = gs['enemy_pos']
                 pdl = payload.get("player_data")
                 if pdl and len(alive_slots) == len(pdl):
@@ -735,7 +735,7 @@ def build_epoch_loader(
         writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
         video_lists, audio_lists = writer.write(records)
     
-    if world_size > 1: torch.distributed.barrier()
+    if world_size > 1: torch.distributed.barrier(device_ids=[device_id])
     
     video_lists = [os.path.join(fl_dir, f"pov{k}_video.txt") for k in range(5)]
     audio_lists = [os.path.join(fl_dir, f"pov{k}_audio.txt") for k in range(5)]
@@ -750,7 +750,7 @@ def build_epoch_loader(
             return dst
         video_path_lists = [make_paths_only_list(p) for p in video_lists]
         audio_path_lists = [make_paths_only_list(p) for p in audio_lists]
-    if world_size > 1: torch.distributed.barrier()
+    if world_size > 1: torch.distributed.barrier(device_ids=[device_id])
 
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     dali_cfg = DaliConfig(sequence_length=args.T_frames, batch_size=args.batch_size, num_threads=args.dali_threads,
