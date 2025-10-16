@@ -10,3 +10,4 @@ numpy<2.0
 tqdm
 timm
 pyyaml
+bitsandbytes

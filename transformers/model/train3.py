@@ -646,6 +646,7 @@ def set_seed_all(seed: int, rank: int):
 
 def build_optimizer_scheduler(model, args, total_updates):
     """Build AdamW + LambdaLR schedule over *optimizer updates* (not micro-steps)."""
+    
     def split_decay(params):
         decay, no_decay = [], []
         for p in params:
@@ -663,7 +664,23 @@ def build_optimizer_scheduler(model, args, total_updates):
     opt_groups.append({"params": decay, "lr": base_lr, "weight_decay": args.weight_decay})
     opt_groups.append({"params": no_decay, "lr": base_lr, "weight_decay": 0.0})
 
-    optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.95), eps=1e-8)
+    optimizer = None
+    opt_name = getattr(args, "optim", "adamw")
+    try:
+        import bitsandbytes as bnb
+    except Exception:
+        bnb = None
+
+    if opt_name == "adamw8bit":
+        if bnb is None:
+            raise ImportError("bitsandbytes not installed. `pip install bitsandbytes`")
+        optimizer = bnb.optim.AdamW8bit(opt_groups, betas=(0.9, 0.95), eps=1e-8)
+    elif opt_name == "paged_adamw8bit":
+        if bnb is None:
+            raise ImportError("bitsandbytes not installed. `pip install bitsandbytes`")
+        optimizer = bnb.optim.PagedAdamW8bit(opt_groups, betas=(0.9, 0.95), eps=1e-8)
+    else:
+        optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.95), eps=1e-8)
 
     # Interpret warmup in *updates*. If you only have warmup_steps (micro-steps), convert it.
     warmup_updates = getattr(args, "warmup_updates", None)
@@ -947,6 +964,10 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--optim", type=str, default="adamw8bit",
+                    choices=["adamw", "adamw8bit", "paged_adamw8bit"],
+                    help="Use torch AdamW or bitsandbytes 8-bit optimizers")
+
     # Logistics
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=1000)
