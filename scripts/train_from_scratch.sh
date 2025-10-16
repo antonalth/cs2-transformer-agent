@@ -7,6 +7,7 @@ NPROC="${NPROC:-4}"
 LOG_FILE="${RUN_DIR}/train.log"
 
 export OMP_NUM_THREADS=10
+#export TRANSFORMERS_OFFLINE=1
 
 echo "→ Run dir : ${RUN_DIR}"
 mkdir -p "${RUN_DIR}"

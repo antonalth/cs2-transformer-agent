@@ -727,6 +727,7 @@ def build_epoch_loader(
     """Builds the full data loading pipeline for a given epoch and split."""
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed, windows_per_round=args.windows_per_round)
     records, id_map = index.build(team_rounds, epoch=epoch)
+    device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     
     split_name_for_dir = "val" if last_batch_policy == "partial" else "train"
     fl_dir = os.path.join(args.run_dir, f"filelists_{split_name_for_dir}_e{epoch:04d}")
@@ -752,7 +753,6 @@ def build_epoch_loader(
         audio_path_lists = [make_paths_only_list(p) for p in audio_lists]
     if world_size > 1: torch.distributed.barrier(device_ids=[device_id])
 
-    device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     dali_cfg = DaliConfig(sequence_length=args.T_frames, batch_size=args.batch_size, num_threads=args.dali_threads,
                           device_id=device_id, shard_id=rank, num_shards=world_size, seed=args.seed + epoch)
     dali_pipe = DaliInputPipeline(video_filelists=video_lists, audio_filelists=audio_lists, cfg=dali_cfg,
