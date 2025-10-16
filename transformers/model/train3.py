@@ -172,17 +172,34 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
     return team_rounds
 
 class EpochIndex:
-    def __init__(self, T_frames: int, seed: int):
-        self.T_frames, self.seed = T_frames, seed
+    def __init__(self, T_frames: int, seed: int, windows_per_round: int = 1):
+        self.T_frames = T_frames
+        self.seed = seed
+        self.windows_per_round = max(1, int(windows_per_round))
+
     def build(self, team_rounds: List[TeamRound], epoch: int) -> Tuple[List[SampleRecord], Dict[int, SampleRecord]]:
         rnd = random.Random(self.seed + epoch)
         records, id_map = [], {}
-        for sid, tr in enumerate(team_rounds):
-            start_f = rnd.randint(0, tr.frame_count - self.T_frames) if tr.frame_count >= self.T_frames else 0
-            rec = SampleRecord(sample_id=sid, demoname=tr.demoname, lmdb_path=tr.lmdb_path, round_num=tr.round_num,
-                               team=tr.team, pov_videos=tr.pov_videos, pov_audio=tr.pov_audio, start_f=start_f,
-                               start_tick_win=tr.start_tick + TICKS_PER_FRAME * start_f, T_frames=self.T_frames)
-            records.append(rec); id_map[sid] = rec
+        sid = 0
+        for tr in team_rounds:
+            for _ in range(self.windows_per_round):
+                # random start (clamped if shorter than T)
+                if tr.frame_count >= self.T_frames:
+                    start_f = rnd.randint(0, tr.frame_count - self.T_frames)
+                else:
+                    start_f = 0
+                rec = SampleRecord(
+                    sample_id=sid,
+                    demoname=tr.demoname, lmdb_path=tr.lmdb_path,
+                    round_num=tr.round_num, team=tr.team,
+                    pov_videos=tr.pov_videos, pov_audio=tr.pov_audio,
+                    start_f=start_f,
+                    start_tick_win=tr.start_tick + TICKS_PER_FRAME * start_f,
+                    T_frames=self.T_frames
+                )
+                records.append(rec)
+                id_map[sid] = rec
+                sid += 1
         return records, id_map
 
 class FilelistWriter:
@@ -708,7 +725,7 @@ def build_epoch_loader(
     last_batch_policy="drop", rank=0, world_size=1
 ):
     """Builds the full data loading pipeline for a given epoch and split."""
-    index = EpochIndex(T_frames=args.T_frames, seed=args.seed)
+    index = EpochIndex(T_frames=args.T_frames, seed=args.seed, windows_per_round=args.windows_per_round)
     records, id_map = index.build(team_rounds, epoch=epoch)
     
     split_name_for_dir = "val" if last_batch_policy == "partial" else "train"
@@ -919,6 +936,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--use-precomputed-embeddings", action='store_true')
     parser.add_argument("--dali-threads", type=int, default=4)
+    parser.add_argument("--windows-per-round", type=int, default=1,
+                        help="How many temporal windows to sample per team-round each epoch")
+
     # Training args
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
