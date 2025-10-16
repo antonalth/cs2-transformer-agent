@@ -644,7 +644,7 @@ def set_seed_all(seed: int, rank: int):
     seed_with_rank = seed + rank
     random.seed(seed_with_rank); np.random.seed(seed_with_rank)
     torch.manual_seed(seed_with_rank); torch.cuda.manual_seed_all(seed_with_rank)
-    
+
 def build_optimizer_scheduler(model, args, total_updates):
     """Build optimizer + LR scheduler where 'total_updates' = number of optimizer updates.
        Supports: AdamW / bnb 8-bit, and schedules: cosine / cosine_restarts / onecycle.
@@ -911,7 +911,7 @@ def train(args, model_cfg):
     updates_per_epoch = math.ceil(micro_steps_per_epoch / max(1, args.accum_steps))
     total_updates = updates_per_epoch * args.epochs
 
-    optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_updates, updates_per_epoch)
+    optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_updates)
 
 
     # If your scheduler’s warmup is specified in *micro-steps*, convert it to *updates*
