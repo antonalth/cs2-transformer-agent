@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import gc
 import json
 import math
 import time
@@ -644,7 +645,7 @@ def set_seed_all(seed: int, rank: int):
     random.seed(seed_with_rank); np.random.seed(seed_with_rank)
     torch.manual_seed(seed_with_rank); torch.cuda.manual_seed_all(seed_with_rank)
 
-def build_optimizer_scheduler(model, args, total_updates):
+def build_optimizer_scheduler(model, args, total_updates, updates_per_epoch):
     """Build AdamW + LambdaLR schedule over *optimizer updates* (not micro-steps)."""
     
     def split_decay(params):
@@ -682,27 +683,57 @@ def build_optimizer_scheduler(model, args, total_updates):
     else:
         optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.95), eps=1e-8)
 
-    # Interpret warmup in *updates*. If you only have warmup_steps (micro-steps), convert it.
-    warmup_updates = getattr(args, "warmup_updates", None)
-    if warmup_updates is None:
-        warmup_updates = math.ceil(args.warmup_steps / max(1, getattr(args, "accum_steps", 1)))
 
-    def lr_lambda(u):
-        # u = number of completed optimizer updates so far
-        if u < warmup_updates:
-            return max(1e-8, u / max(1, warmup_updates))
-        progress = (u - warmup_updates) / max(1, total_updates - warmup_updates)
-        progress = min(1.0, max(0.0, progress))
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return max(args.min_lr / args.lr, cosine)
+    # --- schedulers (in optimizer updates) ---
+    warmup_updates = max(0, int(args.warmup_updates))
+    schedule = args.lr_schedule
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    if schedule == "cosine_restarts":
+        # Derive a nice cycle if not provided: ~2 epochs per cycle
+        T0 = int(args.cycle_updates or max(1, 2 * updates_per_epoch))
+        warm = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=max(1, warmup_updates)
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=T0, T_mult=max(1.0, args.cycle_mult), eta_min=args.min_lr
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warm, cosine], milestones=[warmup_updates]
+        )
 
-    # Apply step-0 warmup LR *without* calling scheduler.step() before the first optimizer step
+    elif schedule == "onecycle":
+        # No long min-LR tail; LR drops to floor only at the very end
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=base_lr,
+            total_steps=max(1, total_updates),
+            pct_start=min(0.3, warmup_updates / max(1, total_updates)),  # keep your warmup intent
+            anneal_strategy="cos",
+            div_factor=100.0,  # initial lr = base_lr/div_factor
+            final_div_factor=max(1.0, base_lr / max(args.min_lr, 1e-8))
+        )
+
+    else:  # "cosine" single cycle to min_lr
+        def lr_lambda(u):
+            if u < warmup_updates:
+                return max(1e-8, u / max(1, warmup_updates))
+            prog = (u - warmup_updates) / max(1, total_updates - warmup_updates)
+            prog = min(1.0, max(0.0, prog))
+            cosv = 0.5 * (1.0 + math.cos(math.pi * prog))
+            return max(args.min_lr / base_lr, cosv)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Apply step-0 LR without calling scheduler.step() early
     with torch.no_grad():
-        s0 = lr_lambda(0)
-        for pg in optimizer.param_groups:
-            pg["lr"] = base_lr * s0
+        if schedule == "onecycle":
+            # OneCycleLR sets lr on first .step(); keep a tiny warmup start
+            start_factor = 1e-3 if warmup_updates > 0 else 1.0
+            for pg in optimizer.param_groups:
+                pg["lr"] = base_lr * start_factor
+        else:
+            s0 = (1.0 / max(1, warmup_updates)) if warmup_updates > 0 else 1.0
+            for pg in optimizer.param_groups:
+                pg["lr"] = base_lr * s0
 
     use_fp16 = getattr(model.module.cfg if hasattr(model, 'module') else model.cfg, "compute_dtype") == "fp16"
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
@@ -823,6 +854,17 @@ def train(args, model_cfg):
                      'round_number': 0.2, 'round_state': 0.5, 'pos_heatmap': 1.0, 'enemy_heatmap': 1.0 }
     loss_fn = CompositeLoss(weights=loss_weights).to(device)
     
+    # ---- Balanced-loss setup ----
+    base_loss_weights = loss_weights.copy()           # keep your chosen priors
+    ema_loss = {k: 1.0 for k in base_loss_weights}    # start neutral
+    ema_beta = args.balance_momentum
+    sum_base_w = sum(base_loss_weights.values()) or 1.0
+
+    update_count = 0          # counts optimizer updates (not micro-steps)
+    eval_count = 0            # how many validations have run
+    # ---- /balanced-loss setup ----
+
+
     manifest = Manifest(args.data_root, args.manifest)
     store = LmdbStore()
     logging.info("Building training set index...")
@@ -830,14 +872,13 @@ def train(args, model_cfg):
     logging.info("Building validation set index...")
     val_team_rounds = build_team_rounds(args.data_root, manifest.get_games("val"), store)
 
-    # micro-steps = loader iterations per epoch (per process shard)
-    micro_steps_per_epoch = (len(train_team_rounds) // (world_size * args.batch_size)) if train_team_rounds else 0
-
-    # optimizer updates per epoch (after gradient accumulation)
+    effective_samples = len(train_team_rounds) * max(1, args.windows_per_round)
+    micro_steps_per_epoch = (effective_samples // (world_size * args.batch_size)) if effective_samples else 0
     updates_per_epoch = math.ceil(micro_steps_per_epoch / max(1, args.accum_steps))
-
-    # total optimizer updates across all epochs
     total_updates = updates_per_epoch * args.epochs
+
+    optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_updates, updates_per_epoch)
+
 
     # If your scheduler’s warmup is specified in *micro-steps*, convert it to *updates*
     # so that build_optimizer_scheduler gets consistent units.
@@ -884,6 +925,8 @@ def train(args, model_cfg):
                     if ema: ema.update(model)
                     scheduler.step()
 
+                    update_count += 1
+
                 if rank == 0 and (global_step % args.log_every == 0):
                     writer.add_scalar("train/total_loss", total_loss.item() * args.accum_steps, global_step)
                     for k, v in loss_dict.items(): writer.add_scalar(f"train_loss/{k}", v, global_step)
@@ -891,14 +934,65 @@ def train(args, model_cfg):
                     logging.info(f"Step: {global_step}, Loss: {total_loss.item() * args.accum_steps:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
 
                 if args.eval_every > 0 and (global_step > 0 and global_step % args.eval_every == 0) and val_team_rounds:
-                    val_iter, val_asm, _ = build_epoch_loader(
-                        args, 0, store, val_team_rounds, last_batch_policy="partial", rank=rank, world_size=world_size
-                    )
-                    val_metrics = validate(val_iter, val_asm, model, loss_fn, args)
+                    # pre-clean to reduce peak memory
+                    torch.cuda.synchronize(); torch.cuda.empty_cache(); gc.collect()
+
+                    val_iter = val_asm = None
+                    try:
+                        val_iter, val_asm, _ = build_epoch_loader(
+                            args, 0, store, val_team_rounds, last_batch_policy="partial", rank=rank, world_size=world_size
+                        )
+                        val_metrics = validate(val_iter, val_asm, model, loss_fn, args)  # dict: {"total", "stats", "mouse", ...}
+                    finally:
+                        # aggressively tear down validation pipeline
+                        try:
+                            if hasattr(val_iter, "iterator") and hasattr(val_iter.iterator, "_pipes"):
+                                for p in val_iter.iterator._pipes:
+                                    try: p._pipe.release()
+                                    except Exception: pass
+                        except Exception:
+                            pass
+                        del val_iter, val_asm
+                        torch.cuda.synchronize(); torch.cuda.empty_cache(); gc.collect()
+
+                    # --- Log raw validation losses ---
                     if writer:
                         writer.add_scalar("val/total_loss", val_metrics["total"], global_step)
                         for k, v in val_metrics.items():
-                            if k != "total": writer.add_scalar(f"val_loss/{k}", v, global_step)
+                            if k != "total":
+                                writer.add_scalar(f"val_loss/{k}", v, global_step)
+
+                    # --- Update EMA of raw per-head losses (skip "total") ---
+                    for k in base_loss_weights.keys():
+                        if k in val_metrics:
+                            ema_loss[k] = ema_beta * ema_loss[k] + (1.0 - ema_beta) * float(val_metrics[k])
+
+                    # --- Rebalance after warmup and every N evals ---
+                    eval_count += 1
+                    if (update_count >= args.balance_losses_after_updates) and (eval_count % max(1, args.balance_every_evals) == 0):
+                        # scale ∝ 1 / EMA(loss); then renormalize to keep total weight sum unchanged
+                        scales = {k: 1.0 / max(ema_loss[k], 1e-8) for k in base_loss_weights}
+                        unnorm = {k: base_loss_weights[k] * scales[k] for k in base_loss_weights}
+                        Z = sum_base_w / max(sum(unnorm.values()), 1e-12)
+                        balanced = {k: Z * unnorm[k] for k in base_loss_weights}
+
+                        # apply to the running loss function
+                        if hasattr(loss_fn, "weights"):
+                            loss_fn.weights.update(balanced)
+                        else:
+                            loss_fn.weights = balanced  # fallback
+
+                        if writer:
+                            for k in balanced:
+                                writer.add_scalar(f"weights/{k}", balanced[k], global_step)
+
+                    # --- Log weighted contributions (current weights × raw val loss) ---
+                    current_w = getattr(loss_fn, "weights", base_loss_weights)
+                    if writer:
+                        for k in base_loss_weights:
+                            if k in val_metrics:
+                                writer.add_scalar(f"val_contrib/{k}", current_w[k] * float(val_metrics[k]), global_step)
+
                     if rank == 0 and val_metrics["total"] < best_val:
                         best_val = val_metrics["total"]
                         save_checkpoint(args.run_dir, "best.ckpt", epoch, global_step, best_val, model, optimizer, scheduler, scaler, ema, args)
@@ -967,6 +1061,13 @@ def main():
     parser.add_argument("--optim", type=str, default="adamw8bit",
                     choices=["adamw", "adamw8bit", "paged_adamw8bit"],
                     help="Use torch AdamW or bitsandbytes 8-bit optimizers")
+    # near other training args
+    parser.add_argument("--lr-schedule", type=str, default="cosine",
+        choices=["cosine", "cosine_restarts", "onecycle"])
+    parser.add_argument("--warmup-updates", type=int, default=1500)  # in optimizer updates
+    parser.add_argument("--cycle-updates", type=int, default=0)      # restarts: 0 -> derive from epoch length
+    parser.add_argument("--cycle-mult", type=float, default=2.0)     # multiplicative cycle growth
+
 
     # Logistics
     parser.add_argument("--log-every", type=int, default=50)
@@ -981,6 +1082,14 @@ def main():
     # Smoke test args
     parser.add_argument("--num-steps", type=int, default=10)
     parser.add_argument("--detailed-loss", action='store_true')
+
+    parser.add_argument("--balance-losses-after-updates", type=int, default=1500,
+                    help="Start balancing after this many optimizer updates (not micro-steps)")
+    parser.add_argument("--balance-momentum", type=float, default=0.99,
+                        help="EMA momentum for per-head raw losses (0.9–0.99 is typical)")
+    parser.add_argument("--balance-every-evals", type=int, default=1,
+                        help="Recompute balanced weights every N validation runs")
+
 
     args = parser.parse_args()
     if args.manifest is None: args.manifest = os.path.join(args.data_root, "manifest.json")

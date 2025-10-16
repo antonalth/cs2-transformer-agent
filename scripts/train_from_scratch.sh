@@ -50,7 +50,12 @@ torchrun --standalone --nproc_per_node="${NPROC}" transformers/model/train3.py \
     --lr 2.5e-4 \
     --min-lr 1e-5 \
     --batch-size 1 \
-    --accum-steps 8
+    --accum-steps 8 \
+    --lr-schedule cosine_restarts \
+    --warmup-updates 1500 \
+    --cycle-updates 0 \
+    --cycle-mult 2.0
+
 
 echo "✅ Training finished."
 if [[ -n "${TB_PID:-}" ]] && ps -p "${TB_PID}" >/dev/null 2>&1; then
