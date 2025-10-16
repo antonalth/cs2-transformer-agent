@@ -644,31 +644,37 @@ def set_seed_all(seed: int, rank: int):
     seed_with_rank = seed + rank
     random.seed(seed_with_rank); np.random.seed(seed_with_rank)
     torch.manual_seed(seed_with_rank); torch.cuda.manual_seed_all(seed_with_rank)
-
-def build_optimizer_scheduler(model, args, total_updates, updates_per_epoch):
-    """Build AdamW + LambdaLR schedule over *optimizer updates* (not micro-steps)."""
     
+def build_optimizer_scheduler(model, args, total_updates):
+    """Build optimizer + LR scheduler where 'total_updates' = number of optimizer updates.
+       Supports: AdamW / bnb 8-bit, and schedules: cosine / cosine_restarts / onecycle.
+    """
+    import math
+    import torch
+    from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts, SequentialLR
+
+    # ---- param groups with/without weight decay ----
     def split_decay(params):
         decay, no_decay = [], []
         for p in params:
-            if not p.requires_grad: 
+            if not p.requires_grad:
                 continue
-            if p.ndim == 1: 
-                no_decay.append(p)
-            else: 
-                decay.append(p)
+            (no_decay if p.ndim == 1 else decay).append(p)
         return decay, no_decay
 
-    base_lr, opt_groups = args.lr, []
+    base_lr = args.lr
     model_params = model.module.parameters() if hasattr(model, 'module') else model.parameters()
     decay, no_decay = split_decay(model_params)
-    opt_groups.append({"params": decay, "lr": base_lr, "weight_decay": args.weight_decay})
-    opt_groups.append({"params": no_decay, "lr": base_lr, "weight_decay": 0.0})
+    opt_groups = [
+        {"params": decay, "lr": base_lr, "weight_decay": args.weight_decay},
+        {"params": no_decay, "lr": base_lr, "weight_decay": 0.0},
+    ]
 
-    optimizer = None
+    # ---- optimizer: torch AdamW or bitsandbytes ----
     opt_name = getattr(args, "optim", "adamw")
+    optimizer = None
     try:
-        import bitsandbytes as bnb
+        import bitsandbytes as bnb  # optional
     except Exception:
         bnb = None
 
@@ -683,60 +689,88 @@ def build_optimizer_scheduler(model, args, total_updates, updates_per_epoch):
     else:
         optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.95), eps=1e-8)
 
+    # ---- schedule params (all in *updates*) ----
+    # warmup: prefer --warmup-updates; else convert from --warmup-steps (micro-steps)->updates
+    warmup_updates = getattr(args, "warmup_updates", None)
+    if warmup_updates is None:
+        warmup_updates = math.ceil(getattr(args, "warmup_steps", 0) / max(1, getattr(args, "accum_steps", 1)))
+    warmup_updates = max(0, int(warmup_updates))
 
-    # --- schedulers (in optimizer updates) ---
-    warmup_updates = max(0, int(args.warmup_updates))
-    schedule = args.lr_schedule
+    # derive updates_per_epoch if not provided (we often have total_updates ≈ updates_per_epoch * epochs)
+    epochs = max(1, int(getattr(args, "epochs", 1)))
+    updates_per_epoch = max(1, total_updates // epochs)
 
+    # schedule choice
+    schedule = getattr(args, "lr_schedule", "cosine")  # "cosine", "cosine_restarts", "onecycle"
+
+    # optional restart params
+    cycle_updates = int(getattr(args, "cycle_updates", 0) or (2 * updates_per_epoch))  # default: ~2 epochs per cycle
+    cycle_mult = float(getattr(args, "cycle_mult", 2.0))
+
+    # optional onecycle params
+    onecycle_div = float(getattr(args, "onecycle_div_factor", 100.0))
+    onecycle_final_div = float(getattr(args, "onecycle_final_div_factor",
+                                       max(1.0, base_lr / max(getattr(args, "min_lr", 1e-8), 1e-8))))
+
+    # ---- scheduler construction ----
     if schedule == "cosine_restarts":
-        # Derive a nice cycle if not provided: ~2 epochs per cycle
-        T0 = int(args.cycle_updates or max(1, 2 * updates_per_epoch))
-        warm = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=max(1, warmup_updates)
-        )
-        cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=T0, T_mult=max(1.0, args.cycle_mult), eta_min=args.min_lr
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warm, cosine], milestones=[warmup_updates]
-        )
+        # Warmup (linear), then cosine restarts
+        warm = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=max(1, warmup_updates)) \
+               if warmup_updates > 0 else None
+        cosine = CosineAnnealingWarmRestarts(optimizer, T_0=max(1, cycle_updates),
+                                             T_mult=max(1.0, cycle_mult),
+                                             eta_min=getattr(args, "min_lr", 0.0))
+        if warm is not None:
+            scheduler = SequentialLR(optimizer, schedulers=[warm, cosine], milestones=[warmup_updates])
+        else:
+            scheduler = cosine
 
     elif schedule == "onecycle":
-        # No long min-LR tail; LR drops to floor only at the very end
+        # OneCycle over total_updates: warm, then decay to near min_lr at the very end
+        pct_start = (warmup_updates / max(1, total_updates)) if warmup_updates > 0 else 0.3
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=base_lr,
             total_steps=max(1, total_updates),
-            pct_start=min(0.3, warmup_updates / max(1, total_updates)),  # keep your warmup intent
+            pct_start=min(0.9, max(0.0, pct_start)),
             anneal_strategy="cos",
-            div_factor=100.0,  # initial lr = base_lr/div_factor
-            final_div_factor=max(1.0, base_lr / max(args.min_lr, 1e-8))
+            div_factor=onecycle_div,
+            final_div_factor=onecycle_final_div,
         )
 
-    else:  # "cosine" single cycle to min_lr
+    else:
+        # single cosine to min_lr with linear warmup
         def lr_lambda(u):
+            # u = completed optimizer updates
             if u < warmup_updates:
                 return max(1e-8, u / max(1, warmup_updates))
-            prog = (u - warmup_updates) / max(1, total_updates - warmup_updates)
-            prog = min(1.0, max(0.0, prog))
-            cosv = 0.5 * (1.0 + math.cos(math.pi * prog))
-            return max(args.min_lr / base_lr, cosv)
+            progress = (u - warmup_updates) / max(1, total_updates - warmup_updates)
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(getattr(args, "min_lr", 0.0) / base_lr, cosine)
+
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Apply step-0 LR without calling scheduler.step() early
+    # ---- apply step-0 LR without calling scheduler.step() early ----
     with torch.no_grad():
         if schedule == "onecycle":
-            # OneCycleLR sets lr on first .step(); keep a tiny warmup start
-            start_factor = 1e-3 if warmup_updates > 0 else 1.0
+            # initial lr = base_lr / div_factor
+            init_lr = base_lr / max(1e-8, onecycle_div)
             for pg in optimizer.param_groups:
-                pg["lr"] = base_lr * start_factor
-        else:
-            s0 = (1.0 / max(1, warmup_updates)) if warmup_updates > 0 else 1.0
+                pg["lr"] = init_lr
+        elif warmup_updates > 0:
+            s0 = 1.0 / max(1, warmup_updates)
             for pg in optimizer.param_groups:
                 pg["lr"] = base_lr * s0
+        else:
+            for pg in optimizer.param_groups:
+                pg["lr"] = base_lr
 
-    use_fp16 = getattr(model.module.cfg if hasattr(model, 'module') else model.cfg, "compute_dtype") == "fp16"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
+    # ---- AMP scaler ----
+    use_fp16 = getattr(getattr(model, 'module', model), "cfg", None)
+    use_fp16 = (getattr(use_fp16, "compute_dtype", None) == "fp16")
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_fp16))
+
     return optimizer, scheduler, scaler
 
 
