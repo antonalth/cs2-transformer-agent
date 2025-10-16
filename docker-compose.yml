@@ -12,7 +12,9 @@ services:
       - ./cache/hf:/workspace/.cache/huggingface
       # Torch / timm / torch.hub cache
       - ./cache/torch:/workspace/.cache/torch
-
+    ports:
+      - "6006:6006"   # TensorBoard
+      - "8888:8888" # (optional) Jupyter
     stdin_open: true
     tty: true
     ipc: host
