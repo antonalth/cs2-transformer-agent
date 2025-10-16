@@ -37,7 +37,7 @@ trap cleanup INT TERM
 torchrun --standalone --nproc_per_node="${NPROC}" transformers/model/train3.py \
     --mode train \
     --windows-per-round 5 \
-    --T-frames 128 \
+    --T-frames 256 \
     --epochs 12 \
     --run-dir "${RUN_DIR}" \
     --use-precomputed-embeddings \
