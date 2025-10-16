@@ -627,16 +627,19 @@ def set_seed_all(seed: int, rank: int):
     random.seed(seed_with_rank); np.random.seed(seed_with_rank)
     torch.manual_seed(seed_with_rank); torch.cuda.manual_seed_all(seed_with_rank)
 
-def build_optimizer_scheduler(model, args, total_steps):
-    """Builds the AdamW optimizer, parameter groups, and learning rate scheduler."""
+def build_optimizer_scheduler(model, args, total_updates):
+    """Build AdamW + LambdaLR schedule over *optimizer updates* (not micro-steps)."""
     def split_decay(params):
         decay, no_decay = [], []
         for p in params:
-            if not p.requires_grad: continue
-            if p.ndim == 1: no_decay.append(p)
-            else: decay.append(p)
+            if not p.requires_grad: 
+                continue
+            if p.ndim == 1: 
+                no_decay.append(p)
+            else: 
+                decay.append(p)
         return decay, no_decay
-    
+
     base_lr, opt_groups = args.lr, []
     model_params = model.module.parameters() if hasattr(model, 'module') else model.parameters()
     decay, no_decay = split_decay(model_params)
@@ -644,16 +647,33 @@ def build_optimizer_scheduler(model, args, total_steps):
     opt_groups.append({"params": no_decay, "lr": base_lr, "weight_decay": 0.0})
 
     optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.95), eps=1e-8)
-    def lr_lambda(step):
-        if step < args.warmup_steps: return max(1e-8, step / max(1, args.warmup_steps))
-        progress = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
-        cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, max(0.0, progress))))
+
+    # Interpret warmup in *updates*. If you only have warmup_steps (micro-steps), convert it.
+    warmup_updates = getattr(args, "warmup_updates", None)
+    if warmup_updates is None:
+        warmup_updates = math.ceil(args.warmup_steps / max(1, getattr(args, "accum_steps", 1)))
+
+    def lr_lambda(u):
+        # u = number of completed optimizer updates so far
+        if u < warmup_updates:
+            return max(1e-8, u / max(1, warmup_updates))
+        progress = (u - warmup_updates) / max(1, total_updates - warmup_updates)
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return max(args.min_lr / args.lr, cosine)
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
+
+    # Apply step-0 warmup LR *without* calling scheduler.step() before the first optimizer step
+    with torch.no_grad():
+        s0 = lr_lambda(0)
+        for pg in optimizer.param_groups:
+            pg["lr"] = base_lr * s0
+
     use_fp16 = getattr(model.module.cfg if hasattr(model, 'module') else model.cfg, "compute_dtype") == "fp16"
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     return optimizer, scheduler, scaler
+
 
 def save_checkpoint(run_dir, filename, epoch, step, best_val, model, optimizer, scheduler, scaler, ema, args):
     """Saves a complete training checkpoint."""
@@ -776,9 +796,23 @@ def train(args, model_cfg):
     logging.info("Building validation set index...")
     val_team_rounds = build_team_rounds(args.data_root, manifest.get_games("val"), store)
 
-    steps_per_epoch = (len(train_team_rounds) // (world_size * args.batch_size)) if train_team_rounds else 0
-    total_steps = steps_per_epoch * args.epochs
-    optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_steps)
+    # micro-steps = loader iterations per epoch (per process shard)
+    micro_steps_per_epoch = (len(train_team_rounds) // (world_size * args.batch_size)) if train_team_rounds else 0
+
+    # optimizer updates per epoch (after gradient accumulation)
+    updates_per_epoch = math.ceil(micro_steps_per_epoch / max(1, args.accum_steps))
+
+    # total optimizer updates across all epochs
+    total_updates = updates_per_epoch * args.epochs
+
+    # If your scheduler’s warmup is specified in *micro-steps*, convert it to *updates*
+    # so that build_optimizer_scheduler gets consistent units.
+    if hasattr(args, "warmup_steps"):
+        args._orig_warmup_steps = args.warmup_steps  # optional: keep a copy
+        args.warmup_steps = math.ceil(args.warmup_steps / max(1, args.accum_steps))
+
+    optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_updates)
+
     ema = EMA(model, decay=args.ema_decay) if args.ema_decay and args.ema_decay > 0 else None
 
     start_epoch, global_step, best_val = 0, 0, float("inf")
