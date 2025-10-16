@@ -851,20 +851,29 @@ def build_epoch_loader(
 def validate(dali_iter, assembler, model, loss_fn, args):
     """Runs the validation loop and returns averaged metrics."""
     model.eval()
-    totals = defaultdict(float); count = 0
+    totals = defaultdict(float)
+    count = 0
     try:
         while True:
-            # FIX: Unpack the list returned by the DALI iterator
             batch_raw = next(dali_iter)[0]
             batch = assembler.assemble(batch_raw, args.use_precomputed_embeddings)
-            preds = model(batch)
-            loss, loss_dict = loss_fn(preds, batch["targets"], batch["alive_mask"])
+            
+            # Add autocast here for validation
+            with torch.autocast("cuda", enabled=(model.module.cfg.compute_dtype in ["bf16", "fp16"]),
+                                dtype=torch.bfloat16 if model.module.cfg.compute_dtype == "bf16" else torch.float16):
+                preds = model(batch)
+                loss, loss_dict = loss_fn(preds, batch["targets"], batch["alive_mask"])
+
             totals["total"] += loss.item()
-            for k, v in loss_dict.items(): totals[k] += v
+            for k, v in loss_dict.items():
+                totals[k] += v
             count += 1
-    except StopIteration: pass
-    for k in totals: totals[k] /= max(1, count)
+    except StopIteration:
+        pass
+    for k in totals:
+        totals[k] /= max(1, count)
     return dict(totals)
+
 
 # =============================================================================
 # SECTION 3: MAIN TRAINING ORCHESTRATOR
