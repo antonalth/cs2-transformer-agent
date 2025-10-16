@@ -718,7 +718,7 @@ def build_optimizer_scheduler(model, args, total_updates):
         warm = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=max(1, warmup_updates)) \
                if warmup_updates > 0 else None
         cosine = CosineAnnealingWarmRestarts(optimizer, T_0=max(1, cycle_updates),
-                                             T_mult=max(1.0, cycle_mult),
+                                             T_mult=int(max(1.0, cycle_mult)),
                                              eta_min=getattr(args, "min_lr", 0.0))
         if warm is not None:
             scheduler = SequentialLR(optimizer, schedulers=[warm, cosine], milestones=[warmup_updates])
