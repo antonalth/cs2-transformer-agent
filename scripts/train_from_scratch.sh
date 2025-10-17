@@ -54,7 +54,8 @@ torchrun --standalone --nproc_per_node="${NPROC}" transformers/model/train3.py \
     --lr-schedule cosine_restarts \
     --warmup-updates 1500 \
     --cycle-updates 0 \
-    --cycle-mult 2.0
+    --cycle-mult 2.0 \
+    --balance-losses-after-updates 200
 
 
 echo "✅ Training finished."
