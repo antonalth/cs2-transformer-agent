@@ -37,8 +37,10 @@ import msgpack_numpy as mpnp
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F 
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+
 
 # --- Try to import DALI ---
 try:
@@ -296,7 +298,7 @@ class DaliConfig:
 class DaliInputPipeline:
     def __init__(self, video_filelists, audio_filelists, cfg, use_precomputed, video_pathlists=None, audio_pathlists=None, last_batch_policy="drop"):
         if not DALI_AVAILABLE: raise ImportError(f"NVIDIA DALI not available: {_DALI_IMPORT_ERROR}")
-        
+
         if use_precomputed:
             self.pipeline = self._build_npy_pipeline(video_filelists, audio_filelists, video_pathlists, audio_pathlists, cfg)
             out_map = [f"video_embed{k}" for k in range(5)] + [f"audio_embed{k}" for k in range(5)] + ["labels0"]
@@ -537,7 +539,7 @@ class CompositeLoss(nn.Module):
         super().__init__()
         self.weights = weights
         self.coord_mapper = CoordinateMapper(grid_dims=grid_dims)
-        self.mse_loss = nn.MSELoss(reduction='none'); self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.mse_loss = nn.MSELoss(reduction='none')
         self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=-1, label_smoothing=0.05)
         X, Y, Z = grid_dims
         self.register_buffer('xs', torch.arange(X, dtype=torch.float32), persistent=False)
@@ -571,16 +573,44 @@ class CompositeLoss(nn.Module):
             mask = alive_mask[:, :, i].float()
             losses['stats'] += self.weights['stats'] * self._scalar_loss(self.mse_loss(p_pred["stats"] * self.stats_scale, p_targ["stats"] * self.stats_scale).mean(-1), mask)
             losses['mouse'] += self.weights['mouse'] * self._scalar_loss(self.mse_loss(p_pred["mouse_delta_deg"], p_targ["mouse_delta_deg"]).mean(-1), mask)
+            
+            # FIX #2: Use dynamically weighted BCE for imbalanced multi-label heads
             for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
                 wkey = key.replace('_logits','')
-                losses[wkey] += self.weights[wkey] * self._scalar_loss(self.bce_loss(p_pred[key], p_targ[key]).mean(-1), mask)
-            losses['weapon'] += self.weights['weapon'] * self._scalar_loss(self.ce_loss(p_pred["active_weapon_idx"].view(B*T, -1), p_targ["active_weapon_idx"].view(B*T)), mask.view(B*T))
+                logits = p_pred[key]  # [B, T, C]
+                labels = p_targ[key]  # [B, T, C]
+                with torch.no_grad():
+                    pos = labels.float().mean(dim=(0, 1))
+                    pos_weight = ((1 - pos) / (pos + 1e-6)).clamp_(1.0, 10.0)
+                bce = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight, reduction='none').mean(-1)
+                losses[wkey] += self.weights[wkey] * self._scalar_loss(bce, mask)
+
+            # FIX #6: Use dynamically weighted CE for imbalanced weapon classification
+            targ_idx = p_targ["active_weapon_idx"].view(-1)
+            num_classes = p_pred["active_weapon_idx"].shape[-1]
+            with torch.no_grad():
+                valid_indices = targ_idx[targ_idx != -1]
+                if valid_indices.numel() > 0:
+                    counts = torch.bincount(valid_indices, minlength=num_classes)
+                    class_weights = 1.0 / (counts.float() + 1e-6)
+                    class_weights = (class_weights / class_weights.sum()) * num_classes
+                else:
+                    class_weights = torch.ones(num_classes, device=device)
+            ce_loss_weighted = nn.CrossEntropyLoss(reduction='none', ignore_index=-1, label_smoothing=0.05, weight=class_weights)
+            losses['weapon'] += self.weights['weapon'] * self._scalar_loss(ce_loss_weighted(p_pred["active_weapon_idx"].view(B*T, -1), targ_idx), mask.view(B*T))
+
         for key in p_loss_keys: total_loss += losses[key]
         gs_pred, gs_targ = predictions["game_strategy"], targets["game_strategy"]
         frame_mask = alive_mask.any(dim=-1).float()
-        losses['round_number'] = self.weights['round_number'] * self._scalar_loss(self.mse_loss(gs_pred["round_number"], gs_targ["round_number"].view(B, T, 1)).squeeze(-1), frame_mask)
-        losses['round_state'] = self.weights['round_state'] * self._scalar_loss(self.bce_loss(gs_pred["round_state_logits"], gs_targ["round_state_logits"]).mean(-1), frame_mask)
+        
+        # FIX #4: Use Cross-Entropy loss for round number classification
+        round_logits = gs_pred["round_number_logits"].view(B * T, -1)
+        round_targets = (gs_targ["round_number"].long().view(B*T) - 1).clamp(min=-1) # 1-indexed to 0-indexed, -1 for ignore
+        losses['round_number'] = self.weights['round_number'] * self._scalar_loss(self.ce_loss(round_logits, round_targets), frame_mask.view(B*T))
+        
+        losses['round_state'] = self.weights['round_state'] * self._scalar_loss(F.binary_cross_entropy_with_logits(gs_pred["round_state_logits"], gs_targ["round_state_logits"], reduction='none').mean(-1), frame_mask)
         total_loss += losses['round_number'] + losses['round_state']
+        
         # POS heatmap loss (balanced BCE to avoid all-zero collapse)
         pred_pos = torch.stack([p["pos_heatmap_logits"] for p in predictions["player"]], 2)
         targ_pos = torch.stack([p["pos_coords"] for p in targets["player"]], 2)
@@ -839,16 +869,16 @@ def build_epoch_loader(
     index = EpochIndex(T_frames=args.T_frames, seed=args.seed, windows_per_round=args.windows_per_round)
     records, id_map = index.build(team_rounds, epoch=epoch)
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
-    
+
     split_name_for_dir = "val" if last_batch_policy == "partial" else "train"
     fl_dir = os.path.join(args.run_dir, f"filelists_{split_name_for_dir}_e{epoch:04d}")
 
     if rank == 0:
         writer = FilelistWriter(fl_dir, use_precomputed=args.use_precomputed_embeddings, data_root=args.data_root)
         video_lists, audio_lists = writer.write(records)
-    
+
     if world_size > 1: torch.distributed.barrier(device_ids=[device_id])
-    
+
     video_lists = [os.path.join(fl_dir, f"pov{k}_video.txt") for k in range(5)]
     audio_lists = [os.path.join(fl_dir, f"pov{k}_audio.txt") for k in range(5)]
 
@@ -869,7 +899,7 @@ def build_epoch_loader(
     dali_pipe = DaliInputPipeline(video_filelists=video_lists, audio_filelists=audio_lists, cfg=dali_cfg,
                                   use_precomputed=args.use_precomputed_embeddings, video_pathlists=video_path_lists,
                                   audio_pathlists=audio_path_lists, last_batch_policy=last_batch_policy)
-    
+
     fetcher = LmdbMetaFetcher(store)
     device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
     assembler = BatchAssembler(id_map, fetcher, device=device)
@@ -920,7 +950,7 @@ def compute_weight_free_metrics(predictions, targets, alive_mask, coord_mapper=N
         'stats', 'mouse_delta_deg', 'keyboard_logits', 'eco_logits',
         'inventory_logits', 'active_weapon_idx', 'pos_heatmap_logits'
       predictions['game_strategy'] has:
-        'round_number', 'round_state_logits'
+        'round_number_logits', 'round_state_logits'
       targets mirror these (keyboard/eco/inventory likely {0,1} multi-labels;
       weapon is class index; pos target is 'pos_coords' (xyz floats); round_number regression).
     """
@@ -954,6 +984,7 @@ def compute_weight_free_metrics(predictions, targets, alive_mask, coord_mapper=N
                 acc.add("player/mouse_RMSE", rmse, 1)
 
         # Multi-label BCE heads: keyboard, eco, inventory
+        # FIX #2: Report precision and recall in addition to F1
         for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
             if key in p_pred and key in p_targ:
                 logits = p_pred[key][mask]     # [N, C]
@@ -972,42 +1003,48 @@ def compute_weight_free_metrics(predictions, targets, alive_mask, coord_mapper=N
                     f1        = 2 * precision * recall / (precision + recall + 1e-9)
                     base = key.replace("_logits", "")
                     acc.add(f"player/{base}_micro_acc", micro_acc, 1)
+                    acc.add(f"player/{base}_micro_precision", precision, 1)
+                    acc.add(f"player/{base}_micro_recall", recall, 1)
                     acc.add(f"player/{base}_micro_F1", f1, 1)
 
         # Weapon classification
+        # FIX #6: Add top-k accuracy metrics for weapon classification
         if "active_weapon_idx" in p_pred and "active_weapon_idx" in p_targ:
-            # prediction may be logits; targets are indices
-            pred_logits = p_pred["active_weapon_idx"]  # [B,T,C]
-            targ_idx = p_targ["active_weapon_idx"].long()  # [B,T]
-            pred_idx = _softmax(pred_logits, dim=-1).argmax(-1)
-            correct = (pred_idx[mask] == targ_idx[mask]).float()
-            if correct.numel() > 0:
-                acc.add("player/weapon_acc", correct.mean(), 1)
+            pred_logits = p_pred["active_weapon_idx"][mask]
+            targ_idx = p_targ["active_weapon_idx"][mask].long()
+            if pred_logits.numel() > 0 and targ_idx.numel() > 0:
+                # Top-1
+                pred_idx = pred_logits.argmax(-1)
+                acc.add("player/weapon_acc", (pred_idx == targ_idx).float().mean(), 1)
+                # Top-K
+                _, topk_preds = torch.topk(pred_logits, k=5, dim=-1)
+                targ_expanded = targ_idx.unsqueeze(-1)
+                acc.add("player/weapon_top3_acc", (topk_preds[:, :3] == targ_expanded).any(dim=-1).float().mean(), 1)
+                acc.add("player/weapon_top5_acc", (topk_preds == targ_expanded).any(dim=-1).float().mean(), 1)
 
         # Position heatmap: voxel accuracy & within-1-voxel hit rate
+        # FIX #1: Correct voxel index decoding and flattening logic for [Z,Y,X] layout
         if "pos_heatmap_logits" in p_pred and "pos_coords" in p_targ:
-            # [B,T,Cx,Cy,Cz]
-            logits = p_pred["pos_heatmap_logits"]
-            # argmax voxel
-            flat_idx = logits.view(B*T, -1).argmax(-1).view(B, T)
-            # target voxel via mapper
+            logits = p_pred["pos_heatmap_logits"] # [B,T,Z,Y,X]
             if coord_mapper is not None:
-                # discretize target world coords
-                world = p_targ["pos_coords"]  # [B,T,3]
-                grid_idx = coord_mapper.discretize_world_to_grid(world)  # [B,T,3], long
+                flat_idx = logits.view(B*T, -1).argmax(-1).view(B, T)
+                world = p_targ["pos_coords"]
+                grid_idx = coord_mapper.discretize_world_to_grid(world)
                 X, Y, Z = coord_mapper.grid_dims.cpu().numpy()
-                targ_flat = (grid_idx[..., 0] * (Y*Z) + grid_idx[..., 1] * Z + grid_idx[..., 2]).long()
+
+                # Correct Z-major flattening to match tensor layout
+                targ_flat = (grid_idx[..., 2] * (Y * X) + grid_idx[..., 1] * X + grid_idx[..., 0]).long()
                 eq = (flat_idx[mask] == targ_flat[mask]).float()
                 if eq.numel() > 0:
                     acc.add("player/pos_voxel_acc", eq.mean(), 1)
-                # within-1-neighborhood hit
-                # build neighbor set (Manhattan distance <= 1)
-                # compute deltas by decoding flat_idx back to (x,y,z)
-                xi = (flat_idx // (Y*Z)) % X
-                yi = (flat_idx // Z) % Y
-                zi = flat_idx % Z
-                tx = grid_idx[...,0]; ty = grid_idx[...,1]; tz = grid_idx[...,2]
-                dx = (xi - tx).abs(); dy = (yi - ty).abs(); dz = (zi - tz).abs()
+
+                # Correct Z-major decoding of predicted index
+                pred_z = flat_idx // (Y * X)
+                pred_y = (flat_idx // X) % Y
+                pred_x = flat_idx % X
+                
+                targ_x = grid_idx[...,0]; targ_y = grid_idx[...,1]; targ_z = grid_idx[...,2]
+                dx = (pred_x - targ_x).abs(); dy = (pred_y - targ_y).abs(); dz = (pred_z - targ_z).abs()
                 near1 = (((dx <= 1) & (dy <= 1) & (dz <= 1)).float())[mask]
                 if near1.numel() > 0:
                     acc.add("player/pos_within1voxel_rate", near1.mean(), 1)
@@ -1022,26 +1059,141 @@ def compute_weight_free_metrics(predictions, targets, alive_mask, coord_mapper=N
         if correct.numel() > 0:
             acc.add("game/round_state_acc", correct.mean(), 1)
 
-    if "round_number" in gs_pred and "round_number" in gs_targ:
-        diff = (gs_pred["round_number"].squeeze(-1) - gs_targ["round_number"])[frame_mask].float()
-        if diff.numel() > 0:
-            mae = diff.abs().mean()
-            rmse = (diff.pow(2).mean()).sqrt()
-            acc.add("game/round_number_MAE", mae, 1)
-            acc.add("game/round_number_RMSE", rmse, 1)
+    # FIX #4: Change round number metric from MAE/RMSE to classification accuracy
+    if "round_number_logits" in gs_pred and "round_number" in gs_targ:
+        pred_logits = gs_pred["round_number_logits"][frame_mask]
+        targ_idx = (gs_targ["round_number"][frame_mask].round().long() - 1) # 1-indexed to 0-indexed
+        if pred_logits.numel() > 0 and targ_idx.numel() > 0:
+            # Top-1
+            pred_idx = pred_logits.argmax(-1)
+            acc.add("game/round_number_acc", (pred_idx == targ_idx).float().mean(), 1)
+            # Top-3
+            _, top3_preds = torch.topk(pred_logits, k=3, dim=-1)
+            acc.add("game/round_number_top3_acc", (top3_preds == targ_idx.unsqueeze(-1)).any(dim=-1).float().mean(), 1)
 
     return acc.to_dict()
+# =============================================================================
+# SECTION 2: NEW TRAINING COMPONENTS (CONTINUED)
+# =============================================================================
+
+@torch.no_grad()
+def find_optimal_thresholds_and_recompute_metrics(
+    all_logits: torch.Tensor,
+    all_labels: torch.Tensor,
+    thresholds: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    """
+    CPU-only: given concatenated logits [N, C] and labels [N, C] (float in {0,1}),
+    find per-class thresholds that maximize F1 on the validation split, then
+    recompute calibrated micro-precision/recall/F1 and macro-F1.
+
+    Returns a dict with:
+      - calibrated_micro_precision / _recall / _F1
+      - calibrated_macro_F1
+      - mean_optimal_threshold / median_optimal_threshold
+    """
+    # Ensure CPU float32
+    all_logits = all_logits.detach().to("cpu", dtype=torch.float32)
+    all_labels = all_labels.detach().to("cpu", dtype=torch.float32)
+
+    out = {
+        "calibrated_micro_precision": 0.0,
+        "calibrated_micro_recall": 0.0,
+        "calibrated_micro_F1": 0.0,
+        "calibrated_macro_F1": 0.0,
+        "mean_optimal_threshold": 0.5,
+        "median_optimal_threshold": 0.5,
+    }
+
+    if all_logits.numel() == 0:
+        return out
+
+    probs = torch.sigmoid(all_logits)  # [N, C]
+    N, C = probs.shape
+    if thresholds is None:
+        thresholds = torch.linspace(0.0, 1.0, 101, dtype=torch.float32)  # [T]
+    T = thresholds.numel()
+
+    # Per-class threshold search (vectorized over thresholds)
+    best_thresholds = torch.full((C,), 0.5, dtype=torch.float32)
+    valid_for_thresh = torch.zeros((C,), dtype=torch.bool)
+
+    for c in range(C):
+        p = probs[:, c]         # [N]
+        y = all_labels[:, c]    # [N]
+        pos = int(y.sum().item())
+        neg = N - pos
+        # Skip degenerate classes (no positives OR no negatives)
+        if pos == 0 or neg == 0:
+            continue
+
+        valid_for_thresh[c] = True
+        preds = (p.unsqueeze(0) >= thresholds.unsqueeze(1)).to(torch.float32)  # [T, N]
+        tp = (preds * y).sum(dim=1)                    # [T]
+        fp = (preds * (1.0 - y)).sum(dim=1)            # [T]
+        fn = ((1.0 - preds) * y).sum(dim=1)            # [T]
+        prec = tp / (tp + fp + 1e-9)                   # [T]
+        rec  = tp / (tp + fn + 1e-9)                   # [T]
+        f1   = 2.0 * prec * rec / (prec + rec + 1e-9)  # [T]
+        best_idx = int(torch.argmax(f1).item())
+        best_thresholds[c] = thresholds[best_idx]
+
+    # Final predictions with per-class thresholds
+    final_preds = (probs >= best_thresholds.view(1, -1)).to(torch.float32)  # [N, C]
+
+    # Micro metrics
+    tp_micro = (final_preds * all_labels).sum()
+    fp_micro = (final_preds * (1.0 - all_labels)).sum()
+    fn_micro = ((1.0 - final_preds) * all_labels).sum()
+    prec_micro = (tp_micro / (tp_micro + fp_micro + 1e-9)).item()
+    rec_micro  = (tp_micro / (tp_micro + fn_micro + 1e-9)).item()
+    f1_micro   = (2.0 * prec_micro * rec_micro / (prec_micro + rec_micro + 1e-9))
+
+    # Macro-F1 over valid classes only (where both pos and neg exist)
+    tp_c = (final_preds * all_labels).sum(dim=0)                 # [C]
+    fp_c = (final_preds * (1.0 - all_labels)).sum(dim=0)         # [C]
+    fn_c = ((1.0 - final_preds) * all_labels).sum(dim=0)         # [C]
+    # A class contributes to macro-F1 only if it has at least one positive and one negative label
+    pos_c = (all_labels.sum(dim=0) > 0.0)
+    neg_c = ((all_labels.shape[0] - all_labels.sum(dim=0)) > 0.0)
+    valid_macro = pos_c & neg_c
+    macro_f1_val = 0.0
+    if valid_macro.any():
+        prec_c = tp_c[valid_macro] / (tp_c[valid_macro] + fp_c[valid_macro] + 1e-9)
+        rec_c  = tp_c[valid_macro] / (tp_c[valid_macro] + fn_c[valid_macro] + 1e-9)
+        f1_c   = 2.0 * prec_c * rec_c / (prec_c + rec_c + 1e-9)
+        macro_f1_val = float(torch.mean(f1_c).item())
+
+    # Threshold summaries over classes where we actually optimized a threshold
+    if valid_for_thresh.any():
+        thr_mean = float(best_thresholds[valid_for_thresh].mean().item())
+        thr_median = float(best_thresholds[valid_for_thresh].median().item())
+    else:
+        thr_mean = 0.5
+        thr_median = 0.5
+
+    out.update({
+        "calibrated_micro_precision": prec_micro,
+        "calibrated_micro_recall": rec_micro,
+        "calibrated_micro_F1": f1_micro,
+        "calibrated_macro_F1": macro_f1_val,
+        "mean_optimal_threshold": thr_mean,
+        "median_optimal_threshold": thr_median,
+    })
+    return out
+
 
 @torch.no_grad()
 def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
              coord_mapper=None,
              also_weighted_view: bool = True,
-             train_like_loss_fn: Optional[nn.Module] = None):
+             train_like_loss_fn: Optional[nn.Module] = None) -> Dict[str, float]:
     """
-    Runs validation and returns:
-      - fixed_view: {'total', '<per-head>'}  using eval_loss_fn (FROZEN weights)
-      - maybe 'weighted_view/total_like_train'  if also_weighted_view=True
-      - metrics/*  raw, weight-free metrics
+    Runs validation and returns batch-averaged losses/metrics plus calibrated metrics:
+      - fixed/*: per-head & total using eval_loss_fn (FROZEN weights)
+      - weighted_view/total_like_train: optional, using train_like_loss_fn
+      - metrics/*: threshold=0.5, weight-free metrics from compute_weight_free_metrics(...)
+      - metrics_calibrated/*: per-head calibrated micro/macro with optimal per-class thresholds
     """
     model.eval()
     mdl = _to_ddp_module(model)
@@ -1049,10 +1201,14 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
 
     totals = defaultdict(float)
     counts = 0
-    metrics_accum = MetricsAccumulator()
 
+    # Heads we calibrate (multi-label BCE heads)
+    multi_label_heads = ["keyboard_logits", "eco_logits", "inventory_logits"]
+    collected = {k: {"logits": [], "labels": []} for k in multi_label_heads}
+
+    # AMP dtype if configured
     amp_dtype = None
-    if getattr(mdl.cfg, "compute_dtype", None) in ["bf16", "fp16"]:
+    if getattr(mdl, "cfg", None) is not None and getattr(mdl.cfg, "compute_dtype", None) in ("bf16", "fp16"):
         amp_dtype = torch.bfloat16 if mdl.cfg.compute_dtype == "bf16" else torch.float16
 
     try:
@@ -1060,40 +1216,123 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
             batch_raw = next(dali_iter)[0]
             batch = assembler.assemble(batch_raw, args.use_precomputed_embeddings)
 
-            with torch.autocast("cuda", enabled=(amp_dtype is not None), dtype=amp_dtype):
+            with torch.autocast(device_type="cuda", enabled=(amp_dtype is not None), dtype=amp_dtype):
                 outputs = model(batch)
 
-                # ==== Fixed-weight loss ====
+                # ---- Fixed-weight loss view ----
                 fixed_total, fixed_losses = eval_loss_fn(outputs, batch["targets"], batch["alive_mask"])
 
-                # ==== (Optional) train-like weighted view ====
-                if also_weighted_view and train_like_loss_fn is not None:
+                # ---- Optional train-like weighted view ----
+                if also_weighted_view and (train_like_loss_fn is not None):
                     weighted_total, _ = train_like_loss_fn(outputs, batch["targets"], batch["alive_mask"])
                 else:
                     weighted_total = None
 
-            # aggregate losses
+            # Aggregate losses
             totals["fixed/total"] += float(fixed_total)
             for k, v in fixed_losses.items():
                 totals[f"fixed/{k}"] += float(v)
             if weighted_total is not None:
                 totals["weighted_view/total_like_train"] += float(weighted_total)
 
-            # metrics (weight-free)
-            wf_metrics = compute_weight_free_metrics(outputs, batch["targets"], batch["alive_mask"], coord_mapper=coord_mapper)
-            for k, v in wf_metrics.items():
+            # Weight-free metrics at 0.5
+            wf = compute_weight_free_metrics(outputs, batch["targets"], batch["alive_mask"], coord_mapper=coord_mapper)
+            for k, v in wf.items():
                 totals[f"metrics/{k}"] += float(v)
+
+            # ---- Collect logits/labels for calibration (CPU) ----
+            # Number of players (usually 5), keep robust to structure
+            num_players = min(len(outputs.get("player", [])), batch["alive_mask"].shape[-1])
+            for i in range(num_players):
+                mask = batch["alive_mask"][:, :, i].to(torch.bool)  # [B, T]
+                if not mask.any():
+                    continue
+                for key in multi_label_heads:
+                    # Guard for missing heads in outputs/targets
+                    if (key in outputs["player"][i]) and (key in batch["targets"]["player"][i]):
+                        # logits/labels: [B, T, C] -> masked -> [N, C]
+                        logits_bt = outputs["player"][i][key].detach()
+                        labels_bt = batch["targets"]["player"][i][key].detach().to(torch.float32)
+                        # Ensure last dim = C, mask over [B, T]
+                        logits_flat = logits_bt[mask].to("cpu", dtype=torch.float32)
+                        labels_flat = labels_bt[mask].to("cpu", dtype=torch.float32)
+                        if logits_flat.numel() > 0:
+                            collected[key]["logits"].append(logits_flat)
+                            collected[key]["labels"].append(labels_flat)
 
             counts += 1
     except StopIteration:
         pass
 
-    # average
+    # ---- DDP gather (if enabled) so calibration uses the full validation split ----
+    ddp = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if ddp else 1
+    rank = dist.get_rank() if ddp else 0
+
+    def _gather_lists(obj_local):
+        """Gather Python objects across ranks; returns a flat list of elements from all ranks."""
+        if not ddp:
+            return [obj_local]
+        bucket = [None for _ in range(world_size)]
+        dist.all_gather_object(bucket, obj_local)
+        return bucket
+
+    # Perform calibration per head
+    for key in multi_label_heads:
+        # Gather per-rank lists
+        gathered = _gather_lists({
+            "logits": collected[key]["logits"],
+            "labels": collected[key]["labels"],
+        })
+
+        # Flatten across ranks on rank 0
+        if rank == 0:
+            all_logits_list, all_labels_list = [], []
+            for item in gathered:
+                all_logits_list.extend(item["logits"])
+                all_labels_list.extend(item["labels"])
+
+            if len(all_logits_list) > 0:
+                all_logits = torch.cat(all_logits_list, dim=0)  # CPU [N, C]
+                all_labels = torch.cat(all_labels_list, dim=0)  # CPU [N, C]
+                cal = find_optimal_thresholds_and_recompute_metrics(all_logits, all_labels)
+            else:
+                cal = {
+                    "calibrated_micro_precision": 0.0,
+                    "calibrated_micro_recall": 0.0,
+                    "calibrated_micro_F1": 0.0,
+                    "calibrated_macro_F1": 0.0,
+                    "mean_optimal_threshold": 0.5,
+                    "median_optimal_threshold": 0.5,
+                }
+        else:
+            cal = None
+
+        # Broadcast calibrated dict to all ranks so return values match
+        if ddp:
+            container = [cal]
+            dist.broadcast_object_list(container, src=0)
+            cal = container[0]
+
+        base = key.replace("_logits", "")
+        totals[f"metrics_calibrated/player/{base}_micro_precision"] = float(cal["calibrated_micro_precision"])
+        totals[f"metrics_calibrated/player/{base}_micro_recall"]    = float(cal["calibrated_micro_recall"])
+        totals[f"metrics_calibrated/player/{base}_micro_F1"]        = float(cal["calibrated_micro_F1"])
+        totals[f"metrics_calibrated/player/{base}_macro_F1"]        = float(cal["calibrated_macro_F1"])
+        totals[f"metrics_calibrated/player/{base}_mean_optimal_threshold"]   = float(cal["mean_optimal_threshold"])
+        totals[f"metrics_calibrated/player/{base}_median_optimal_threshold"] = float(cal["median_optimal_threshold"])
+
+    # ---- Average batch-wise totals (calibrated metrics are already final) ----
     out = {}
+    denom = max(1, counts)
     for k, v in totals.items():
-        out[k] = v / max(1, counts)
+        if k.startswith("metrics_calibrated/"):
+            out[k] = float(v)
+        else:
+            out[k] = float(v) / denom
 
     return out
+
 
 # =============================================================================
 # SECTION 3: MAIN TRAINING ORCHESTRATOR
@@ -1389,7 +1628,7 @@ def main():
     if args.manifest is None: args.manifest = os.path.join(args.data_root, "manifest.json")
 
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
-    
+
     model_cfg = CS2Config(context_frames=args.T_frames)
 
     if args.mode == "train":

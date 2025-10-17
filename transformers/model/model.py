@@ -103,7 +103,7 @@ predictions for the next frame.
   The `[GAME_STRATEGY]` output token is used to predict:
   - Enemy Positions (Heatmap): A 3D heatmap of predicted enemy locations.
   - Game Phase (Classification): Logits for the round state (e.g., "Bomb Planted").
-  - Round Number (Regression): A single scalar value.
+  - Round Number (Classification): Logits for the round number (1-30).
 
 ----------------------------------------------------------------------------------------------------
 3. HIGH-PERFORMANCE OPTIMIZATIONS
@@ -168,7 +168,7 @@ class PlayerPredictions(TypedDict):
 class GameStrategyPredictions(TypedDict):
     enemy_pos_heatmap_logits: torch.Tensor   # [B, 8, 64, 64]
     round_state_logits: torch.Tensor         # [B, 5]
-    round_number: torch.Tensor               # [B, 1]
+    round_number_logits: torch.Tensor        # [B, 30]
 
 class Predictions(TypedDict):
     player: List[PlayerPredictions]          # len == 5
@@ -208,7 +208,7 @@ class CS2Config:
     context_frames: int = 1
 
     max_cache_len_tokens: Optional[int] = None
-    
+
     # NEW: This flag controls inference masking. If True, inference uses a standard
     # (token-by-token) causal mask, ensuring consistency with models trained using
     # `use_fused_causal=True`. Set to False to use the frame-block mask during inference.
@@ -220,7 +220,7 @@ class CS2Config:
     hf_use_processor: bool = False     # True = preprocess inside encoder with HF image processor
     hf_forward_chunk: int = 16
     hf_norm_chunk: int = 16
-    hf_compute_dtype: Literal["fp32", "fp16", "bf16"]  = "fp16"
+    hf_compute_dtype: Literal["fp32", "fp16", "bf16"]  = "bf16"
     hf_channels_last: bool = True     # same perf
     vision_backbone_hidden_size: int = 768
     # Audio
@@ -235,6 +235,7 @@ class CS2Config:
     inventory_dim: int = 128
     weapon_dim: int = 128
     round_state_dim: int = 5
+    round_number_dim: int = 30 # FIX #4
 
     # Heatmaps
     pos_z, pos_y, pos_x = 8, 64, 64
@@ -245,11 +246,11 @@ class CS2Config:
     rope_scaling: Optional[Dict[str, Any]] = None  # e.g.
     # {"type": "linear", "factor": 2.0}                   # 2× context
     # {"type": "linear_by_len", "orig": 4096, "target": 8192}
-    
+
     enable_cached_training: bool = False
     cached_chunk_T: int = 512
     cached_detach: bool = True
-    
+
     enable_grad_checkpoint: bool = True
     grad_ckpt_use_reentrant: bool = False
 
@@ -448,7 +449,7 @@ class DINOv3VisualEncoder(nn.Module):
                 pixel_values = self._normalize_chunk(x, from_uint8=from_uint8)
 
             feats = self._forward_backbone_no_grad(pixel_values) # [N_chunk, hidden_size]
-            
+
             # MODIFIED: Reshape raw features directly, DO NOT project.
             vis_chunk = feats.view(B, (t1 - t0), P, self.hidden)
             chunks.append(vis_chunk)
@@ -500,10 +501,10 @@ class AudioCNN(nn.Module):
         if is_batched:
             # If we started with a 6D tensor, reshape the output back
             x = x.view(B, T, P, -1)
-        
+
         # If input was 4D, the 2D output is what's expected by the caller.
         return x #das ist mein roter buntstift, habe ich ganz alleine gemalt. (mithilfe von chef gpt)
-    
+
 class PlayerTokenFuser(nn.Module):
     """Fuse visual+audio via elementwise add, add slot identity, then LayerNorm.
 
@@ -614,11 +615,11 @@ class RoPEPositionalEncoding(nn.Module):
         idx = torch.arange(0, half, device=device, dtype=torch.float32)
         inv = self.base ** (idx / half)
         inv_freq = 1.0 / inv
-        
+
         # Apply NTK-like scaling only if specified (i.e., for the temporal axis)
         if use_scaling:
             inv_freq = inv_freq * self.scale
-            
+
         return inv_freq
 
     def _build_cos_sin(
@@ -627,7 +628,7 @@ class RoPEPositionalEncoding(nn.Module):
         """Builds the cosine and sine matrices for a given position tensor."""
         # Pass the scaling flag down to the frequency calculation
         inv_freq = self._inv_freq(dim, device, use_scaling=use_scaling).to(dtype)
-        
+
         t = positions.to(device=device, dtype=dtype).unsqueeze(-1)      # [L, 1]
         freqs = t * inv_freq.unsqueeze(0)                                # [L, half]
         cos = torch.cos(freqs)
@@ -640,7 +641,7 @@ class RoPEPositionalEncoding(nn.Module):
         # x: [B, L, H, rot_dim_slice]
         B, L, H, rd_slice = x.shape
         assert rd_slice % 2 == 0, "Rotary dimension must be even."
-        
+
         x_pair = x.reshape(B, L, H, rd_slice // 2, 2)
         half_dim = rd_slice // 2
         cos = cos.reshape(1, L, 1, half_dim)
@@ -648,10 +649,10 @@ class RoPEPositionalEncoding(nn.Module):
 
         x1 = x_pair[..., 0]
         x2 = x_pair[..., 1]
-        
+
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
-        
+
         y = torch.stack([y1, y2], dim=-1).reshape(B, L, H, rd_slice)
         return y
 
@@ -674,7 +675,7 @@ class RoPEPositionalEncoding(nn.Module):
 
         # Determine the total dimension to rotate.
         rd = self.rot_dim or q.shape[-1]
-        
+
         # For 2D RoPE, the rotation dimension must be divisible by 4 to be split evenly
         # into two valid (even) rotation dimensions.
         if rd % 4 != 0:
@@ -696,18 +697,18 @@ class RoPEPositionalEncoding(nn.Module):
         cos_t, sin_t = self._build_cos_sin(temporal_pos, rot_dim_temp, q.device, q.dtype, use_scaling=True)
         q_t_rot = self._apply_rotary(q_t, cos_t, sin_t)
         k_t_rot = self._apply_rotary(k_t, cos_t, sin_t)
-        
+
         # --- Structural Rotation (without scaling) ---
         cos_s, sin_s = self._build_cos_sin(structural_pos, rot_dim_struc, q.device, q.dtype, use_scaling=False)
         q_s_rot = self._apply_rotary(q_s, cos_s, sin_s)
         k_s_rot = self._apply_rotary(k_s, cos_s, sin_s)
-        
+
         # --- Recombine the tensors ---
         rotated_q = torch.cat([q_t_rot, q_s_rot, q_pass], dim=-1)
         rotated_k = torch.cat([k_t_rot, k_s_rot, k_pass], dim=-1)
 
         return rotated_q, rotated_k
-    
+
 class SwiGLUFFN(nn.Module):
     """
     SwiGLU MLP with parameter parity to GELU-4d when ffn_mult=4.
@@ -785,7 +786,7 @@ class CS2GQAAttention(nn.Module):
             return m
 
         raise ValueError(f"Unsupported attn_mask dims: {m.dim()}")
-    
+
     def forward(
         self,
         x: torch.Tensor,
@@ -798,12 +799,12 @@ class CS2GQAAttention(nn.Module):
         Hq, Hkv, Hd = self.cfg.n_q_heads, self.cfg.n_kv_heads, self.head_dim
         assert Hq % Hkv == 0, "n_q_heads must be a multiple of n_kv_heads for GQA"
         gqa_factor = Hq // Hkv
-        
+
         use_kv_cache = kv_cache is not None
 
         if kv_cache is not None and kv_cache.key.device != x.device:
             raise RuntimeError("KV cache/device mismatch between steps.")
-        
+
         if L_new == 0:
             # nothing to do; return no-op and preserve cache
             return x[:, :0, :], (kv_cache if use_kv_cache else None)
@@ -901,10 +902,10 @@ class CS2GQAAttention(nn.Module):
         out = out.permute(0, 2, 1, 3).contiguous().reshape(B, L_new, D)
         out = self.wo(out)
         # ---------------------------------------------------------------------------
-        
+
         return out, new_cache
 
-    
+
 class CS2TransformerEncoderLayer(nn.Module):
     def __init__(self, cfg: CS2Config, rope: RoPEPositionalEncoding):
         super().__init__()
@@ -929,9 +930,9 @@ class CS2TransformerEncoderLayer(nn.Module):
         structural_pos_ids: torch.Tensor,
         kv_cache: Optional[KVCache] = None
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-        
+
         use_checkpoint = self.training and self.cfg.enable_grad_checkpoint
-        
+
         if use_checkpoint and kv_cache is None:
             # full checkpoint path (no cache)
             def attn_block(x_in):
@@ -988,16 +989,16 @@ class CS2Backbone(nn.Module):
 
         new_kv_cache_list = []
         use_kv_cache = kv_cache_list is not None
-        
+
         for i, layer in enumerate(self.layers):
             layer_cache = kv_cache_list[i] if use_kv_cache else None
-            
+
             x, new_layer_cache = layer(
                 x, attn_mask, temporal_pos_ids, structural_pos_ids, kv_cache=layer_cache
             )
             if use_kv_cache:
                 new_kv_cache_list.append(new_layer_cache)
-            
+
         return x, (new_kv_cache_list if use_kv_cache else None)
 
 # -----------------------------------------------------------------------------
@@ -1008,7 +1009,7 @@ class PlayerHeads(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         d = cfg.d_model
-        
+
         # --- Standard prediction heads ---
         self.stats = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 3))
         self.mouse = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 2))
@@ -1020,12 +1021,12 @@ class PlayerHeads(nn.Module):
         # --- Corrected 3D Heatmap Deconvolutional Head ---
         # New target shape for the position heatmap
         self.pos_shape = (8, 64, 64) # (Z, Y, X)
-        
+
         # --- MEMORY FIX: Reduced feature channels from 128 to 48 ---
         # This was the primary cause of high memory usage in conv layers.
         # It reduces VRAM usage in this section by ~62.5%
         self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
-        
+
         # 1. New, smaller seed layer.
         # We will create a tiny 2x2x2 seed volume.
         self.pos_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
@@ -1035,12 +1036,12 @@ class PlayerHeads(nn.Module):
             nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
             _GN3d(self.vol_feats),
             nn.GELU(),
-            
+
             nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
             _GN3d(self.vol_feats),
             nn.GELU(),
         )
-        
+
         class Up2x2(nn.Module):
             def __init__(self, cin, cout):
                 super().__init__()
@@ -1063,7 +1064,7 @@ class PlayerHeads(nn.Module):
             Up2x2(self.vol_feats // 2,  self.vol_feats // 4),
             Up2x2(self.vol_feats // 4,  self.vol_feats // 8),
         )
-        
+
         # 3. Final Projection: Reduce feature channels to a single logit channel
         self.pos_final_conv = nn.Conv3d(self.vol_feats // 8, 1, kernel_size=1)
 
@@ -1104,12 +1105,12 @@ class StrategyHead(nn.Module):
         super().__init__()
         d = cfg.d_model
         self.enemy_shape = (cfg.pos_z, cfg.pos_y, cfg.pos_x)
-        
+
         # --- MEMORY FIX: Reduced feature channels from 128 to 48 ---
         # This was the primary cause of high memory usage in conv layers.
         # It reduces VRAM usage in this section by ~62.5%
         self.vol_feats = 48  # Latent channels for the deconv stem (tunable)
-        
+
         self.enemy_seed_projector = nn.Linear(d, self.vol_feats * 2 * 2 * 2)
         self.seed_upsampler = nn.Sequential(
             nn.ConvTranspose3d(self.vol_feats, self.vol_feats, kernel_size=4, stride=2, padding=1),
@@ -1119,7 +1120,7 @@ class StrategyHead(nn.Module):
             _GN3d(self.vol_feats),
             nn.GELU(),
         )
-        
+
         # 2. Deconvolution path: Upsample Y and X dimensions by 8x (2^3) using
         #    anisotropic strides to preserve the Z dimension. This architecture
         #    is modeled directly on the working PlayerHeads implementation.
@@ -1144,17 +1145,18 @@ class StrategyHead(nn.Module):
             Up2x2(self.vol_feats // 2,  self.vol_feats // 4),
             Up2x2(self.vol_feats // 4,  self.vol_feats // 8),
         )
-        
+
         # 3. Final Projection: Reduce feature channels to a single logit channel
         self.enemy_final_conv = nn.Conv3d( self.vol_feats // 8, 1, kernel_size=1)
 
         # --- Other standard prediction heads ---
         self.round_state = nn.Linear(d, cfg.round_state_dim)
-        self.round_number = nn.Linear(d, 1)
+        # FIX #4: Change round number head from regression to classification
+        self.round_number = nn.Linear(d, cfg.round_number_dim)
 
     def forward(self, token: torch.Tensor) -> GameStrategyPredictions:
         B = token.shape[0]
-        
+
         tiny_seed_vec = self.enemy_seed_projector(token)
         tiny_seed_vol = tiny_seed_vec.reshape(B, self.vol_feats, 2, 2, 2)
         seed = self.seed_upsampler(tiny_seed_vol)
@@ -1170,9 +1172,9 @@ class StrategyHead(nn.Module):
         return {
             "enemy_pos_heatmap_logits": enemy_pos_heatmap_logits,
             "round_state_logits": self.round_state(token),
-            "round_number": self.round_number(token),
+            "round_number_logits": self.round_number(token), # FIX #4
         }
-    
+
 # -----------------------------------------------------------------------------
 # 5) Top-level model
 # -----------------------------------------------------------------------------
@@ -1282,7 +1284,7 @@ class CS2Transformer(nn.Module):
                     B, T, P, self.cfg.vision_backbone_hidden_size,
                     device=dev, dtype=target_dtype
                 )
-                
+
                 if torch.count_nonzero(alive):
                     alive_images = images[alive]
                     num_alive = alive_images.shape[0]
@@ -1298,7 +1300,7 @@ class CS2Transformer(nn.Module):
             # --- Step 3: Process Audio and Fuse Tokens ---
             # The audio path is simpler as the CNN is always trained.
             aud_input = batch["mel_spectrogram"].to(dev, non_blocking=True)
-            
+
             aud = self.audio_encoder(aud_input).to(target_dtype)
             player_tokens = self.player_fuser(vis, aud, alive)
 
@@ -1330,7 +1332,7 @@ class CS2Transformer(nn.Module):
                     h_slice, updated_kv_cache = self.backbone(seq_slice, attn_mask=None, kv_cache_list=kv_cache_list)
                     kv_cache_list = updated_kv_cache
                     outputs.append(h_slice)
-                
+
                 h = torch.cat(outputs, dim=1)
             else:
                 # Standard Single-Shot Path
@@ -1339,7 +1341,7 @@ class CS2Transformer(nn.Module):
             # --- Step 6: Prediction Heads ---
             h_frames = h.reshape(B, T, Lpf, d)
             num_players = self.cfg.num_players
-            
+
             player_tok_all_frames = h_frames[:, :, :num_players, :]
             strat_tok_all_frames  = h_frames[:, :, num_players, :]
 
@@ -1384,7 +1386,7 @@ class CS2Transformer(nn.Module):
                 images = single_frame_batch["images"]
                 mel = single_frame_batch["mel_spectrogram"]
                 alive = single_frame_batch["alive_mask"].bool()
-                
+
                 dev = next(self.parameters()).device
                 images, mel, alive = images.to(dev), mel.to(dev), alive.to(dev)
                 B, T, P, C, H, W = images.shape # T==1
@@ -1550,7 +1552,7 @@ def main():
     # so we can slice the predictions.
     with torch.no_grad():
         full_preds = model(dummy_batch)
-        
+
     predictions: Predictions = {
         "player": [{k: v[:, -1] for k, v in p.items()} for p in full_preds["player"]],
         "game_strategy": {k: v[:, -1] for k, v in full_preds["game_strategy"].items()}
@@ -1571,7 +1573,7 @@ def main():
     strat_pred = predictions["game_strategy"]
     assert strat_pred["enemy_pos_heatmap_logits"].shape == (B, cfg.pos_z, cfg.pos_y, cfg.pos_x), "Enemy pos_heatmap shape is wrong"
     assert strat_pred["round_state_logits"].shape == (B, cfg.round_state_dim), "Round state_logits shape is wrong"
-    assert strat_pred["round_number"].shape == (B, 1), "Round number shape is wrong"
+    assert strat_pred["round_number_logits"].shape == (B, cfg.round_number_dim), "Round number shape is wrong" # FIX #4
     print("✅ Shape Test Passed!")
 
     # --- Run Standard Benchmark ---
