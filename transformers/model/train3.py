@@ -632,14 +632,25 @@ class CompositeLoss(nn.Module):
 # =============================================================================
 
 class EMA:
+class EMA:
     """Exponential Moving Average of model weights."""
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.params = {k: v.detach().clone() for k,v in model.state_dict().items() if v.dtype.is_floating_point}
+    
     @torch.no_grad()
     def update(self, model):
         for k, v in model.state_dict().items():
-            if k in self.params: self.params[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+            if k in self.params:
+                # Move the EMA parameter to the model's device if it's not already there
+                ema_param = self.params[k].to(v.device)
+                
+                # Perform the update on the correct device
+                ema_param.mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+                
+                # Store the updated parameter back into the dictionary
+                self.params[k] = ema_param
+
     def state_dict(self): return self.params
     def load_state_dict(self, d): self.params = d
     @torch.no_grad()
