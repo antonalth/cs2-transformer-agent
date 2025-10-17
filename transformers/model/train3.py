@@ -604,11 +604,27 @@ class CompositeLoss(nn.Module):
         frame_mask = alive_mask.any(dim=-1).float()
         
         # FIX #4: Use Cross-Entropy loss for round number classification
-        round_logits = gs_pred["round_number_logits"].view(B * T, -1)
-        round_targets = (gs_targ["round_number"].long().view(B*T) - 1).clamp(min=-1) # 1-indexed to 0-indexed, -1 for ignore
-        losses['round_number'] = self.weights['round_number'] * self._scalar_loss(self.ce_loss(round_logits, round_targets), frame_mask.view(B*T))
-        
-        losses['round_state'] = self.weights['round_state'] * self._scalar_loss(F.binary_cross_entropy_with_logits(gs_pred["round_state_logits"], gs_targ["round_state_logits"], reduction='none').mean(-1), frame_mask)
+        round_logits  = gs_pred["round_number_logits"].view(B * T, -1)
+        round_targets = gs_targ["round_number"].long().view(B*T) - 1  # 1-indexed -> 0-indexed
+        C = round_logits.size(-1)
+        # Ignore overtime rounds (labels >= C) so they contribute zero loss
+        overtime = (round_targets >= C)
+        if overtime.any():
+            round_targets[overtime] = -1  # -1 matches ignore_index in self.ce_loss
+        round_targets = round_targets.clamp(min=-1)  # keep padding as -1
+
+        ce = self.ce_loss(round_logits, round_targets)  # reduction='none', ignore_index=-1
+        valid_mask = frame_mask.view(B*T) * (round_targets != -1).float()
+        if valid_mask.sum() > 0:
+            losses['round_number'] = self.weights['round_number'] * self._scalar_loss(ce, valid_mask)
+        else:
+            # no valid round labels (all overtime/padding) -> zero loss
+            losses['round_number'] = round_logits.sum() * 0.0
+
+        losses['round_state'] = self.weights['round_state'] * self._scalar_loss(
+            F.binary_cross_entropy_with_logits(gs_pred["round_state_logits"], gs_targ["round_state_logits"], reduction='none').mean(-1),
+            frame_mask
+        )
         total_loss += losses['round_number'] + losses['round_state']
         
         # POS heatmap loss (balanced BCE to avoid all-zero collapse)
@@ -1099,8 +1115,8 @@ def _calibrated_metrics_from_hist(pos_hist: torch.Tensor,
     total_pos = pos_hist.sum(dim=-1)  # [C]
     total_neg = neg_hist.sum(dim=-1)  # [C]
 
-    # For each threshold index t, treat prediction as (prob >= thresholds[t])
-    # So TP/FP at t are sums of hist bins with index >= t (right-cumulative)
+    # For threshold index t, prediction is (prob >= thresholds[t]):
+    # TP/FP at t are sums of hist bins with index >= t (right-cumulative)
     tp_bins = torch.flip(torch.flip(pos_hist, dims=[-1]).cumsum(dim=-1), dims=[-1])  # [C, T]
     fp_bins = torch.flip(torch.flip(neg_hist, dims=[-1]).cumsum(dim=-1), dims=[-1])  # [C, T]
     fn_bins = total_pos.unsqueeze(-1) - tp_bins                                       # [C, T]
@@ -1165,19 +1181,28 @@ def _calibrated_metrics_from_hist(pos_hist: torch.Tensor,
 def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
              coord_mapper=None,
              also_weighted_view: bool = True,
-             train_like_loss_fn: Optional[nn.Module] = None) -> Dict[str, float]:
+             train_like_loss_fn: Optional[nn.Module] = None,
+             # --- calibration sampling controls ---
+             calibrate_mode: str = "count",    # "count" or "fraction"
+             calibrate_target: float = 5.0,    # if "count": max examples per head; if "fraction": e.g., 0.05 for 5%
+             rng: Optional[torch.Generator] = None) -> Dict[str, float]:
     """
     Runs validation with:
       - fixed/* losses (frozen weights view)
       - optional weighted_view/total_like_train
       - metrics/* (0.5-thresh, weight-free)
-      - metrics_calibrated/* using per-class threshold calibration via histograms
+      - metrics_calibrated/* from a tiny random subset (histogram-based)
 
-    Histogram trick avoids gathering logits/labels and keeps GPU memory tiny.
+    Sampling:
+      - calibrate_mode="count": uses up to `calibrate_target` masked examples per head per epoch (default 5).
+      - calibrate_mode="fraction": Bernoulli sample each masked example with prob=`calibrate_target` (e.g., 0.05 for 5%).
     """
     model.eval()
     mdl = _to_ddp_module(model)
     device = next(mdl.parameters()).device
+    if rng is None:
+        rng = torch.Generator(device=device)
+        # Leave unseeded for stochasticity across epochs; set manual_seed() if you want determinism.
 
     totals = defaultdict(float)
     counts = 0
@@ -1196,6 +1221,8 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
             "neg": None,   # [C, T] int64
         } for h in heads
     }
+    # Per-head cap state for "count" mode
+    samples_used = {h: 0 for h in heads}
 
     # AMP dtype if configured
     amp_dtype = None
@@ -1231,7 +1258,7 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
             for k, v in wf.items():
                 totals[f"metrics/{k}"] += float(v)
 
-            # ---- Histogram accumulation for calibration (tiny memory) ----
+            # ---- Histogram accumulation for calibration (tiny random subset) ----
             # Determine number of players robustly
             num_players = min(len(outputs.get("player", [])), batch["alive_mask"].shape[-1])
             for i in range(num_players):
@@ -1243,16 +1270,42 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
                     if (key not in outputs["player"][i]) or (key not in batch["targets"]["player"][i]):
                         continue
 
-                    # logits/labels: [B, T, C] -> masked -> [N, C]
-                    logits_bt = outputs["player"][i][key]                      # [B, T, C] (device)
-                    labels_bt = batch["targets"]["player"][i][key].to(torch.float32)  # [B, T, C] (device/cpu)
+                    # Early skip if "count" mode is already satisfied for this head
+                    if calibrate_mode == "count" and samples_used[key] >= int(calibrate_target):
+                        continue
 
-                    # Ensure tensors on the model device for fast ops
-                    logits_bt = logits_bt.to(device=device)
-                    labels_bt = labels_bt.to(device=device)
+                    # logits/labels: [B, T, C]
+                    logits_bt = outputs["player"][i][key].to(device=device)
+                    labels_bt = batch["targets"]["player"][i][key].to(device=device, dtype=torch.float32)
 
-                    logits = logits_bt[alive]  # [N, C]
-                    labels = labels_bt[alive].to(torch.float32)  # [N, C]
+                    # ----- construct sampling mask -----
+                    if calibrate_mode == "fraction":
+                        p = float(max(0.0, min(1.0, calibrate_target)))
+                        # Bernoulli sampling on alive positions
+                        rand = torch.rand_like(alive, dtype=torch.float32, generator=rng, device=device)
+                        sample_mask = alive & (rand < p)  # [B, T] bool
+                    else:  # "count"
+                        remaining = int(max(0, int(calibrate_target) - samples_used[key]))
+                        if remaining <= 0:
+                            continue
+                        # Flatten alive coords, sample up to 'remaining'
+                        idx = torch.nonzero(alive, as_tuple=False)  # [M, 2] (b, t)
+                        M = idx.shape[0]
+                        if M == 0:
+                            continue
+                        take = min(remaining, M)
+                        perm = torch.randperm(M, device=device, generator=rng)[:take]
+                        sel = idx[perm]  # [take, 2]
+                        sample_mask = torch.zeros_like(alive, dtype=torch.bool, device=device)
+                        sample_mask[sel[:, 0], sel[:, 1]] = True
+                        samples_used[key] += take  # update cap
+
+                    if not sample_mask.any():
+                        continue
+
+                    # Masked -> [N, C]
+                    logits = logits_bt[sample_mask]                  # [N, C]
+                    labels = labels_bt[sample_mask].to(torch.float32)  # [N, C]
                     if logits.numel() == 0:
                         continue
 
@@ -1263,9 +1316,8 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
                         hist[key]["neg"] = torch.zeros((C, T), dtype=torch.long, device=device)
 
                     # Probabilities -> bin indices in [0, T-1]
-                    probs = torch.sigmoid(logits).to(torch.float32)  # [N, C]
-                    # Scale-and-clamp binning aligns with thresholds grid
-                    bins = torch.clamp((probs * (T - 1)).long(), 0, T - 1)  # [N, C]
+                    probs = torch.sigmoid(logits).to(torch.float32)            # [N, C]
+                    bins = torch.clamp((probs * (T - 1)).long(), 0, T - 1)     # [N, C]
 
                     # Update per-class pos/neg hist (loop over C keeps memory tiny; C is small)
                     for c in range(C):
@@ -1297,7 +1349,7 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
     for key in heads:
         base = key.replace("_logits", "")
         if hist[key]["pos"] is None:
-            # No data for this head in this eval
+            # No data sampled for this head in this eval
             for n, v in {
                 "micro_precision": 0.0,
                 "micro_recall": 0.0,
@@ -1327,6 +1379,7 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
             out[k] = float(v) / denom
 
     return out
+
 
 
 # =============================================================================
