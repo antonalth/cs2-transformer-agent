@@ -847,33 +847,224 @@ def build_epoch_loader(
     steps_per_epoch = (len(records) // (world_size * args.batch_size)) if len(records) > 0 else 0
     return dali_pipe.iterator, assembler, steps_per_epoch
 
+# ==== Fixed-weight evaluation helpers ====
+
+def _to_ddp_module(model):
+    # Get the real module if wrapped in DDP
+    return model.module if hasattr(model, "module") else model
+
+def build_eval_loss(eval_weights, grid_dims=(64, 64, 8), sigma=1.5, device=None):
+    # Create a CompositeLoss with frozen weights ONLY for evaluation
+    loss = CompositeLoss(weights=eval_weights, grid_dims=grid_dims, sigma=sigma)
+    if device is not None:
+        loss = loss.to(device)
+    return loss
+
+# ==== Weight-free metric computation ====
+
+class MetricsAccumulator:
+    def __init__(self):
+        self.sums = defaultdict(float)
+        self.counts = defaultdict(float)
+    def add(self, key, value, n=1.0):
+        self.sums[key] += float(value)
+        self.counts[key] += float(n)
+    def mean(self, key, default=float("inf")):
+        c = self.counts.get(key, 0.0)
+        return (self.sums.get(key, 0.0) / max(c, 1e-9)) if c > 0 else default
+    def to_dict(self, prefix=None):
+        out = {}
+        for k in self.sums.keys():
+            m = self.mean(k)
+            out[(prefix + "/" + k) if prefix else k] = m
+        return out
+
+def _sigmoid(x): return torch.sigmoid(x)
+def _softmax(x, dim=-1): return torch.softmax(x, dim=dim)
+
 @torch.no_grad()
-def validate(dali_iter, assembler, model, loss_fn, args):
-    """Runs the validation loop and returns averaged metrics."""
+def compute_weight_free_metrics(predictions, targets, alive_mask, coord_mapper=None):
+    """
+    Returns raw, weight-free metrics per head.
+    Structure expectations (based on your CompositeLoss):
+      predictions['player'][i] has:
+        'stats', 'mouse_delta_deg', 'keyboard_logits', 'eco_logits',
+        'inventory_logits', 'active_weapon_idx', 'pos_heatmap_logits'
+      predictions['game_strategy'] has:
+        'round_number', 'round_state_logits'
+      targets mirror these (keyboard/eco/inventory likely {0,1} multi-labels;
+      weapon is class index; pos target is 'pos_coords' (xyz floats); round_number regression).
+    """
+    acc = MetricsAccumulator()
+    device = alive_mask.device
+    B, T, P = alive_mask.shape  # players P=5
+
+    # ---- Player heads ----
+    # Regression: stats, mouse
+    for i in range(P):
+        mask = alive_mask[:, :, i]  # [B,T]
+        mcount = mask.sum().clamp(min=1)
+
+        p_pred, p_targ = predictions["player"][i], targets["player"][i]
+        # stats: L1 / L2
+        if "stats" in p_pred and "stats" in p_targ:
+            diff = (p_pred["stats"] - p_targ["stats"])[mask]  # [..., D]
+            if diff.numel() > 0:
+                mae = diff.abs().mean()
+                rmse = (diff.pow(2).mean()).sqrt()
+                acc.add("player/stats_MAE", mae, 1)
+                acc.add("player/stats_RMSE", rmse, 1)
+
+        # mouse: L1 / L2
+        if "mouse_delta_deg" in p_pred and "mouse_delta_deg" in p_targ:
+            diff = (p_pred["mouse_delta_deg"] - p_targ["mouse_delta_deg"])[mask]
+            if diff.numel() > 0:
+                mae = diff.abs().mean()
+                rmse = (diff.pow(2).mean()).sqrt()
+                acc.add("player/mouse_MAE", mae, 1)
+                acc.add("player/mouse_RMSE", rmse, 1)
+
+        # Multi-label BCE heads: keyboard, eco, inventory
+        for key in ["keyboard_logits", "eco_logits", "inventory_logits"]:
+            if key in p_pred and key in p_targ:
+                logits = p_pred[key][mask]     # [N, C]
+                labels = p_targ[key][mask]     # [N, C], {0,1} or soft
+                if logits.numel() > 0:
+                    probs = _sigmoid(logits)
+                    preds = (probs >= 0.5).float()
+                    # micro accuracy across classes
+                    micro_acc = (preds.eq(labels.round())).float().mean()
+                    # precision/recall/F1 (micro)
+                    tp = (preds * labels).sum()
+                    fp = (preds * (1 - labels)).sum()
+                    fn = ((1 - preds) * labels).sum()
+                    precision = tp / (tp + fp + 1e-9)
+                    recall    = tp / (tp + fn + 1e-9)
+                    f1        = 2 * precision * recall / (precision + recall + 1e-9)
+                    base = key.replace("_logits", "")
+                    acc.add(f"player/{base}_micro_acc", micro_acc, 1)
+                    acc.add(f"player/{base}_micro_F1", f1, 1)
+
+        # Weapon classification
+        if "active_weapon_idx" in p_pred and "active_weapon_idx" in p_targ:
+            # prediction may be logits; targets are indices
+            pred_logits = p_pred["active_weapon_idx"]  # [B,T,C]
+            targ_idx = p_targ["active_weapon_idx"].long()  # [B,T]
+            pred_idx = _softmax(pred_logits, dim=-1).argmax(-1)
+            correct = (pred_idx[mask] == targ_idx[mask]).float()
+            if correct.numel() > 0:
+                acc.add("player/weapon_acc", correct.mean(), 1)
+
+        # Position heatmap: voxel accuracy & within-1-voxel hit rate
+        if "pos_heatmap_logits" in p_pred and "pos_coords" in p_targ:
+            # [B,T,Cx,Cy,Cz]
+            logits = p_pred["pos_heatmap_logits"]
+            # argmax voxel
+            flat_idx = logits.view(B*T, -1).argmax(-1).view(B, T)
+            # target voxel via mapper
+            if coord_mapper is not None:
+                # discretize target world coords
+                world = p_targ["pos_coords"]  # [B,T,3]
+                grid_idx = coord_mapper.discretize_world_to_grid(world)  # [B,T,3], long
+                X, Y, Z = coord_mapper.grid_dims.cpu().numpy()
+                targ_flat = (grid_idx[..., 0] * (Y*Z) + grid_idx[..., 1] * Z + grid_idx[..., 2]).long()
+                eq = (flat_idx[mask] == targ_flat[mask]).float()
+                if eq.numel() > 0:
+                    acc.add("player/pos_voxel_acc", eq.mean(), 1)
+                # within-1-neighborhood hit
+                # build neighbor set (Manhattan distance <= 1)
+                # compute deltas by decoding flat_idx back to (x,y,z)
+                xi = (flat_idx // (Y*Z)) % X
+                yi = (flat_idx // Z) % Y
+                zi = flat_idx % Z
+                tx = grid_idx[...,0]; ty = grid_idx[...,1]; tz = grid_idx[...,2]
+                dx = (xi - tx).abs(); dy = (yi - ty).abs(); dz = (zi - tz).abs()
+                near1 = (((dx <= 1) & (dy <= 1) & (dz <= 1)).float())[mask]
+                if near1.numel() > 0:
+                    acc.add("player/pos_within1voxel_rate", near1.mean(), 1)
+
+    # ---- Game strategy heads ----
+    gs_pred, gs_targ = predictions["game_strategy"], targets["game_strategy"]
+    frame_mask = alive_mask.any(dim=-1)  # [B,T]
+    if "round_state_logits" in gs_pred and "round_state_logits" in gs_targ:
+        pred_idx = _softmax(gs_pred["round_state_logits"], dim=-1).argmax(-1)
+        targ_idx = gs_targ["round_state_logits"].argmax(-1) if gs_targ["round_state_logits"].dim() == gs_pred["round_state_logits"].dim() else gs_targ["round_state"]
+        correct = (pred_idx[frame_mask] == targ_idx[frame_mask]).float()
+        if correct.numel() > 0:
+            acc.add("game/round_state_acc", correct.mean(), 1)
+
+    if "round_number" in gs_pred and "round_number" in gs_targ:
+        diff = (gs_pred["round_number"].squeeze(-1) - gs_targ["round_number"])[frame_mask].float()
+        if diff.numel() > 0:
+            mae = diff.abs().mean()
+            rmse = (diff.pow(2).mean()).sqrt()
+            acc.add("game/round_number_MAE", mae, 1)
+            acc.add("game/round_number_RMSE", rmse, 1)
+
+    return acc.to_dict()
+
+@torch.no_grad()
+def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
+             coord_mapper=None,
+             also_weighted_view: bool = True,
+             train_like_loss_fn: Optional[nn.Module] = None):
+    """
+    Runs validation and returns:
+      - fixed_view: {'total', '<per-head>'}  using eval_loss_fn (FROZEN weights)
+      - maybe 'weighted_view/total_like_train'  if also_weighted_view=True
+      - metrics/*  raw, weight-free metrics
+    """
     model.eval()
+    mdl = _to_ddp_module(model)
+    device = next(mdl.parameters()).device
+
     totals = defaultdict(float)
-    count = 0
+    counts = 0
+    metrics_accum = MetricsAccumulator()
+
+    amp_dtype = None
+    if getattr(mdl.cfg, "compute_dtype", None) in ["bf16", "fp16"]:
+        amp_dtype = torch.bfloat16 if mdl.cfg.compute_dtype == "bf16" else torch.float16
+
     try:
         while True:
             batch_raw = next(dali_iter)[0]
             batch = assembler.assemble(batch_raw, args.use_precomputed_embeddings)
-            
-            # Add autocast here for validation
-            with torch.autocast("cuda", enabled=(model.module.cfg.compute_dtype in ["bf16", "fp16"]),
-                                dtype=torch.bfloat16 if model.module.cfg.compute_dtype == "bf16" else torch.float16):
-                preds = model(batch)
-                loss, loss_dict = loss_fn(preds, batch["targets"], batch["alive_mask"])
 
-            totals["total"] += loss.item()
-            for k, v in loss_dict.items():
-                totals[k] += v
-            count += 1
+            with torch.autocast("cuda", enabled=(amp_dtype is not None), dtype=amp_dtype):
+                outputs = model(batch)
+
+                # ==== Fixed-weight loss ====
+                fixed_total, fixed_losses = eval_loss_fn(outputs, batch["targets"], batch["alive_mask"])
+
+                # ==== (Optional) train-like weighted view ====
+                if also_weighted_view and train_like_loss_fn is not None:
+                    weighted_total, _ = train_like_loss_fn(outputs, batch["targets"], batch["alive_mask"])
+                else:
+                    weighted_total = None
+
+            # aggregate losses
+            totals["fixed/total"] += float(fixed_total)
+            for k, v in fixed_losses.items():
+                totals[f"fixed/{k}"] += float(v)
+            if weighted_total is not None:
+                totals["weighted_view/total_like_train"] += float(weighted_total)
+
+            # metrics (weight-free)
+            wf_metrics = compute_weight_free_metrics(outputs, batch["targets"], batch["alive_mask"], coord_mapper=coord_mapper)
+            for k, v in wf_metrics.items():
+                totals[f"metrics/{k}"] += float(v)
+
+            counts += 1
     except StopIteration:
         pass
-    for k in totals:
-        totals[k] /= max(1, count)
-    return dict(totals)
 
+    # average
+    out = {}
+    for k, v in totals.items():
+        out[k] = v / max(1, counts)
+
+    return out
 
 # =============================================================================
 # SECTION 3: MAIN TRAINING ORCHESTRATOR
@@ -985,7 +1176,30 @@ def train(args, model_cfg):
                         val_iter, val_asm, _ = build_epoch_loader(
                             args, 0, store, val_team_rounds, last_batch_policy="partial", rank=rank, world_size=world_size
                         )
-                        val_metrics = validate(val_iter, val_asm, model, loss_fn, args)  # dict: {"total", "stats", "mouse", ...}
+                        # --- START VALIDATION PATCH ---
+                        mdl = _to_ddp_module(model)
+                        device = next(mdl.parameters()).device
+
+                        # Use base config weights for a stable evaluation metric
+                        frozen_eval_weights = {k: float(v) for k, v in base_loss_weights.items()}
+
+                        eval_loss_fn = build_eval_loss(frozen_eval_weights,
+                                                       grid_dims=getattr(mdl, "grid_dims", (64,64,8)),
+                                                       sigma=getattr(mdl, "sigma", 1.5),
+                                                       device=device)
+                        
+                        # The diagnostic weighted view uses the current training loss_fn
+                        train_like_loss_fn = loss_fn
+                        
+                        # If a CoordinateMapper is available, pass it for metrics
+                        coord_mapper = getattr(eval_loss_fn, "coord_mapper", None)
+
+                        val_out = validate(val_iter, val_asm, model, eval_loss_fn, args,
+                                           coord_mapper=coord_mapper,
+                                           also_weighted_view=True,
+                                           train_like_loss_fn=train_like_loss_fn)
+                        # --- END VALIDATION PATCH ---
+
                     finally:
                         # aggressively tear down validation pipeline
                         try:
@@ -1000,15 +1214,26 @@ def train(args, model_cfg):
 
                     # --- Log raw validation losses ---
                     if writer:
-                        writer.add_scalar("val/total_loss", val_metrics["total"], global_step)
-                        for k, v in val_metrics.items():
-                            if k != "total":
-                                writer.add_scalar(f"val_loss/{k}", v, global_step)
+                        # Log the fixed, comparable validation loss
+                        writer.add_scalar("val_fixed/total_loss", val_out["fixed/total"], global_step)
+                        for k, v in val_out.items():
+                            if k.startswith("fixed/") and k != "fixed/total":
+                                writer.add_scalar(f"val_loss/{k.split('/', 1)[1]}", v, global_step)
+                        
+                        # Log the diagnostic weighted view
+                        if "weighted_view/total_like_train" in val_out:
+                            writer.add_scalar("val_weighted_view/total_like_train", val_out["weighted_view/total_like_train"], global_step)
+                        
+                        # Log all weight-free metrics
+                        for k, v in val_out.items():
+                            if k.startswith("metrics/"):
+                                writer.add_scalar(k, v, global_step)
 
                     # --- Update EMA of raw per-head losses (skip "total") ---
+                    # Use the fixed-weight per-head losses for rebalancing
                     for k in base_loss_weights.keys():
-                        if k in val_metrics:
-                            ema_loss[k] = ema_beta * ema_loss[k] + (1.0 - ema_beta) * float(val_metrics[k])
+                        if f"fixed/{k}" in val_out:
+                            ema_loss[k] = ema_beta * ema_loss[k] + (1.0 - ema_beta) * float(val_out[f"fixed/{k}"])
 
                     # --- Rebalance after warmup and every N evals ---
                     eval_count += 1
@@ -1029,15 +1254,10 @@ def train(args, model_cfg):
                             for k in balanced:
                                 writer.add_scalar(f"weights/{k}", balanced[k], global_step)
 
-                    # --- Log weighted contributions (current weights × raw val loss) ---
-                    current_w = getattr(loss_fn, "weights", base_loss_weights)
-                    if writer:
-                        for k in base_loss_weights:
-                            if k in val_metrics:
-                                writer.add_scalar(f"val_contrib/{k}", current_w[k] * float(val_metrics[k]), global_step)
-
-                    if rank == 0 and val_metrics["total"] < best_val:
-                        best_val = val_metrics["total"]
+                    # --- Use the FIXED metric for model selection ---
+                    primary_early_stop_metric = val_out["fixed/total"]
+                    if rank == 0 and primary_early_stop_metric < best_val:
+                        best_val = primary_early_stop_metric
                         save_checkpoint(args.run_dir, "best.ckpt", epoch, global_step, best_val, model, optimizer, scheduler, scaler, ema, args)
                 
                 if rank == 0 and args.save_every > 0 and (global_step > 0 and global_step % args.save_every == 0):
@@ -1110,6 +1330,8 @@ def main():
     parser.add_argument("--warmup-updates", type=int, default=1500)  # in optimizer updates
     parser.add_argument("--cycle-updates", type=int, default=0)      # restarts: 0 -> derive from epoch length
     parser.add_argument("--cycle-mult", type=float, default=2.0)     # multiplicative cycle growth
+    parser.add_argument("--onecycle-div-factor", type=float, default=100.0)
+    parser.add_argument("--onecycle-final-div-factor", type=float, default=10000.0)
 
 
     # Logistics
