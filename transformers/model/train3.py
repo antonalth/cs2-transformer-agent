@@ -1072,116 +1072,94 @@ def compute_weight_free_metrics(predictions, targets, alive_mask, coord_mapper=N
             acc.add("game/round_number_top3_acc", (top3_preds == targ_idx.unsqueeze(-1)).any(dim=-1).float().mean(), 1)
 
     return acc.to_dict()
+
 # =============================================================================
 # SECTION 2: NEW TRAINING COMPONENTS (CONTINUED)
 # =============================================================================
 
+# ======= Helper: compute calibrated metrics from per-class histograms =======
+
 @torch.no_grad()
-def find_optimal_thresholds_and_recompute_metrics(
-    all_logits: torch.Tensor,
-    all_labels: torch.Tensor,
-    thresholds: Optional[torch.Tensor] = None,
-) -> Dict[str, float]:
+def _calibrated_metrics_from_hist(pos_hist: torch.Tensor,
+                                  neg_hist: torch.Tensor,
+                                  thresholds: torch.Tensor) -> Dict[str, float]:
     """
-    CPU-only: given concatenated logits [N, C] and labels [N, C] (float in {0,1}),
-    find per-class thresholds that maximize F1 on the validation split, then
-    recompute calibrated micro-precision/recall/F1 and macro-F1.
+    pos_hist, neg_hist: int64 tensors on the SAME device, shape [C, T]
+      where T == thresholds.numel() bins over [0, 1].
+    thresholds: float32 tensor [T] monotonically increasing in [0, 1].
 
-    Returns a dict with:
-      - calibrated_micro_precision / _recall / _F1
-      - calibrated_macro_F1
-      - mean_optimal_threshold / median_optimal_threshold
+    Returns calibrated micro/macro F1 and threshold summaries.
     """
-    # Ensure CPU float32
-    all_logits = all_logits.detach().to("cpu", dtype=torch.float32)
-    all_labels = all_labels.detach().to("cpu", dtype=torch.float32)
+    device = pos_hist.device
+    pos_hist = pos_hist.to(device=device, dtype=torch.long)
+    neg_hist = neg_hist.to(device=device, dtype=torch.long)
+    thresholds = thresholds.to(device=device, dtype=torch.float32)
 
-    out = {
-        "calibrated_micro_precision": 0.0,
-        "calibrated_micro_recall": 0.0,
-        "calibrated_micro_F1": 0.0,
-        "calibrated_macro_F1": 0.0,
-        "mean_optimal_threshold": 0.5,
-        "median_optimal_threshold": 0.5,
-    }
+    # Totals per class
+    total_pos = pos_hist.sum(dim=-1)  # [C]
+    total_neg = neg_hist.sum(dim=-1)  # [C]
 
-    if all_logits.numel() == 0:
-        return out
+    # For each threshold index t, treat prediction as (prob >= thresholds[t])
+    # So TP/FP at t are sums of hist bins with index >= t (right-cumulative)
+    tp_bins = torch.flip(torch.flip(pos_hist, dims=[-1]).cumsum(dim=-1), dims=[-1])  # [C, T]
+    fp_bins = torch.flip(torch.flip(neg_hist, dims=[-1]).cumsum(dim=-1), dims=[-1])  # [C, T]
+    fn_bins = total_pos.unsqueeze(-1) - tp_bins                                       # [C, T]
 
-    probs = torch.sigmoid(all_logits)  # [N, C]
-    N, C = probs.shape
-    if thresholds is None:
-        thresholds = torch.linspace(0.0, 1.0, 101, dtype=torch.float32)  # [T]
-    T = thresholds.numel()
+    # Per-class F1 across thresholds
+    prec = tp_bins.to(torch.float32) / (tp_bins + fp_bins + 1e-9)
+    rec  = tp_bins.to(torch.float32) / (tp_bins + fn_bins + 1e-9)
+    f1   = 2.0 * prec * rec / (prec + rec + 1e-9)                                     # [C, T]
 
-    # Per-class threshold search (vectorized over thresholds)
-    best_thresholds = torch.full((C,), 0.5, dtype=torch.float32)
-    valid_for_thresh = torch.zeros((C,), dtype=torch.bool)
+    # Valid classes: at least one positive AND one negative globally
+    valid = (total_pos > 0) & (total_neg > 0)
+    C = pos_hist.size(0)
+    best_idx = torch.zeros(C, dtype=torch.long, device=device)
+    if valid.any():
+        best_idx[valid] = torch.argmax(f1[valid], dim=-1)
+    best_thr = thresholds[best_idx]                                                   # [C]
 
-    for c in range(C):
-        p = probs[:, c]         # [N]
-        y = all_labels[:, c]    # [N]
-        pos = int(y.sum().item())
-        neg = N - pos
-        # Skip degenerate classes (no positives OR no negatives)
-        if pos == 0 or neg == 0:
-            continue
-
-        valid_for_thresh[c] = True
-        preds = (p.unsqueeze(0) >= thresholds.unsqueeze(1)).to(torch.float32)  # [T, N]
-        tp = (preds * y).sum(dim=1)                    # [T]
-        fp = (preds * (1.0 - y)).sum(dim=1)            # [T]
-        fn = ((1.0 - preds) * y).sum(dim=1)            # [T]
-        prec = tp / (tp + fp + 1e-9)                   # [T]
-        rec  = tp / (tp + fn + 1e-9)                   # [T]
-        f1   = 2.0 * prec * rec / (prec + rec + 1e-9)  # [T]
-        best_idx = int(torch.argmax(f1).item())
-        best_thresholds[c] = thresholds[best_idx]
-
-    # Final predictions with per-class thresholds
-    final_preds = (probs >= best_thresholds.view(1, -1)).to(torch.float32)  # [N, C]
+    # Read class-wise counts at the chosen threshold for each class
+    tp_best = tp_bins.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)                  # [C]
+    fp_best = fp_bins.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)                  # [C]
+    fn_best = total_pos - tp_best                                                     # [C]
 
     # Micro metrics
-    tp_micro = (final_preds * all_labels).sum()
-    fp_micro = (final_preds * (1.0 - all_labels)).sum()
-    fn_micro = ((1.0 - final_preds) * all_labels).sum()
+    tp_micro = tp_best.sum().to(torch.float32)
+    fp_micro = fp_best.sum().to(torch.float32)
+    fn_micro = fn_best.sum().to(torch.float32)
     prec_micro = (tp_micro / (tp_micro + fp_micro + 1e-9)).item()
     rec_micro  = (tp_micro / (tp_micro + fn_micro + 1e-9)).item()
     f1_micro   = (2.0 * prec_micro * rec_micro / (prec_micro + rec_micro + 1e-9))
 
-    # Macro-F1 over valid classes only (where both pos and neg exist)
-    tp_c = (final_preds * all_labels).sum(dim=0)                 # [C]
-    fp_c = (final_preds * (1.0 - all_labels)).sum(dim=0)         # [C]
-    fn_c = ((1.0 - final_preds) * all_labels).sum(dim=0)         # [C]
-    # A class contributes to macro-F1 only if it has at least one positive and one negative label
-    pos_c = (all_labels.sum(dim=0) > 0.0)
-    neg_c = ((all_labels.shape[0] - all_labels.sum(dim=0)) > 0.0)
-    valid_macro = pos_c & neg_c
-    macro_f1_val = 0.0
-    if valid_macro.any():
-        prec_c = tp_c[valid_macro] / (tp_c[valid_macro] + fp_c[valid_macro] + 1e-9)
-        rec_c  = tp_c[valid_macro] / (tp_c[valid_macro] + fn_c[valid_macro] + 1e-9)
+    # Macro-F1 over valid classes only
+    macro_f1 = 0.0
+    if valid.any():
+        prec_c = (tp_best[valid].to(torch.float32) /
+                  (tp_best[valid] + fp_best[valid] + 1e-9))
+        rec_c  = (tp_best[valid].to(torch.float32) /
+                  (tp_best[valid] + fn_best[valid] + 1e-9))
         f1_c   = 2.0 * prec_c * rec_c / (prec_c + rec_c + 1e-9)
-        macro_f1_val = float(torch.mean(f1_c).item())
+        macro_f1 = float(f1_c.mean().item())
 
-    # Threshold summaries over classes where we actually optimized a threshold
-    if valid_for_thresh.any():
-        thr_mean = float(best_thresholds[valid_for_thresh].mean().item())
-        thr_median = float(best_thresholds[valid_for_thresh].median().item())
+    # Threshold summaries
+    if valid.any():
+        mean_thr = float(best_thr[valid].mean().item())
+        median_thr = float(best_thr[valid].median().item())
     else:
-        thr_mean = 0.5
-        thr_median = 0.5
+        mean_thr = 0.5
+        median_thr = 0.5
 
-    out.update({
+    return {
         "calibrated_micro_precision": prec_micro,
-        "calibrated_micro_recall": rec_micro,
-        "calibrated_micro_F1": f1_micro,
-        "calibrated_macro_F1": macro_f1_val,
-        "mean_optimal_threshold": thr_mean,
-        "median_optimal_threshold": thr_median,
-    })
-    return out
+        "calibrated_micro_recall":    rec_micro,
+        "calibrated_micro_F1":        f1_micro,
+        "calibrated_macro_F1":        macro_f1,
+        "mean_optimal_threshold":     mean_thr,
+        "median_optimal_threshold":   median_thr,
+    }
 
+
+# ============================ VALIDATE (DDP-safe) ============================
 
 @torch.no_grad()
 def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
@@ -1189,11 +1167,13 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
              also_weighted_view: bool = True,
              train_like_loss_fn: Optional[nn.Module] = None) -> Dict[str, float]:
     """
-    Runs validation and returns batch-averaged losses/metrics plus calibrated metrics:
-      - fixed/*: per-head & total using eval_loss_fn (FROZEN weights)
-      - weighted_view/total_like_train: optional, using train_like_loss_fn
-      - metrics/*: threshold=0.5, weight-free metrics from compute_weight_free_metrics(...)
-      - metrics_calibrated/*: per-head calibrated micro/macro with optimal per-class thresholds
+    Runs validation with:
+      - fixed/* losses (frozen weights view)
+      - optional weighted_view/total_like_train
+      - metrics/* (0.5-thresh, weight-free)
+      - metrics_calibrated/* using per-class threshold calibration via histograms
+
+    Histogram trick avoids gathering logits/labels and keeps GPU memory tiny.
     """
     model.eval()
     mdl = _to_ddp_module(model)
@@ -1202,9 +1182,20 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
     totals = defaultdict(float)
     counts = 0
 
-    # Heads we calibrate (multi-label BCE heads)
-    multi_label_heads = ["keyboard_logits", "eco_logits", "inventory_logits"]
-    collected = {k: {"logits": [], "labels": []} for k in multi_label_heads}
+    # Multi-label heads to calibrate
+    heads = ["keyboard_logits", "eco_logits", "inventory_logits"]
+
+    # Threshold grid (shared across ranks)
+    T = 101
+    thr = torch.linspace(0.0, 1.0, T, device=device, dtype=torch.float32)
+
+    # Per-head histogram state (allocated lazily once we know C)
+    hist = {
+        h: {
+            "pos": None,   # [C, T] int64
+            "neg": None,   # [C, T] int64
+        } for h in heads
+    }
 
     # AMP dtype if configured
     amp_dtype = None
@@ -1240,81 +1231,85 @@ def validate(dali_iter, assembler, model, eval_loss_fn, args, *,
             for k, v in wf.items():
                 totals[f"metrics/{k}"] += float(v)
 
-            # ---- Collect logits/labels for calibration (CPU) ----
-            # Number of players (usually 5), keep robust to structure
+            # ---- Histogram accumulation for calibration (tiny memory) ----
+            # Determine number of players robustly
             num_players = min(len(outputs.get("player", [])), batch["alive_mask"].shape[-1])
             for i in range(num_players):
-                mask = batch["alive_mask"][:, :, i].to(torch.bool)  # [B, T]
-                if not mask.any():
+                alive = batch["alive_mask"][:, :, i].to(torch.bool)  # [B, T]
+                if not alive.any():
                     continue
-                for key in multi_label_heads:
-                    # Guard for missing heads in outputs/targets
-                    if (key in outputs["player"][i]) and (key in batch["targets"]["player"][i]):
-                        # logits/labels: [B, T, C] -> masked -> [N, C]
-                        logits_bt = outputs["player"][i][key].detach()
-                        labels_bt = batch["targets"]["player"][i][key].detach().to(torch.float32)
-                        # Ensure last dim = C, mask over [B, T]
-                        logits_flat = logits_bt[mask].to("cpu", dtype=torch.float32)
-                        labels_flat = labels_bt[mask].to("cpu", dtype=torch.float32)
-                        if logits_flat.numel() > 0:
-                            collected[key]["logits"].append(logits_flat)
-                            collected[key]["labels"].append(labels_flat)
+
+                for key in heads:
+                    if (key not in outputs["player"][i]) or (key not in batch["targets"]["player"][i]):
+                        continue
+
+                    # logits/labels: [B, T, C] -> masked -> [N, C]
+                    logits_bt = outputs["player"][i][key]                      # [B, T, C] (device)
+                    labels_bt = batch["targets"]["player"][i][key].to(torch.float32)  # [B, T, C] (device/cpu)
+
+                    # Ensure tensors on the model device for fast ops
+                    logits_bt = logits_bt.to(device=device)
+                    labels_bt = labels_bt.to(device=device)
+
+                    logits = logits_bt[alive]  # [N, C]
+                    labels = labels_bt[alive].to(torch.float32)  # [N, C]
+                    if logits.numel() == 0:
+                        continue
+
+                    # Lazily allocate hist tensors once we know C
+                    C = logits.shape[-1]
+                    if hist[key]["pos"] is None:
+                        hist[key]["pos"] = torch.zeros((C, T), dtype=torch.long, device=device)
+                        hist[key]["neg"] = torch.zeros((C, T), dtype=torch.long, device=device)
+
+                    # Probabilities -> bin indices in [0, T-1]
+                    probs = torch.sigmoid(logits).to(torch.float32)  # [N, C]
+                    # Scale-and-clamp binning aligns with thresholds grid
+                    bins = torch.clamp((probs * (T - 1)).long(), 0, T - 1)  # [N, C]
+
+                    # Update per-class pos/neg hist (loop over C keeps memory tiny; C is small)
+                    for c in range(C):
+                        b_c = bins[:, c]                   # [N]
+                        y_c = (labels[:, c] > 0.5)         # [N] bool
+
+                        if y_c.any():
+                            hist[key]["pos"][c].scatter_add_(
+                                0, b_c[y_c], torch.ones_like(b_c[y_c], dtype=torch.long, device=device)
+                            )
+                        if (~y_c).any():
+                            hist[key]["neg"][c].scatter_add_(
+                                0, b_c[~y_c], torch.ones_like(b_c[~y_c], dtype=torch.long, device=device)
+                            )
 
             counts += 1
     except StopIteration:
         pass
 
-    # ---- DDP gather (if enabled) so calibration uses the full validation split ----
+    # ---- DDP: sum tiny histograms across ranks (CUDA ints; NCCL-friendly) ----
     ddp = dist.is_available() and dist.is_initialized()
-    world_size = dist.get_world_size() if ddp else 1
-    rank = dist.get_rank() if ddp else 0
+    if ddp:
+        for key in heads:
+            if hist[key]["pos"] is not None:
+                dist.all_reduce(hist[key]["pos"], op=dist.ReduceOp.SUM)
+                dist.all_reduce(hist[key]["neg"], op=dist.ReduceOp.SUM)
 
-    def _gather_lists(obj_local):
-        """Gather Python objects across ranks; returns a flat list of elements from all ranks."""
-        if not ddp:
-            return [obj_local]
-        bucket = [None for _ in range(world_size)]
-        dist.all_gather_object(bucket, obj_local)
-        return bucket
-
-    # Perform calibration per head
-    for key in multi_label_heads:
-        # Gather per-rank lists
-        gathered = _gather_lists({
-            "logits": collected[key]["logits"],
-            "labels": collected[key]["labels"],
-        })
-
-        # Flatten across ranks on rank 0
-        if rank == 0:
-            all_logits_list, all_labels_list = [], []
-            for item in gathered:
-                all_logits_list.extend(item["logits"])
-                all_labels_list.extend(item["labels"])
-
-            if len(all_logits_list) > 0:
-                all_logits = torch.cat(all_logits_list, dim=0)  # CPU [N, C]
-                all_labels = torch.cat(all_labels_list, dim=0)  # CPU [N, C]
-                cal = find_optimal_thresholds_and_recompute_metrics(all_logits, all_labels)
-            else:
-                cal = {
-                    "calibrated_micro_precision": 0.0,
-                    "calibrated_micro_recall": 0.0,
-                    "calibrated_micro_F1": 0.0,
-                    "calibrated_macro_F1": 0.0,
-                    "mean_optimal_threshold": 0.5,
-                    "median_optimal_threshold": 0.5,
-                }
-        else:
-            cal = None
-
-        # Broadcast calibrated dict to all ranks so return values match
-        if ddp:
-            container = [cal]
-            dist.broadcast_object_list(container, src=0)
-            cal = container[0]
-
+    # ---- Compute calibrated metrics per head from histograms ----
+    for key in heads:
         base = key.replace("_logits", "")
+        if hist[key]["pos"] is None:
+            # No data for this head in this eval
+            for n, v in {
+                "micro_precision": 0.0,
+                "micro_recall": 0.0,
+                "micro_F1": 0.0,
+                "macro_F1": 0.0,
+                "mean_optimal_threshold": 0.5,
+                "median_optimal_threshold": 0.5,
+            }.items():
+                totals[f"metrics_calibrated/player/{base}_{n}"] = float(v)
+            continue
+
+        cal = _calibrated_metrics_from_hist(hist[key]["pos"], hist[key]["neg"], thr)
         totals[f"metrics_calibrated/player/{base}_micro_precision"] = float(cal["calibrated_micro_precision"])
         totals[f"metrics_calibrated/player/{base}_micro_recall"]    = float(cal["calibrated_micro_recall"])
         totals[f"metrics_calibrated/player/{base}_micro_F1"]        = float(cal["calibrated_micro_F1"])
