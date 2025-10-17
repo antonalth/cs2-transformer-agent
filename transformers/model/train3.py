@@ -37,6 +37,7 @@ import msgpack_numpy as mpnp
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F 
 from torch.utils.tensorboard import SummaryWriter
 
 # --- Try to import DALI ---
