@@ -632,7 +632,6 @@ class CompositeLoss(nn.Module):
 # =============================================================================
 
 class EMA:
-class EMA:
     """Exponential Moving Average of model weights."""
     def __init__(self, model, decay=0.999):
         self.decay = decay
