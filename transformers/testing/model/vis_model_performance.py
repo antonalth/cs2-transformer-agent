@@ -672,6 +672,7 @@ def run_model_on_record(state: ViewerState) -> None:
 
     # Build batch
     device = state.device
+    model_dtype = next(state.model.parameters()).dtype
     B, T, P = 1, rec.T_frames, NUM_POV
 
     # Alive mask
@@ -693,13 +694,13 @@ def run_model_on_record(state: ViewerState) -> None:
     batch: Dict[str, torch.Tensor] = {"alive_mask": alive_mask}
 
     if vid_embeds is not None:
-        batch["video_embeddings"] = vid_embeds  # [1,T,5,d_model_backbone]
+        batch["video_embeddings"] = vid_embeds.to(dtype=model_dtype)  # [1,T,5,d_model_backbone]
         # Audio: if not embedded found, set zeros token so fuser still works
         if mel_embeds is not None:
-            batch["mel_spectrogram"] = mel_embeds  # allow audio encoder/fuser to accept
+            batch["mel_spectrogram"] = mel_embeds.to(dtype=model_dtype)  # allow audio encoder/fuser to accept
         else:
             # Zero mel — shape expected by audio encoder: [B,T,5,2,128,1] (stereo, 1 frame)
-            batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device)
+            batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device, dtype=model_dtype)
     else:
         # Fallback: use raw images (on-the-fly encoder path).
         # Convert frames to tensor shape [B,T,5,3,H,W] RGB and scale 0..1
@@ -721,7 +722,7 @@ def run_model_on_record(state: ViewerState) -> None:
         buf = np.ascontiguousarray(buf)
         images = torch.from_numpy(buf).permute(0, 1, 4, 2, 3).unsqueeze(0).float() / 255.0
         batch["images"] = images.to(device)
-        batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device)
+        batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device, dtype=model_dtype)
 
     state.model.eval()
     with torch.no_grad():
