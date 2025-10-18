@@ -1,771 +1,717 @@
 #!/usr/bin/env python3
-# Visualize CS2Transformer model performance on raw video windows.
-# - Loads a specified "best" checkpoint (EMA weights if present).
-# - Randomly samples a T-frame window from train/val via the existing DALI + LMDB pipeline.
-# - Runs the ViT (on-the-fly) and the autoregressive-masked transformer (single-shot forward over T).
-# - Opens an OpenCV window that lets you step through frames and compare targets (green) vs. model predictions (red).
-# - Displays the 5 POVs in a 3x2 grid; the sixth cell shows game-state labels (GT vs. Pred).
-# - Keyboard: q=quit, j=next frame, k=prev frame, n=new random sample.
-# This script plugs into your codebase (model.py / train3.py / injection_mold.py).
+"""
+ARP Viewer — interactive visualizer for CS2 autoregressive model
+
+Features
+- Loads a specified checkpoint and runs inference on a random T-frame window
+  sampled from your dataset (train/val) **without** using DALI.
+- Uses **pre-embedded** features when available (video/audio); otherwise falls
+  back to on-the-fly vision path for the selected frames only (CPU/GPU OK).
+- Displays all 5 player POVs in a compact **3x2 grid** (one empty slot is used
+  to show global game-state labels — ground-truth vs prediction).
+- Controls:  
+    q – quit  
+    j – next tick (frame)  
+    k – previous tick  
+    n – new random sample (reruns model on another random T-window)
+- Overlays (per POV): green = ground-truth, red = prediction.  
+  Lightweight HUD inspired by `testing/lmdb/lmdb_inspect_linux.py`.
+
+Assumptions & integration
+- LMDB contains meta + per-tick records (`*_INFO` and normal tick keys) as
+  produced by your pipeline. We derive:
+  \- alive mask, stats (health/armor/money), mouse delta, positions, keyboard
+     bitmasks, eco/inventory bitmasks, active weapon, round state, enemy pos.
+- Recordings (MP4) live under `<data_root>/recordings/<demoname>/...` as in
+  your repo. We read frames for display via OpenCV (not DALI).
+- Pre-embedded features (optional but preferred for inference):  
+  `<data_root>/vit_embed/<demoname>/<something>.npy`  
+  `<data_root>/aud_embed/<demoname>/<something>.npy`  
+  If not found for the sampled window, we fall back to images path in model.
+
+Place this file at: `transformers/testing/model/arp_viewer.py`
+"""
+from __future__ import annotations
 
 import argparse
+import json
 import os
-import sys
-import time
+import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
+import lmdb
+import msgpack
+import msgpack_numpy as mpnp
 import numpy as np
 import torch
-import cv2
+import torch.nn.functional as F
 
-# --------------------------
-# --- FIXED IMPORT SETUP ---
-# --------------------------
-# This section correctly locates the necessary project modules based on the
-# script's file path, assuming it is run from `transformers/testing/model/`.
-
-# This script's location: transformers/testing/model/viz_model_performance.py
-THIS_FILE = Path(__file__).resolve()
-# REPO_ROOT should resolve to the `transformers/` directory
-REPO_ROOT = THIS_FILE.parents[2]
-MODEL_DIR = REPO_ROOT / "model"        # Directory containing model.py, train3.py
-TOLMDB_DIR = REPO_ROOT / "to_lmdb"     # Directory containing injection_mold.py
-
-# Add the directories containing the modules to the Python system path
-for p in (MODEL_DIR, TOLMDB_DIR):
-    if p.exists() and str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-    elif not p.exists():
-        print(f"[WARN] Expected module directory not found: {p}", file=sys.stderr)
-
-# --------------------------
-# --- PROJECT MODULES ---
-# --------------------------
+# --------------------------------------------------------------------------------------
+# Import model (uses your local tree). Adjust import if your path differs.
+# --------------------------------------------------------------------------------------
+# Expected at transformers/model/model.py in your repo
 try:
-    from model import CS2Transformer, CS2Config
-    import train3 as T3  # we rely on Manifest, LmdbStore, build_team_rounds, build_epoch_loader
-except ImportError as e:
-    print(f"Fatal: Failed to import from {MODEL_DIR}. Error: {e}", file=sys.stderr)
-    print("Please ensure the script is located at 'transformers/testing/model/viz_model_performance.py'", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    # For label name mappings (actions, items, etc.). Optional.
-    import injection_mold as IM
+    from model import model as cs2_model  # allow running from project root
 except Exception:
-    print("[INFO] 'injection_mold.py' not found or failed to import. Using fallback IDs for names.", file=sys.stderr)
-    IM = None  # we will fall back to IDs if names are unavailable
+    # Try relative to this file (testing/model/ -> ../../model)
+    import sys
+    THIS = Path(__file__).resolve()
+    sys.path.append(str(THIS.parents[2] / "model"))
+    import model as cs2_model  # type: ignore
 
+CS2Transformer = cs2_model.CS2Transformer
+CS2Config = cs2_model.CS2Config
 
-# --------------------------
-# Helpers: checkpoint loading
-# --------------------------
-def load_weights_from_checkpoint(model: torch.nn.Module, ckpt_path: str) -> Dict[str, Any]:
-    """
-    Load EMA weights if present, else model weights, from a train3.py checkpoint.
-    Returns the full checkpoint dict.
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state_dict = None
-    # Prefer EMA for evaluation if available
-    if "ema" in ckpt and ckpt["ema"]:
-        try:
-            model.load_state_dict(ckpt["ema"], strict=False)
-            print(f"[ckpt] Loaded EMA weights from: {ckpt_path}")
-            state_dict = ckpt["ema"]
-        except Exception as e:
-            print(f"[ckpt] EMA load failed ({e}); falling back to 'model' state_dict.")
-    if state_dict is None:
-        model.load_state_dict(ckpt["model"], strict=False)
-        print(f"[ckpt] Loaded model weights from: {ckpt_path}")
-    return ckpt
+# Optional: item/action label maps from injection_mold (for pretty HUD)
+BIT_TO_KEYBOARD = None
+BIT_TO_ECO = None
+BIT_TO_ITEM = None
+try:
+    # Try to import sibling injection_mold in project
+    import importlib.util, types
+    cand_paths = [
+        Path(__file__).resolve().parents[2] / "testing" / "lmdb" / "lmdb_inspect_linux.py",
+        Path(__file__).resolve().parents[2] / "to_lmdb" / "injection_mold.py",
+        Path(__file__).resolve().parents[2] / "injection_mold.py",
+    ]
+    for p in cand_paths:
+        if p.is_file():
+            spec = importlib.util.spec_from_file_location("_inj", str(p))
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)  # type: ignore
+                spec.loader.exec_module(mod)  # type: ignore
+                # These names exist in your repo; fall back gracefully if missing
+                BIT_TO_KEYBOARD = getattr(mod, "BIT_TO_KEYBOARD", None)
+                BIT_TO_ECO = getattr(mod, "BIT_TO_ECO", None)
+                BIT_TO_ITEM = getattr(mod, "BIT_TO_ITEM", None)
+                break
+except Exception:
+    pass
 
+if BIT_TO_KEYBOARD is None:
+    BIT_TO_KEYBOARD = {i: f"K{i}" for i in range(31)}
+if BIT_TO_ECO is None:
+    BIT_TO_ECO = {i: f"ECO{i}" for i in range(224)}
+if BIT_TO_ITEM is None:
+    BIT_TO_ITEM = {i: f"IT{i}" for i in range(128)}
 
-def auto_find_best_ckpt(run_dir: str) -> str:
-    """
-    Try to find a 'best' checkpoint inside <run_dir>/checkpoints.
-    Heuristics: prefer filenames containing 'best', else newest .pt/.pth.
-    """
-    ckpt_dir = Path(run_dir) / "checkpoints"
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"No checkpoints directory found at {ckpt_dir}")
-    # Gather candidates
-    cands = list(ckpt_dir.glob("*.pt")) + list(ckpt_dir.glob("*.pth"))
-    if not cands:
-        raise FileNotFoundError(f"No checkpoint files found under {ckpt_dir}")
-    # Prefer “best” in filename
-    bestish = [p for p in cands if "best" in p.name.lower()]
-    if bestish:
-        # choose newest among them
-        bestish.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return str(bestish[0])
-    # else newest overall
-    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return str(cands[0])
+# --------------------------------------------------------------------------------------
+# Constants (mirror your training setup)
+# --------------------------------------------------------------------------------------
+TICK_RATE = 64
+EXPECTED_VIDEO_FPS = 32
+TICKS_PER_FRAME = TICK_RATE // EXPECTED_VIDEO_FPS  # 2
+NUM_POV = 5
 
-def resolve_pov_paths(args) -> List[str]:
-    paths = []
-    if args.pov_pattern:
-        # allow '{}' or '%d'
-        for i in range(5):
-            try:
-                if '{}' in args.pov_pattern:
-                    paths.append(args.pov_pattern.format(i))
-                elif '%d' in args.pov_pattern:
-                    paths.append(args.pov_pattern % i)
-                else:
-                    raise ValueError("Pattern must include '{}' or '%d'")
-            except Exception as e:
-                raise RuntimeError(f"Failed to format --pov-pattern for i={i}: {e}")
-    else:
-        for i in range(5):
-            p = getattr(args, f"pov{i}")
-            if p is None:
-                raise RuntimeError(f"--pov{i} is required when --pov-pattern is not used")
-            paths.append(p)
-    for p in paths:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"POV video not found: {p}")
-    return paths
-
-def read_frames_cv2(video_path: str, start_frame: int, T: int) -> List[np.ndarray]:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    # clamp start to valid range
-    start = max(0, min(start_frame, max(0, total - T)))
-    # jump to start
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-    frames = []
-    for _ in range(T):
-        ok, f = cap.read()
-        if not ok:
-            break
-        frames.append(f)  # BGR uint8
-    cap.release()
-    # if short, pad with black
-    while len(frames) < T:
-        if frames:
-            h, w = frames[-1].shape[:2]
-        else:
-            h, w = 720, 1280
-        frames.append(np.zeros((h, w, 3), np.uint8))
-    return frames
-
-def load_5pov_frames(pov_paths: List[str], start_frame: int, T: int, target_hw=(360, 640)) -> torch.Tensor:
-    """Return [T, 5, 3, H, W] RGB uint8 tensor for viewer overlays."""
-    Tlist = []
-    for t in range(T):
-        Tlist.append([])
-
-    # Read each POV independently (keeps things simple/reliable)
-    pov_frames = [read_frames_cv2(p, start_frame, T) for p in pov_paths]  # each: list of T BGR frames
-    Ht, Wt = target_hw
-    for t in range(T):
-        for pov in range(5):
-            bgr = pov_frames[pov][t]
-            rgb = cv2.cvtColor(cv2.resize(bgr, (Wt, Ht)), cv2.COLOR_BGR2RGB)
-            Tlist[t].append(torch.from_numpy(rgb).permute(2, 0, 1))  # [3,H,W] uint8
-    # stack
-    x = torch.stack([torch.stack(Tlist[t], dim=0) for t in range(T)], dim=0)  # [T,5,3,H,W]
-    return x
-
-
-# --------------------------
-# Grid & overlay helpers
-# --------------------------
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 0.4
+FONT_SCALE = 0.45
+COLOR_GT = (0, 255, 0)
+COLOR_PRED = (0, 0, 255)
+COLOR_TEXT = (230, 230, 230)
+COLOR_SHADOW = (0, 0, 0)
 LINE_TYPE = 1
-TEXT_SHADOW = (0, 0, 0)
-GREEN = (0, 255, 0)  # targets
-RED = (0, 0, 255)    # predictions
-WHITE = (255, 255, 255)
-GRAY = (160, 160, 160)
+LINE_HEIGHT = 16
 
+# --------------------------------------------------------------------------------------
+# Lightweight LMDB utilities (subset of train3.py)
+# --------------------------------------------------------------------------------------
+@dataclass
+class TeamRound:
+    demoname: str
+    lmdb_path: str
+    round_num: int
+    team: str
+    start_tick: int
+    end_tick: int
+    pov_videos: List[str]
+    pov_audio: List[str]
 
-def draw_text(img: np.ndarray, text: str, x: int, y: int, color: Tuple[int, int, int], line_height: int = 16) -> int:
-    """Draw text with a tiny shadow; returns updated y for next line."""
-    cv2.putText(img, text, (x+1, y+1), FONT, FONT_SCALE, TEXT_SHADOW, LINE_TYPE, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), FONT, FONT_SCALE, color, LINE_TYPE, cv2.LINE_AA)
-    return y + line_height
+@dataclass
+class SampleRecord:
+    sample_id: int
+    demoname: str
+    lmdb_path: str
+    round_num: int
+    team: str
+    pov_videos: List[str]
+    pov_audio: List[str]
+    start_f: int
+    start_tick_win: int
+    T_frames: int
 
+class LmdbStore:
+    def __init__(self, max_readers: int = 512):
+        self._envs: Dict[str, lmdb.Environment] = {}
+        self._info_cache: Dict[str, Dict[str, Any]] = {}
+        self._max_readers = max_readers
 
-def blank_panel(w: int, h: int, text: str = "") -> np.ndarray:
-    panel = np.zeros((h, w, 3), dtype=np.uint8)
-    if text:
-        (tw, th), _ = cv2.getTextSize(text, FONT, 0.8, 2)
-        cx = (w - tw) // 2
-        cy = (h + th) // 2
-        cv2.putText(panel, text, (cx, cy), FONT, 0.8, GRAY, 2, cv2.LINE_AA)
-    return panel
+    def open(self, lmdb_path: str) -> lmdb.Environment:
+        if lmdb_path not in self._envs:
+            self._envs[lmdb_path] = lmdb.open(
+                lmdb_path, readonly=True, lock=False, readahead=True, max_readers=self._max_readers
+            )
+        return self._envs[lmdb_path]
 
+    def read_info(self, demoname: str, lmdb_path: str) -> Dict[str, Any]:
+        """Reads `<demoname>_INFO` JSON describing rounds and media paths (relative)."""
+        cache_key = (demoname, lmdb_path)
+        if cache_key in self._info_cache:
+            return self._info_cache[cache_key]
+        with self.open(lmdb_path).begin(write=False) as txn:
+            blob = txn.get(f"{demoname}_INFO".encode("utf-8"))
+            if blob is None:
+                raise FileNotFoundError(f"Missing _INFO for {demoname}")
+            info = json.loads(blob.decode("utf-8"))
+        self._info_cache[cache_key] = info
+        return info
 
-def img_from_tensor(x: torch.Tensor) -> np.ndarray:
-    """
-    x: [3, H, W], uint8/float32.
-    Returns BGR uint8 for cv2.
-    """
-    if x.dtype != torch.uint8:
-        x = x.clamp(0, 255).to(torch.uint8)
-    arr = x.permute(1, 2, 0).cpu().numpy()  # HWC RGB
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+# Minimal metadata fetcher for ground-truth overlays
+class LmdbMetaFetcher:
+    @staticmethod
+    def _key(d: str, r: int, t: str, tick: int) -> bytes:
+        return f"{d}_round_{r:03d}_team_{t}_tick_{tick:08d}".encode("utf-8")
 
+    @staticmethod
+    def _bitmask_to_weapon_index(mask: np.ndarray) -> int:
+        # mask shape [2] uint64
+        if mask.sum() == 0:
+            return -1
+        for i in range(128):
+            if (mask[i // 64] >> np.uint64(i % 64)) & np.uint64(1):
+                return i
+        return -1
 
-def topk_multi_hot_from_logits(logits: torch.Tensor, names: List[str], k: int = 3) -> List[str]:
-    """
-    Apply a sigmoid-like ranking to get top-k 'active' names.
-    Without calibration we just take the top-k logits.
-    """
-    logits = logits.detach().cpu().float().numpy()
-    idx = np.argsort(-logits)[:k]
-    labels = []
-    for i in idx:
-        if 0 <= i < len(names):
-            labels.append(names[i])
-        else:
-            labels.append(f"id:{i}")
-    return labels
+    def fetch_window(self, env: lmdb.Environment, rec: SampleRecord) -> Dict[str, np.ndarray]:
+        T = rec.T_frames
+        alive = np.zeros((T, NUM_POV), dtype=np.bool_)
+        stats = np.zeros((T, NUM_POV, 3), np.float32)            # health, armor, money
+        mouse = np.zeros((T, NUM_POV, 2), np.float32)
+        pos = np.zeros((T, NUM_POV, 3), np.float32)
+        kbd = np.zeros((T, NUM_POV), np.uint32)
+        eco = np.zeros((T, NUM_POV, 4), np.uint64)
+        inv = np.zeros((T, NUM_POV, 2), np.uint64)
+        wep = np.full((T, NUM_POV), -1, np.int32)
+        rnd_num = np.full((T,), rec.round_num, np.int32)
+        rnd_state = np.zeros((T,), np.uint8)
+        enemy_pos = np.zeros((T, NUM_POV, 3), np.float32)
 
+        ticks = rec.start_tick_win + (np.arange(T, dtype=np.int32) * TICKS_PER_FRAME)
+        with env.begin(write=False) as txn:
+            for f, tick in enumerate(ticks):
+                blob = txn.get(self._key(rec.demoname, rec.round_num, rec.team, int(tick)))
+                if not blob:
+                    continue
+                payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
+                gs = payload.get("game_state")
+                if not gs:
+                    continue
+                gs0 = gs[0]
+                rnd_state[f] = int(gs0.get("round_state", 0))
+                enemy_pos[f] = gs0.get("enemy_pos", np.zeros((NUM_POV, 3), np.float32))
+                team_alive_mask = int(gs0.get("team_alive", 0))
+                alive_slots = [i for i in range(NUM_POV) if (team_alive_mask >> i) & 1]
+                for slot in alive_slots:
+                    alive[f, slot] = True
+                pdl = payload.get("player_data")
+                if pdl and len(alive_slots) == len(pdl):
+                    for p_idx, pdata in zip(alive_slots, pdl):
+                        p = pdata[0]
+                        stats[f, p_idx] = [p.get("health", 0), p.get("armor", 0), p.get("money", 0)]
+                        mouse[f, p_idx] = p.get("mouse", (0.0, 0.0))
+                        pos[f, p_idx] = p.get("pos", (0.0, 0.0, 0.0))
+                        kbd[f, p_idx] = p.get("keyboard_bitmask", 0)
+                        eco[f, p_idx] = p.get("eco_bitmask", np.zeros((4,), np.uint64))
+                        inv[f, p_idx] = p.get("inventory_bitmask", np.zeros((2,), np.uint64))
+                        wep[f, p_idx] = self._bitmask_to_weapon_index(p.get("active_weapon_bitmask", np.zeros((2,), np.uint64)))
+        return {
+            "alive_mask": alive,
+            "stats": stats,
+            "mouse_delta": mouse,
+            "position": pos,
+            "keyboard_mask": kbd,
+            "eco_mask": eco,
+            "inventory_mask": inv,
+            "active_weapon_idx": wep,
+            "round_number": rnd_num,
+            "round_state_mask": rnd_state,
+            "enemy_positions": enemy_pos,
+        }
 
-def map_weapon_idx(idx: int) -> str:
-    if IM is not None and hasattr(IM, "item_id_map_names"):
-        try:
-            return IM.item_id_map_names[int(idx)]
-        except Exception:
-            return f"weapon_id:{int(idx)}"
-    return f"weapon_id:{int(idx)}"
+# --------------------------------------------------------------------------------------
+# Frame access via OpenCV (no DALI). Simple, robust readers per POV.
+# --------------------------------------------------------------------------------------
+class VideoWindow:
+    def __init__(self, paths: List[str], fps: float = EXPECTED_VIDEO_FPS):
+        assert len(paths) == NUM_POV
+        self.caps = [cv2.VideoCapture(p) for p in paths]
+        self.fps = fps
+        for i, cap in enumerate(self.caps):
+            if not cap.isOpened():
+                print(f"[warn] Failed to open video for POV{i}: {paths[i]}")
 
+    def read_frames(self, start_f: int, T: int) -> List[Optional[np.ndarray]]:
+        frames_per_pov: List[Optional[np.ndarray]] = [None] * NUM_POV
+        for i, cap in enumerate(self.caps):
+            if not cap.isOpened():
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
+            buf = []
+            ok = True
+            for _ in range(T):
+                ok, frm = cap.read()
+                if not ok:
+                    break
+                buf.append(frm)
+            frames_per_pov[i] = np.stack(buf, axis=0) if buf else None
+        return frames_per_pov
 
-def round_state_name(i: int) -> str:
-    # If you have canonical names, add here or use IM. Otherwise show the integer.
-    # (Common CS2 states include: 0-Live, 1-BombPlanted, 2-RoundEnd, etc.)
-    return str(int(i))
-
-
-def build_keyboard_names() -> List[str]:
-    if IM is not None and hasattr(IM, "KEYBOARD_ONLY_ACTIONS"):
-        return list(IM.KEYBOARD_ONLY_ACTIONS)
-    # Fallback minimal set
-    return [f"K{i}" for i in range(31)]
-
-
-# --------------------------
-# Prediction helpers
-# --------------------------
-@torch.no_grad()
-def run_model_single_window(model: CS2Transformer, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-    model.eval()
-    moved = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            moved[k] = v.to(device, non_blocking=True)
-        else:
-            moved[k] = v
-
-    # If precomputed embeddings are present, ensure the model uses them
-    # The key "video_embeddings" matches what is produced by train3.py's BatchAssembler
-    if "video_embeddings" in moved:
-        # Prevent the model from trying to re-encode raw images if they accidentally exist in the batch
-        if "images" in moved:
-            moved["images"] = None
-    
-    preds = model(moved)
-    
-    # move to CPU for viewer
-    def to_cpu_tree(obj):
-        if isinstance(obj, torch.Tensor): return obj.detach().cpu()
-        if isinstance(obj, dict):         return {k: to_cpu_tree(v) for k, v in obj.items()}
-        if isinstance(obj, list):         return [to_cpu_tree(v) for v in obj]
-        return obj
-    return to_cpu_tree(preds)
-
-
-def clamp_int(x, lo, hi):
-    return max(lo, min(hi, int(x)))
-
-
-def render_grid_for_time(
-    t: int,
-    images_t: torch.Tensor,           # [5, 3, H, W] (uint8 or float)
-    alive_mask_t: torch.Tensor,       # [5] bool
-    preds_t: Dict[str, Any],          # per time t, B=1 removed already
-    targets_t: Dict[str, Any],        # per time t, B=1 removed already
-    panel_size: Tuple[int, int] = (640, 360),
-) -> np.ndarray:
-    """
-    Compose a 3x2 grid (WxH per panel) showing 5 POVs + a summary panel.
-    """
-    W, H = panel_size
-    # Build six panels in row-major order: (0,0),(1,0),(2,0) / (0,1),(1,1),(2,1)
-    panels: List[np.ndarray] = []
-    kb_names = build_keyboard_names()
-
-    for p_idx in range(5):
-        if bool(alive_mask_t[p_idx].item()):
-            frame_bgr = img_from_tensor(images_t[p_idx])
-        else:
-            frame_bgr = blank_panel(W, H, "DEAD")
-
-        # Overlays
-        y = 18
-        # --- Targets (green) ---
-        tgt_stats = targets_t["player"][p_idx].get("stats", None)
-        if tgt_stats is not None:
-            hp, armor, money = [float(x) for x in tgt_stats]
-            y = draw_text(frame_bgr, f"TGT: HP {hp:.0f}  AR {armor:.0f}  $ {money:.0f}", 8, y, GREEN)
-        tgt_mouse = targets_t["player"][p_idx].get("mouse_delta_deg", None)
-        if tgt_mouse is not None:
-            y = draw_text(frame_bgr, f"TGT: mouse(d,p) {tgt_mouse[0]:.2f}, {tgt_mouse[1]:.2f}", 8, y, GREEN)
-        tgt_weapon = targets_t["player"][p_idx].get("active_weapon_idx", None)
-        if tgt_weapon is not None:
-            y = draw_text(frame_bgr, f"TGT: weapon {map_weapon_idx(int(tgt_weapon))}", 8, y, GREEN)
-        tgt_kb = targets_t["player"][p_idx].get("keyboard_logits", None)
-        if tgt_kb is not None:
-            # target is multi-hot 0/1; show up to 3 active actions
-            import numpy as _np
-            kb = _np.where(_np.asarray(tgt_kb) > 0.5)[0].tolist()
-            kb = kb[:3]
-            names = [kb_names[i] if 0 <= i < len(kb_names) else f"id:{i}" for i in kb]
-            y = draw_text(frame_bgr, "TGT: " + ", ".join(names), 8, y, GREEN)
-
-        # --- Predictions (red) ---
-        pr_stats = preds_t["player"][p_idx].get("stats", None)
-        if pr_stats is not None:
-            hp, armor, money = [float(x) for x in pr_stats]
-            y = draw_text(frame_bgr, f"PRD: HP {hp:.0f}  AR {armor:.0f}  $ {money:.0f}", 8, y, RED)
-        pr_mouse = preds_t["player"][p_idx].get("mouse_delta_deg", None)
-        if pr_mouse is not None:
-            y = draw_text(frame_bgr, f"PRD: mouse(d,p) {pr_mouse[0]:.2f}, {pr_mouse[1]:.2f}", 8, y, RED)
-        pr_weapon = preds_t["player"][p_idx].get("active_weapon_idx", None)
-        if pr_weapon is not None:
-            # categorical logits; show top-1 id/name
-            if isinstance(pr_weapon, torch.Tensor):
-                i = int(torch.argmax(pr_weapon).item())
-            else:
-                try:
-                    i = int(pr_weapon)
-                except Exception:
-                    i = -1
-            y = draw_text(frame_bgr, f"PRD: weapon {map_weapon_idx(i)}", 8, y, RED)
-        pr_kb = preds_t["player"][p_idx].get("keyboard_logits", None)
-        if pr_kb is not None:
-            # multi-label logits; show top-3
-            names = topk_multi_hot_from_logits(pr_kb, kb_names, k=3)
-            y = draw_text(frame_bgr, "PRD: " + ", ".join(names), 8, y, RED)
-
-        panels.append(frame_bgr)
-
-    # Sixth panel = summary (game state, etc.)
-    summary = blank_panel(W, H)
-    y = 24
-    # Round number
-    rn_tgt = targets_t["game_strategy"].get("round_number", None)
-    rn_prd = preds_t["game_strategy"].get("round_number", None) or preds_t["game_strategy"].get("round_number_logits", None)
-    if rn_tgt is not None:
-        try:
-            y = draw_text(summary, f"Round#:  TGT {int(rn_tgt)}", 12, y, GREEN)
-        except Exception:
-            pass
-    if rn_prd is not None:
-        # Either regression or logits; try both ways
-        if isinstance(rn_prd, torch.Tensor):
-            if rn_prd.numel() == 1:
-                rn_hat = int(torch.round(rn_prd).item())
-            else:
-                rn_hat = int(torch.argmax(rn_prd).item()) + 1 # Convert 0-indexed to 1-indexed
-        else:
+    def release(self):
+        for c in self.caps:
             try:
-                rn_hat = int(rn_prd)
+                c.release()
             except Exception:
-                rn_hat = -1
-        y = draw_text(summary, f"Round#:  PRD {rn_hat}", 12, y, RED)
+                pass
 
-    # Round state
-    rs_tgt = targets_t["game_strategy"].get("round_state_logits", None)
-    if isinstance(rs_tgt, torch.Tensor):
-        rs_tgt_id = int(torch.argmax(rs_tgt).item())
-    elif isinstance(rs_tgt, (list, np.ndarray)):
-        rs_tgt_id = int(np.argmax(rs_tgt))
-    else:
-        rs_tgt_id = None
-    if rs_tgt_id is not None:
-        y = draw_text(summary, f"State:   TGT {round_state_name(rs_tgt_id)}", 12, y, GREEN)
+# --------------------------------------------------------------------------------------
+# Pre-embedded loader (optional). Tries to find contiguous [T,5,d] segment.
+# If not resolvable, returns None and we will use raw images path.
+# --------------------------------------------------------------------------------------
+class PreembedResolver:
+    def __init__(self, data_root: str, demoname: str):
+        self.data_root = Path(data_root)
+        self.demo = demoname
+        self.vit_root = self.data_root / "vit_embed" / demoname
+        self.aud_root = self.data_root / "aud_embed" / demoname
 
-    rs_prd = preds_t["game_strategy"].get("round_state_logits", None)
-    if isinstance(rs_prd, torch.Tensor):
-        rs_prd_id = int(torch.argmax(rs_prd).item())
-    elif isinstance(rs_prd, (list, np.ndarray)):
-        rs_prd_id = int(np.argmax(rs_prd))
-    else:
-        rs_prd_id = None
-    if rs_prd_id is not None:
-        y = draw_text(summary, f"State:   PRD {round_state_name(rs_prd_id)}", 12, y, RED)
+    def _glob_candidates(self, kind: str) -> List[Path]:
+        root = self.vit_root if kind == "vit" else self.aud_root
+        if not root.is_dir():
+            return []
+        # Be permissive — accept any .npy here; your pipeline typically saves
+        # one array per POV segment. We'll try to match by round/team substring.
+        return sorted(root.rglob("*.npy"))
 
-    panels.append(summary)
-
-    # Tile into a 3x2 grid
-    row1 = np.concatenate(panels[0:3], axis=1)
-    row2 = np.concatenate(panels[3:6], axis=1)
-    grid = np.concatenate([row1, row2], axis=0)
-    return grid
-
-
-def slice_time(preds: Dict[str, Any], t: int) -> Dict[str, Any]:
-    """
-    Reduce predictions/targets to time index t for B=1 and return a simple dict:
-    { 'player': [ {...heads...} *5 ], 'game_strategy': {...} }
-    """
-    out: Dict[str, Any] = {"player": [], "game_strategy": {}}
-    # Players
-    for i in range(5):
-        pi: Dict[str, Any] = {}
-        P = preds["player"][i]
-        for k, v in P.items():
-            # expected shape [B, T, ...]
-            if isinstance(v, torch.Tensor):
-                pi[k] = v[0, t]
+    def load_window(self, round_num: int, team: str, start_f: int, T: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return (video_embeddings [T,5,d], audio_embeddings [T,5,da]) or (None, None)."""
+        vit_files = self._glob_candidates("vit")
+        aud_files = self._glob_candidates("aud")
+        if not vit_files:
+            return None, None
+        # Heuristic: pick first set whose filename mentions round/team.
+        pick_v = [p for p in vit_files if f"round_{round_num:03d}" in p.stem and f"team_{team}" in p.stem]
+        pick_a = [p for p in aud_files if f"round_{round_num:03d}" in p.stem and f"team_{team}" in p.stem]
+        try:
+            if pick_v:
+                arr_v = np.load(pick_v[0])  # shape maybe [T_total, 5, d]
+                if arr_v.ndim == 2:
+                    # some pipelines store [5,d] per frame sequence – cannot slice reliably
+                    return None, None
+                Ttot = arr_v.shape[0]
+                s = min(start_f, max(0, Ttot - T))
+                arr_v = arr_v[s : s + T]
             else:
-                pi[k] = v
-        out["player"].append(pi)
-    # Strategy
-    for k, v in preds["game_strategy"].items():
-        if isinstance(v, torch.Tensor):
-            out["game_strategy"][k] = v[0, t]
-        else:
-            out["game_strategy"][k] = v
-    return out
+                return None, None
+            arr_a = None
+            if pick_a:
+                arr_a = np.load(pick_a[0])
+                Ttot_a = arr_a.shape[0]
+                s = min(start_f, max(0, Ttot_a - T))
+                arr_a = arr_a[s : s + T]
+            return arr_v, arr_a
+        except Exception:
+            return None, None
+
+# --------------------------------------------------------------------------------------
+# Drawing helpers
+# --------------------------------------------------------------------------------------
+
+def put_text(img: np.ndarray, text: str, xy: Tuple[int, int], color=COLOR_TEXT) -> Tuple[int, int]:
+    x, y = xy
+    # shadow
+    cv2.putText(img, text, (x + 1, y + 1), FONT, FONT_SCALE, COLOR_SHADOW, LINE_TYPE, cv2.LINE_AA)
+    cv2.putText(img, text, (x, y), FONT, FONT_SCALE, color, LINE_TYPE, cv2.LINE_AA)
+    return (x, y + LINE_HEIGHT)
 
 
-def slice_targets(targets: Dict[str, Any], t: int) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"player": [], "game_strategy": {}}
-    for i in range(5):
-        pi: Dict[str, Any] = {}
-        P = targets["player"][i]
-        for k, v in P.items():
-            # targets tensors are shape [B, T, ...] already from assembler
-            if isinstance(v, torch.Tensor):
-                pi[k] = v[0, t]
-            else:
-                pi[k] = v
-        out["player"].append(pi)
-    for k, v in targets["game_strategy"].items():
-        if isinstance(v, torch.Tensor):
-            out["game_strategy"][k] = v[0, t]
-        else:
-            out["game_strategy"][k] = v
-    return out
+def bitmask_to_keys(mask: int, mapping: Dict[int, str], top_k: int = 6) -> List[str]:
+    if mask == 0:
+        return []
+    keys = []
+    i = 0
+    while mask and i < 64:
+        if mask & 1:
+            keys.append(mapping.get(i, str(i)))
+        mask >>= 1
+        i += 1
+    return keys[:top_k]
 
 
-# --------------------------
-# Sampling & UI loop
-# --------------------------
-def build_min_args(
-    data_root: str,
-    manifest: str,
-    run_dir: str,
-    split: str,
-    T_frames: int,
-    batch_size: int = 1,
-    dali_threads: int = 4,
-    windows_per_round: int = 1,
-    use_precomputed: bool = False,
-    seed: int = 123,
-):
-    """A tiny object with the fields build_epoch_loader expects."""
-    class A:
-        pass
-    a = A()
-    a.data_root = data_root
-    a.manifest = manifest
-    a.run_dir = run_dir
-    a.mode = "smoke"
-    a.split = split
-    a.T_frames = T_frames
-    a.batch_size = batch_size
-    a.use_precomputed_embeddings = use_precomputed
-    a.dali_threads = dali_threads
-    a.windows_per_round = windows_per_round
-    # extras used downstream (harmless defaults)
-    a.epochs = 1
-    a.lr = 3e-4
-    a.min_lr = 1e-5
-    a.weight_decay = 0.1
-    a.warmup_steps = 2000
-    a.grad_clip = 1.0
-    a.accum_steps = 1
-    a.optim = "adamw"
-    a.lr_schedule = "cosine"
-    a.warmup_updates = 1500
-    a.cycle_updates = 0
-    a.cycle_mult = 2.0
-    a.onecycle_div_factor = 100.0
-    a.onecycle_final_div_factor = 10000.0
-    a.log_every = 50
-    a.eval_every = 1000
-    a.save_every = 1000
-    a.resume = ""
-    a.compile = False
-    a.ema_decay = 0.999
-    a.seed = seed
-    a.dist_backend = "nccl"
-    a.balance_losses_after_updates = 1500
-    a.balance_momentum = 0.99
-    a.balance_every_evals = 1
-    a.detailed_loss = False
-    a.num_steps=10
-
-    return a
+def multi_hot_to_topk(logits: torch.Tensor, mapping: Dict[int, str], k: int = 3) -> List[str]:
+    # logits [C]; apply sigmoid and take top-k
+    probs = torch.sigmoid(logits.detach().float())
+    topk = torch.topk(probs, k=min(k, probs.numel()))
+    idx = topk.indices.cpu().tolist()
+    return [mapping.get(i, str(i)) for i in idx]
 
 
-def build_random_iterator_and_assembler(args) -> Tuple[Any, Any]:
-    """Build the input pipeline for a single epoch and return (iterator, assembler)."""
-    # Manifest & games
-    manifest = T3.Manifest(args.data_root, args.manifest)
-    games = manifest.get_games(args.split)
-    if not games:
-        raise RuntimeError(f"No games for split '{args.split}'. Check manifest & data_root.")
-    store = T3.LmdbStore()
-    team_rounds = T3.build_team_rounds(args.data_root, games, store)
+def draw_pov_panel(frame: np.ndarray,
+                   gt: Dict[str, Any], pred: Dict[str, torch.Tensor],
+                   f_idx: int, pov_idx: int) -> np.ndarray:
+    """Overlay compact GT (green) and prediction (red) for one POV on a single frame image."""
+    if frame is None:
+        frame = np.zeros((360, 640, 3), np.uint8)
+        put_text(frame, "[missing frame]", (8, 18), (0, 200, 255))
+        return frame
 
-    # Iterator for one "epoch" (just need it to fetch samples)
-    d_iter, assembler, _ = T3.build_epoch_loader(
-        args, epoch=np.random.randint(0, 100000), store=store, team_rounds=team_rounds,
-        last_batch_policy=("partial" if args.split.lower() == "val" else "drop"),
-        rank=0, world_size=1
-    )
-    return d_iter, assembler
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
 
-def build_preembedded_iter(args) -> Tuple[Any, Any]:
-    # Use your existing machinery but ask for precomputed embeddings only.
-    args.use_precomputed_embeddings = True
-    manifest = T3.Manifest(args.data_root, args.manifest)
-    games = manifest.get_games(args.split)
-    if not games:
-        raise RuntimeError(f"No games for split '{args.split}'. Check manifest & data_root.")
+    # Alive check -> if dead, darken and label
+    alive = bool(gt["alive_mask"][f_idx, pov_idx])
+    if not alive:
+        overlay[:] = 0
+        put_text(overlay, "DEAD", (8, 18), (0, 200, 255))
+        return overlay
 
-    store = T3.LmdbStore()
-    team_rounds = T3.build_team_rounds(args.data_root, games, store)
+    # --- GT in green ---
+    y = 20
+    s_h, s_a, s_m = gt["stats"][f_idx, pov_idx].tolist()
+    y = put_text(overlay, f"GT hp:{int(s_h)} ar:{int(s_a)} $:{int(s_m)}", (8, y), COLOR_GT)[1]
+    kbd_names = bitmask_to_keys(int(gt["keyboard_mask"][f_idx, pov_idx]), BIT_TO_KEYBOARD)
+    y = put_text(overlay, f"GT keys: {', '.join(kbd_names)}", (8, y), COLOR_GT)[1]
+    wep_idx = int(gt["active_weapon_idx"][f_idx, pov_idx])
+    wep_name = BIT_TO_ITEM.get(wep_idx, str(wep_idx)) if wep_idx >= 0 else "None"
+    y = put_text(overlay, f"GT wep: {wep_name}", (8, y), COLOR_GT)[1]
+    mdx, mdy = gt["mouse_delta"][f_idx, pov_idx].tolist()
+    y = put_text(overlay, f"GT mouse: ({mdx:+.3f}, {mdy:+.3f})", (8, y), COLOR_GT)[1]
 
-    # Build the epoch loader; this should yield ONLY cached token batches
-    d_iter, assembler, _ = T3.build_epoch_loader(
-        args, epoch=np.random.randint(0, 100000), store=store, team_rounds=team_rounds,
-        last_batch_policy=("partial" if args.split.lower() == "val" else "drop"),
-        rank=0, world_size=1
-    )
-    return d_iter, assembler
+    # --- Pred in red ---
+    # Each model head may be absent; guard accordingly
+    if pred:
+        if "stats" in pred:
+            s = pred["stats"][f_idx].detach().float().cpu().numpy().tolist()
+            y = put_text(overlay, f"PR hp:{s[0]:.0f} ar:{s[1]:.0f} $:{s[2]:.0f}", (8, y), COLOR_PRED)[1]
+        if "keyboard_logits" in pred:
+            names = multi_hot_to_topk(pred["keyboard_logits"][f_idx], BIT_TO_KEYBOARD, k=4)
+            y = put_text(overlay, f"PR keys: {', '.join(names)}", (8, y), COLOR_PRED)[1]
+        if "active_weapon_idx" in pred:
+            idx = int(torch.argmax(pred["active_weapon_idx"][f_idx]).item())
+            y = put_text(overlay, f"PR wep: {BIT_TO_ITEM.get(idx, str(idx))}", (8, y), COLOR_PRED)[1]
+        if "mouse_delta_deg" in pred:
+            m = pred["mouse_delta_deg"][f_idx].detach().float().cpu().numpy().tolist()
+            y = put_text(overlay, f"PR mouse: ({m[0]:+.3f}, {m[1]:+.3f})", (8, y), COLOR_PRED)[1]
 
-def sample_one_batch(d_iter, assembler, use_precomputed: bool = False) -> Dict[str, torch.Tensor]:
-    """Pull a single batch from DALI and assemble it into the model's input dict."""
-    dali_out = next(iter(d_iter))  # DALIGenericIterator yields a list; with auto_reset=True
-    if isinstance(dali_out, list) and len(dali_out) == 1:
-        dali_out = dali_out[0]
-    batch = assembler.assemble(dali_out, use_precomputed)
-    return batch
-
-def sample_preembedded_batch(d_iter, assembler) -> Dict[str, torch.Tensor]:
-    """Yield a batch with precomputed tokens (no raw images)."""
-    # The iterator returns one list per device; unwrap
-    dali_out = next(iter(d_iter))
-    if isinstance(dali_out, list) and len(dali_out) == 1:
-        dali_out = dali_out[0]
-    # assemble with use_precomputed=True
-    batch = assembler.assemble(dali_out, use_precomputed=True)
-    return batch
+    return overlay
 
 
-def ui_loop(
-    model: CS2Transformer,
-    device: torch.device,
-    args,
-):
-    if args.preembedded:
-        # 1) Build an iterator that yields preembedded batches only
-        d_iter, assembler = build_preembedded_iter(args)
+def draw_global_panel(size: Tuple[int, int],
+                      gt_round_state: int,
+                      pred_round_state_logits: Optional[torch.Tensor]) -> np.ndarray:
+    h, w = size
+    img = np.zeros((h, w, 3), np.uint8)
+    y = 20
+    y = put_text(img, "Global", (8, y), (180, 180, 255))[1]
+    y = put_text(img, f"GT round_state: {gt_round_state}", (8, y), COLOR_GT)[1]
+    if pred_round_state_logits is not None:
+        idx = int(torch.argmax(pred_round_state_logits).item())
+        y = put_text(img, f"PR round_state: {idx}", (8, y), COLOR_PRED)[1]
+    return img
 
-        # 2) Resolve 5 POV video files for external frame rendering
-        pov_paths = resolve_pov_paths(args)
+# --------------------------------------------------------------------------------------
+# Viewer core
+# --------------------------------------------------------------------------------------
 
-        # 3) Pull first preembedded sample
-        batch = sample_preembedded_batch(d_iter, assembler)
-        
-        # Figure out sequence length T from embeddings/targets
-        if "video_embeddings" in batch:
-            T = int(batch["video_embeddings"].shape[1])
-        else:
-            # fallback if embeddings not in batch; try targets
-            any_head = next(iter(batch["targets"]["game_strategy"].values()))
-            T = int(any_head.shape[1])
-        
-        # Use a start frame of 0, as metadata is not passed in the batch
-        start_frame = 0
+@dataclass
+class ViewerState:
+    env: lmdb.Environment
+    rounds: List[TeamRound]
+    data_root: str
+    model: cs2_model.CS2Transformer
+    device: torch.device
+    use_preembedded: bool
 
-        # 4) Load frames externally for *display* only
-        frames = load_5pov_frames(pov_paths, start_frame, T, target_hw=(360, 640))  # [T,5,3,H,W] RGB uint8
-        
-        # Use alive mask from batch if available, otherwise assume all alive
-        if "alive_mask" in batch:
-            alive = batch["alive_mask"]  # [B,T,5]
-        else:
-            alive = torch.ones((1, T, 5), dtype=torch.bool)
+    # Current sample
+    rec: Optional[SampleRecord] = None
+    frames_5x: Optional[List[Optional[np.ndarray]]] = None  # list of [T,H,W,3] or None per pov
+    gt: Optional[Dict[str, np.ndarray]] = None
+    preds: Optional[Dict[str, Any]] = None
 
-        preds = run_model_single_window(model, batch, device)
+    # Cursor
+    t_idx: int = 0
 
-        images = frames.unsqueeze(0)  # [B=1,T,5,3,H,W] RGB uint8 (matches rest of viewer)
-        targets = batch["targets"]
 
+def build_rounds_from_info(store: LmdbStore, data_root: str, demoname: str, lmdb_path: str) -> List[TeamRound]:
+    """Build eligible rounds with valid media (5 pov videos + 5 audio)."""
+    info = store.read_info(demoname, lmdb_path)
+    base = Path(data_root) / "recordings" / demoname
+    rounds: List[TeamRound] = []
+    for r in info.get("rounds", []):
+        pov_v = [str((base / p).resolve()) for p in r.get("pov_videos", [])]
+        pov_a = [str((base / p).resolve()) for p in r.get("pov_audio", [])]
+        if len(pov_v) != 5 or len(pov_a) != 5:
+            continue
+        if not all(os.path.exists(p) for p in pov_v + pov_a):
+            continue
+        rounds.append(TeamRound(
+            demoname=demoname,
+            lmdb_path=lmdb_path,
+            round_num=int(r.get("round_num", 0)),
+            team=str(r.get("team", "T")).upper(),
+            start_tick=int(r.get("start_tick", 0)),
+            end_tick=int(r.get("end_tick", 0)),
+            pov_videos=pov_v,
+            pov_audio=pov_a,
+        ))
+    return rounds
+
+
+def sample_random_window(tr: TeamRound, T_frames: int, sample_id: int = 0) -> SampleRecord:
+    # Choose a start_f within [0 .. frame_count - T]
+    total_frames = max(0, (tr.end_tick - tr.start_tick) // TICKS_PER_FRAME)
+    if total_frames <= T_frames:
+        start_f = 0
     else:
-        # original path (raw images via DALI)
-        d_iter, assembler = build_random_iterator_and_assembler(args)
-        batch = sample_one_batch(d_iter, assembler, use_precomputed=False)
-        preds = run_model_single_window(model, batch, device)
-        images = batch["images"]
-        alive = batch["alive_mask"]
-        targets = batch["targets"]
+        start_f = random.randint(0, total_frames - T_frames)
+    start_tick_win = tr.start_tick + start_f * TICKS_PER_FRAME
+    return SampleRecord(
+        sample_id=sample_id,
+        demoname=tr.demoname,
+        lmdb_path=tr.lmdb_path,
+        round_num=tr.round_num,
+        team=tr.team,
+        pov_videos=tr.pov_videos,
+        pov_audio=tr.pov_audio,
+        start_f=start_f,
+        start_tick_win=start_tick_win,
+        T_frames=T_frames,
+    )
 
-    B, T, P, C, H, W = images.shape
-    assert B == 1 and P == 5, f"Expected B=1, P=5; got {images.shape}"
 
-    # Window/Panel geometry
-    PANEL_W, PANEL_H = 640, 360
+def run_model_on_record(state: ViewerState) -> None:
+    """Build a CS2Batch with either preembedded or images path and run the model.
+    Stores `state.preds`.
+    """
+    rec = state.rec
+    assert rec is not None
 
-    # cv2 window
-    win_name = "CS2 Model Viewer"
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win_name, PANEL_W * 3, PANEL_H * 2)
+    # Fetch GT meta for overlay
+    fetcher = LmdbMetaFetcher()
+    gt = fetcher.fetch_window(state.env, rec)
+    state.gt = gt
 
-    t = 0  # current time index
-    while True:
-        t = clamp_int(t, 0, T - 1)
+    # Frames for display (OpenCV BGR -> RGB later if needed by model)
+    vw = VideoWindow(rec.pov_videos)
+    frames_5x = vw.read_frames(rec.start_f, rec.T_frames)  # list of [T,H,W,3] or None
+    vw.release()
+    state.frames_5x = frames_5x
 
-        # Slice preds/targets at time t
-        preds_t = slice_time(preds, t)
-        targets_t = slice_targets(targets, t)
+    # Build batch
+    device = state.device
+    B, T, P = 1, rec.T_frames, NUM_POV
 
-        # Compose grid
-        grid = render_grid_for_time(
-            t,
-            images_t=images[0, t],
-            alive_mask_t=alive[0, t],
-            preds_t=preds_t,
-            targets_t=targets_t,
-            panel_size=(PANEL_W, PANEL_H),
-        )
-        # Overlay headline
-        head = f"split={args.split}  T={T}  frame={t+1}/{T}   ckpt={Path(args.ckpt).name if args.ckpt else 'auto'}"
-        cv2.putText(grid, head, (12, 24), FONT, 0.6, WHITE, 2, cv2.LINE_AA)
+    # Alive mask
+    alive_mask = torch.from_numpy(gt["alive_mask"]).unsqueeze(0).to(device)
 
-        cv2.imshow(win_name, grid)
-        key = cv2.waitKey(0) & 0xFF  # wait for next key
+    # Try preembedded first (video_embeddings path)
+    vid_embeds = None
+    mel_embeds = None
+    if state.use_preembedded:
+        resolver = PreembedResolver(state.data_root, rec.demoname)
+        v_arr, a_arr = resolver.load_window(rec.round_num, rec.team, rec.start_f, rec.T_frames)
+        if v_arr is not None and v_arr.shape[:2] == (T, P):
+            vid_embeds = torch.from_numpy(v_arr).unsqueeze(0).to(device)
+        if a_arr is not None and a_arr.shape[:2] == (T, P):
+            mel_embeds = torch.from_numpy(a_arr).unsqueeze(0).to(device)
 
-        if key == ord('q'):
+    batch: Dict[str, torch.Tensor] = {"alive_mask": alive_mask}
+
+    if vid_embeds is not None:
+        batch["video_embeddings"] = vid_embeds  # [1,T,5,d_model_backbone]
+        # Audio: if not embedded found, set zeros token so fuser still works
+        if mel_embeds is not None:
+            batch["mel_spectrogram"] = mel_embeds  # allow audio encoder/fuser to accept
+        else:
+            # Zero mel — shape expected by audio encoder: [B,T,5,2,128,1] (stereo, 1 frame)
+            batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device)
+    else:
+        # Fallback: use raw images (on-the-fly encoder path).
+        # Convert frames to tensor shape [B,T,5,3,H,W] RGB and scale 0..1
+        # If any POV missing, fill with black.
+        H = 360
+        W = 640
+        buf = np.zeros((T, P, H, W, 3), dtype=np.uint8)
+        for p in range(P):
+            arr = frames_5x[p]
+            if arr is None:
+                continue
+            # resize if needed
+            ah, aw = arr.shape[1:3]
+            if (ah, aw) != (H, W):
+                arr = np.stack([cv2.resize(f, (W, H), interpolation=cv2.INTER_LINEAR) for f in arr], axis=0)
+            buf[:, p] = arr
+        # BGR->RGB
+        buf = buf[..., ::-1]
+        images = torch.from_numpy(buf).permute(0, 1, 4, 2, 3).unsqueeze(0).float() / 255.0
+        batch["images"] = images.to(device)
+        batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device)
+
+    state.model.eval()
+    with torch.no_grad():
+        preds = state.model(batch)
+
+    # Normalize predictions into convenient [T]-major lists
+    out: Dict[str, Any] = {"player": [], "game_strategy": {}}
+    # Player heads per POV
+    for i in range(NUM_POV):
+        p: Dict[str, torch.Tensor] = {}
+        for key in ["stats", "pos_heatmap_logits", "mouse_delta_deg", "keyboard_logits",
+                    "eco_logits", "inventory_logits", "active_weapon_idx"]:
+            if isinstance(preds["player"][i].get(key, None), torch.Tensor):
+                # shape [B,T,...] => [T,...]
+                p[key] = preds["player"][i][key][0]
+        out["player"].append(p)
+    # Global head
+    gs = preds.get("game_strategy", {})
+    if isinstance(gs, dict):
+        for key in ["enemy_pos_heatmap_logits", "round_state_logits", "round_number_logits"]:
+            if isinstance(gs.get(key, None), torch.Tensor):
+                out.setdefault("game_strategy", {})[key] = gs[key][0]
+    state.preds = out
+    state.t_idx = 0
+
+
+def compose_grid(state: ViewerState) -> np.ndarray:
+    assert state.frames_5x is not None and state.gt is not None and state.preds is not None
+    T = state.rec.T_frames  # type: ignore
+    f = np.clip(state.t_idx, 0, T - 1)
+
+    # Base cell size from actual frames if available
+    # Try to use first available POV frame to set size; default 360x640 otherwise
+    H, W = 360, 640
+    for arr in state.frames_5x:
+        if arr is not None and len(arr) > 0:
+            H, W = arr.shape[1], arr.shape[2]
             break
-        elif key == ord('j'):
-            t = min(t + 1, T - 1)
-        elif key == ord('k'):
-            t = max(t - 1, 0)
-        elif key == ord('n'):
-            # New random window
-            print("Sampling new random window...")
-            if args.preembedded:
-                batch = sample_preembedded_batch(d_iter, assembler)
-                frames = load_5pov_frames(pov_paths, 0, T, target_hw=(360, 640))
-                images = frames.unsqueeze(0)
-                alive = batch.get("alive_mask", torch.ones((1, T, 5), dtype=torch.bool))
-            else:
-                batch = sample_one_batch(d_iter, assembler, use_precomputed=False)
-                images = batch["images"]
-                alive = batch["alive_mask"]
 
-            preds = run_model_single_window(model, batch, device)
-            targets = batch["targets"]
-            B, T, P, C, H, W = images.shape
-            t = 0  # reset to first frame
+    # Generate 5 POV panels
+    panels: List[np.ndarray] = []
+    for i in range(NUM_POV):
+        frame = state.frames_5x[i][f] if state.frames_5x[i] is not None and f < len(state.frames_5x[i]) else None
+        pred_dict = state.preds["player"][i]
+        panel = draw_pov_panel(frame, state.gt, pred_dict, f, i)
+        panels.append(panel)
 
-    cv2.destroyAllWindows()
+    # Sixth panel = global: round_state
+    pred_gs = state.preds.get("game_strategy", {})
+    pred_round_state = pred_gs.get("round_state_logits", None)
+    global_panel = draw_global_panel((H, W), int(state.gt["round_state_mask"][f]), pred_round_state[f] if pred_round_state is not None else None)
 
+    # 3x2 grid: [0,1,2; 3,4,5]
+    row1 = np.concatenate(panels[0:3], axis=1)
+    row2 = np.concatenate(panels[3:5] + [global_panel], axis=1)
+    grid = np.concatenate([row1, row2], axis=0)
+
+    # Footer bar with controls/status
+    bar_h = 28
+    bar = np.zeros((bar_h, grid.shape[1], 3), np.uint8)
+    txt = f"tick {state.rec.start_tick_win + f*TICKS_PER_FRAME}  |  frame {f+1}/{T}  |  j/k=step  n=new  q=quit"
+    put_text(bar, txt, (10, 18), (200, 220, 255))
+    return np.concatenate([grid, bar], axis=0)
+
+
+# --------------------------------------------------------------------------------------
+# Checkpoint loading helpers
+# --------------------------------------------------------------------------------------
+
+def load_model(ckpt_path: str, device: torch.device, dtype: str = "bf16") -> cs2_model.CS2Transformer:
+    cfg = CS2Config()
+    if dtype in ("bf16", "fp16", "fp32"):
+        cfg.compute_dtype = dtype
+        cfg.amp_autocast = (dtype != "fp32")
+    model = CS2Transformer(cfg)
+    # Robust state_dict loader
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state = None
+    for k in ["model_state_dict", "state_dict", "model", "module"]:
+        if isinstance(ckpt, dict) and k in ckpt and isinstance(ckpt[k], dict):
+            state = ckpt[k]
+            break
+    if state is None and isinstance(ckpt, dict):
+        # Maybe raw state_dict
+        state = {k: v for k, v in ckpt.items() if isinstance(v, (torch.Tensor, np.ndarray))}
+    if state:
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[load] missing: {len(missing)} params (non-fatal)")
+        if unexpected:
+            print(f"[load] unexpected: {len(unexpected)} params (non-fatal)")
+    model.to(device)
+    return model
+
+# --------------------------------------------------------------------------------------
+# Main loop
+# --------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive CS2 model performance viewer")
-    parser.add_argument("--run-dir", type=str, required=False, default="runs/exp1",
-                        help="Training run directory containing checkpoints/ and filelists.")
-    parser.add_argument("--ckpt", type=str, default="",
-                        help="Path to .pt/.pth checkpoint. If empty, auto-picks best from run-dir.")
-    parser.add_argument("--data-root", type=str, default=os.environ.get("DATA_ROOT", "data"))
-    parser.add_argument("--manifest", type=str, default=None,
-                        help="Manifest JSON listing games by split. Defaults to <data-root>/manifest.json")
-    parser.add_argument("--split", type=str, choices=["train", "val"], default="val")
-    parser.add_argument("--T-frames", dest="T_frames", type=int, default=64)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="fp16")
-    parser.add_argument("--preembedded", action="store_true",
-                        help="Use precomputed embeddings from LMDB for model input (no DALI).")
-    parser.add_argument("--pov0", type=str, default=None, help="Video path for POV 0")
-    parser.add_argument("--pov1", type=str, default=None, help="Video path for POV 1")
-    parser.add_argument("--pov2", type=str, default=None, help="Video path for POV 2")
-    parser.add_argument("--pov3", type=str, default=None, help="Video path for POV 3")
-    parser.add_argument("--pov4", type=str, default=None, help="Video path for POV 4")
-    parser.add_argument("--pov-pattern", type=str, default=None,
-                        help="printf-style or python-format pattern for 5 POVs, e.g. '/path/pov_%d.mp4' or '/path/pov_{}.mp4'")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="CS2 ARP viewer (no DALI)")
+    p.add_argument("--ckpt", required=True, help="Path to model checkpoint .pt")
+    p.add_argument("--lmdb", required=True, help="Path to a single game LMDB (e.g., /data/lmdb/demoname.lmdb)")
+    p.add_argument("--demoname", required=True, help="Demoname key inside LMDB (e.g., match_2024_09_18_123456)")
+    p.add_argument("--data-root", required=True, help="Root folder containing recordings/ and (optionally) vit_embed/, aud_embed/")
+    p.add_argument("--T", type=int, default=64, help="Number of frames per sample window")
+    p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    p.add_argument("--cpu", action="store_true", help="Force CPU (debug)")
+    p.add_argument("--no-preembedded", action="store_true", help="Disable preembedded and always use images path")
+    args = p.parse_args()
 
-    if args.manifest is None:
-        args.manifest = str(Path(args.data_root) / "manifest.json")
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    model = load_model(args.ckpt, device, dtype=args.dtype)
 
-    # Build model config (match training where possible)
-    cfg = CS2Config(context_frames=args.T_frames)
-    # Use standard causal (token-by-token) mask at inference by default
-    cfg.inference_use_standard_causal = True
+    store = LmdbStore()
+    env = store.open(args.lmdb)
+    rounds = build_rounds_from_info(store, args.data_root, args.demoname, args.lmdb)
+    if not rounds:
+        print("No valid rounds with media found. Check --demoname/--lmdb/--data-root.")
+        return
 
-    device = torch.device(args.device)
-    if args.dtype == "bf16" and not (device.type == "cuda" and torch.cuda.is_bf16_supported()):
-        print("[warn] bf16 not supported; falling back to fp32.")
-        args.dtype = "fp32"
-    if args.dtype == "fp16" and device.type == "cpu":
-        print("[warn] fp16 on CPU unsupported; falling back to fp32.")
-        args.dtype = "fp32"
-
-    model = CS2Transformer(cfg).to(device)
-    # Mixed precision autocast in the model is already guarded by cfg.amp_autocast
-    if args.dtype == "fp16":
-        pass  # runtime autocast uses fp16
-    elif args.dtype == "bf16":
-        pass
-    else:
-        # Force fp32 compute if requested
-        for p in model.parameters():
-            p.data = p.data.float()
-
-    # Resolve checkpoint path
-    ckpt_path = args.ckpt or auto_find_best_ckpt(args.run_dir)
-    _ = load_weights_from_checkpoint(model, ckpt_path)
-    # Add resolved path to args for display
-    args.ckpt = ckpt_path
-
-    # Minimal args object for data pipeline
-    min_args = build_min_args(
+    state = ViewerState(
+        env=env,
+        rounds=rounds,
         data_root=args.data_root,
-        manifest=args.manifest,
-        run_dir=args.run_dir,
-        split=args.split,
-        T_frames=args.T_frames,
-        batch_size=1,
-        dali_threads=4,
-        windows_per_round=1,
-        use_precomputed=args.preembedded,
-        seed=int(time.time()), # use different seed each run
+        model=model,
+        device=device,
+        use_preembedded=(not args.no_preembedded),
     )
-    # Pass through pov arguments for ui_loop to use
-    min_args.preembedded = args.preembedded
-    min_args.pov_pattern = args.pov_pattern
-    for i in range(5):
-        setattr(min_args, f"pov{i}", getattr(args, f"pov{i}"))
 
+    def new_random_sample():
+        tr = random.choice(state.rounds)
+        state.rec = sample_random_window(tr, args.T)
+        run_model_on_record(state)
 
-    # Enter UI
-    ui_loop(model, device, min_args)
+    new_random_sample()
+
+    win_name = "CS2-ARP Viewer"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 1920, 1080)
+
+    while True:
+        canvas = compose_grid(state)
+        cv2.imshow(win_name, canvas)
+        key = cv2.waitKey(0) & 0xFF
+        if key in (ord('q'), 27):
+            break
+        elif key == ord('j'):
+            state.t_idx = min(state.t_idx + 1, state.rec.T_frames - 1)  # type: ignore
+        elif key == ord('k'):
+            state.t_idx = max(state.t_idx - 1, 0)
+        elif key == ord('n'):
+            new_random_sample()
+        # ignore others
+
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
