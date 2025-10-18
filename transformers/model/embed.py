@@ -48,7 +48,7 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 
 # Reuse components from the training scripts
-from train2 import DaliConfig, FPS
+from train3 import DaliConfig, FPS
 from model import CS2Config, DINOv3VisualEncoder
 
 # --- Try to import DALI ---

@@ -71,7 +71,7 @@ try:
     # Try to import sibling injection_mold in project
     import importlib.util, types
     cand_paths = [
-        Path(__file__).resolve().parents[2] / "testing" / "lmdb" / "lmdb_inspect_linux.py",
+        #Path(__file__).resolve().parents[2] / "testing" / "lmdb" / "lmdb_inspect_linux.py",
         Path(__file__).resolve().parents[2] / "to_lmdb" / "injection_mold.py",
         Path(__file__).resolve().parents[2] / "injection_mold.py",
     ]
