@@ -375,6 +375,7 @@ class DaliInputPipeline:
             for k in range(5):
                 # existing readers
                 video, label_vid = fn.readers.video(
+                    device="gpu",
                     name=f"V{k}", file_list=vlists[k], sequence_length=cfg.sequence_length, pad_sequences=True,
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
                     stick_to_shard=True, random_shuffle=False,# shuffle_after_epoch=False,
