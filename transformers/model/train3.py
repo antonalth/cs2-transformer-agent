@@ -322,7 +322,7 @@ class DaliInputPipeline:
                     name=f"{reader_prefix}_VidLblReader",
                     file_list=vlist_lbl,
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                    stick_to_shard=True, random_shuffle=False#, shuffle_after_epoch=False
                 )
 
                 # Read start_f (frames) from the audio label list
@@ -330,7 +330,7 @@ class DaliInputPipeline:
                     name=f"{reader_prefix}_AudLblReader",
                     file_list=alist_lbl,
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                    stick_to_shard=True, random_shuffle=False#, shuffle_after_epoch=False
                 )
 
                 # Load npy embeddings from path-only lists (keeps label IO separate)
@@ -338,13 +338,13 @@ class DaliInputPipeline:
                     name=f"{reader_prefix}_VidEmbedReader",
                     file_list=vpath_only,
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                    stick_to_shard=True, random_shuffle=False#, shuffle_after_epoch=False
                 )
                 a_raw = fn.readers.numpy(
                     name=f"{reader_prefix}_AudEmbedReader",
                     file_list=apath_only,
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                    stick_to_shard=True, random_shuffle=False#, shuffle_after_epoch=False
                 )
 
                 # Cast labels
@@ -377,13 +377,13 @@ class DaliInputPipeline:
                 video, label_vid = fn.readers.video(
                     name=f"V{k}", file_list=vlists[k], sequence_length=cfg.sequence_length, pad_sequences=True,
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False,
+                    stick_to_shard=True, random_shuffle=False,# shuffle_after_epoch=False,
                     dtype=types.UINT8, file_list_frame_num=True, file_list_include_preceding_frame=True
                 )
                 audio_raw, label_cpu = fn.readers.file(
                     name=f"A{k}", file_list=alists[k],
                     shard_id=cfg.shard_id, num_shards=cfg.num_shards,
-                    stick_to_shard=True, random_shuffle=False, shuffle_after_epoch=False
+                    stick_to_shard=True, random_shuffle=False,# shuffle_after_epoch=False
                 )
 
                 # NEW: start_f comes straight from the audio label (no packing)
