@@ -20,7 +20,7 @@ Features
 Assumptions & integration
 - LMDB contains meta + per-tick records (`*_INFO` and normal tick keys) as
   produced by your pipeline. We derive:
-  \- alive mask, stats (health/armor/money), mouse delta, positions, keyboard
+- alive mask, stats (health/armor/money), mouse delta, positions, keyboard
      bitmasks, eco/inventory bitmasks, active weapon, round state, enemy pos.
 - Recordings (MP4) live under `<data_root>/recordings/<demoname>/...` as in
   your repo. We read frames for display via OpenCV (not DALI).
