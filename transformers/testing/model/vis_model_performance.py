@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 ARP Viewer — interactive visualizer for CS2 autoregressive model
 
 Features
@@ -412,6 +412,48 @@ class PreembedResolver:
         # one array per POV segment. We'll try to match by round/team substring.
         return sorted(root.rglob("*.npy"))
 
+    @staticmethod
+    def _normalize_embed(arr: np.ndarray) -> Optional[np.ndarray]:
+        """Return array as [T,5,D] if possible; otherwise None.
+
+        Accepts common shapes like [T,5,D] or [5,T,D]. Collapses any remaining
+        trailing dims into D. Ensures positive strides / contiguous memory.
+        """
+        if arr is None:
+            return None
+        a = np.asarray(arr)
+        if a.ndim < 2:
+            return None
+        # If exactly 3D, try [T,5,D] or [5,T,D]
+        if a.ndim == 3:
+            if a.shape[1] == NUM_POV:
+                # [T,5,D]
+                T, P, D = a.shape
+                a = a.reshape(T, P, D)
+            elif a.shape[0] == NUM_POV:
+                # [5,T,D] -> swap axes
+                a = np.moveaxis(a, 0, 1)  # [T,5,D]
+            else:
+                # attempt to locate POV axis=5 and time as the other large axis
+                pov_axis = next((i for i, s in enumerate(a.shape) if s == NUM_POV), None)
+                if pov_axis is None:
+                    return None
+                time_axis = 0 if pov_axis != 0 else 1
+                a = np.moveaxis(a, [time_axis, pov_axis], [0, 1])
+                a = a.reshape(a.shape[0], a.shape[1], -1)
+        else:
+            # For >=4D: identify POV axis=5 and move time axis to 0, then flatten the rest
+            pov_axis = next((i for i, s in enumerate(a.shape) if s == NUM_POV), None)
+            if pov_axis is None:
+                return None
+            # choose time axis as the largest axis != pov_axis
+            candidates = [(i, s) for i, s in enumerate(a.shape) if i != pov_axis]
+            time_axis = max(candidates, key=lambda x: x[1])[0]
+            a = np.moveaxis(a, [time_axis, pov_axis], [0, 1])
+            T = a.shape[0]
+            a = a.reshape(T, NUM_POV, -1)
+        return np.ascontiguousarray(a)
+
     def load_window(self, round_num: int, team: str, start_f: int, T: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Return (video_embeddings [T,5,d], audio_embeddings [T,5,da]) or (None, None)."""
         vit_files = self._glob_candidates("vit")
@@ -423,21 +465,23 @@ class PreembedResolver:
         pick_a = [p for p in aud_files if f"round_{round_num:03d}" in p.stem and f"team_{team}" in p.stem]
         try:
             if pick_v:
-                arr_v = np.load(pick_v[0])  # shape maybe [T_total, 5, d]
-                if arr_v.ndim == 2:
-                    # some pipelines store [5,d] per frame sequence – cannot slice reliably
+                arr_v = np.load(pick_v[0], mmap_mode=None)
+                arr_v = self._normalize_embed(arr_v)
+                if arr_v is None:
                     return None, None
                 Ttot = arr_v.shape[0]
                 s = min(start_f, max(0, Ttot - T))
-                arr_v = arr_v[s : s + T]
+                arr_v = np.ascontiguousarray(arr_v[s : s + T])
             else:
                 return None, None
             arr_a = None
             if pick_a:
-                arr_a = np.load(pick_a[0])
-                Ttot_a = arr_a.shape[0]
-                s = min(start_f, max(0, Ttot_a - T))
-                arr_a = arr_a[s : s + T]
+                a = np.load(pick_a[0], mmap_mode=None)
+                a = self._normalize_embed(a)
+                if a is not None:
+                    Ttot_a = a.shape[0]
+                    s = min(start_f, max(0, Ttot_a - T))
+                    arr_a = np.ascontiguousarray(a[s : s + T])
             return arr_v, arr_a
         except Exception:
             return None, None
@@ -640,8 +684,10 @@ def run_model_on_record(state: ViewerState) -> None:
         resolver = PreembedResolver(state.data_root, rec.demoname)
         v_arr, a_arr = resolver.load_window(rec.round_num, rec.team, rec.start_f, rec.T_frames)
         if v_arr is not None and v_arr.shape[:2] == (T, P):
+            v_arr = np.ascontiguousarray(v_arr)
             vid_embeds = torch.from_numpy(v_arr).unsqueeze(0).to(device)
         if a_arr is not None and a_arr.shape[:2] == (T, P):
+            a_arr = np.ascontiguousarray(a_arr)
             mel_embeds = torch.from_numpy(a_arr).unsqueeze(0).to(device)
 
     batch: Dict[str, torch.Tensor] = {"alive_mask": alive_mask}
@@ -670,8 +716,9 @@ def run_model_on_record(state: ViewerState) -> None:
             if (ah, aw) != (H, W):
                 arr = np.stack([cv2.resize(f, (W, H), interpolation=cv2.INTER_LINEAR) for f in arr], axis=0)
             buf[:, p] = arr
-        # BGR->RGB
-        buf = buf[..., ::-1]
+        # BGR->RGB without negative strides (avoid buf[..., ::-1])
+        buf = buf[..., [2, 1, 0]]  # creates a positive-stride copy
+        buf = np.ascontiguousarray(buf)
         images = torch.from_numpy(buf).permute(0, 1, 4, 2, 3).unsqueeze(0).float() / 255.0
         batch["images"] = images.to(device)
         batch["mel_spectrogram"] = torch.zeros((B, T, P, 2, 128, 1), device=device)
