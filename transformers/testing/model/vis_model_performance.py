@@ -20,7 +20,7 @@ Features
 Assumptions & integration
 - LMDB contains meta + per-tick records (`*_INFO` and normal tick keys) as
   produced by your pipeline. We derive:
-- alive mask, stats (health/armor/money), mouse delta, positions, keyboard
+  \- alive mask, stats (health/armor/money), mouse delta, positions, keyboard
      bitmasks, eco/inventory bitmasks, active weapon, round state, enemy pos.
 - Recordings (MP4) live under `<data_root>/recordings/<demoname>/...` as in
   your repo. We read frames for display via OpenCV (not DALI).
@@ -170,19 +170,82 @@ class LmdbStore:
 
 # Minimal metadata fetcher for ground-truth overlays
 class LmdbMetaFetcher:
+    """Robust LMDB meta fetcher that tolerates numpy structured scalars/arrays.
+
+    Some pipelines store `game_state` and `player_data` as numpy structured
+    scalars (np.void) rather than plain dicts. Access those via field-indexing
+    instead of `.get(...)`.
+    """
+
     @staticmethod
     def _key(d: str, r: int, t: str, tick: int) -> bytes:
         return f"{d}_round_{r:03d}_team_{t}_tick_{tick:08d}".encode("utf-8")
 
     @staticmethod
     def _bitmask_to_weapon_index(mask: np.ndarray) -> int:
-        # mask shape [2] uint64
-        if mask.sum() == 0:
+        # mask shape [2] uint64 or compatible
+        try:
+            m = np.asarray(mask).astype(np.uint64).reshape(-1)
+        except Exception:
+            return -1
+        if m.size < 2:
+            m = np.pad(m, (0, max(0, 2 - m.size)), constant_values=0)
+        if (m[0] | m[1]) == 0:
             return -1
         for i in range(128):
-            if (mask[i // 64] >> np.uint64(i % 64)) & np.uint64(1):
-                return i
+            if (m[i // 64] >> np.uint64(i % 64)) & np.uint64(1):
+                return int(i)
         return -1
+
+    @staticmethod
+    def _get_field(obj, key, default=None):
+        """Safely get a field from dict-like or numpy.void/structured array."""
+        if obj is None:
+            return default
+        # dict-like
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        # numpy structured scalar or array
+        if isinstance(obj, np.void):
+            fields = getattr(obj, "dtype", None).fields if hasattr(obj, "dtype") else None
+            if fields and key in fields:
+                try:
+                    return obj[key]
+                except Exception:
+                    return default
+            return default
+        if isinstance(obj, np.ndarray) and obj.dtype.fields:
+            # structured array: allow field selection
+            try:
+                return obj[key]
+            except Exception:
+                return default
+        # object with attribute
+        if hasattr(obj, key):
+            try:
+                return getattr(obj, key)
+            except Exception:
+                return default
+        return default
+
+    @staticmethod
+    def _to_int(x, default=0):
+        try:
+            if isinstance(x, (np.generic, np.ndarray)):
+                return int(np.asarray(x).item())
+            return int(x)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _to_tuple(x, n, default=0.0):
+        try:
+            arr = np.asarray(x).reshape(-1)
+            if arr.size >= n:
+                return tuple(float(v) for v in arr[:n])
+        except Exception:
+            pass
+        return (default,) * n
 
     def fetch_window(self, env: lmdb.Environment, rec: SampleRecord) -> Dict[str, np.ndarray]:
         T = rec.T_frames
@@ -205,27 +268,85 @@ class LmdbMetaFetcher:
                 if not blob:
                     continue
                 payload = msgpack.unpackb(blob, raw=False, object_hook=mpnp.decode)
-                gs = payload.get("game_state")
-                if not gs:
+
+                # --- game_state ---
+                gs = payload.get("game_state") if isinstance(payload, dict) else None
+                if gs is None:
                     continue
-                gs0 = gs[0]
-                rnd_state[f] = int(gs0.get("round_state", 0))
-                enemy_pos[f] = gs0.get("enemy_pos", np.zeros((NUM_POV, 3), np.float32))
-                team_alive_mask = int(gs0.get("team_alive", 0))
+                # normalize gs0 to first entry / scalar
+                if isinstance(gs, (list, tuple)):
+                    gs0 = gs[0] if len(gs) else None
+                elif isinstance(gs, np.ndarray):
+                    gs0 = gs.flat[0] if gs.size else None
+                else:
+                    gs0 = gs
+                if gs0 is None:
+                    continue
+
+                rs = self._get_field(gs0, "round_state", 0)
+                rnd_state[f] = np.uint8(self._to_int(rs, 0))
+
+                ep = self._get_field(gs0, "enemy_pos", np.zeros((NUM_POV, 3), np.float32))
+                try:
+                    enemy_pos[f] = np.asarray(ep, dtype=np.float32).reshape(NUM_POV, 3)
+                except Exception:
+                    pass
+
+                team_alive = self._get_field(gs0, "team_alive", 0)
+                team_alive_mask = self._to_int(team_alive, 0)
                 alive_slots = [i for i in range(NUM_POV) if (team_alive_mask >> i) & 1]
                 for slot in alive_slots:
                     alive[f, slot] = True
-                pdl = payload.get("player_data")
-                if pdl and len(alive_slots) == len(pdl):
-                    for p_idx, pdata in zip(alive_slots, pdl):
-                        p = pdata[0]
-                        stats[f, p_idx] = [p.get("health", 0), p.get("armor", 0), p.get("money", 0)]
-                        mouse[f, p_idx] = p.get("mouse", (0.0, 0.0))
-                        pos[f, p_idx] = p.get("pos", (0.0, 0.0, 0.0))
-                        kbd[f, p_idx] = p.get("keyboard_bitmask", 0)
-                        eco[f, p_idx] = p.get("eco_bitmask", np.zeros((4,), np.uint64))
-                        inv[f, p_idx] = p.get("inventory_bitmask", np.zeros((2,), np.uint64))
-                        wep[f, p_idx] = self._bitmask_to_weapon_index(p.get("active_weapon_bitmask", np.zeros((2,), np.uint64)))
+
+                # --- player_data ---
+                pdl = payload.get("player_data") if isinstance(payload, dict) else None
+                entries = []
+                if isinstance(pdl, (list, tuple)):
+                    entries = list(pdl)
+                elif isinstance(pdl, np.ndarray):
+                    entries = [p for p in pdl.flat]
+                if not entries:
+                    continue
+
+                # Some pipelines store each entry as [player_struct] or the struct itself
+                # Align lengths
+                for p_idx, raw in zip(alive_slots, entries):
+                    if isinstance(raw, (list, tuple)) and raw:
+                        p = raw[0]
+                    else:
+                        p = raw
+                    # Now p is dict-like or numpy.void
+                    h = self._to_int(self._get_field(p, "health", 0), 0)
+                    a = self._to_int(self._get_field(p, "armor", 0), 0)
+                    mny = self._to_int(self._get_field(p, "money", 0), 0)
+                    stats[f, p_idx] = [h, a, mny]
+
+                    md = self._get_field(p, "mouse", (0.0, 0.0))
+                    mdx, mdy = self._to_tuple(md, 2, 0.0)
+                    mouse[f, p_idx] = [mdx, mdy]
+
+                    ps = self._get_field(p, "pos", (0.0, 0.0, 0.0))
+                    px, py, pz = self._to_tuple(ps, 3, 0.0)
+                    pos[f, p_idx] = [px, py, pz]
+
+                    kb = self._get_field(p, "keyboard_bitmask", 0)
+                    kbd[f, p_idx] = np.uint32(self._to_int(kb, 0))
+
+                    eco_mask = self._get_field(p, "eco_bitmask", np.zeros((4,), np.uint64))
+                    try:
+                        eco[f, p_idx] = np.asarray(eco_mask, dtype=np.uint64).reshape(4)
+                    except Exception:
+                        pass
+
+                    inv_mask = self._get_field(p, "inventory_bitmask", np.zeros((2,), np.uint64))
+                    try:
+                        inv[f, p_idx] = np.asarray(inv_mask, dtype=np.uint64).reshape(2)
+                    except Exception:
+                        pass
+
+                    aw = self._get_field(p, "active_weapon_bitmask", np.zeros((2,), np.uint64))
+                    wep[f, p_idx] = self._bitmask_to_weapon_index(aw)
+
         return {
             "alive_mask": alive,
             "stats": stats,
@@ -240,9 +361,6 @@ class LmdbMetaFetcher:
             "enemy_positions": enemy_pos,
         }
 
-# --------------------------------------------------------------------------------------
-# Frame access via OpenCV (no DALI). Simple, robust readers per POV.
-# --------------------------------------------------------------------------------------
 class VideoWindow:
     def __init__(self, paths: List[str], fps: float = EXPECTED_VIDEO_FPS):
         assert len(paths) == NUM_POV
