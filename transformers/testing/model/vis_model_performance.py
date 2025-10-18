@@ -143,7 +143,7 @@ def img_from_tensor(x: torch.Tensor) -> np.ndarray:
     if x.dtype != torch.uint8:
         x = x.clamp(0, 255).to(torch.uint8)
     arr = x.permute(1, 2, 0).cpu().numpy()  # HWC RGB
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB_BGR)
 
 
 def topk_multi_hot_from_logits(logits: torch.Tensor, names: List[str], k: int = 3) -> List[str]:
@@ -193,13 +193,8 @@ def run_model_single_window(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Dict[str, Any]:
-    """
-    Runs the transformer on a single batch (B=1) window with raw images.
-    Returns predictions on CPU for convenience.
-    """
     model.eval()
-    # Ensure we use raw images, not precomputed embeddings
-    assert "images" in batch, "Batch must contain raw 'images' for on-the-fly ViT encoding."
+
     # Move tensors to device
     moved = {}
     for k, v in batch.items():
@@ -207,8 +202,13 @@ def run_model_single_window(
             moved[k] = v.to(device, non_blocking=True)
         else:
             moved[k] = v
-    preds = model(moved)  # forward across T (causal mask inside)
-    # Pull to CPU
+
+    # IMPORTANT: prefer precomputed embeddings; do not trigger ViT on raw images.
+    model_in = dict(moved)
+    model_in.pop("images", None)   # keep images in `batch` for display, but don't feed to model
+
+    preds = model(model_in)  # forward across T using the preembedded path
+
     def to_cpu_tree(obj):
         if isinstance(obj, torch.Tensor):
             return obj.detach().cpu()
@@ -217,6 +217,7 @@ def run_model_single_window(
         if isinstance(obj, list):
             return [to_cpu_tree(v) for v in obj]
         return obj
+
     return to_cpu_tree(preds)
 
 
@@ -422,7 +423,7 @@ def build_min_args(
     a.split = split
     a.T_frames = T_frames
     a.batch_size = batch_size
-    a.use_precomputed_embeddings = use_precomputed
+    a.use_precomputed_embeddings = True
     a.dali_threads = dali_threads
     a.windows_per_round = windows_per_round
     # extras used downstream (harmless defaults)
@@ -505,7 +506,7 @@ def ui_loop(
 ):
     # Build pipeline and take the first sample
     d_iter, assembler = build_random_iterator_and_assembler(args)
-    batch = sample_one_batch(d_iter, assembler, use_precomputed=False)
+    batch = sample_one_batch(d_iter, assembler, use_precomputed=True)
 
     # Pre-compute predictions for the current window
     preds = run_model_single_window(model, batch, device)
@@ -544,7 +545,10 @@ def ui_loop(
             panel_size=(PANEL_W, PANEL_H),
         )
         # Overlay headline
-        head = f"split={args.split}  T={args.T_frames}  frame={t+1}/{T}   ckpt={Path(args.ckpt).name if args.ckpt else 'auto'}"
+        head = (
+            f"split={args.split}  T={args.T_frames}  frame={t+1}/{T}   "
+            f"ckpt={Path(args.ckpt).name if args.ckpt else 'auto'}   preembed=True"
+        )
         cv2.putText(grid, head, (12, 24), FONT, 0.6, WHITE, 2, cv2.LINE_AA)
 
         cv2.imshow(win_name, grid)
@@ -559,7 +563,7 @@ def ui_loop(
         elif key == ord('n'):
             # New random window
             print("Sampling new random window...")
-            batch = sample_one_batch(d_iter, assembler, use_precomputed=False)
+            batch = sample_one_batch(d_iter, assembler, use_precomputed=True)
             preds = run_model_single_window(model, batch, device)
             images = batch["images"]
             alive = batch["alive_mask"]
@@ -628,7 +632,7 @@ def main():
         batch_size=1,
         dali_threads=4,
         windows_per_round=1,
-        use_precomputed=False,
+        use_precomputed=True,
         seed=int(time.time()), # use different seed each run
     )
 
