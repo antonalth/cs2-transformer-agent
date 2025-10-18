@@ -1291,7 +1291,7 @@ class CS2Transformer(nn.Module):
                     # Get packed raw features from the modified encoder
                     packed_vis_raw = self.visual_encoder(alive_images.reshape(num_alive, 1, 1, C, H, W))
                     # Scatter the results back into the dense tensor
-                    vis_raw[alive] = packed_vis_raw.squeeze(1).squeeze(1)
+                    vis_raw[alive] = packed_vis_raw.squeeze(1).squeeze(1).to(vis_raw.dtype)
 
             # --- Step 2: Apply the SHARED Projection Layer ---
             # Both paths converge here. `vis` is the final [B, T, P, d_model] tensor.
