@@ -104,6 +104,74 @@ def auto_find_best_ckpt(run_dir: str) -> str:
     cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return str(cands[0])
 
+def resolve_pov_paths(args) -> List[str]:
+    paths = []
+    if args.pov_pattern:
+        # allow '{}' or '%d'
+        for i in range(5):
+            try:
+                if '{}' in args.pov_pattern:
+                    paths.append(args.pov_pattern.format(i))
+                elif '%d' in args.pov_pattern:
+                    paths.append(args.pov_pattern % i)
+                else:
+                    raise ValueError("Pattern must include '{}' or '%d'")
+            except Exception as e:
+                raise RuntimeError(f"Failed to format --pov-pattern for i={i}: {e}")
+    else:
+        for i in range(5):
+            p = getattr(args, f"pov{i}")
+            if p is None:
+                raise RuntimeError(f"--pov{i} is required when --pov-pattern is not used")
+            paths.append(p)
+    for p in paths:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"POV video not found: {p}")
+    return paths
+
+def read_frames_cv2(video_path: str, start_frame: int, T: int) -> List[np.ndarray]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    # clamp start to valid range
+    start = max(0, min(start_frame, max(0, total - T)))
+    # jump to start
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    frames = []
+    for _ in range(T):
+        ok, f = cap.read()
+        if not ok:
+            break
+        frames.append(f)  # BGR uint8
+    cap.release()
+    # if short, pad with black
+    while len(frames) < T:
+        if frames:
+            h, w = frames[-1].shape[:2]
+        else:
+            h, w = 720, 1280
+        frames.append(np.zeros((h, w, 3), np.uint8))
+    return frames
+
+def load_5pov_frames(pov_paths: List[str], start_frame: int, T: int, target_hw=(360, 640)) -> torch.Tensor:
+    """Return [T, 5, 3, H, W] RGB uint8 tensor for viewer overlays."""
+    Tlist = []
+    for t in range(T):
+        Tlist.append([])
+
+    # Read each POV independently (keeps things simple/reliable)
+    pov_frames = [read_frames_cv2(p, start_frame, T) for p in pov_paths]  # each: list of T BGR frames
+    Ht, Wt = target_hw
+    for t in range(T):
+        for pov in range(5):
+            bgr = pov_frames[pov][t]
+            rgb = cv2.cvtColor(cv2.resize(bgr, (Wt, Ht)), cv2.COLOR_BGR2RGB)
+            Tlist[t].append(torch.from_numpy(rgb).permute(2, 0, 1))  # [3,H,W] uint8
+    # stack
+    x = torch.stack([torch.stack(Tlist[t], dim=0) for t in range(T)], dim=0)  # [T,5,3,H,W]
+    return x
+
 
 # --------------------------
 # Grid & overlay helpers
@@ -143,7 +211,7 @@ def img_from_tensor(x: torch.Tensor) -> np.ndarray:
     if x.dtype != torch.uint8:
         x = x.clamp(0, 255).to(torch.uint8)
     arr = x.permute(1, 2, 0).cpu().numpy()  # HWC RGB
-    return cv2.cvtColor(arr, cv2.COLOR_RGB_BGR)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
 def topk_multi_hot_from_logits(logits: torch.Tensor, names: List[str], k: int = 3) -> List[str]:
@@ -188,14 +256,8 @@ def build_keyboard_names() -> List[str]:
 # Prediction helpers
 # --------------------------
 @torch.no_grad()
-def run_model_single_window(
-    model: CS2Transformer,
-    batch: Dict[str, torch.Tensor],
-    device: torch.device,
-) -> Dict[str, Any]:
+def run_model_single_window(model: CS2Transformer, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     model.eval()
-
-    # Move tensors to device
     moved = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
@@ -203,21 +265,21 @@ def run_model_single_window(
         else:
             moved[k] = v
 
-    # IMPORTANT: prefer precomputed embeddings; do not trigger ViT on raw images.
-    model_in = dict(moved)
-    model_in.pop("images", None)   # keep images in `batch` for display, but don't feed to model
-
-    preds = model(model_in)  # forward across T using the preembedded path
-
+    # If precomputed embeddings are present, ensure the model uses them
+    # The key "video_embeddings" matches what is produced by train3.py's BatchAssembler
+    if "video_embeddings" in moved:
+        # Prevent the model from trying to re-encode raw images if they accidentally exist in the batch
+        if "images" in moved:
+            moved["images"] = None
+    
+    preds = model(moved)
+    
+    # move to CPU for viewer
     def to_cpu_tree(obj):
-        if isinstance(obj, torch.Tensor):
-            return obj.detach().cpu()
-        if isinstance(obj, dict):
-            return {k: to_cpu_tree(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [to_cpu_tree(v) for v in obj]
+        if isinstance(obj, torch.Tensor): return obj.detach().cpu()
+        if isinstance(obj, dict):         return {k: to_cpu_tree(v) for k, v in obj.items()}
+        if isinstance(obj, list):         return [to_cpu_tree(v) for v in obj]
         return obj
-
     return to_cpu_tree(preds)
 
 
@@ -313,7 +375,7 @@ def render_grid_for_time(
             if rn_prd.numel() == 1:
                 rn_hat = int(torch.round(rn_prd).item())
             else:
-                rn_hat = int(torch.argmax(rn_prd).item())
+                rn_hat = int(torch.argmax(rn_prd).item()) + 1 # Convert 0-indexed to 1-indexed
         else:
             try:
                 rn_hat = int(rn_prd)
@@ -423,7 +485,7 @@ def build_min_args(
     a.split = split
     a.T_frames = T_frames
     a.batch_size = batch_size
-    a.use_precomputed_embeddings = True
+    a.use_precomputed_embeddings = use_precomputed
     a.dali_threads = dali_threads
     a.windows_per_round = windows_per_round
     # extras used downstream (harmless defaults)
@@ -448,26 +510,13 @@ def build_min_args(
     a.compile = False
     a.ema_decay = 0.999
     a.seed = seed
-    a.grad_ckpt = False
-    a.grad_ckpt_use_reentrant = False
-    a.cached_training = False
-    a.cached_chunk_T = 256
-    a.cached_detach = True
-    a.hf_model_name = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-    a.hf_compute_dtype = "bf16"
-    a.hf_channels_last = True
-    a.hf_use_processor = True
-    a.hf_norm_chunk = 64
-    a.hf_forward_chunk = 64
-    a.audio_cnn_channels = (64, 128, 256)
-    a.mel_bins = 128
-    a.db_cutoff = -80.0
-    a.sample_rate = 48000
-    a.window_length = 2048
-    a.hop_length = 320
-    a.mel_fmin = 50.0
-    a.mel_fmax = 16000.0
-    a.fps = 32
+    a.dist_backend = "nccl"
+    a.balance_losses_after_updates = 1500
+    a.balance_momentum = 0.99
+    a.balance_every_evals = 1
+    a.detailed_loss = False
+    a.num_steps=10
+
     return a
 
 
@@ -489,6 +538,24 @@ def build_random_iterator_and_assembler(args) -> Tuple[Any, Any]:
     )
     return d_iter, assembler
 
+def build_preembedded_iter(args) -> Tuple[Any, Any]:
+    # Use your existing machinery but ask for precomputed embeddings only.
+    args.use_precomputed_embeddings = True
+    manifest = T3.Manifest(args.data_root, args.manifest)
+    games = manifest.get_games(args.split)
+    if not games:
+        raise RuntimeError(f"No games for split '{args.split}'. Check manifest & data_root.")
+
+    store = T3.LmdbStore()
+    team_rounds = T3.build_team_rounds(args.data_root, games, store)
+
+    # Build the epoch loader; this should yield ONLY cached token batches
+    d_iter, assembler, _ = T3.build_epoch_loader(
+        args, epoch=np.random.randint(0, 100000), store=store, team_rounds=team_rounds,
+        last_batch_policy=("partial" if args.split.lower() == "val" else "drop"),
+        rank=0, world_size=1
+    )
+    return d_iter, assembler
 
 def sample_one_batch(d_iter, assembler, use_precomputed: bool = False) -> Dict[str, torch.Tensor]:
     """Pull a single batch from DALI and assemble it into the model's input dict."""
@@ -498,23 +565,65 @@ def sample_one_batch(d_iter, assembler, use_precomputed: bool = False) -> Dict[s
     batch = assembler.assemble(dali_out, use_precomputed)
     return batch
 
+def sample_preembedded_batch(d_iter, assembler) -> Dict[str, torch.Tensor]:
+    """Yield a batch with precomputed tokens (no raw images)."""
+    # The iterator returns one list per device; unwrap
+    dali_out = next(iter(d_iter))
+    if isinstance(dali_out, list) and len(dali_out) == 1:
+        dali_out = dali_out[0]
+    # assemble with use_precomputed=True
+    batch = assembler.assemble(dali_out, use_precomputed=True)
+    return batch
+
 
 def ui_loop(
     model: CS2Transformer,
     device: torch.device,
     args,
 ):
-    # Build pipeline and take the first sample
-    d_iter, assembler = build_random_iterator_and_assembler(args)
-    batch = sample_one_batch(d_iter, assembler, use_precomputed=True)
+    if args.preembedded:
+        # 1) Build an iterator that yields preembedded batches only
+        d_iter, assembler = build_preembedded_iter(args)
 
-    # Pre-compute predictions for the current window
-    preds = run_model_single_window(model, batch, device)
+        # 2) Resolve 5 POV video files for external frame rendering
+        pov_paths = resolve_pov_paths(args)
 
-    # Unpack for convenience
-    images = batch["images"]        # [B, T, 5, 3, H, W]
-    alive = batch["alive_mask"]     # [B, T, 5]
-    targets = batch["targets"]      # nested dict of [B, T, ...]
+        # 3) Pull first preembedded sample
+        batch = sample_preembedded_batch(d_iter, assembler)
+        
+        # Figure out sequence length T from embeddings/targets
+        if "video_embeddings" in batch:
+            T = int(batch["video_embeddings"].shape[1])
+        else:
+            # fallback if embeddings not in batch; try targets
+            any_head = next(iter(batch["targets"]["game_strategy"].values()))
+            T = int(any_head.shape[1])
+        
+        # Use a start frame of 0, as metadata is not passed in the batch
+        start_frame = 0
+
+        # 4) Load frames externally for *display* only
+        frames = load_5pov_frames(pov_paths, start_frame, T, target_hw=(360, 640))  # [T,5,3,H,W] RGB uint8
+        
+        # Use alive mask from batch if available, otherwise assume all alive
+        if "alive_mask" in batch:
+            alive = batch["alive_mask"]  # [B,T,5]
+        else:
+            alive = torch.ones((1, T, 5), dtype=torch.bool)
+
+        preds = run_model_single_window(model, batch, device)
+
+        images = frames.unsqueeze(0)  # [B=1,T,5,3,H,W] RGB uint8 (matches rest of viewer)
+        targets = batch["targets"]
+
+    else:
+        # original path (raw images via DALI)
+        d_iter, assembler = build_random_iterator_and_assembler(args)
+        batch = sample_one_batch(d_iter, assembler, use_precomputed=False)
+        preds = run_model_single_window(model, batch, device)
+        images = batch["images"]
+        alive = batch["alive_mask"]
+        targets = batch["targets"]
 
     B, T, P, C, H, W = images.shape
     assert B == 1 and P == 5, f"Expected B=1, P=5; got {images.shape}"
@@ -545,10 +654,7 @@ def ui_loop(
             panel_size=(PANEL_W, PANEL_H),
         )
         # Overlay headline
-        head = (
-            f"split={args.split}  T={args.T_frames}  frame={t+1}/{T}   "
-            f"ckpt={Path(args.ckpt).name if args.ckpt else 'auto'}   preembed=True"
-        )
+        head = f"split={args.split}  T={T}  frame={t+1}/{T}   ckpt={Path(args.ckpt).name if args.ckpt else 'auto'}"
         cv2.putText(grid, head, (12, 24), FONT, 0.6, WHITE, 2, cv2.LINE_AA)
 
         cv2.imshow(win_name, grid)
@@ -563,10 +669,17 @@ def ui_loop(
         elif key == ord('n'):
             # New random window
             print("Sampling new random window...")
-            batch = sample_one_batch(d_iter, assembler, use_precomputed=True)
+            if args.preembedded:
+                batch = sample_preembedded_batch(d_iter, assembler)
+                frames = load_5pov_frames(pov_paths, 0, T, target_hw=(360, 640))
+                images = frames.unsqueeze(0)
+                alive = batch.get("alive_mask", torch.ones((1, T, 5), dtype=torch.bool))
+            else:
+                batch = sample_one_batch(d_iter, assembler, use_precomputed=False)
+                images = batch["images"]
+                alive = batch["alive_mask"]
+
             preds = run_model_single_window(model, batch, device)
-            images = batch["images"]
-            alive = batch["alive_mask"]
             targets = batch["targets"]
             B, T, P, C, H, W = images.shape
             t = 0  # reset to first frame
@@ -587,6 +700,15 @@ def main():
     parser.add_argument("--T-frames", dest="T_frames", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="fp16")
+    parser.add_argument("--preembedded", action="store_true",
+                        help="Use precomputed embeddings from LMDB for model input (no DALI).")
+    parser.add_argument("--pov0", type=str, default=None, help="Video path for POV 0")
+    parser.add_argument("--pov1", type=str, default=None, help="Video path for POV 1")
+    parser.add_argument("--pov2", type=str, default=None, help="Video path for POV 2")
+    parser.add_argument("--pov3", type=str, default=None, help="Video path for POV 3")
+    parser.add_argument("--pov4", type=str, default=None, help="Video path for POV 4")
+    parser.add_argument("--pov-pattern", type=str, default=None,
+                        help="printf-style or python-format pattern for 5 POVs, e.g. '/path/pov_%d.mp4' or '/path/pov_{}.mp4'")
     args = parser.parse_args()
 
     if args.manifest is None:
@@ -632,9 +754,15 @@ def main():
         batch_size=1,
         dali_threads=4,
         windows_per_round=1,
-        use_precomputed=True,
+        use_precomputed=args.preembedded,
         seed=int(time.time()), # use different seed each run
     )
+    # Pass through pov arguments for ui_loop to use
+    min_args.preembedded = args.preembedded
+    min_args.pov_pattern = args.pov_pattern
+    for i in range(5):
+        setattr(min_args, f"pov{i}", getattr(args, f"pov{i}"))
+
 
     # Enter UI
     ui_loop(model, device, min_args)
