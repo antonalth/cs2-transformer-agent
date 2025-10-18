@@ -63,38 +63,18 @@ except Exception:
 CS2Transformer = cs2_model.CS2Transformer
 CS2Config = cs2_model.CS2Config
 
-# Optional: item/action label maps from injection_mold (for pretty HUD)
-BIT_TO_KEYBOARD = None
-BIT_TO_ECO = None
-BIT_TO_ITEM = None
-try:
-    # Try to import sibling injection_mold in project
-    import importlib.util, types
-    cand_paths = [
-        #Path(__file__).resolve().parents[2] / "testing" / "lmdb" / "lmdb_inspect_linux.py",
-        Path(__file__).resolve().parents[2] / "to_lmdb" / "injection_mold.py",
-        Path(__file__).resolve().parents[2] / "injection_mold.py",
-    ]
-    for p in cand_paths:
-        if p.is_file():
-            spec = importlib.util.spec_from_file_location("_inj", str(p))
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)  # type: ignore
-                spec.loader.exec_module(mod)  # type: ignore
-                # These names exist in your repo; fall back gracefully if missing
-                BIT_TO_KEYBOARD = getattr(mod, "BIT_TO_KEYBOARD", None)
-                BIT_TO_ECO = getattr(mod, "BIT_TO_ECO", None)
-                BIT_TO_ITEM = getattr(mod, "BIT_TO_ITEM", None)
-                break
-except Exception:
-    pass
 
-if BIT_TO_KEYBOARD is None:
-    BIT_TO_KEYBOARD = {i: f"K{i}" for i in range(31)}
-if BIT_TO_ECO is None:
-    BIT_TO_ECO = {i: f"ECO{i}" for i in range(224)}
-if BIT_TO_ITEM is None:
-    BIT_TO_ITEM = {i: f"IT{i}" for i in range(128)}
+# Item/Action label maps (copied from injection_mold.py — no dynamic imports)
+# These mirror the maps built during dataset creation so HUD labels match your data.
+ITEM_NAMES = ['AK-47', 'AUG', 'AWP', 'Bayonet', 'Bowie Knife', 'Butterfly Knife', 'C4 Explosive', 'CZ75-Auto', 'Charm Detachments', 'Classic Knife', 'Decoy Grenade', 'Defuse Kit', 'Desert Eagle', 'Dual Berettas', 'FAMAS', 'Falchion Knife', 'Five-SeveN', 'Flashbang', 'Flip Knife', 'G3SG1', 'Galil AR', 'Glock-18', 'Gut Knife', 'Heavy Assault Suit', 'High Explosive Grenade', 'Huntsman Knife', 'Incendiary Grenade', 'Karambit', 'Kevlar & Helmet', 'Kevlar Vest', 'Knife', 'Kukri Knife', 'M249', 'M4A1-S', 'M4A4', 'M9 Bayonet', 'MAC-10', 'MAG-7', 'MP5-SD', 'MP7', 'MP9', 'Medi-Shot', 'Molotov', 'Navaja Knife', 'Negev', 'Nomad Knife', 'Nova', 'P2000', 'P250', 'P90', 'PP-Bizon', 'Paracord Knife', 'R8 Revolver', 'Rescue Kit', 'SCAR-20', 'SG 553', 'SSG 08', 'Sawed-Off', 'Shadow Daggers', 'Skeleton Knife', 'Smoke Grenade', 'Stiletto Knife', 'Survival Knife', 'Talon Knife', 'Tec-9', 'Trade Up Contract', 'UMP-45', 'USP-S', 'Ursus Knife', 'XM1014', 'Zeus x27', 'item_nvg', 'knife', 'knife_t']
+KEYBOARD_ONLY_ACTIONS = ['IN_ATTACK', 'IN_JUMP', 'IN_DUCK', 'IN_FORWARD', 'IN_BACK', 'IN_USE', 'IN_CANCEL', 'IN_TURNLEFT', 'IN_TURNRIGHT', 'IN_MOVELEFT', 'IN_MOVERIGHT', 'IN_ATTACK2', 'IN_RELOAD', 'IN_ALT1', 'IN_ALT2', 'IN_SPEED', 'IN_WALK', 'IN_ZOOM', 'IN_WEAPON1', 'IN_WEAPON2', 'IN_BULLRUSH', 'IN_GRENADE1', 'IN_GRENADE2', 'IN_ATTACK3', 'IN_SCORE', 'IN_INSPECT', 'SWITCH_1', 'SWITCH_2', 'SWITCH_3', 'SWITCH_4', 'SWITCH_5']
+# ECO actions are buyzone + item purchases using the 'safe' item names
+ECO_ACTIONS = ['BUY_AK_47', 'BUY_AUG', 'BUY_AWP', 'BUY_Bayonet', 'BUY_Bowie_Knife', 'BUY_Butterfly_Knife', 'BUY_C4_Explosive', 'BUY_CZ75_Auto', 'BUY_Charm_Detachments', 'BUY_Classic_Knife', 'BUY_Decoy_Grenade', 'BUY_Defuse_Kit', 'BUY_Desert_Eagle', 'BUY_Dual_Berettas', 'BUY_FAMAS', 'BUY_Falchion_Knife', 'BUY_Five_SeveN', 'BUY_Flashbang', 'BUY_Flip_Knife', 'BUY_G3SG1', 'BUY_Galil_AR', 'BUY_Glock_18', 'BUY_Gut_Knife', 'BUY_Heavy_Assault_Suit', 'BUY_High_Explosive_Grenade', 'BUY_Huntsman_Knife', 'BUY_Incendiary_Grenade', 'BUY_Karambit', 'BUY_Kevlar_Vest', 'BUY_Kevlar_and_Helmet', 'BUY_Knife', 'BUY_Kukri_Knife', 'BUY_M249', 'BUY_M4A1_S', 'BUY_M4A4', 'BUY_M9_Bayonet', 'BUY_MAC_10', 'BUY_MAG_7', 'BUY_MP5_SD', 'BUY_MP7', 'BUY_MP9', 'BUY_Medi_Shot', 'BUY_Molotov', 'BUY_Navaja_Knife', 'BUY_Negev', 'BUY_Nomad_Knife', 'BUY_Nova', 'BUY_P2000', 'BUY_P250', 'BUY_P90', 'BUY_PP_Bizon', 'BUY_Paracord_Knife', 'BUY_R8_Revolver', 'BUY_Rescue_Kit', 'BUY_SCAR_20', 'BUY_SG_553', 'BUY_SSG_08', 'BUY_Sawed_Off', 'BUY_Shadow_Daggers', 'BUY_Skeleton_Knife', 'BUY_Smoke_Grenade', 'BUY_Stiletto_Knife', 'BUY_Survival_Knife', 'BUY_Talon_Knife', 'BUY_Tec_9', 'BUY_Trade_Up_Contract', 'BUY_UMP_45', 'BUY_USP_S', 'BUY_Ursus_Knife', 'BUY_XM1014', 'BUY_Zeus_x27', 'BUY_item_nvg', 'BUY_knife', 'BUY_knife_t', 'IN_BUYZONE']
+
+# Build bit→label maps expected by this script
+BIT_TO_ITEM = {i: name for i, name in enumerate(ITEM_NAMES)}
+BIT_TO_KEYBOARD = {i: name for i, name in enumerate(KEYBOARD_ONLY_ACTIONS)}
+BIT_TO_ECO = {i: name for i, name in enumerate(ECO_ACTIONS)}
 
 # --------------------------------------------------------------------------------------
 # Constants (mirror your training setup)
