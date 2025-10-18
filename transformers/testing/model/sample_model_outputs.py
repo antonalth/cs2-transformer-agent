@@ -522,7 +522,7 @@ def draw_pov_panel(frame: np.ndarray,
                    f_idx: int, pov_idx: int) -> np.ndarray:
     """Overlay compact GT (green) and prediction (red) for one POV on a single frame image."""
     if frame is None:
-        frame = np.zeros((360, 640, 3), np.uint8)
+        frame = np.zeros((480, 640, 3), np.uint8)
         put_text(frame, "[missing frame]", (8, 18), (0, 200, 255))
         return frame
 
@@ -703,7 +703,7 @@ def run_model_on_record(state: ViewerState) -> None:
         # Fallback: use raw images (on-the-fly encoder path).
         # Convert frames to tensor shape [B,T,5,3,H,W] RGB and scale 0..1
         # If any POV missing, fill with black.
-        H = 360
+        H = 480
         W = 640
         buf = np.zeros((T, P, H, W, 3), dtype=np.uint8)
         for p in range(P):
@@ -753,8 +753,8 @@ def compose_grid(state: ViewerState) -> np.ndarray:
     f = np.clip(state.t_idx, 0, T - 1)
 
     # Base cell size from actual frames if available
-    # Try to use first available POV frame to set size; default 360x640 otherwise
-    H, W = 360, 640
+    # Try to use first available POV frame to set size; default 480x640 otherwise
+    H, W = 480, 640
     for arr in state.frames_5x:
         if arr is not None and len(arr) > 0:
             H, W = arr.shape[1], arr.shape[2]
