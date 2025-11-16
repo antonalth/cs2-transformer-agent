@@ -11,3 +11,4 @@ tqdm
 timm
 pyyaml
 bitsandbytes
+tensorboard

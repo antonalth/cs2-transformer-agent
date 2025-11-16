@@ -16,3 +16,4 @@ gemini.md
 *.log
 *__pycache__
 runs/
+.idea/workspace.xml
