@@ -305,7 +305,7 @@ class DatasetRoot:
     def __init__(self, config: DatasetConfig):
         self.store = self.LmdbCache()
         self.dataset_path = os.path.abspath(config.data_root)
-        manifest_path = self.dataset_path / "manifest.json"
+        manifest_path = os.path.join(self.dataset_path, "manifest.json")
         with open(manifest_path, "r", encoding="utf-8") as f: self.manifest = json.load(f)
         self.train = self.build_games("train")
         self.val = self.build_games("val")
