@@ -351,7 +351,129 @@ class DatasetRoot:
                         )
                     )
         return Epoch(self.config, epoch_idx, samples)
-    
+
+if __name__ == "__main__":
+    # Simple smoke test for DatasetRoot / Epoch
+    logging.basicConfig(level=logging.INFO)
+
+    parser = argparse.ArgumentParser("dataset.py smoke test")
+    parser.add_argument("--data_root", type=str, required=True,
+                        help="Root directory of the dataset (same as DatasetConfig.data_root)")
+    parser.add_argument("--run_dir", type=str, default="./runs/smoke_test",
+                        help="Run directory for DatasetConfig.run_dir")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val"],
+                        help="Which split to build an epoch for")
+    parser.add_argument("--epoch_idx", type=int, default=0,
+                        help="Epoch index used for window sampling")
+    parser.add_argument("--num_samples", type=int, default=2,
+                        help="How many samples to draw from the epoch")
+    parser.add_argument("--frames_per_sample", type=int, default=16,
+                        help="How many frames per sample to render into the video")
+    parser.add_argument("--video_out", type=str, required=True,
+                        help="Output path for the smoke-test video (e.g. /tmp/ds_smoke.mp4)")
+    args = parser.parse_args()
+
+    # Build config and dataset root
+    cfg = DatasetConfig(
+        data_root=args.data_root,
+        run_dir=args.run_dir,
+    )
+    ds_root = DatasetRoot(cfg)
+    epoch = ds_root.build_epoch(args.split, args.epoch_idx)
+
+    if len(epoch) == 0:
+        logging.error("Epoch is empty, nothing to smoke-test.")
+        raise SystemExit(1)
+
+    import cv2  # Only needed for the smoke test
+
+    # Probe first sample for shape info
+    first_sample = epoch[0]
+    images = first_sample.images  # [T, 5, H, W, C]
+    T, num_pov, H, W, C = images.shape
+    frames_per_sample_default = min(args.frames_per_sample, T)
+
+    # Prepare VideoWriter
+    os.makedirs(os.path.dirname(args.video_out) or ".", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(args.video_out, fourcc, FRAME_RATE, (W * num_pov, H))
+    if not writer.isOpened():
+        logging.error(f"Could not open VideoWriter for {args.video_out}")
+        raise SystemExit(1)
+
+    logging.info(
+        "Smoke test: writing up to %d samples, %d frames/sample to %s",
+        args.num_samples,
+        frames_per_sample_default,
+        args.video_out,
+    )
+
+    def tensor_to_uint8(x: torch.Tensor) -> np.ndarray:
+        """Convert [.., H, W, C] torch tensor to uint8 numpy array."""
+        arr = x.detach().cpu().numpy()
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        return arr
+
+    num_samples = min(args.num_samples, len(epoch))
+    for s_idx in range(num_samples):
+        sample = epoch[s_idx]
+        images = tensor_to_uint8(sample.images)  # [T, 5, H, W, C]
+        gt = sample.truth
+
+        frames_this = min(args.frames_per_sample, images.shape[0])
+
+        for t in range(frames_this):
+            # Take frame t from all POVs → [5, H, W, C]
+            frame_stack = images[t]
+
+            # Tile 5 POVs horizontally → [H, W*5, C]
+            row = np.concatenate([frame_stack[p] for p in range(num_pov)], axis=1)
+            frame_bgr = cv2.cvtColor(row, cv2.COLOR_RGB2BGR)
+
+            # Overlay tiny text for each POV
+            for pov in range(num_pov):
+                x0 = pov * W + 4
+                y0 = 14  # small offset from top
+
+                alive = bool(gt.alive_mask[t, pov].item())
+                hp = float(gt.stats[t, pov, 0].item())
+                weapon = int(gt.active_weapon_idx[t, pov].item())
+                rnd = int(gt.round_number[t].item())
+                state = int(gt.round_state_mask[t].item())
+
+                txt1 = f"P{pov} {'A' if alive else 'D'} hp={int(hp)} w={weapon}"
+                txt2 = f"r={rnd} st={state}"
+
+                color = (0, 255, 0) if alive else (0, 0, 255)
+
+                cv2.putText(
+                    frame_bgr,
+                    txt1,
+                    (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame_bgr,
+                    txt2,
+                    (x0, y0 + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            writer.write(frame_bgr)
+
+    writer.release()
+    logging.info("Smoke test complete, video written to %s", args.video_out)
+
+
 __all__ = [
     "DatasetConfig"
     "DatasetRoot",
