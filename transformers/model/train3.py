@@ -166,9 +166,9 @@ def build_team_rounds(data_root: str, games: List[Tuple[str, str]], store: LmdbS
             if len(r.get("pov_videos", [])) != 5 or len(r.get("pov_audio", [])) != 5: continue
             def _resolve(p): return os.path.abspath(os.path.join(data_root, "recordings", demoname, p))
             videos, audio = [_resolve(pv) for pv in r["pov_videos"]], [_resolve(pa) for pa in r["pov_audio"]]
-            if not all(os.path.exists(p) for p in videos + audio):
-                logging.warning(f"Skipping {demoname}/{r['round_num']}: missing media file.")
-                continue
+            # if not all(os.path.exists(p) for p in videos + audio):
+            #     logging.warning(f"Skipping {demoname}/{r['round_num']}: missing media file.")
+            #     continue
             team_rounds.append(TeamRound(demoname=demoname, lmdb_path=lmdb_path, round_num=int(r["round_num"]),
                                        team=str(r["team"]).upper(), start_tick=int(r["start_tick"]), end_tick=int(r["end_tick"]),
                                        pov_videos=videos, pov_audio=audio))
@@ -1397,7 +1397,7 @@ def train(args, model_cfg):
     writer = SummaryWriter(args.run_dir) if rank == 0 else None
 
     # --- Build Model, Loss, Optimizer ---
-    model = CS2Transformer(model_cfg).to(device)
+    model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device)
     if args.compile: model = torch.compile(model)
     if is_ddp: model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
     
@@ -1437,7 +1437,7 @@ def train(args, model_cfg):
         args._orig_warmup_steps = args.warmup_steps  # optional: keep a copy
         args.warmup_steps = math.ceil(args.warmup_steps / max(1, args.accum_steps))
 
-    optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_updates)
+    # optimizer, scheduler, scaler = build_optimizer_scheduler(model, args, total_updates) # i assume this is a duplicate
 
     ema = EMA(model, decay=args.ema_decay) if args.ema_decay and args.ema_decay > 0 else None
 
@@ -1597,7 +1597,7 @@ def smoke_test(args, model_cfg):
     dali_iter, assembler, _ = build_epoch_loader(args, 0, store, team_rounds)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CS2Transformer(model_cfg).to(device)
+    model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device)
     loss_weights = { 'stats': 1.0, 'mouse': 1.0, 'keyboard': 1.0, 'eco': 1.0, 'inventory': 1.0, 'weapon': 0.25,
                      'round_number': 1.0, 'round_state': 1.0, 'pos_heatmap': 1.0, 'enemy_heatmap': 1.0 }
     loss_fn = CompositeLoss(weights=loss_weights).to(device)
