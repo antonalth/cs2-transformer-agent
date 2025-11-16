@@ -170,7 +170,7 @@ class Epoch(torch.utils.data.Dataset):
     def _get_audio_decoder(self, path: str) -> AudioDecoder:
         dec = self.audio_decoders.get(path)
         if dec is None:
-            dec = AudioDecoder(path, device=self.config.epoch_audio_decoding_device)
+            dec = AudioDecoder(path)
             self.audio_decoders[path] = dec
         return dec
     
