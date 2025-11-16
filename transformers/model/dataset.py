@@ -330,7 +330,7 @@ class DatasetRoot:
                 continue
             round = Round(game=game, round_num=int(r["round_num"]),
                           team=str(r["team"]).upper(), start_tick=int(r["start_tick"]),
-                          end_tick=int(r["end_tick"]), pov_videos=videos, pov_audio=audio)
+                          end_tick=int(r["end_tick"]), pov_video=videos, pov_audio=audio)
             game.rounds.append(round)
 
     def build_epoch(self, split: str, epoch_idx: int) -> Epoch:
