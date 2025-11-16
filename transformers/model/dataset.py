@@ -264,7 +264,6 @@ class Epoch(torch.utils.data.Dataset):
             enemy_positions   = torch.from_numpy(enemy_pos),                # float32
         )
 
-
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -306,7 +305,7 @@ class DatasetRoot:
     def __init__(self, config: DatasetConfig):
         self.store = self.LmdbCache()
         self.dataset_path = os.path.abspath(config.data_root)
-        manifest_path = self.dataset_path / "mainfest.json"
+        manifest_path = self.dataset_path / "manifest.json"
         with open(manifest_path, "r", encoding="utf-8") as f: self.manifest = json.load(f)
         self.train = self.build_games("train")
         self.val = self.build_games("val")
