@@ -14,10 +14,6 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
 
-#from nvidia.dali import fn, types, pipeline_def
-#from nvidia.dali.plugin.pytorch import DALIGenericIterator
-#from nvidia.dali.plugin.base_iterator import LastBatchPolicy
-
 from model import CS2Transformer, CS2Config
 
 TICK_RATE = 64
@@ -74,23 +70,6 @@ class Epoch(torch.utils.data.Dataset):
         self.epoch_idx = epoch_idx
         self.samples = samples
         self.lmdb_envs = {}
-        #self.temp_dir = os.path.abspath(config.run_dir) / f"epoch{epoch_idx}"
-        #os.makedirs(self.temp_dir, exist_ok=True)
-        #self.vid_paths = [os.path.join(self.temp_dir, f"pov{k}_video.txt") for k in range(5)]
-        #self.aud_paths = [os.path.join(self.temp_dir, f"pov{k}_audio.txt") for k in range(5)]
-        #self.write_files() 
-    
-    #might not even be needed, since testing non-dali
-    def write_files(self):
-        with contextlib.ExitStack() as stack:
-            files = [stack.enter_context(open(p, "w")) for p in self.vid_paths + self.aud_paths]
-            vid_fs, aud_fs = files[:5], files[5:]
-
-            for id, s in enumerate(self.samples):
-                for k in range(5):
-                    vid_fs[k].write(f"{s.round.pov_video[k]} {id} {s.start_frame} {s.length_frames}\n")
-                    aud_fs[k].write(f"{s.round.pov_audio[k]} {s.start_frame}\n")
-        return
     
     def _get_lmdb_env(self, lmdb_path: str):
         env = self.lmdb_envs.get(lmdb_path)
