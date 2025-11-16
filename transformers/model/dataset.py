@@ -75,6 +75,7 @@ class Round:
     def frame_count(self) -> int:
         return ticks_to_framecount(self.start_tick, self.end_tick)
 
+@dataclass
 class RoundSample:
     round: Round
     start_tick: int
