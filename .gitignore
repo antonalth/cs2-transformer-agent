@@ -18,3 +18,4 @@ gemini.md
 /scripts/broker/node_modules
 /cache/**/ */
 *.log
+.idea/workspace.xml
