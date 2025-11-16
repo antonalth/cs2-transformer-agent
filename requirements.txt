@@ -12,5 +12,4 @@ timm
 pyyaml
 bitsandbytes
 tensorboard
---extra-index-url https://download.pytorch.org/whl/cu128
 torchcodec
