@@ -1,11 +1,7 @@
 data/**/ */
 big_training/**/ */
-libs/__pycache__/**/ */
 /big_training
 /data
-/bbox_algs/__pycache__
-/bbox_algs/deprecated/__pycache__
-/libs/__pycache__
 *.jpeg
 .DS_Store
 *.db
@@ -18,4 +14,6 @@ gemini.md
 /scripts/broker/node_modules
 /cache/**/ */
 *.log
+*__pycache__
+runs/
 .idea/workspace.xml
