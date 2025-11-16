@@ -1397,7 +1397,8 @@ def train(args, model_cfg):
     writer = SummaryWriter(args.run_dir) if rank == 0 else None
 
     # --- Build Model, Loss, Optimizer ---
-    model = CS2Transformer(model_cfg, use_dummy_vision=True).to(device)
+    compute_embedds = args.use_precomputed_embeddings
+    model = CS2Transformer(model_cfg, use_dummy_vision=compute_embedds).to(device) 
     if args.compile: model = torch.compile(model)
     if is_ddp: model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
     
