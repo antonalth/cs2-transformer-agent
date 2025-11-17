@@ -12,3 +12,6 @@ timm
 pyyaml
 bitsandbytes
 tensorboard
+torchcodec
+torchaudio
+torchvision==0.24.1
