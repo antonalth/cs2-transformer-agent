@@ -49,7 +49,7 @@ class DatasetConfig:
     epoch_audio_decoding_device: str = "cpu"
     audio_sample_rate: float = 24000.0
     audio_n_fft: int = 1024
-    audio_hop_length: int = audio_sample_rate // FRAME_RATE
+    audio_hop_length: int = 750 #audio_sample_rate // FRAME_RATE
     audio_mel_bins: int = 128
 
 @dataclass
