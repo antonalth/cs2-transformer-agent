@@ -198,7 +198,7 @@ class Epoch(torch.utils.data.Dataset):
             frames = decoder.get_frames_in_range(sample.start_frame, sample.start_frame + sample.length_frames).data
             pov_tensors.append(self.pad_or_truncate_to(frames, self.config.epoch_round_sample_length, dim=0))
 
-        return torch.stack(pov_tensors, dim=0).permute(1, 0, 2, 3, 4)
+        return torch.stack(pov_tensors, dim=0).permute(1, 0, 3, 4, 2)
     
     def _decode_audio(self, sample: RoundSample):
         pov_mels = []
