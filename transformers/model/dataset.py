@@ -384,7 +384,7 @@ if __name__ == "__main__":
                         help="Epoch index used for window sampling")
     parser.add_argument("--num_samples", type=int, default=2,
                         help="How many samples to draw from the epoch")
-    parser.add_argument("--frames_per_sample", type=int, default=16,
+    parser.add_argument("--frames_per_sample", type=int, default=32,
                         help="How many frames per sample to render into the video")
     parser.add_argument("--video_out", type=str, required=True,
                         help="Output path for the smoke-test video (e.g. /tmp/ds_smoke.mp4)")
@@ -406,14 +406,20 @@ if __name__ == "__main__":
 
     # Probe first sample for shape info
     first_sample = epoch[0]
-    images = first_sample.images  # [T, 5, H, W, C]
+    # Note: We expect [T, 5, H, W, C] after the permute fix
+    images = first_sample.images 
     T, num_pov, H, W, C = images.shape
-    frames_per_sample_default = min(args.frames_per_sample, T)
+    
+    # Validation check for dimensions in case the fix wasn't applied
+    if C > W and C > H:
+         logging.warning("Dimension C seems large. Did you apply the permute fix? (Time, Pov, H, W, C)")
 
     # Prepare VideoWriter
     os.makedirs(os.path.dirname(args.video_out) or ".", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    # Output width is W * num_pov
     writer = cv2.VideoWriter(args.video_out, fourcc, FRAME_RATE, (W * num_pov, H))
+    
     if not writer.isOpened():
         logging.error(f"Could not open VideoWriter for {args.video_out}")
         raise SystemExit(1)
@@ -421,7 +427,7 @@ if __name__ == "__main__":
     logging.info(
         "Smoke test: writing up to %d samples, %d frames/sample to %s",
         args.num_samples,
-        frames_per_sample_default,
+        min(args.frames_per_sample, T),
         args.video_out,
     )
 
@@ -433,6 +439,7 @@ if __name__ == "__main__":
         return arr
 
     num_samples = min(args.num_samples, len(epoch))
+    
     for s_idx in range(num_samples):
         sample = epoch[s_idx]
         images = tensor_to_uint8(sample.images)  # [T, 5, H, W, C]
@@ -448,48 +455,61 @@ if __name__ == "__main__":
             row = np.concatenate([frame_stack[p] for p in range(num_pov)], axis=1)
             frame_bgr = cv2.cvtColor(row, cv2.COLOR_RGB2BGR)
 
-            # Overlay tiny text for each POV
+            # Overlay detailed info for each POV
             for pov in range(num_pov):
                 x0 = pov * W + 4
-                y0 = 14  # small offset from top
-
+                
+                # Extract Scalars/Vectors
                 alive = bool(gt.alive_mask[t, pov].item())
-                hp = float(gt.stats[t, pov, 0].item())
-                weapon = int(gt.active_weapon_idx[t, pov].item())
+                hp = int(gt.stats[t, pov, 0].item())
+                ap = int(gt.stats[t, pov, 1].item())
+                money = int(gt.stats[t, pov, 2].item())
+                
+                pos = gt.position[t, pov].tolist()     # [x, y, z]
+                mouse = gt.mouse_delta[t, pov].tolist() # [dx, dy]
+                # Assuming enemy_pos is per-player (target/nearest) or global
+                eny = gt.enemy_positions[t, pov].tolist() 
+                
+                wep_idx = int(gt.active_weapon_idx[t, pov].item())
+                kbd = int(gt.keyboard_mask[t, pov].item())
+                
+                # Masks (Eco: 4x int64, Inv: 2x int64)
+                eco = gt.eco_mask[t, pov].tolist()
+                inv = gt.inventory_mask[t, pov].tolist()
+
                 rnd = int(gt.round_number[t].item())
                 state = int(gt.round_state_mask[t].item())
 
-                txt1 = f"P{pov} {'A' if alive else 'D'} hp={int(hp)} w={weapon}"
-                txt2 = f"r={rnd} st={state}"
+                # Build Text Lines
+                status_txt = "ALIVE" if alive else "DEAD"
+                lines = [
+                    f"P{pov} {status_txt} R:{rnd} St:{state}",
+                    f"HP:{hp} AP:{ap} $:{money}",
+                    f"Wep:{wep_idx} Keys:{kbd:X}",
+                    f"Pos: {pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}",
+                    f"Aim: {mouse[0]:.2f}, {mouse[1]:.2f}",
+                    f"Eny: {eny[0]:.0f}, {eny[1]:.0f}, {eny[2]:.0f}",
+                    f"Inv: {inv[0]:X}{inv[1]:X}",
+                    f"Eco: {eco[0]:X}{eco[1]:X}..." # Truncated slightly to fit
+                ]
 
-                color = (0, 255, 0) if alive else (0, 0, 255)
-
-                cv2.putText(
-                    frame_bgr,
-                    txt1,
-                    (x0, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame_bgr,
-                    txt2,
-                    (x0, y0 + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.35,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
+                color = (0, 255, 0) if alive else (0, 0, 255) # Green vs Red
+                
+                # Render Lines
+                y_start = 15
+                line_height = 12
+                
+                for i, txt in enumerate(lines):
+                    y = y_start + (i * line_height)
+                    # Draw black outline for readability
+                    cv2.putText(frame_bgr, txt, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 2, cv2.LINE_AA)
+                    # Draw text
+                    cv2.putText(frame_bgr, txt, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
 
             writer.write(frame_bgr)
 
     writer.release()
     logging.info("Smoke test complete, video written to %s", args.video_out)
-
 
 __all__ = [
     "DatasetConfig"
