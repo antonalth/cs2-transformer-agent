@@ -65,9 +65,11 @@ class GroundTruth:
     round_number: torch.IntTensor     # [T]
     round_state_mask: torch.ByteTensor# [T]
     enemy_positions: torch.FloatTensor# [T, 5, 3]
+    enemy_alive_mask: torch.BoolTensor      # [T, 5]
 
 @dataclass
 class TrainingSample:
+    _roundsample: RoundSample
     images: torch.Tensor
     audio: torch.Tensor
     truth: GroundTruth
@@ -231,6 +233,7 @@ class Epoch(torch.utils.data.Dataset):
         rnd_num   = np.full((T,), r.round_num, dtype=np.int32)
         rnd_state = np.zeros((T,), dtype=np.uint8)
         enemy_pos = np.zeros((T, 5, 3), dtype=np.float32)
+        enemy_alive = np.zeros((T, 5), dtype=np.bool_)
 
         ticks = sample.start_tick + (np.arange(T, dtype=np.int32) * TICKS_PER_FRAME)
 
@@ -250,6 +253,10 @@ class Epoch(torch.utils.data.Dataset):
                 alive_slots = [i for i in range(5) if (int(gs["team_alive"]) >> i) & 1]
                 for slot in alive_slots:
                     alive[f, slot] = True
+
+                enemy_alive_slots =  [i for i in range(5) if (int(gs["enemy_alive"]) >> i) & 1]
+                for slot in enemy_alive_slots:
+                    enemy_alive[f, slot] = True
 
                 rnd_state[f]   = gs["round_state"]
                 enemy_pos[f]   = gs["enemy_pos"]
@@ -272,13 +279,14 @@ class Epoch(torch.utils.data.Dataset):
             stats             = torch.from_numpy(stats),                    # float32
             mouse_delta       = torch.from_numpy(mouse),                    # float32
             position          = torch.from_numpy(pos),                      # float32
-            keyboard_mask     = torch.from_numpy(kbd.astype(np.int32)),    # int32
-            eco_mask          = torch.from_numpy(eco.astype(np.int64)),    # int64
-            inventory_mask    = torch.from_numpy(inv.astype(np.int64)),    # int64
+            keyboard_mask     = torch.from_numpy(kbd.astype(np.int32)),     # int32
+            eco_mask          = torch.from_numpy(eco.astype(np.int64)),     # int64
+            inventory_mask    = torch.from_numpy(inv.astype(np.int64)),     # int64
             active_weapon_idx = torch.from_numpy(wep),                      # int32
             round_number      = torch.from_numpy(rnd_num),                  # int32
             round_state_mask  = torch.from_numpy(rnd_state),                # uint8 → byte tensor
             enemy_positions   = torch.from_numpy(enemy_pos),                # float32
+            enemy_alive_mask = torch.from_numpy(enemy_alive)                # bool
         )
 
     def __len__(self) -> int:
@@ -289,7 +297,7 @@ class Epoch(torch.utils.data.Dataset):
         images = self._decode_video(s)
         audio = self._decode_audio(s)
         gt = self._get_truth(s)
-        return TrainingSample(images=images, audio=audio, truth=gt)
+        return TrainingSample(images=images, audio=audio, truth=gt, _roundsample = s)
 
 class DatasetRoot:
     dataset_path: str
@@ -370,31 +378,34 @@ class DatasetRoot:
         return Epoch(self.config, epoch_idx, samples)
 
 if __name__ == "__main__":
+    import cv2
+    import visualize  # Ensure visualize.py is in the same directory
+    import hashlib
+
     # Simple smoke test for DatasetRoot / Epoch
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser("dataset.py smoke test")
     parser.add_argument("--data_root", type=str, required=True,
-                        help="Root directory of the dataset (same as DatasetConfig.data_root)")
+                        help="Root directory of the dataset")
     parser.add_argument("--run_dir", type=str, default="./runs/smoke_test",
-                        help="Run directory for DatasetConfig.run_dir")
+                        help="Run directory for temp files")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val"],
                         help="Which split to build an epoch for")
     parser.add_argument("--epoch_idx", type=int, default=0,
                         help="Epoch index used for window sampling")
     parser.add_argument("--num_samples", type=int, default=2,
                         help="How many samples to draw from the epoch")
-    parser.add_argument("--frames_per_sample", type=int, default=32,
-                        help="How many frames per sample to render into the video")
+    parser.add_argument("--frames_per_sample", type=int, default=64,
+                        help="How many frames per sample to render")
+    parser.add_argument("--debug_files", action="store_true",
+                        help="Print video filenames for debugging duplicates")
     parser.add_argument("--video_out", type=str, required=True,
                         help="Output path for the smoke-test video (e.g. /tmp/ds_smoke.mp4)")
     args = parser.parse_args()
 
-    # Build config and dataset root
-    cfg = DatasetConfig(
-        data_root=args.data_root,
-        run_dir=args.run_dir,
-    )
+    # Build config and dataset
+    cfg = DatasetConfig(data_root=args.data_root, run_dir=args.run_dir)
     ds_root = DatasetRoot(cfg)
     epoch = ds_root.build_epoch(args.split, args.epoch_idx)
 
@@ -402,114 +413,73 @@ if __name__ == "__main__":
         logging.error("Epoch is empty, nothing to smoke-test.")
         raise SystemExit(1)
 
-    import cv2  # Only needed for the smoke test
-
-    # Probe first sample for shape info
+    # Probe first sample for dimensions
     first_sample = epoch[0]
-    # Note: We expect [T, 5, H, W, C] after the permute fix
-    images = first_sample.images 
-    T, num_pov, H, W, C = images.shape
-    
-    # Validation check for dimensions in case the fix wasn't applied
-    if C > W and C > H:
-         logging.warning("Dimension C seems large. Did you apply the permute fix? (Time, Pov, H, W, C)")
+    # sample.images shape: [T, 5, H, W, C] (assuming HWC permute fix is applied)
+    T, num_pov, H, W, C = first_sample.images.shape
+
+    # Calculate grid dimensions: 3 columns (POV0-2) by 2 rows (POV3-4 + Global)
+    grid_w = W * 3
+    grid_h = H * 2
 
     # Prepare VideoWriter
     os.makedirs(os.path.dirname(args.video_out) or ".", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    # Output width is W * num_pov
-    writer = cv2.VideoWriter(args.video_out, fourcc, FRAME_RATE, (W * num_pov, H))
-    
+    writer = cv2.VideoWriter(args.video_out, fourcc, FRAME_RATE, (grid_w, grid_h))
+
     if not writer.isOpened():
         logging.error(f"Could not open VideoWriter for {args.video_out}")
         raise SystemExit(1)
 
-    logging.info(
-        "Smoke test: writing up to %d samples, %d frames/sample to %s",
-        args.num_samples,
-        min(args.frames_per_sample, T),
-        args.video_out,
-    )
+    logging.info(f"Writing {min(args.num_samples, len(epoch))} samples to {args.video_out} ({grid_w}x{grid_h})")
 
     def tensor_to_uint8(x: torch.Tensor) -> np.ndarray:
-        """Convert [.., H, W, C] torch tensor to uint8 numpy array."""
         arr = x.detach().cpu().numpy()
         if arr.dtype != np.uint8:
             arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
         return arr
 
-    num_samples = min(args.num_samples, len(epoch))
-    
-    for s_idx in range(num_samples):
+    def md5(fname):
+        hash_md5 = hashlib.md5()
+        with open(fname, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+    for s_idx in range(min(args.num_samples, len(epoch))):
         sample = epoch[s_idx]
-        images = tensor_to_uint8(sample.images)  # [T, 5, H, W, C]
-        gt = sample.truth
+        
+        if args.debug_files:
+            logging.info(f"--- Sample {s_idx} Debug Info ---")
+            logging.info(f"Round: {sample._roundsample.round.round_num} Team: {sample._roundsample.round.team}")
+            for p_idx, vid_path in enumerate(sample._roundsample.round.pov_video):
+                logging.info(f"  POV {p_idx}: {vid_path}, md5: {md5(vid_path)}")
 
-        frames_this = min(args.frames_per_sample, images.shape[0])
+        images_uint8 = tensor_to_uint8(sample.images) # [T, 5, H, W, C]
+        frames_to_render = min(args.frames_per_sample, images_uint8.shape[0])
 
-        for t in range(frames_this):
-            # Take frame t from all POVs → [5, H, W, C]
-            frame_stack = images[t]
+        logging.info(f"Rendering sample {s_idx+1}: {frames_to_render} frames...")
 
-            # Tile 5 POVs horizontally → [H, W*5, C]
-            row = np.concatenate([frame_stack[p] for p in range(num_pov)], axis=1)
-            frame_bgr = cv2.cvtColor(row, cv2.COLOR_RGB2BGR)
+        for t in range(frames_to_render):
+            # Extract the 5 frames for this timestep
+            # Convert RGB (TorchCodec default) to BGR (OpenCV default) for correct color rendering
+            current_frames = [
+                cv2.cvtColor(images_uint8[t, p], cv2.COLOR_RGB2BGR) 
+                for p in range(5)
+            ]
 
-            # Overlay detailed info for each POV
-            for pov in range(num_pov):
-                x0 = pov * W + 4
-                
-                # Extract Scalars/Vectors
-                alive = bool(gt.alive_mask[t, pov].item())
-                hp = int(gt.stats[t, pov, 0].item())
-                ap = int(gt.stats[t, pov, 1].item())
-                money = int(gt.stats[t, pov, 2].item())
-                
-                pos = gt.position[t, pov].tolist()     # [x, y, z]
-                mouse = gt.mouse_delta[t, pov].tolist() # [dx, dy]
-                # Assuming enemy_pos is per-player (target/nearest) or global
-                eny = gt.enemy_positions[t, pov].tolist() 
-                
-                wep_idx = int(gt.active_weapon_idx[t, pov].item())
-                kbd = int(gt.keyboard_mask[t, pov].item())
-                
-                # Masks (Eco: 4x int64, Inv: 2x int64)
-                eco = gt.eco_mask[t, pov].tolist()
-                inv = gt.inventory_mask[t, pov].tolist()
+            # Use visualize.py to build the composite frame
+            # We pass the GroundTruth object directly; visualize.py handles the tensor conversion
+            composite = visualize.visualize_frame(
+                frames=current_frames, 
+                t=t, 
+                ground_truth=sample.truth
+            )
 
-                rnd = int(gt.round_number[t].item())
-                state = int(gt.round_state_mask[t].item())
-
-                # Build Text Lines
-                status_txt = "ALIVE" if alive else "DEAD"
-                lines = [
-                    f"P{pov} {status_txt} R:{rnd} St:{state}",
-                    f"HP:{hp} AP:{ap} $:{money}",
-                    f"Wep:{wep_idx} Keys:{kbd:X}",
-                    f"Pos: {pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}",
-                    f"Aim: {mouse[0]:.2f}, {mouse[1]:.2f}",
-                    f"Eny: {eny[0]:.0f}, {eny[1]:.0f}, {eny[2]:.0f}",
-                    f"Inv: {inv[0]:X}{inv[1]:X}",
-                    f"Eco: {eco[0]:X}{eco[1]:X}..." # Truncated slightly to fit
-                ]
-
-                color = (0, 255, 0) if alive else (0, 0, 255) # Green vs Red
-                
-                # Render Lines
-                y_start = 15
-                line_height = 12
-                
-                for i, txt in enumerate(lines):
-                    y = y_start + (i * line_height)
-                    # Draw black outline for readability
-                    cv2.putText(frame_bgr, txt, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 2, cv2.LINE_AA)
-                    # Draw text
-                    cv2.putText(frame_bgr, txt, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
-
-            writer.write(frame_bgr)
+            writer.write(composite)
 
     writer.release()
-    logging.info("Smoke test complete, video written to %s", args.video_out)
+    logging.info("Smoke test complete.")
 
 __all__ = [
     "DatasetConfig"
