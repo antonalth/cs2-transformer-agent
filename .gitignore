@@ -17,3 +17,7 @@ gemini.md
 *__pycache__
 runs/
 .idea/workspace.xml
+*.onnx
+*.engine
+cache/
+tmp_dali_filelists/
