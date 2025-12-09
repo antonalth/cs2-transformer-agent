@@ -45,7 +45,7 @@ class DatasetConfig:
     epoch_gen_random_seed: int = 42
     epoch_windows_per_round: int = 3 #how many random windows
     epoch_round_sample_length: int = 128 #number of frames per window
-    epoch_video_decoding_device: str = "cpu"
+    epoch_video_decoding_device: str = "cuda"
     epoch_audio_decoding_device: str = "cpu"
     audio_sample_rate: float = 24000.0
     audio_n_fft: int = 1024
@@ -203,17 +203,31 @@ class Epoch(torch.utils.data.Dataset):
         return torch.stack(pov_tensors, dim=0).permute(1, 0, 3, 4, 2)
     
     def _decode_audio(self, sample: RoundSample):
-        pov_mels = []
+            pov_mels = []
 
-        for pov in sample.round.pov_audio:
-            decoder = self._get_audio_decoder(pov)
-            waveform = decoder.get_samples_played_in_range(start_seconds=sample.start_time, stop_seconds=sample.end_time).data
-            if waveform.numel() == 0:
-                waveform = torch.zeros(2, int(self.config.audio_sample_rate / FRAME_RATE))
-            mel = self.pad_or_truncate_to(self.mel_transform(waveform), self.config.epoch_round_sample_length, dim=-1)
-            pov_mels.append(mel.permute(2, 0, 1).unsqueeze(-1))
+            for pov in sample.round.pov_audio:
+                decoder = self._get_audio_decoder(pov)
+            
+                try:
+                    # Attempt to decode the requested global window for this specific file
+                    waveform = decoder.get_samples_played_in_range(
+                        start_seconds=sample.start_time, 
+                        stop_seconds=sample.end_time
+                    ).data
+                except RuntimeError:
+                    waveform = torch.empty(0)
 
-        return torch.stack(pov_mels, dim=1)
+                if waveform.numel() == 0:
+                    expected_samples = int((self.config.audio_sample_rate / FRAME_RATE) * self.config.epoch_round_sample_length)
+                    waveform = torch.zeros(2, expected_samples)
+
+                mel = self.mel_transform(waveform)
+
+                mel = self.pad_or_truncate_to(mel, self.config.epoch_round_sample_length, dim=-1)
+                
+                pov_mels.append(mel.permute(2, 0, 1).unsqueeze(-1))
+
+            return torch.stack(pov_mels, dim=1)
 
     def _get_truth(self, sample: RoundSample) -> GroundTruth:
         r = sample.round
