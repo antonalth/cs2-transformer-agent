@@ -7,9 +7,8 @@ librosa
 opencv-python
 numpy<2.0
 tqdm
+ninja
 timm
 pyyaml
 bitsandbytes
 tensorboard
---index-url=https://download.pytorch.org/whl/cu128
-torchcodec
