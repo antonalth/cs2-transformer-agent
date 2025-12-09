@@ -2,7 +2,6 @@ transformers
 lmdb
 --no-binary=msgpack msgpack
 msgpack-numpy
-flash-attn
 matplotlib
 librosa
 opencv-python
@@ -12,6 +11,5 @@ timm
 pyyaml
 bitsandbytes
 tensorboard
+--index-url=https://download.pytorch.org/whl/cu128
 torchcodec
-torchaudio
-torchvision==0.24.1

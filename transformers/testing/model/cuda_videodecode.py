@@ -27,9 +27,9 @@ def main():
         # 2. Initialize Decoder on GPU
         decoder = VideoDecoder(args.video_path, device="cuda")
         
-        # 3. Decode a few frames
-        # This will fail immediately if NVDEC is not supported/linked
-        frames = decoder.get_frames_at_indices([0, 1, 2, 3]).data
+        # 3. Decode a small range (Frames 0 to 4)
+        # We use get_frames_in_range as it is confirmed to exist in your version
+        frames = decoder.get_frames_in_range(0, 4).data
         
         print("\n[SUCCESS] Video decoded on GPU!")
         print(f"   Tensor Shape: {frames.shape} (N, C, H, W)")
@@ -43,6 +43,7 @@ def main():
         if "Unsupported device: cuda" in str(e):
             print(">> DIAGNOSIS: Your torchcodec/ffmpeg build does NOT support NVDEC.")
             print(">> FIX: You must use device='cpu' or recompile torchcodec with CUDA flags.")
+            print("        (See: https://github.com/pytorch/torchcodec#gpu-support)")
     except Exception as e:
         print(f"\n[FAILURE] Unexpected error: {e}")
 

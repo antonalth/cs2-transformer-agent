@@ -518,7 +518,7 @@ class AudioCNN(nn.Module):
             x = x.view(B, T, P, -1)
 
         # If input was 4D, the 2D output is what's expected by the caller.
-        return x #das ist mein roter buntstift, habe ich ganz alleine gemalt. (mithilfe von chef gpt)
+        return x 
 
 class PlayerTokenFuser(nn.Module):
     """Fuse visual+audio via elementwise add, add slot identity, then LayerNorm.

@@ -44,8 +44,8 @@ class DatasetConfig:
 
     epoch_gen_random_seed: int = 42
     epoch_windows_per_round: int = 3 #how many random windows
-    epoch_round_sample_length: int = 128 #number of frames per window
-    epoch_video_decoding_device: str = "cuda"
+    epoch_round_sample_length: int = 512 #number of frames per window
+    epoch_video_decoding_device: str = "cpu"
     epoch_audio_decoding_device: str = "cpu"
     audio_sample_rate: float = 24000.0
     audio_n_fft: int = 1024
@@ -196,10 +196,12 @@ class Epoch(torch.utils.data.Dataset):
         pov_tensors = []
 
         for pov in sample.round.pov_video:
-            decoder = self._get_video_decoder(pov)
+            #decoder = self._get_video_decoder(pov) #does not work with CUDA since we dont free these
+            decoder = VideoDecoder(pov, device=self.config.epoch_video_decoding_device)
             frames = decoder.get_frames_in_range(sample.start_frame, sample.start_frame + sample.length_frames).data
             pov_tensors.append(self.pad_or_truncate_to(frames, self.config.epoch_round_sample_length, dim=0))
 
+        del decoder
         return torch.stack(pov_tensors, dim=0).permute(1, 0, 3, 4, 2)
     
     def _decode_audio(self, sample: RoundSample):
@@ -391,15 +393,29 @@ class DatasetRoot:
                     )
         return Epoch(self.config, epoch_idx, samples)
 
+   # --- HELPER FUNCTION FOR DATALOADER ---
+# Must be defined at module level for 'spawn' multiprocessing
+def _collate_identity(batch):
+    return batch[0]
+
 if __name__ == "__main__":
+    import sys
+    import time
     import cv2
     import visualize  # Ensure visualize.py is in the same directory
     import hashlib
+    import torch.multiprocessing as mp
+    from torch.utils.data import DataLoader
 
-    # Simple smoke test for DatasetRoot / Epoch
-    logging.basicConfig(level=logging.INFO)
+    # Force "spawn" for multiprocessing (Required for CUDA/LMDB in workers)
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
-    parser = argparse.ArgumentParser("dataset.py smoke test")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    parser = argparse.ArgumentParser("dataset.py smoke test & benchmark")
     parser.add_argument("--data_root", type=str, required=True,
                         help="Root directory of the dataset")
     parser.add_argument("--run_dir", type=str, default="./runs/smoke_test",
@@ -408,35 +424,107 @@ if __name__ == "__main__":
                         help="Which split to build an epoch for")
     parser.add_argument("--epoch_idx", type=int, default=0,
                         help="Epoch index used for window sampling")
-    parser.add_argument("--num_samples", type=int, default=2,
-                        help="How many samples to draw from the epoch")
+    parser.add_argument("--num_samples", type=int, default=5,
+                        help="Number of samples to process")
     parser.add_argument("--frames_per_sample", type=int, default=64,
-                        help="How many frames per sample to render")
+                        help="How many frames per sample to render (Viz only)")
     parser.add_argument("--debug_files", action="store_true",
                         help="Print video filenames for debugging duplicates")
     parser.add_argument("--video_out", type=str, required=True,
-                        help="Output path for the smoke-test video (e.g. /tmp/ds_smoke.mp4)")
+                        help="Output path for the smoke-test video")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of background worker processes")
+    parser.add_argument("--time", action="store_true",
+                        help="Profile execution time (Loading vs Visualization)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Run pure data loading benchmark (no visualization)")
     args = parser.parse_args()
 
-    # Build config and dataset
+    # 1. Build Config and Dataset
     cfg = DatasetConfig(data_root=args.data_root, run_dir=args.run_dir)
     ds_root = DatasetRoot(cfg)
     epoch = ds_root.build_epoch(args.split, args.epoch_idx)
 
     if len(epoch) == 0:
-        logging.error("Epoch is empty, nothing to smoke-test.")
+        logging.error("Epoch is empty.")
         raise SystemExit(1)
 
-    # Probe first sample for dimensions
+    # 2. Peek at first sample for metadata (Dimensions)
+    logging.info("Peeking at first sample for dimensions...")
     first_sample = epoch[0]
-    # sample.images shape: [T, 5, H, W, C] (assuming HWC permute fix is applied)
     T, num_pov, H, W, C = first_sample.images.shape
+    
+    # --- RESET HANDLES FOR WORKERS ---
+    epoch.lmdb_envs = {}
+    epoch.video_decoders = {}
+    epoch.audio_decoders = {}
+    # ---------------------------------
 
-    # Calculate grid dimensions: 3 columns (POV0-2) by 2 rows (POV3-4 + Global)
-    grid_w = W * 3
-    grid_h = H * 2
+    # 3. Setup DataLoader
+    loader = DataLoader(
+        epoch,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.workers,
+        prefetch_factor=2 if args.workers > 0 else None,
+        collate_fn=_collate_identity,
+        persistent_workers=(args.workers > 0)
+    )
 
-    # Prepare VideoWriter
+    # ==========================================
+    # MODE A: BENCHMARK (Throughput Test)
+    # ==========================================
+    if args.benchmark:
+        print(f"\n{'='*40}")
+        print(f"BENCHMARK MODE: {args.workers} Workers | {cfg.epoch_video_decoding_device.upper()} Decoding")
+        print(f"Target: Process {args.num_samples} samples (No Visualization)")
+        print(f"{'='*40}\n")
+
+        iterator = iter(loader)
+        
+        # Measure First Batch (includes worker spin-up and prefetch latency)
+        t0 = time.perf_counter()
+        try:
+            batch = next(iterator)
+            # Access tensor to ensure transfer is complete
+            _ = batch.images.shape 
+        except StopIteration:
+            print("Dataset empty.")
+            sys.exit(0)
+        t1 = time.perf_counter()
+        
+        first_batch_time = t1 - t0
+        print(f"1. First Batch Latency: {first_batch_time:.4f}s")
+
+        # Measure Remaining Batches (steady state throughput)
+        remaining = args.num_samples - 1
+        if remaining > 0:
+            t_start_rest = time.perf_counter()
+            for i in range(remaining):
+                try:
+                    batch = next(iterator)
+                    _ = batch.images.shape
+                except StopIteration:
+                    break
+            t_end_rest = time.perf_counter()
+            
+            rest_duration = t_end_rest - t_start_rest
+            avg_speed = remaining / rest_duration
+            
+            print(f"2. Steady State ({remaining} samples): {rest_duration:.4f}s")
+            print(f"   Throughput: {avg_speed:.2f} samples/second")
+        else:
+            print("   (Not enough samples for steady state measurement)")
+
+        print(f"\nTotal Time: {(time.perf_counter() - t0):.4f}s")
+        sys.exit(0)
+
+    # ==========================================
+    # MODE B: VISUALIZATION (Smoke Test)
+    # ==========================================
+    
+    # Video Writer Setup
+    grid_w, grid_h = W * 3, H * 2
     os.makedirs(os.path.dirname(args.video_out) or ".", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.video_out, fourcc, FRAME_RATE, (grid_w, grid_h))
@@ -445,7 +533,7 @@ if __name__ == "__main__":
         logging.error(f"Could not open VideoWriter for {args.video_out}")
         raise SystemExit(1)
 
-    logging.info(f"Writing {min(args.num_samples, len(epoch))} samples to {args.video_out} ({grid_w}x{grid_h})")
+    logging.info(f"Writing {args.num_samples} samples to {args.video_out}")
 
     def tensor_to_uint8(x: torch.Tensor) -> np.ndarray:
         arr = x.detach().cpu().numpy()
@@ -453,47 +541,63 @@ if __name__ == "__main__":
             arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
         return arr
 
-    def md5(fname):
-        hash_md5 = hashlib.md5()
-        with open(fname, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+    total_load_time = 0.0
+    total_vis_time = 0.0
+    
+    iterator = iter(loader)
+    t_start_load = time.perf_counter()
 
     for s_idx in range(min(args.num_samples, len(epoch))):
-        sample = epoch[s_idx]
         
+        # Load
+        try:
+            sample = next(iterator)
+        except StopIteration:
+            break
+        t_end_load = time.perf_counter()
+        load_duration = t_end_load - t_start_load
+        total_load_time += load_duration
+
         if args.debug_files:
             logging.info(f"--- Sample {s_idx} Debug Info ---")
-            logging.info(f"Round: {sample._roundsample.round.round_num} Team: {sample._roundsample.round.team}")
-            for p_idx, vid_path in enumerate(sample._roundsample.round.pov_video):
-                logging.info(f"  POV {p_idx}: {vid_path}, md5: {md5(vid_path)}")
+            logging.info(f"Round: {sample._roundsample.round.round_num}")
 
-        images_uint8 = tensor_to_uint8(sample.images) # [T, 5, H, W, C]
+        # Visualize
+        t_start_vis = time.perf_counter()
+        logging.info(f"Rendering sample {s_idx+1}...")
+        
+        images_uint8 = tensor_to_uint8(sample.images)
         frames_to_render = min(args.frames_per_sample, images_uint8.shape[0])
 
-        logging.info(f"Rendering sample {s_idx+1}: {frames_to_render} frames...")
-
         for t in range(frames_to_render):
-            # Extract the 5 frames for this timestep
-            # Convert RGB (TorchCodec default) to BGR (OpenCV default) for correct color rendering
             current_frames = [
                 cv2.cvtColor(images_uint8[t, p], cv2.COLOR_RGB2BGR) 
                 for p in range(5)
             ]
-
-            # Use visualize.py to build the composite frame
-            # We pass the GroundTruth object directly; visualize.py handles the tensor conversion
             composite = visualize.visualize_frame(
-                frames=current_frames, 
-                t=t, 
-                ground_truth=sample.truth
+                frames=current_frames, t=t, ground_truth=sample.truth
             )
-
             writer.write(composite)
 
+        t_end_vis = time.perf_counter()
+        vis_duration = t_end_vis - t_start_vis
+        total_vis_time += vis_duration
+
+        if args.time:
+            print(f"  [Sample {s_idx+1}] Load: {load_duration:.4f}s | Viz: {vis_duration:.4f}s")
+
+        t_start_load = time.perf_counter()
+
     writer.release()
+    
+    if args.time and args.num_samples > 0:
+        print("-" * 40)
+        print(f"Average Load Time: {total_load_time / args.num_samples:.4f}s")
+        print(f"Average Viz Time:  {total_vis_time / args.num_samples:.4f}s")
+        print("-" * 40)
+        
     logging.info("Smoke test complete.")
+
 
 __all__ = [
     "DatasetConfig"

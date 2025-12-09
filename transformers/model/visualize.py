@@ -122,35 +122,24 @@ def convert_tensor_to_viz_data(gt_object, t: int):
     """
     Extracts data from a GroundTruth object (Batched Tensors) at time t
     and converts it into the dictionary format expected by the renderer.
-    
-    Handles:
-    1. Tensor -> scalar/list conversion (cpu, detaching).
-    2. Active Weapon Index (int) -> Name string lookup (since dataset.py collapses the bitmask).
     """
     
     # Check if this is actually a tensor object or already a dict (support both)
     if isinstance(gt_object, dict):
-        return gt_object # Assume it's already in the right format (e.g. from injection_mold raw read)
+        return gt_object # Assume it's already in the right format
 
     # 1. Game State Extraction
-    # round_number: [T]
-    # round_state_mask: [T]
-    # enemy_positions: [T, 5, 3] -> We usually just want the global view for the panel, 
-    # but the tensor has it per-POV. We'll just take POV 0's view of enemies or average/union them if needed.
-    # Actually, dataset.py duplicates global enemy pos into [T, 5, 3] usually, or it's POV specific.
-    # We will assume POV 0 has the enemy positions for the game state panel.
-    
+    # We initialize alive masks to 0 and reconstruct them from the boolean tensors below
     game_state = {
-        'tick': t * 2, # Approximation if tick info is lost, or we just print frame idx
+        'tick': t * 2, # Approximation
         'round_state': int(gt_object.round_state_mask[t].item()),
-        'team_alive': 0, # Reconstructed below
-        'enemy_alive': 0, # Not strictly tracked in GT struct, derived or skipped
-        'enemy_pos': gt_object.enemy_positions[t].tolist() # Take P0's truth
+        'team_alive': 0, 
+        'enemy_alive': 0, 
+        'enemy_pos': gt_object.enemy_positions[t].tolist()
     }
     
-    # 2. Player Data Extraction
+    # 2. Player Data Extraction (Team)
     player_data = []
-    
     team_alive_mask = 0
     
     for p in range(5):
@@ -161,9 +150,7 @@ def convert_tensor_to_viz_data(gt_object, t: int):
         # Stats: [Health, Armor, Money]
         stats = gt_object.stats[t, p].tolist()
         
-        # Weapon: Dataset provides Index (int), Visualizer usually expects bitmask.
-        # We will patch the renderer to handle a string/int for 'active_weapon_bitmask' 
-        # specifically if it detects it's not a list/array.
+        # Weapon Handling
         wep_idx = int(gt_object.active_weapon_idx[t, p].item())
         
         p_dict = {
@@ -173,13 +160,23 @@ def convert_tensor_to_viz_data(gt_object, t: int):
             'pos': gt_object.position[t, p].tolist(),
             'mouse': gt_object.mouse_delta[t, p].tolist(),
             'keyboard_bitmask': int(gt_object.keyboard_mask[t, p].item()),
-            'eco_bitmask': gt_object.eco_mask[t, p].cpu().numpy(), # Keep as numpy for decoder
+            'eco_bitmask': gt_object.eco_mask[t, p].cpu().numpy(),
             'inventory_bitmask': gt_object.inventory_mask[t, p].cpu().numpy(),
-            'active_weapon_idx': wep_idx # Special field for Tensor mode
+            'active_weapon_idx': wep_idx
         }
         player_data.append(p_dict)
 
+    # 3. Enemy Data Extraction
+    enemy_alive_mask = 0
+    if hasattr(gt_object, 'enemy_alive_mask'):
+        for p in range(5):
+            # Check availability just in case
+            if p < gt_object.enemy_alive_mask.shape[1]: 
+                if bool(gt_object.enemy_alive_mask[t, p].item()):
+                    enemy_alive_mask |= (1 << p)
+
     game_state['team_alive'] = team_alive_mask
+    game_state['enemy_alive'] = enemy_alive_mask
     
     return {'game_state': game_state, 'player_data': player_data}
 
@@ -277,23 +274,30 @@ def render_global_panel(h, w, game_state, pred_game_state=None):
     tick_val = game_state.get('tick', '?')
     r_state = decode_round_state(game_state['round_state'])
     
-    # Handle missing 'team_alive' in pure tensor conversion if not reconstructed
     t_alive = game_state.get('team_alive', 0)
     e_alive = game_state.get('enemy_alive', 0)
+
+    # Helper to format binary string (e.g., "11011")
+    def fmt_alive(mask):
+        return bin(mask)[2:].zfill(5)[::-1] # Reversed so index 0 is left (or right, depending on preference)
 
     gt_lines = [
         f"Tick/Frame: {tick_val}",
         f"State: {r_state}",
-        f"T Alive: {bin(t_alive)[2:].zfill(5)}",
-        f"E Alive: {bin(e_alive)[2:].zfill(5)}",
+        f"T Alive: {bin(t_alive)[2:].zfill(5)} (Mask)",
+        f"E Alive: {bin(e_alive)[2:].zfill(5)} (Mask)",
         "",
         "Enemy Positions (GT):"
     ]
     
     for i, pos in enumerate(game_state['enemy_pos']):
-        # Simple heuristic to hide 0,0,0 or obviously empty positions
-        if abs(pos[0]) > 1.0 or abs(pos[1]) > 1.0:
-            gt_lines.append(f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}")
+        # Only show position if the enemy is actually alive according to the bitmask
+        is_alive = (e_alive >> i) & 1
+        
+        # Simple heuristic: hide 0,0,0 or obviously empty positions if not marked alive
+        if is_alive or (abs(pos[0]) > 1.0 or abs(pos[1]) > 1.0):
+            status = "" if is_alive else "(DEAD?)"
+            gt_lines.append(f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f} {status}")
 
     next_y = draw_text_lines(panel, gt_lines, 10, 60, COLORS['gt'], scale=0.5)
 
