@@ -76,6 +76,8 @@ class CS2Config:
     # --- System ---
     use_flash_attention: bool = True
     gradient_checkpointing: bool = True
+    # Precision: "bfloat16" is recommended for FlashAttn
+    dtype: torch.dtype = torch.bfloat16 
 
 # -----------------------------------------------------------------------------
 # 2. Submodules
@@ -111,6 +113,10 @@ class AudioEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [Batch, 2, Freq, Time]
+        # Ensure input type matches weights (e.g., bf16)
+        if x.dtype != self.net[0].weight.dtype:
+            x = x.to(self.net[0].weight.dtype)
+            
         x = self.net(x)
         # Flatten spatial dims: [B, C, 4, 4] -> [B, C * 16]
         return x.flatten(1).unsqueeze(1) # Return as sequence length 1: [B, 1, Dim]
@@ -132,27 +138,28 @@ class MultimodalProjector(nn.Module):
             num_hidden_layers=cfg.qformer_layers,
             num_attention_heads=cfg.qformer_heads,
             encoder_hidden_size=cfg.vision_hidden_size, # Size of DINO features
-            vocab_size=1 # Not used but required by config
+            vocab_size=1, # Not used but required by config
+            dtype=cfg.dtype
         )
         self.qformer = Blip2QFormerModel(q_config)
         
         # 2. Learnable Queries: [1, Num_Queries, Hidden]
-        self.query_tokens = nn.Parameter(torch.randn(1, self.num_queries, cfg.qformer_hidden_size))
+        self.query_tokens = nn.Parameter(torch.randn(1, self.num_queries, cfg.qformer_hidden_size, dtype=cfg.dtype))
         
         # 3. Audio Adapter
         # Project audio to match DINO feature dimension so they can be concatenated
-        self.audio_proj = nn.Linear(cfg.audio_channels[2] * 16, cfg.vision_hidden_size)
+        self.audio_proj = nn.Linear(cfg.audio_channels[2] * 16, cfg.vision_hidden_size, dtype=cfg.dtype)
         
         # 4. Final Projection (MLP)
         # Flattens all Q-Former output tokens -> Single Llama Token
         in_dim = self.num_queries * cfg.qformer_hidden_size
         self.llama_proj = nn.Sequential(
-            nn.Linear(in_dim, cfg.llama_hidden_size * 2),
+            nn.Linear(in_dim, cfg.llama_hidden_size * 2, dtype=cfg.dtype),
             nn.GELU(),
-            nn.Linear(cfg.llama_hidden_size * 2, cfg.llama_hidden_size)
+            nn.Linear(cfg.llama_hidden_size * 2, cfg.llama_hidden_size, dtype=cfg.dtype)
         )
         
-        self.norm = nn.LayerNorm(cfg.llama_hidden_size)
+        self.norm = nn.LayerNorm(cfg.llama_hidden_size, dtype=cfg.dtype)
 
     def forward(self, vision_feats: torch.Tensor, audio_feats: torch.Tensor) -> torch.Tensor:
         """
@@ -196,36 +203,37 @@ class CS2Heads(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         d = cfg.llama_hidden_size
+        dt = cfg.dtype
         
         # --- Player Action Heads ---
-        self.mouse = nn.Linear(d, 2)
-        self.keyboard = nn.Linear(d, cfg.keyboard_dim)
-        self.eco = nn.Linear(d, cfg.eco_dim)
-        self.inventory = nn.Linear(d, cfg.inventory_dim)
-        self.weapon = nn.Linear(d, cfg.weapon_dim)
-        self.stats = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 3))
+        self.mouse = nn.Linear(d, 2, dtype=dt)
+        self.keyboard = nn.Linear(d, cfg.keyboard_dim, dtype=dt)
+        self.eco = nn.Linear(d, cfg.eco_dim, dtype=dt)
+        self.inventory = nn.Linear(d, cfg.inventory_dim, dtype=dt)
+        self.weapon = nn.Linear(d, cfg.weapon_dim, dtype=dt)
+        self.stats = nn.Sequential(nn.Linear(d, d, dtype=dt), nn.GELU(), nn.Linear(d, 3, dtype=dt))
         
         # --- Player Spatial Heads (Bin Classification) ---
-        self.player_pos_x = nn.Linear(d, cfg.bins_x)
-        self.player_pos_y = nn.Linear(d, cfg.bins_y)
-        self.player_pos_z = nn.Linear(d, cfg.bins_z)
+        self.player_pos_x = nn.Linear(d, cfg.bins_x, dtype=dt)
+        self.player_pos_y = nn.Linear(d, cfg.bins_y, dtype=dt)
+        self.player_pos_z = nn.Linear(d, cfg.bins_z, dtype=dt)
 
         # --- Global/Strategy Heads ---
-        self.round_state = nn.Linear(d, cfg.round_state_dim)
-        self.round_number = nn.Linear(d, cfg.round_number_dim)
-        self.team_alive = nn.Linear(d, 6) # 0-5 count
-        self.enemy_alive = nn.Linear(d, 6)
+        self.round_state = nn.Linear(d, cfg.round_state_dim, dtype=dt)
+        self.round_number = nn.Linear(d, cfg.round_number_dim, dtype=dt)
+        self.team_alive = nn.Linear(d, 6, dtype=dt) # 0-5 count
+        self.enemy_alive = nn.Linear(d, 6, dtype=dt)
 
         # --- Enemy Spatial Heads ---
         # The Strategy token needs to predict 5 discrete enemies.
         # We assume the Strategy token is a compressed representation of the whole map.
         # We expand it into 5 "Enemy Query" vectors.
-        self.enemy_expander = nn.Linear(d, 5 * d) 
+        self.enemy_expander = nn.Linear(d, 5 * d, dtype=dt)
         
         # Independent classifiers for enemy positions (conceptually distinct from self-pos)
-        self.enemy_pos_x = nn.Linear(d, cfg.bins_x)
-        self.enemy_pos_y = nn.Linear(d, cfg.bins_y)
-        self.enemy_pos_z = nn.Linear(d, cfg.bins_z)
+        self.enemy_pos_x = nn.Linear(d, cfg.bins_x, dtype=dt)
+        self.enemy_pos_y = nn.Linear(d, cfg.bins_y, dtype=dt)
+        self.enemy_pos_z = nn.Linear(d, cfg.bins_z, dtype=dt)
 
     def forward_player(self, x: torch.Tensor):
         return {
@@ -274,7 +282,11 @@ class CS2BehaviorModel(nn.Module):
         
         # 1. Vision Backbone (Frozen)
         print(f"Loading Frozen DINOv3: {cfg.vision_model_name}...")
-        self.vision = AutoModel.from_pretrained(cfg.vision_model_name, trust_remote_code=True)
+        self.vision = AutoModel.from_pretrained(
+            cfg.vision_model_name, 
+            trust_remote_code=True,
+            dtype=cfg.dtype
+        )
         self.vision.eval()
         for p in self.vision.parameters(): p.requires_grad = False
         
@@ -286,10 +298,17 @@ class CS2BehaviorModel(nn.Module):
         
         # 4. Global Tokens (Strategy + Scratchpad)
         # Added to the sequence for every frame
-        self.strat_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size))
-        self.scratch_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size))
+        self.strat_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
+        self.scratch_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
         
         # 5. Transformer Backbone (Llama)
+        # Standard Llama configuration (RoPE, GQA, etc. are automatic)
+        
+        # Logic to handle cache vs checkpointing conflict
+        use_cache = True
+        if cfg.gradient_checkpointing:
+            use_cache = False
+            
         llama_conf = LlamaConfig(
             vocab_size=1, # Not used
             hidden_size=cfg.llama_hidden_size,
@@ -298,7 +317,8 @@ class CS2BehaviorModel(nn.Module):
             num_attention_heads=cfg.llama_heads,
             num_key_value_heads=cfg.llama_kv_heads,
             max_position_embeddings=4096,
-            use_cache=True,
+            use_cache=use_cache,
+            dtype=cfg.dtype,
             attn_implementation="flash_attention_2" if cfg.use_flash_attention else "eager"
         )
         self.backbone = LlamaModel(llama_conf)
@@ -325,7 +345,9 @@ class CS2BehaviorModel(nn.Module):
         with torch.no_grad():
             # DINOv3 Forward
             # output.last_hidden_state: [N, Patches, 768]
-            vis_out = self.vision(pixel_values=flat_imgs).last_hidden_state
+            # Ensure pixel values are correct dtype
+            vis_in = flat_imgs if flat_imgs.dtype == self.cfg.dtype else flat_imgs.to(self.cfg.dtype)
+            vis_out = self.vision(pixel_values=vis_in).last_hidden_state
         
         # Audio Forward: [N, 1, Audio_Dim]
         aud_out = self.audio(flat_audio)
@@ -407,16 +429,16 @@ class CS2BehaviorModel(nn.Module):
 
 if __name__ == "__main__":
     # Smoke Test
-    cfg = CS2Config(llama_layers=2, context_frames=4)
+    cfg = CS2Config(llama_layers=2, context_frames=4, dtype=torch.bfloat16)
     model = CS2BehaviorModel(cfg).cuda()
     
     # Fake Batch
     # [B, T, 5, 3, 224, 224] (DINO Input Size)
-    imgs = torch.randn(2, 4, 5, 3, 224, 224).cuda()
-    audio = torch.randn(2, 4, 5, 2, 128, 128).cuda()
+    imgs = torch.randn(2, 4, 5, 3, 224, 224, dtype=torch.bfloat16).cuda()
+    audio = torch.randn(2, 4, 5, 2, 128, 128, dtype=torch.bfloat16).cuda()
     
     print("Running forward pass...")
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast("cuda"):
         out = model(imgs, audio)
     
     print("Output shapes:")
