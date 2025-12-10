@@ -33,6 +33,7 @@ import wandb
 from dataset import DatasetConfig, DatasetRoot, TrainingSample, GroundTruth
 from model import CS2Config, CS2BehaviorModel
 from model_loss import CS2Loss
+import debug
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Trainer")
@@ -163,49 +164,54 @@ def train_one_epoch(
         
         # 2. Forward Pass
         dtype = torch.bfloat16 if cfg.mixed_precision == "bf16" else torch.float16
-        
-        with autocast(device_type="cuda", dtype=dtype):
-            preds = model(
-                images=sample.images, 
-                audio=sample.audio
-            )
-            
-            # Loss Calculation
-            loss, metrics = criterion(preds, sample.truth)
-            loss = loss / cfg.grad_accumulation_steps
+        try: 
+            with autocast(device_type="cuda", dtype=dtype):
+                preds = model(
+                    images=sample.images, 
+                    audio=sample.audio
+                )
+                
+                # Loss Calculation
+                loss, metrics = criterion(preds, sample.truth)
+                loss = loss / cfg.grad_accumulation_steps
 
-        # 3. Backward
-        scaler.scale(loss).backward()
+            # 3. Backward
+            scaler.scale(loss).backward()
 
-        # 4. Optimizer Step
-        if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm)
+            # 4. Optimizer Step
+            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                
+                # Logging
+                metrics["train/loss"] = loss.item() * cfg.grad_accumulation_steps
+                metrics["train/lr"] = optimizer.param_groups[0]["lr"]
+                metrics["train/step"] = (epoch * steps_in_epoch) + batch_idx
+                
+                wandb.log(metrics)
             
-            scaler.step(optimizer)
-            scaler.update()
+            total_loss += loss.item() * cfg.grad_accumulation_steps
             
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            
-            # Logging
-            metrics["train/loss"] = loss.item() * cfg.grad_accumulation_steps
-            metrics["train/lr"] = optimizer.param_groups[0]["lr"]
-            metrics["train/step"] = (epoch * steps_in_epoch) + batch_idx
-            
-            wandb.log(metrics)
-        
-        total_loss += loss.item() * cfg.grad_accumulation_steps
-        
-        if batch_idx % 50 == 0:
-            elapsed = time.time() - t0
-            t0 = time.time()
-            logger.info(
-                f"Ep {epoch} [{batch_idx}/{steps_in_epoch}] "
-                f"Loss: {loss.item()*cfg.grad_accumulation_steps:.4f} | "
-                f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                f"Time/50: {elapsed:.1f}s"
-            )
+            if batch_idx % 50 == 0:
+                elapsed = time.time() - t0
+                t0 = time.time()
+                logger.info(
+                    f"Ep {epoch} [{batch_idx}/{steps_in_epoch}] "
+                    f"Loss: {loss.item()*cfg.grad_accumulation_steps:.4f} | "
+                    f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
+                    f"Time/50: {elapsed:.1f}s"
+                )
+
+        except torch.cuda.OutOfMemoryError:
+            logger.error("OOM Detected! Saving snapshot...")
+            debug.save_snapshot(f"oom_epoch{epoch}_batch{batch_idx}.pickle")
+            raise
 
     return total_loss / steps_in_epoch
 
@@ -253,7 +259,12 @@ def main():
     parser.add_argument("--run_name", type=str, default="cs2_run")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--debug", action="store_true", help="Enable memory profiling")
     args = parser.parse_args()
+
+    # Enable debug tools
+    if args.debug:
+        debug.enable()
 
     # 1. Setup Config
     cfg = TrainConfig(
