@@ -46,10 +46,8 @@ class DatasetConfig:
     epoch_windows_per_round: int = 3 #how many random windows
     epoch_round_sample_length: int = 128 #number of frames per window
     epoch_video_decoding_device: str = "cpu"
-    audio_sample_rate: float = 24000.0
-    audio_n_fft: int = 1024
-    audio_hop_length: int = 750 #audio_sample_rate // FRAME_RATE
-    audio_mel_bins: int = 128
+    audio_sample_rate: int = 24000
+
 
 @dataclass
 class GroundTruth:
@@ -68,10 +66,12 @@ class GroundTruth:
 
 @dataclass
 class TrainingSample:
-    _roundsample: RoundSample
-    images: torch.Tensor
-    audio: torch.Tensor
-    truth: GroundTruth
+    _roundsample: RoundSample # internal reference back
+    images: torch.Tensor # [T, P=5, C, H, W]
+    audio: torch.Tensor # raw waveform in [P=5, 2, samples]
+    audio_sample_rate: int #sample rate of audio
+    truth: GroundTruth # GT for sample
+    length: int # number of frames in sample (e.g. T)
 
 @dataclass
 class Game:
@@ -121,15 +121,6 @@ class Epoch(torch.utils.data.Dataset):
         self.epoch_idx = epoch_idx
         self.samples = samples
         self.lmdb_envs: dict[str, lmdb.Environment] = {}
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=config.audio_sample_rate,
-            n_fft=config.audio_n_fft,
-            hop_length=config.audio_hop_length,
-            n_mels=config.audio_mel_bins,
-            center=False,
-            pad_mode="reflect",
-            power=2.0,
-        )
 
     def _get_lmdb_env(self, lmdb_path: str) -> lmdb.Environment:
         env = self.lmdb_envs.get(lmdb_path)
@@ -152,7 +143,6 @@ class Epoch(torch.utils.data.Dataset):
                 return i
         return -1
 
-    #todo understand
     def pad_or_truncate_to(self, x: torch.Tensor, T: int, dim: int = 0) -> torch.Tensor:
         """
         Pad or truncate `x` along dimension `dim` to length `T` using zeros.
@@ -173,56 +163,47 @@ class Epoch(torch.utils.data.Dataset):
         pad = x.new_zeros(pad_shape)
         return torch.cat([x, pad], dim=dim)
     
-    def _decode_video(self, sample: RoundSample):
+    def _decode_video(self, sample: RoundSample) -> torch.Tensor:
         pov_tensors = []
 
         for pov in sample.round.pov_video:
-            decoder = VideoDecoder(pov, device=self.config.epoch_video_decoding_device)
+            decoder = VideoDecoder(pov, device=self.config.epoch_video_decoding_device, dimension_order="NCHW")
             frames = decoder.get_frames_in_range(sample.start_frame, sample.start_frame + sample.length_frames).data
             pov_tensors.append(self.pad_or_truncate_to(frames, self.config.epoch_round_sample_length, dim=0))
             del decoder
-            
-        return torch.stack(pov_tensors, dim=0).permute(1, 0, 3, 4, 2)
+        # return stacked [P=5, T, C, H, W] -> [T, P=5, C, H, W]
+        return torch.stack(pov_tensors, dim=0).permute(1, 0, 2, 3, 4) 
     
     def _decode_audio(self, sample: RoundSample):
-            pov_mels = []
-            
-            # STFT constraint: Input must be at least n_fft long.
-            min_samples = self.config.audio_n_fft
+        pov_waveforms = []
+        
+        # target duration in seconds (frames / fps)
+        window_secs = sample.length_frames / FRAME_RATE
+        target_samples = int(round(window_secs * self.config.audio_sample_rate))
 
-            for pov in sample.round.pov_audio:
-                decoder = AudioDecoder(pov)
-            
-                try:
-                    # Attempt to decode the requested global window for this specific file
-                    waveform = decoder.get_samples_played_in_range(
-                        start_seconds=sample.start_time, 
-                        stop_seconds=sample.end_time
-                    ).data
-                except RuntimeError:
-                    waveform = torch.empty(0)
+        for pov in sample.round.pov_audio:
+            decoder = AudioDecoder(pov)
+            try:
+                waveform = decoder.get_samples_played_in_range(
+                    start_seconds=sample.start_time,
+                    stop_seconds=sample.end_time,
+                    sample_rate = int(self.config.audio_sample_rate)
+                ).data  # [2, S]
+            except RuntimeError:
+                waveform = torch.empty(0)
 
-                # 1. Handle Empty/Missing Audio
-                if waveform.numel() == 0:
-                    # Return enough zeros to satisfy n_fft
-                    waveform = torch.zeros(2, min_samples)
-                
-                # 2. Handle Short Waveforms (e.g. End of Round truncated audio)
-                elif waveform.shape[-1] < min_samples:
-                    pad_len = min_samples - waveform.shape[-1]
-                    # Pad the time dimension (last dim)
-                    waveform = F.pad(waveform, (0, pad_len))
+            if waveform.numel() == 0:
+                waveform = torch.zeros(2, target_samples)
+            elif waveform.shape[-1] < target_samples:
+                pad_len = target_samples - waveform.shape[-1]
+                waveform = F.pad(waveform, (0, pad_len))
+            else:
+                waveform = waveform[..., :target_samples]
 
-                mel = self.mel_transform(waveform)
+            pov_waveforms.append(waveform)  # [2, target_samples]
 
-                # Pad or truncate the MEL steps to match the video frames
-                mel = self.pad_or_truncate_to(mel, self.config.epoch_round_sample_length, dim=-1)
-                
-                pov_mels.append(mel.permute(2, 0, 1).unsqueeze(-1))
-                
-                del decoder
+        return torch.stack(pov_waveforms, dim=0) #[5, 2, target_samples]
 
-            return torch.stack(pov_mels, dim=1)
 
     def _get_truth(self, sample: RoundSample) -> GroundTruth:
         r = sample.round
@@ -306,7 +287,14 @@ class Epoch(torch.utils.data.Dataset):
         images = self._decode_video(s)
         audio = self._decode_audio(s)
         gt = self._get_truth(s)
-        return TrainingSample(images=images, audio=audio, truth=gt, _roundsample = s)
+        return TrainingSample(
+            images=images,
+            audio=audio,
+            truth=gt,
+            _roundsample = s, 
+            length = self.config.epoch_round_sample_length,
+            audio_sample_rate = self.config.audio_sample_rate
+        )
 
 class DatasetRoot:
     dataset_path: str
@@ -395,7 +383,7 @@ if __name__ == "__main__":
     import sys
     import time
     import cv2
-    import visualize  # Ensure visualize.py is in the same directory
+    import visualize  # Ensure visualize.py is in the same directory, TODO rework vis to work with new CHW format
     import hashlib
     import torch.multiprocessing as mp
     from torch.utils.data import DataLoader
@@ -445,12 +433,10 @@ if __name__ == "__main__":
     # 2. Peek at first sample for metadata (Dimensions)
     logging.info("Peeking at first sample for dimensions...")
     first_sample = epoch[0]
-    T, num_pov, H, W, C = first_sample.images.shape
+    T, num_pov, C, H, W = first_sample.images.shape
     
     # --- RESET HANDLES FOR WORKERS ---
     epoch.lmdb_envs = {}
-    epoch.video_decoders = {}
-    epoch.audio_decoders = {}
     # ---------------------------------
 
     # 3. Setup DataLoader

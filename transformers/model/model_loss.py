@@ -12,40 +12,7 @@ from torchvision.ops import sigmoid_focal_loss
 from dataclasses import dataclass
 from typing import Dict, Tuple, Any
 
-@dataclass
-class ModelPrediction:
-    """
-    Container for all output heads of the model.
-    Shape Convention: [Batch, Time, 5 (Players), ...Dimensions...]
-    """
-    # --- Action Heads ---
-    mouse_delta: torch.Tensor       # [B, T, 5, 2]   (Linear)
-    keyboard_logits: torch.Tensor   # [B, T, 5, 32]  (Logits)
-    
-    # --- Economy/Item Heads ---
-    eco_logits: torch.Tensor        # [B, T, 5, 256] (Logits)
-    inventory_logits: torch.Tensor  # [B, T, 5, 128] (Logits)
-    weapon_logits: torch.Tensor     # [B, T, 5, 128] (Logits)
-    
-    # --- Stats Heads ---
-    stats_logits: torch.Tensor      # [B, T, 5, 3]   (Logits -> Sigmoid in loss)
-    
-    # --- Spatial Heads (Player) ---
-    player_pos_x: torch.Tensor      # [B, T, 5, 256] (Logits)
-    player_pos_y: torch.Tensor      # [B, T, 5, 256] (Logits)
-    player_pos_z: torch.Tensor      # [B, T, 5, 32]  (Logits)
-
-    # --- Spatial Heads (Enemy - Sorted/Canonical) ---
-    enemy_pos_x: torch.Tensor       # [B, T, 5, 256] (Logits)
-    enemy_pos_y: torch.Tensor       # [B, T, 5, 256] (Logits)
-    enemy_pos_z: torch.Tensor       # [B, T, 5, 32]  (Logits)
-
-    # --- Global Game State Heads ---
-    round_state_logits: torch.Tensor # [B, T, 5]     (Logits)
-    round_num_logit: torch.Tensor    # [B, T, 1]     (Logit -> Sigmoid)
-    team_alive_logits: torch.Tensor  # [B, T, 6]     (Logits, Classes 0-5)
-    enemy_alive_logits: torch.Tensor # [B, T, 6]     (Logits, Classes 0-5)
-
+from model_novibe import ModelPrediction
 
 class AutomaticWeightedLoss(nn.Module):
     """

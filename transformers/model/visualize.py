@@ -317,7 +317,7 @@ def visualize_frame(frames: list, t: int, ground_truth, prediction=None):
     Creates a combined visualization frame.
     
     Args:
-        frames: List of 5 numpy arrays (H, W, 3) -> The 5 POV images.
+        frames: List of 5 numpy arrays (H, W, 3) -> The 5 POV images. TODO fix dimensions here since rework of datset to CHW
         t: Integer index of the current frame (used to slice tensors).
         ground_truth: GroundTruth object (Batched Tensors) OR Dict.
         prediction: (Optional) GroundTruth object OR Dict.
