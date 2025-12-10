@@ -44,9 +44,8 @@ class DatasetConfig:
 
     epoch_gen_random_seed: int = 42
     epoch_windows_per_round: int = 3 #how many random windows
-    epoch_round_sample_length: int = 64 #number of frames per window
+    epoch_round_sample_length: int = 128 #number of frames per window
     epoch_video_decoding_device: str = "cpu"
-    epoch_audio_decoding_device: str = "cpu"
     audio_sample_rate: float = 24000.0
     audio_n_fft: int = 1024
     audio_hop_length: int = 750 #audio_sample_rate // FRAME_RATE
@@ -116,16 +115,12 @@ class Epoch(torch.utils.data.Dataset):
     config: DatasetConfig
     temp_dir: str
     lmdb_envs: dict[str, lmdb.Environment]
-    video_decoders: dict[str, VideoDecoder]
-    audio_decoders: dict[str, AudioDecoder]
 
     def __init__(self, config: DatasetConfig, epoch_idx: int, samples: List[RoundSample]):
         self.config = config
         self.epoch_idx = epoch_idx
         self.samples = samples
         self.lmdb_envs: dict[str, lmdb.Environment] = {}
-        self.video_decoders: dict[str, VideoDecoder] = {}
-        self.audio_decoders: dict[str, AudioDecoder] = {}
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=config.audio_sample_rate,
             n_fft=config.audio_n_fft,
@@ -177,38 +172,26 @@ class Epoch(torch.utils.data.Dataset):
         pad_shape[dim] = T - t
         pad = x.new_zeros(pad_shape)
         return torch.cat([x, pad], dim=dim)
-
-    def _get_video_decoder(self, path: str) -> VideoDecoder:
-        dec = self.video_decoders.get(path)
-        if dec is None:
-            dec = VideoDecoder(path, device=self.config.epoch_video_decoding_device)
-            self.video_decoders[path] = dec
-        return dec
-    
-    def _get_audio_decoder(self, path: str) -> AudioDecoder:
-        dec = self.audio_decoders.get(path)
-        if dec is None:
-            dec = AudioDecoder(path)
-            self.audio_decoders[path] = dec
-        return dec
     
     def _decode_video(self, sample: RoundSample):
         pov_tensors = []
 
         for pov in sample.round.pov_video:
-            #decoder = self._get_video_decoder(pov) #does not work with CUDA since we dont free these
             decoder = VideoDecoder(pov, device=self.config.epoch_video_decoding_device)
             frames = decoder.get_frames_in_range(sample.start_frame, sample.start_frame + sample.length_frames).data
             pov_tensors.append(self.pad_or_truncate_to(frames, self.config.epoch_round_sample_length, dim=0))
-
-        del decoder
+            del decoder
+            
         return torch.stack(pov_tensors, dim=0).permute(1, 0, 3, 4, 2)
     
     def _decode_audio(self, sample: RoundSample):
             pov_mels = []
+            
+            # STFT constraint: Input must be at least n_fft long.
+            min_samples = self.config.audio_n_fft
 
             for pov in sample.round.pov_audio:
-                decoder = self._get_audio_decoder(pov)
+                decoder = AudioDecoder(pov)
             
                 try:
                     # Attempt to decode the requested global window for this specific file
@@ -219,15 +202,25 @@ class Epoch(torch.utils.data.Dataset):
                 except RuntimeError:
                     waveform = torch.empty(0)
 
+                # 1. Handle Empty/Missing Audio
                 if waveform.numel() == 0:
-                    expected_samples = int((self.config.audio_sample_rate / FRAME_RATE) * self.config.epoch_round_sample_length)
-                    waveform = torch.zeros(2, expected_samples)
+                    # Return enough zeros to satisfy n_fft
+                    waveform = torch.zeros(2, min_samples)
+                
+                # 2. Handle Short Waveforms (e.g. End of Round truncated audio)
+                elif waveform.shape[-1] < min_samples:
+                    pad_len = min_samples - waveform.shape[-1]
+                    # Pad the time dimension (last dim)
+                    waveform = F.pad(waveform, (0, pad_len))
 
                 mel = self.mel_transform(waveform)
 
+                # Pad or truncate the MEL steps to match the video frames
                 mel = self.pad_or_truncate_to(mel, self.config.epoch_round_sample_length, dim=-1)
                 
                 pov_mels.append(mel.permute(2, 0, 1).unsqueeze(-1))
+                
+                del decoder
 
             return torch.stack(pov_mels, dim=1)
 

@@ -33,12 +33,11 @@ class CS2Config:
     # --- Vision (Frozen) ---
     vision_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     vision_hidden_size: int = 768
-    # NEW: Chunk size to prevent OOM during vision encoding
-    vision_chunk_size: int = 16 
+    vision_chunk_size: int = 8 
     
     # --- Audio ---
     audio_mel_bins: int = 128
-    audio_time_steps: int = 32 # Matched to train.py padding
+    audio_time_steps: int = 32
     audio_channels: Tuple[int, int, int] = (32, 64, 128)
     
     # --- Fusion (Q-Former) ---
@@ -72,39 +71,60 @@ class CS2Config:
     torch_dtype: torch.dtype = torch.bfloat16 
 
 # -----------------------------------------------------------------------------
-# 2. Submodules (Audio, Projector, Heads) - UNCHANGED
+# 2. Submodules
 # -----------------------------------------------------------------------------
 
 class AudioEncoder(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         c1, c2, c3 = cfg.audio_channels
+        
         self.net = nn.Sequential(
             nn.Conv2d(2, c1, kernel_size=3, padding=1),
-            nn.BatchNorm2d(c1), nn.GELU(), nn.MaxPool2d(2),
+            nn.BatchNorm2d(c1),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+
             nn.Conv2d(c1, c2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(c2), nn.GELU(), nn.MaxPool2d(2),
+            nn.BatchNorm2d(c2),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+
             nn.Conv2d(c2, c3, kernel_size=3, padding=1),
-            nn.BatchNorm2d(c3), nn.GELU(), nn.AdaptiveAvgPool2d((4, 4))
+            nn.BatchNorm2d(c3),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4))
         )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != self.net[0].weight.dtype: x = x.to(self.net[0].weight.dtype)
-        return self.net(x).flatten(1).unsqueeze(1)
+        # Cast input to match weights if needed (e.g. bf16)
+        if x.dtype != self.net[0].weight.dtype:
+            x = x.to(self.net[0].weight.dtype)
+        x = self.net(x)
+        return x.flatten(1).unsqueeze(1) 
+
 
 class MultimodalProjector(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
         self.num_queries = cfg.num_qformer_queries
+        
         q_config = Blip2QFormerConfig(
             hidden_size=cfg.qformer_hidden_size,
             num_hidden_layers=cfg.qformer_layers,
             num_attention_heads=cfg.qformer_heads,
-            encoder_hidden_size=cfg.vision_hidden_size,
-            vocab_size=1, torch_dtype=cfg.torch_dtype
+            encoder_hidden_size=cfg.vision_hidden_size, 
+            vocab_size=1, 
+            torch_dtype=cfg.torch_dtype
         )
         self.qformer = Blip2QFormerModel(q_config)
+        
+        if cfg.gradient_checkpointing:
+            self.qformer.gradient_checkpointing_enable()
+        
         self.query_tokens = nn.Parameter(torch.randn(1, self.num_queries, cfg.qformer_hidden_size, dtype=cfg.torch_dtype))
         self.audio_proj = nn.Linear(cfg.audio_channels[2] * 16, cfg.vision_hidden_size, dtype=cfg.torch_dtype)
+        
         in_dim = self.num_queries * cfg.qformer_hidden_size
         self.llama_proj = nn.Sequential(
             nn.Linear(in_dim, cfg.llama_hidden_size * 2, dtype=cfg.torch_dtype),
@@ -118,27 +138,40 @@ class MultimodalProjector(nn.Module):
         audio_emb = self.audio_proj(audio_feats)
         encoder_hidden_states = torch.cat([vision_feats, audio_emb], dim=1)
         query_embeds = self.query_tokens.expand(B, -1, -1)
-        outputs = self.qformer(query_embeds=query_embeds, encoder_hidden_states=encoder_hidden_states)
-        token = self.llama_proj(outputs.last_hidden_state.reshape(B, -1))
-        return self.norm(token).unsqueeze(1)
+        
+        outputs = self.qformer(
+            query_embeds=query_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+        q_out = outputs.last_hidden_state
+        
+        fused = q_out.reshape(B, -1)
+        token = self.llama_proj(fused)
+        return self.norm(token).unsqueeze(1) 
+
 
 class CS2Heads(nn.Module):
     def __init__(self, cfg: CS2Config):
         super().__init__()
-        d, dt = cfg.llama_hidden_size, cfg.torch_dtype
+        d = cfg.llama_hidden_size
+        dt = cfg.torch_dtype
+        
         self.mouse = nn.Linear(d, 2, dtype=dt)
         self.keyboard = nn.Linear(d, cfg.keyboard_dim, dtype=dt)
         self.eco = nn.Linear(d, cfg.eco_dim, dtype=dt)
         self.inventory = nn.Linear(d, cfg.inventory_dim, dtype=dt)
         self.weapon = nn.Linear(d, cfg.weapon_dim, dtype=dt)
         self.stats = nn.Sequential(nn.Linear(d, d, dtype=dt), nn.GELU(), nn.Linear(d, 3, dtype=dt))
+        
         self.player_pos_x = nn.Linear(d, cfg.bins_x, dtype=dt)
         self.player_pos_y = nn.Linear(d, cfg.bins_y, dtype=dt)
         self.player_pos_z = nn.Linear(d, cfg.bins_z, dtype=dt)
+
         self.round_state = nn.Linear(d, cfg.round_state_dim, dtype=dt)
         self.round_number = nn.Linear(d, cfg.round_number_dim, dtype=dt)
-        self.team_alive = nn.Linear(d, 6, dtype=dt)
+        self.team_alive = nn.Linear(d, 6, dtype=dt) 
         self.enemy_alive = nn.Linear(d, 6, dtype=dt)
+
         self.enemy_expander = nn.Linear(d, 5 * d, dtype=dt)
         self.enemy_pos_x = nn.Linear(d, cfg.bins_x, dtype=dt)
         self.enemy_pos_y = nn.Linear(d, cfg.bins_y, dtype=dt)
@@ -190,22 +223,34 @@ class CS2BehaviorModel(nn.Module):
         for p in self.vision.parameters(): p.requires_grad = False
         
         self.audio = AudioEncoder(cfg)
+        # FIX: Explicitly cast AudioEncoder to BF16 (or whatever cfg.torch_dtype is)
+        # This prevents the FSDP error: "ValueError: Must flatten tensors with uniform dtype"
+        self.audio.to(cfg.torch_dtype) 
+        
         self.projector = MultimodalProjector(cfg)
         self.strat_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.torch_dtype))
         self.scratch_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.torch_dtype))
         
         use_cache = True
-        if cfg.gradient_checkpointing: use_cache = False
+        if cfg.gradient_checkpointing:
+            use_cache = False
             
         llama_conf = LlamaConfig(
-            vocab_size=1, hidden_size=cfg.llama_hidden_size,
-            intermediate_size=cfg.llama_intermediate, num_hidden_layers=cfg.llama_layers,
-            num_attention_heads=cfg.llama_heads, num_key_value_heads=cfg.llama_kv_heads,
-            max_position_embeddings=4096, use_cache=use_cache, torch_dtype=cfg.torch_dtype,
+            vocab_size=1, 
+            hidden_size=cfg.llama_hidden_size,
+            intermediate_size=cfg.llama_intermediate, 
+            num_hidden_layers=cfg.llama_layers,
+            num_attention_heads=cfg.llama_heads, 
+            num_key_value_heads=cfg.llama_kv_heads,
+            max_position_embeddings=4096,
+            use_cache=use_cache,
+            torch_dtype=cfg.torch_dtype,
             attn_implementation="flash_attention_2" if cfg.use_flash_attention else "eager"
         )
         self.backbone = LlamaModel(llama_conf)
-        if cfg.gradient_checkpointing: self.backbone.gradient_checkpointing_enable()
+        if cfg.gradient_checkpointing:
+            self.backbone.gradient_checkpointing_enable()
+
         self.heads = CS2Heads(cfg)
 
     def forward(self, images: torch.Tensor, audio: torch.Tensor, ground_truth_struct: Any = None) -> ModelPrediction:
@@ -216,10 +261,9 @@ class CS2BehaviorModel(nn.Module):
         flat_audio = audio.view(-1, 2, self.cfg.audio_mel_bins, self.cfg.audio_time_steps)
         
         # --- 1. Chunked Vision Forward ---
-        # NOTE: Chunking vision prevents OOM during DINO forward pass.
         vis_chunks = []
-        chunk_size = self.cfg.vision_chunk_size
         total_images = flat_imgs.shape[0]
+        chunk_size = self.cfg.vision_chunk_size
         
         with torch.no_grad():
             vis_in_full = flat_imgs if flat_imgs.dtype == self.cfg.torch_dtype else flat_imgs.to(self.cfg.torch_dtype)
@@ -227,15 +271,18 @@ class CS2BehaviorModel(nn.Module):
                 chunk = vis_in_full[i : i + chunk_size]
                 chunk_out = self.vision(pixel_values=chunk).last_hidden_state
                 vis_chunks.append(chunk_out)
+        
         vis_out = torch.cat(vis_chunks, dim=0) 
+        
+        # Cleanup to reduce fragmentation
+        del vis_chunks
+        del vis_in_full
+        
         debug.log("Vision Done")
-
-        # Audio Forward
+        
         aud_out = self.audio(flat_audio)
         
         # --- 2. Chunked Fusion (Q-Former) ---
-        # FIX: Also chunk the Q-Former pass to prevent OOM during cross-attention
-        # Cross-Attention creates huge matrices [Chunk, Heads, 4, 1200+].
         projector_chunks = []
         for i in range(0, total_images, chunk_size):
             v_chunk = vis_out[i : i + chunk_size]
@@ -244,6 +291,11 @@ class CS2BehaviorModel(nn.Module):
             projector_chunks.append(p_chunk)
             
         player_tokens_flat = torch.cat(projector_chunks, dim=0)
+        
+        del projector_chunks
+        del vis_out
+        del aud_out
+        
         debug.log("Q-Former Done")
         
         # --- 3. Sequence Assembly ---
