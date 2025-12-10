@@ -21,3 +21,4 @@ runs/
 *.engine
 cache/
 tmp_dali_filelists/
+wandb/

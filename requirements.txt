@@ -12,3 +12,4 @@ timm
 pyyaml
 bitsandbytes
 tensorboard
+wandb

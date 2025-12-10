@@ -419,12 +419,14 @@ class CS2BehaviorModel(nn.Module):
             enemy_pos_y=rs(s_preds["enemy_pos_y"], is_player=False),
             enemy_pos_z=rs(s_preds["enemy_pos_z"], is_player=False),
             
-            # Global State (Broadcasted to [B, T, 5, ...])
-            # ModelPrediction expects 5 copies for loss masking convenience
-            round_state_logits=rs(s_preds["round_state_logits"].unsqueeze(1).repeat(1, 5, 1), is_player=False),
-            round_num_logit=rs(s_preds["round_num_logit"].unsqueeze(1), is_player=False),
-            team_alive_logits=rs(s_preds["team_alive_logits"].unsqueeze(1), is_player=False),
-            enemy_alive_logits=rs(s_preds["enemy_alive_logits"].unsqueeze(1), is_player=False),
+            # Global State (Single Token)
+            # Loss expects [B, T, Dim]. 
+            # s_preds['round_state'] is [B*T, 5]. 
+            # rs(..., False) -> [B, T, 5]. Matches ModelPrediction.
+            round_state_logits=rs(s_preds["round_state_logits"], is_player=False),
+            round_num_logit=rs(s_preds["round_num_logit"], is_player=False),
+            team_alive_logits=rs(s_preds["team_alive_logits"], is_player=False),
+            enemy_alive_logits=rs(s_preds["enemy_alive_logits"], is_player=False),
         )
 
 if __name__ == "__main__":
