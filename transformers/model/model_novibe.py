@@ -33,10 +33,11 @@ from transformers import (
 
 @dataclass
 class ModelConfig:
-    dtype: torch.dtype = torch.bfloat16
     use_flash_attention: bool = True
     gradient_checkpointing: bool = True
     tokens_per_frame: int = 6 # 5 player + 1 strategy
+
+    dtype: torch.dtype = torch.float32  #keep in float32, down with autocast
     
     vision_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     vision_hidden_size: int = 768
@@ -116,7 +117,7 @@ class GameVideoEncoder(nn.Module):
         self.vision = AutoModel.from_pretrained(
             cfg.vision_model_name,
             trust_remote_code=True,
-            torch_dtype=cfg.dtype,
+            dtype=cfg.dtype,
         )
         self.vision.eval()
         for p in self.vision.parameters():
@@ -128,7 +129,7 @@ class GameVideoEncoder(nn.Module):
             num_attention_heads=cfg.qformer_heads,
             encoder_hidden_size=cfg.vision_hidden_size,
             vocab_size=1,
-            torch_dtype=cfg.dtype,
+            dtype=cfg.dtype,
         )
         self.qformer = Blip2QFormerModel(q_config)
         if cfg.gradient_checkpointing:
@@ -211,6 +212,7 @@ class GameAudioEncoder(nn.Module):
         aligned = aligned.permute(0, 2, 1) # [B*P*C, T, 1024]
         out = aligned.view(B, P, C, target_frames, -1) # [B, P, C, T, H]
         out = out.permute(0, 3, 1, 2, 4) # [B, T, P, C, H]
+        out.to(dtype=self.cfg.dtype) # to bf16
         return out
 
 class ModelOutputHeads(nn.Module):
@@ -305,7 +307,7 @@ class GamePredictorBackbone(nn.Module):
             num_key_value_heads=cfg.llama_kv_heads,
             max_position_embeddings=cfg.llama_max_pos_embeddings,
             use_cache=use_cache,
-            torch_dtype=cfg.dtype,
+            dtype=cfg.dtype,
             attn_implementation="flash_attention_2" if cfg.use_flash_attention else "eager"
         )
         self.backbone = LlamaModel(llama_conf)

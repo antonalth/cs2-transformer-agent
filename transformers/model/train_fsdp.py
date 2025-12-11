@@ -13,13 +13,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 
 # FSDP Imports
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
-    BackwardPrefetch,
     ShardingStrategy,
     StateDictType,
     FullStateDictConfig,
@@ -39,7 +37,6 @@ from model_novibe import ModelConfig, GamePredictorBackbone
 from model_loss import CS2Loss
 import debug
 
-# Set up logging only for Rank 0
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Trainer")
 
@@ -55,11 +52,9 @@ class TrainConfig:
     data_root: str = "./cs2_dataset"
     num_workers: int = 4
     
-    # Batch size per GPU. 
-    # With FSDP on 5090s, you can likely do batch_size=1 with len=512, 
-    # or batch_size=2 if you use activation checkpointing aggressively.
+    # 5090 Config
     batch_size: int = 1          
-    grad_accumulation_steps: int = 4 # Total effective batch = 4 GPUs * 1 Batch * 4 Accum = 16
+    grad_accumulation_steps: int = 8 
     
     max_epochs: int = 20
     lr: float = 2e-4             
@@ -68,8 +63,6 @@ class TrainConfig:
     clip_grad_norm: float = 1.0
     
     save_every: int = 1
-    
-    # Increase sequence length here
     seq_len: int = 512 
 
 # ==============================================================================
@@ -143,7 +136,6 @@ def train_one_epoch(
     local_rank: int
 ):
     model.train()
-    # Ensure criterion is in training mode (for AutomaticWeightedLoss)
     criterion.train() 
     
     total_loss = torch.tensor(0.0, device=local_rank)
@@ -155,26 +147,23 @@ def train_one_epoch(
     for batch_idx, sample in enumerate(loader):
         sample = recursive_to_device(sample, local_rank)
         
-        # FSDP automatically handles autocast if mixed_precision is configured
-        preds = model(images=sample.images, audio=sample.audio)
+        # Use Autocast for Mixed Precision compatibility
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            preds = model(images=sample.images, audio=sample.audio)
+            loss, metrics = criterion(preds, sample.truth)
+            loss = loss / cfg.grad_accumulation_steps
         
-        loss, metrics = criterion(preds, sample.truth)
-        loss = loss / cfg.grad_accumulation_steps
-        
-        loss.backward()
+        # Cast loss to bfloat16 for backward pass stability
+        loss.to(torch.bfloat16).backward()
 
         if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-            # FSDP handles gradient clipping internally or via utility, 
-            # but standard clip_grad_norm_ works on FSDP modules too.
             model.clip_grad_norm_(cfg.clip_grad_norm)
             
             optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
             
-            # Logging (Rank 0 only)
             if is_main_process():
-                # Scale loss back up for logging
                 current_loss = loss.item() * cfg.grad_accumulation_steps
                 metrics["train/loss"] = current_loss
                 metrics["train/lr"] = optimizer.param_groups[0]["lr"]
@@ -183,7 +172,6 @@ def train_one_epoch(
         
         total_loss += loss.detach() * cfg.grad_accumulation_steps
 
-    # Aggregate average loss across all ranks for logging
     dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
     return total_loss.item() / steps_in_epoch
 
@@ -197,13 +185,14 @@ def validate(model, criterion, loader, cfg, epoch, local_rank):
     with torch.no_grad():
         for sample in loader:
             sample = recursive_to_device(sample, local_rank)
-            preds = model(sample.images, sample.audio)
-            loss, _ = criterion(preds, sample.truth)
+            
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                preds = model(sample.images, sample.audio)
+                loss, _ = criterion(preds, sample.truth)
             
             total_loss += loss
             count += 1
             
-    # Aggregate stats across GPUs
     dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
     dist.all_reduce(count, op=dist.ReduceOp.SUM)
     
@@ -216,29 +205,18 @@ def validate(model, criterion, loader, cfg, epoch, local_rank):
     return avg_loss
 
 def save_checkpoint(model, optimizer, criterion, epoch, cfg, rank):
-    """
-    Saves a checkpoint compatible with non-FSDP loading.
-    Requires gathering the full state dict to rank 0.
-    """
-    # Configure FSDP to gather full state dict to CPU
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
         model_state = model.state_dict()
 
-    # Criterion might not be FSDP wrapped (it's small), handle normally
     loss_state = criterion.state_dict()
     
-    # Optimizer state is complex in FSDP, usually we skip full optimizer saving
-    # for simple fine-tuning unless pausing/resuming is critical. 
-    # For now, we just save model weights to save disk space and complexity.
-
     if rank == 0:
         path = os.path.join(cfg.output_dir, f"{cfg.run_name}_ep{epoch}.pt")
         torch.save({
             'epoch': epoch,
             'model_state_dict': model_state,
             'loss_state_dict': loss_state,
-            # 'optimizer_state_dict': ... (omitted for speed/simplicity)
         }, path)
         logger.info(f"Saved FSDP checkpoint to {path}")
 
@@ -256,20 +234,16 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # 1. Config
     cfg = TrainConfig(
         data_root=args.data_root,
         batch_size=args.batch_size,
-        seq_len=512 # Targeted sequence length
+        seq_len=512
     )
     
     if is_main_process():
         os.makedirs(cfg.output_dir, exist_ok=True)
         wandb.init(project=cfg.project_name, name=cfg.run_name, config=cfg.__dict__)
-        logger.info(f"World Size: {world_size}")
 
-    # 2. Data
-    # DatasetConfig now uses larger sample length
     ds_config = DatasetConfig(
         data_root=cfg.data_root, 
         run_dir="./runs", 
@@ -277,56 +251,45 @@ def main():
     )
     ds_root = DatasetRoot(ds_config)
     
-    # 3. Model Setup
     model_cfg = ModelConfig()
-    # Update model config with gradient checkpointing for memory savings
     model_cfg.gradient_checkpointing = True 
     
-    # Instantiate on CPU first or meta device, then move to GPU
-    # Note: For FSDP with frozen layers, initialization on GPU is usually safer
+    # Initialize model
     model = GamePredictorBackbone(model_cfg).to(local_rank)
     
-    # 4. FSDP Wrapping
-    # Policy: Wrap LlamaDecoderLayer. This shards the heavy transformer blocks.
+    # Cast to BF16 (handles audio encoder float32 issue)
+    model = model.to(torch.bfloat16)
+
+    # Wrap only Llama layers now
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={LlamaDecoderLayer},
     )
 
-    # Mixed Precision Policy for RTX 5090 (Ampere+ supports bf16)
     bf16_policy = MixedPrecision(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.bfloat16,
     )
 
-    # Wrap model
-    # use_orig_params=True is CRITICAL because the model has frozen layers (vision/audio)
-    # mixed requires_grad is only supported with use_orig_params=True
     model = FSDP(
         model,
         auto_wrap_policy=llama_auto_wrap_policy,
         mixed_precision=bf16_policy,
         device_id=local_rank,
-        sharding_strategy=ShardingStrategy.FULL_SHARD, # Shards params, grads, and optimizer
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
         use_orig_params=True,
         limit_all_gathers=True,
     )
 
-    # Criterion (Loss) - Small, keeps on local GPU
-    criterion = CS2Loss().to(local_rank)
+    criterion = CS2Loss().to(local_rank).to(torch.bfloat16)
 
-    # 5. Optimizer
-    # Pytorch FSDP handles param flattening, pass model.parameters() directly
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=cfg.lr, 
         weight_decay=cfg.weight_decay
     )
     
-    # 6. Scheduler
-    # We assume a fixed number of samples per epoch for estimation
-    # Since we shard the dataset, steps_per_epoch = Total Samples / Global Batch Size
     dummy_epoch = ds_root.build_epoch("train", 0)
     total_samples = len(dummy_epoch.samples)
     global_batch_size = cfg.batch_size * world_size * cfg.grad_accumulation_steps
@@ -336,27 +299,23 @@ def main():
 
     if is_main_process():
         logger.info(f"Training on {total_samples} samples.")
-        logger.info(f"Global Batch Size: {global_batch_size} (Batch {cfg.batch_size} * GPU {world_size} * Accum {cfg.grad_accumulation_steps})")
+        logger.info(f"Global Batch: {global_batch_size}")
 
-    # 7. Loop
     for epoch in range(cfg.max_epochs):
-        # Build full epoch list on every rank
         full_train_epoch = ds_root.build_epoch("train", epoch)
         full_val_epoch = ds_root.build_epoch("val", epoch)
         
-        # --- Manually Shard the Dataset ---
-        # Each rank takes a slice: 0, 4, 8... ; 1, 5, 9... etc
+        # Manual Sharding
         train_samples = full_train_epoch.samples[rank::world_size]
         val_samples = full_val_epoch.samples[rank::world_size]
         
-        # Create lightweight Epoch objects with the sliced samples
         train_ds = Epoch(ds_config, epoch, train_samples)
         val_ds = Epoch(ds_config, epoch, val_samples)
         
         train_loader = DataLoader(
             train_ds, 
             batch_size=cfg.batch_size, 
-            shuffle=True, # Shuffle local shard
+            shuffle=True, 
             num_workers=cfg.num_workers,
             collate_fn=cs2_collate_fn,
             pin_memory=True
