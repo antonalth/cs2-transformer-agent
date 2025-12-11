@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
+"""
+Copyright 2025 Anton Althoff
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+------------------------------------------------------------------------
+"""
+
 import os
 import argparse
 import logging
 import math
 import time
-import functools
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, List
 
@@ -12,71 +28,79 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torch.distributed as dist
-
-# FSDP Imports
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
-    StateDictType,
-    FullStateDictConfig,
-)
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
-)
-
-# HuggingFace definitions for wrapping policy
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 import wandb
 
+# --- Accelerate Imports ---
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from accelerate.utils import ProjectConfiguration
+
 # --- Local Imports ---
-from dataset import DatasetConfig, DatasetRoot, TrainingSample, GroundTruth, Epoch
+from dataset import DatasetConfig, DatasetRoot, TrainingSample, GroundTruth
 from model_novibe import ModelConfig, GamePredictorBackbone
 from model_loss import CS2Loss
 import debug
 
+# Initialize Logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("Trainer")
+logger = logging.getLogger("TrainerFSDP")
 
-def is_main_process():
-    return dist.get_rank() == 0
+# ==============================================================================
+# 1. Configuration
+# ==============================================================================
 
 @dataclass
 class TrainConfig:
+    # Experiment
     project_name: str = "cs2-behavior-cloning"
-    run_name: str = "llama-dac-fsdp-512"
-    output_dir: str = "./checkpoints"
+    run_name: str = "llama-dac-fsdp2"
+    output_dir: str = "./checkpoints_fsdp"
     
+    # Data
     data_root: str = "./cs2_dataset"
     num_workers: int = 4
     
-    # 5090 Config
-    batch_size: int = 1          
-    grad_accumulation_steps: int = 8 
-    
+    # Optimization
+    batch_size: int = 1          # Per GPU
+    grad_accumulation_steps: int = 16 
     max_epochs: int = 20
     lr: float = 2e-4             
     weight_decay: float = 0.05
-    warmup_steps: int = 1000
+    warmup_steps: int = 2000
     clip_grad_norm: float = 1.0
     
+    # System
     save_every: int = 1
-    seq_len: int = 512 
+    mixed_precision: str = "bf16"
 
 # ==============================================================================
-# Helpers
+# 2. Wrapper Module (Fix for FSDP2)
 # ==============================================================================
 
-def setup_distributed():
-    dist.init_process_group("nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
+class TrainingModule(nn.Module):
+    """
+    Wraps the Backbone and Loss into a single nn.Module for FSDP2 compatibility.
+    FSDP2 in Accelerate currently enforces a single model argument in `prepare()`.
+    """
+    def __init__(self, model: nn.Module, criterion: nn.Module):
+        super().__init__()
+        self.model = model
+        self.criterion = criterion
 
-def cleanup_distributed():
-    dist.destroy_process_group()
+    def forward(self, images, audio, truth=None):
+        # Forward pass through backbone
+        preds = self.model(images, audio)
+        
+        if truth is not None:
+            # Calculate loss if ground truth is provided
+            loss, metrics = self.criterion(preds, truth)
+            return loss, metrics, preds
+        
+        return preds
+
+# ==============================================================================
+# 3. Helpers
+# ==============================================================================
 
 def recursive_to_device(obj: Any, device: torch.device, non_blocking: bool = True):
     if torch.is_tensor(obj):
@@ -96,8 +120,26 @@ def recursive_to_device(obj: Any, device: torch.device, non_blocking: bool = Tru
         return [recursive_to_device(v, device, non_blocking) for v in obj]
     return obj
 
+def recursive_apply_to_floats(obj: Any, op):
+    """Recursively apply an operation to all Float/Double tensors."""
+    if torch.is_tensor(obj):
+        if obj.is_floating_point():
+            return op(obj)
+        return obj
+    elif is_dataclass(obj):
+        changes = {}
+        for f in fields(obj):
+            val = getattr(obj, f.name)
+            changes[f.name] = recursive_apply_to_floats(val, op)
+        return type(obj)(**changes)
+    elif isinstance(obj, dict):
+        return {k: recursive_apply_to_floats(v, op) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [recursive_apply_to_floats(v, op) for v in obj]
+    return obj
+
 def cs2_collate_fn(batch: List[TrainingSample]) -> TrainingSample:
-    imgs = torch.stack([s.images for s in batch]) 
+    imgs = torch.stack([s.images for s in batch])
     audio_raw = torch.stack([s.audio for s in batch])
     
     first_gt = batch[0].truth
@@ -122,195 +164,218 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # ==============================================================================
-# Training Loop
+# 4. Training Loop
 # ==============================================================================
 
 def train_one_epoch(
-    model: nn.Module, 
-    criterion: nn.Module, 
+    training_module: nn.Module, 
     loader: DataLoader, 
     optimizer: optim.Optimizer, 
     scheduler: Any, 
+    accelerator: Accelerator,
     cfg: TrainConfig, 
-    epoch: int,
-    local_rank: int
+    epoch: int
 ):
-    model.train()
-    criterion.train() 
+    training_module.train()
     
-    total_loss = torch.tensor(0.0, device=local_rank)
+    total_loss = 0.0
     steps_in_epoch = len(loader)
+    t0 = time.time()
     
-    if is_main_process():
-        logger.info(f"Start Epoch {epoch}")
+    # Determine target dtype for loss inputs to match FSDP params
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
+    target_dtype = dtype_map.get(cfg.mixed_precision, torch.float32)
 
     for batch_idx, sample in enumerate(loader):
-        sample = recursive_to_device(sample, local_rank)
+        sample = recursive_to_device(sample, accelerator.device)
         
-        # Use Autocast for Mixed Precision compatibility
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            preds = model(images=sample.images, audio=sample.audio)
-            loss, metrics = criterion(preds, sample.truth)
+        # FIX: Cast Truth to target dtype (BF16) if mixed precision is enabled
+        # This prevents the Loss function (which is inside FSDP) from promoting calculations 
+        # to FP32, which generates FP32 gradients that fail FSDP's backward dtype check.
+        sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
+
+        # Accumulate gradients on the single wrapped module
+        with accelerator.accumulate(training_module):
+            
+            # Forward pass via Wrapper
+            loss, metrics, _ = training_module(
+                images=sample.images, 
+                audio=sample.audio, 
+                truth=sample.truth
+            )
+            
+            # Manual normalization
             loss = loss / cfg.grad_accumulation_steps
-        
-        # Cast loss to bfloat16 for backward pass stability
-        loss.to(torch.bfloat16).backward()
 
-        if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-            model.clip_grad_norm_(cfg.clip_grad_norm)
+            # Backward
+            accelerator.backward(loss)
+
+            # Optimizer Step
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(training_module.parameters(), cfg.clip_grad_norm)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                if accelerator.is_main_process:
+                    metrics["train/loss"] = loss.item() * cfg.grad_accumulation_steps
+                    metrics["train/lr"] = optimizer.param_groups[0]["lr"]
+                    metrics["train/step"] = (epoch * steps_in_epoch) + batch_idx
+                    wandb.log(metrics)
             
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
+            total_loss += loss.item() * cfg.grad_accumulation_steps
             
-            if is_main_process():
-                current_loss = loss.item() * cfg.grad_accumulation_steps
-                metrics["train/loss"] = current_loss
-                metrics["train/lr"] = optimizer.param_groups[0]["lr"]
-                metrics["train/step"] = (epoch * steps_in_epoch) + batch_idx
-                wandb.log(metrics)
-        
-        total_loss += loss.detach() * cfg.grad_accumulation_steps
+            if batch_idx % 50 == 0 and accelerator.is_main_process:
+                elapsed = time.time() - t0
+                t0 = time.time()
+                logger.info(
+                    f"Ep {epoch} [{batch_idx}/{steps_in_epoch}] "
+                    f"Loss: {loss.item()*cfg.grad_accumulation_steps:.4f} | "
+                    f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
+                    f"Time/50: {elapsed:.1f}s"
+                )
 
-    dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
-    return total_loss.item() / steps_in_epoch
+    return total_loss / steps_in_epoch
 
-def validate(model, criterion, loader, cfg, epoch, local_rank):
-    model.eval()
-    criterion.eval()
+def validate(training_module, loader, accelerator, cfg, epoch):
+    training_module.eval()
     
-    total_loss = torch.tensor(0.0, device=local_rank)
-    count = torch.tensor(0.0, device=local_rank)
+    total_loss = 0.0
+    agg_metrics = {}
+    count = 0
+    
+    # Determine target dtype
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
+    target_dtype = dtype_map.get(cfg.mixed_precision, torch.float32)
+
+    if accelerator.is_main_process:
+        logger.info("Starting Validation...")
     
     with torch.no_grad():
         for sample in loader:
-            sample = recursive_to_device(sample, local_rank)
+            sample = recursive_to_device(sample, accelerator.device)
+            # Ensure consistency in validation too
+            sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
             
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                preds = model(sample.images, sample.audio)
-                loss, _ = criterion(preds, sample.truth)
+            # Forward pass via Wrapper
+            loss, metrics, _ = training_module(
+                images=sample.images, 
+                audio=sample.audio, 
+                truth=sample.truth
+            )
             
-            total_loss += loss
+            # Gather loss from all ranks
+            avg_loss_across_gpus = accelerator.gather(loss).mean()
+            total_loss += avg_loss_across_gpus.item()
+            
+            for k, v in metrics.items():
+                agg_metrics[k] = agg_metrics.get(k, 0.0) + v
             count += 1
             
-    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    avg_loss = total_loss / max(1, count)
     
-    avg_loss = (total_loss / count).item()
-    
-    if is_main_process():
-        logger.info(f"Validation Ep {epoch} - Avg Loss: {avg_loss:.4f}")
-        wandb.log({"val/loss": avg_loss, "epoch": epoch})
+    if accelerator.is_main_process:
+        avg_metrics = {f"val/{k}": v / count for k, v in agg_metrics.items()}
+        avg_metrics["val/loss"] = avg_loss
+        logger.info(f"Validation Complete. Avg Loss: {avg_loss:.4f}")
+        wandb.log(avg_metrics)
     
     return avg_loss
 
-def save_checkpoint(model, optimizer, criterion, epoch, cfg, rank):
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        model_state = model.state_dict()
-
-    loss_state = criterion.state_dict()
-    
-    if rank == 0:
-        path = os.path.join(cfg.output_dir, f"{cfg.run_name}_ep{epoch}.pt")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model_state,
-            'loss_state_dict': loss_state,
-        }, path)
-        logger.info(f"Saved FSDP checkpoint to {path}")
-
 # ==============================================================================
-# Main
+# 5. Main Driver
 # ==============================================================================
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--run_name", type=str, default="cs2_fsdp2_run")
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--debug", action="store_true", help="Enable memory profiling")
     args = parser.parse_args()
 
-    local_rank = setup_distributed()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    if args.debug:
+        debug.enable()
 
+    # 1. Config
     cfg = TrainConfig(
         data_root=args.data_root,
+        run_name=args.run_name,
         batch_size=args.batch_size,
-        seq_len=512
+        grad_accumulation_steps=args.grad_accum
     )
     
-    if is_main_process():
-        os.makedirs(cfg.output_dir, exist_ok=True)
-        wandb.init(project=cfg.project_name, name=cfg.run_name, config=cfg.__dict__)
-
-    ds_config = DatasetConfig(
-        data_root=cfg.data_root, 
-        run_dir="./runs", 
-        epoch_round_sample_length=cfg.seq_len
+    # 2. Accelerator with FSDP2
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
     )
+
+    accelerator = Accelerator(
+        mixed_precision=cfg.mixed_precision,
+        gradient_accumulation_steps=cfg.grad_accumulation_steps,
+        log_with="wandb",
+        project_config=ProjectConfiguration(
+            project_dir=cfg.output_dir, 
+            logging_dir="./logs"
+        ),
+        fsdp_plugin=fsdp_plugin
+    )
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name=cfg.project_name, 
+            config=cfg.__dict__,
+            init_kwargs={"wandb": {"name": cfg.run_name}}
+        )
+        logger.info(f"Accelerator initialized. FSDP Version: {fsdp_plugin.fsdp_version}")
+
+    # 3. Data
+    if accelerator.is_main_process:
+        logger.info("Initializing Dataset...")
+    ds_config = DatasetConfig(data_root=cfg.data_root, run_dir="./runs")
     ds_root = DatasetRoot(ds_config)
     
-    model_cfg = ModelConfig()
-    model_cfg.gradient_checkpointing = True 
+    # 4. Model & Loss (Wrapped)
+    if accelerator.is_main_process:
+        logger.info("Initializing Model & Loss...")
     
-    # Initialize model
-    model = GamePredictorBackbone(model_cfg).to(local_rank)
+    model_cfg = ModelConfig() 
+    backbone = GamePredictorBackbone(model_cfg)
+    criterion = CS2Loss()
     
-    # Cast to BF16 (handles audio encoder float32 issue)
-    model = model.to(torch.bfloat16)
+    # Wrap them together
+    training_module = TrainingModule(backbone, criterion)
 
-    # Wrap only Llama layers now
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={LlamaDecoderLayer},
-    )
-
-    bf16_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
-
-    model = FSDP(
-        model,
-        auto_wrap_policy=llama_auto_wrap_policy,
-        mixed_precision=bf16_policy,
-        device_id=local_rank,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        use_orig_params=True,
-        limit_all_gathers=True,
-    )
-
-    criterion = CS2Loss().to(local_rank).to(torch.bfloat16)
-
+    # 5. Optimizer
+    # Initialize normally; Accelerate wraps it for sharding.
     optimizer = optim.AdamW(
-        model.parameters(), 
+        training_module.parameters(), 
         lr=cfg.lr, 
         weight_decay=cfg.weight_decay
     )
     
+    # 6. Scheduler
     dummy_epoch = ds_root.build_epoch("train", 0)
-    total_samples = len(dummy_epoch.samples)
-    global_batch_size = cfg.batch_size * world_size * cfg.grad_accumulation_steps
-    total_steps = (total_samples // global_batch_size) * cfg.max_epochs
+    steps_per_epoch = len(dummy_epoch) // cfg.batch_size
+    steps_per_epoch = steps_per_epoch // accelerator.num_processes
+    total_steps = (steps_per_epoch // cfg.grad_accumulation_steps) * cfg.max_epochs
     
     scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, total_steps)
 
-    if is_main_process():
-        logger.info(f"Training on {total_samples} samples.")
-        logger.info(f"Global Batch: {global_batch_size}")
+    # 7. Prepare
+    training_module, optimizer, scheduler = accelerator.prepare(
+        training_module, optimizer, scheduler
+    )
 
+    if accelerator.is_main_process:
+        logger.info(f"Ready to train for {cfg.max_epochs} epochs (~{total_steps} updates).")
+
+    # 8. Loop
     for epoch in range(cfg.max_epochs):
-        full_train_epoch = ds_root.build_epoch("train", epoch)
-        full_val_epoch = ds_root.build_epoch("val", epoch)
-        
-        # Manual Sharding
-        train_samples = full_train_epoch.samples[rank::world_size]
-        val_samples = full_val_epoch.samples[rank::world_size]
-        
-        train_ds = Epoch(ds_config, epoch, train_samples)
-        val_ds = Epoch(ds_config, epoch, val_samples)
+        train_ds = ds_root.build_epoch("train", epoch)
+        val_ds = ds_root.build_epoch("val", epoch)
         
         train_loader = DataLoader(
             train_ds, 
@@ -329,18 +394,20 @@ def main():
             collate_fn=cs2_collate_fn
         )
         
+        train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
+        
         train_loss = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler, cfg, epoch, local_rank
+            training_module, train_loader, optimizer, scheduler, accelerator, cfg, epoch
         )
         
-        val_loss = validate(model, criterion, val_loader, cfg, epoch, local_rank)
+        val_loss = validate(training_module, val_loader, accelerator, cfg, epoch)
         
         if (epoch + 1) % cfg.save_every == 0:
-            save_checkpoint(model, optimizer, criterion, epoch, cfg, rank)
+            if accelerator.is_main_process:
+                logger.info(f"Saving checkpoint for epoch {epoch}...")
+            accelerator.save_state(output_dir=os.path.join(cfg.output_dir, f"checkpoint_ep{epoch}"))
 
-    cleanup_distributed()
-    if is_main_process():
-        wandb.finish()
+    accelerator.end_training()
 
 if __name__ == "__main__":
     main()

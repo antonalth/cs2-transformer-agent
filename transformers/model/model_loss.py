@@ -41,18 +41,21 @@ class AutomaticWeightedLoss(nn.Module):
         # Stack losses into [N]
         losses = torch.stack(loss_list)
         
+        # Ensure params match the dtype of the incoming losses (e.g. BF16)
+        params = self.params.to(dtype=losses.dtype)
+
         # Precision = 1 / (2 * sigma^2)
-        precision = 0.5 * torch.exp(-self.params)
+        precision = 0.5 * torch.exp(-params)
         
         # Loss = precision * loss + log(sigma)
         # Note: 0.5 * params is equivalent to log(sigma) since params = log(sigma^2)
-        weighted_losses = (precision * losses) + (0.5 * self.params)
+        weighted_losses = (precision * losses) + (0.5 * params)
         
         # Return total loss and the raw scalar weights for logging
         total_loss = weighted_losses.sum()
         
         # Calculate human-readable weights (1 / 2*sigma^2) for debugging
-        current_weights = precision.detach() # No clone needed usually, but detach is crucial
+        current_weights = precision.detach().float() 
         
         return total_loss, current_weights
 
@@ -147,7 +150,7 @@ class CS2Loss(nn.Module):
             "debug/round_num": l_rnd_nm.item(),
             "debug/team_alive_count": l_t_alv.item(),
             "debug/enemy_alive_count": l_e_alv.item(),
-            
+
             # --- Learned Uncertainties ---
             "sigma/mouse": weights[0].item(),
             "sigma/key":   weights[1].item(),
@@ -168,8 +171,10 @@ class CS2Loss(nn.Module):
         # Huber Loss for robustness against outliers (flicks)
         m_flat = mask.view(-1)
         p_flat = pred.view(-1, 2)[m_flat]
-        g_flat = gt.view(-1, 2)[m_flat]
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device)
+        
+        g_flat = gt.view(-1, 2)[m_flat].to(dtype=pred.dtype)
+        
+        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return F.huber_loss(p_flat, g_flat, delta=1.0)
 
     @staticmethod
@@ -179,38 +184,40 @@ class CS2Loss(nn.Module):
         gt_t = (gt.unsqueeze(-1) >> torch.arange(32, device=pred.device)) & 1
         m_flat = mask.view(-1)
         p_flat = pred.view(-1, 32)[m_flat]
-        g_flat = gt_t.float().view(-1, 32)[m_flat]
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device)
+        
+        g_flat = gt_t.to(dtype=pred.dtype).view(-1, 32)[m_flat]
+        
+        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return sigmoid_focal_loss(p_flat, g_flat, alpha=0.25, gamma=2.0, reduction='mean')
 
     @staticmethod
-    def _unpack_chunks(chunks, num_chunks):
+    def _unpack_chunks(chunks, num_chunks, target_dtype):
         # Helper for Eco/Inv
         bits = torch.arange(64, device=chunks.device)
         unpacked = []
         for i in range(num_chunks):
             expanded = (chunks[..., i].unsqueeze(-1) >> bits) & 1
             unpacked.append(expanded)
-        return torch.cat(unpacked, dim=-1).float()
+        return torch.cat(unpacked, dim=-1).to(dtype=target_dtype)
 
     @staticmethod
     def eco(pred, gt_chunks, mask):
         # Eco: 4 chunks (256 bits), Focal Loss
-        gt_t = CS2Loss._unpack_chunks(gt_chunks, 4)
+        gt_t = CS2Loss._unpack_chunks(gt_chunks, 4, pred.dtype)
         m_flat = mask.view(-1)
         p_flat = pred.view(-1, 256)[m_flat]
         g_flat = gt_t.view(-1, 256)[m_flat]
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device)
+        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return sigmoid_focal_loss(p_flat, g_flat, alpha=0.25, gamma=2.0, reduction='mean')
 
     @staticmethod
     def inventory(pred, gt_chunks, mask):
         # Inv: 2 chunks (128 bits), Focal Loss
-        gt_t = CS2Loss._unpack_chunks(gt_chunks, 2)
+        gt_t = CS2Loss._unpack_chunks(gt_chunks, 2, pred.dtype)
         m_flat = mask.view(-1)
         p_flat = pred.view(-1, 128)[m_flat]
         g_flat = gt_t.view(-1, 128)[m_flat]
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device)
+        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return sigmoid_focal_loss(p_flat, g_flat, alpha=0.25, gamma=2.0, reduction='mean')
 
     @staticmethod
@@ -219,7 +226,7 @@ class CS2Loss(nn.Module):
         m_flat = mask.view(-1)
         p_flat = pred.view(-1, 128)[m_flat]
         g_flat = gt_idx.view(-1)[m_flat].long()
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device)
+        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return F.cross_entropy(p_flat, g_flat, ignore_index=-1)
 
     @staticmethod
@@ -234,8 +241,10 @@ class CS2Loss(nn.Module):
         
         m_flat = mask.view(-1)
         p_flat = torch.sigmoid(pred).view(-1, 3)[m_flat]
-        g_flat = target.view(-1, 3)[m_flat]
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device)
+        
+        g_flat = target.view(-1, 3)[m_flat].to(dtype=pred.dtype)
+        
+        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return F.mse_loss(p_flat, g_flat)
 
     @staticmethod
@@ -261,7 +270,7 @@ class CS2Loss(nn.Module):
         ty = gt_idx[..., 1].contiguous().view(-1)[m_flat]
         tz = gt_idx[..., 2].contiguous().view(-1)[m_flat]
 
-        if px.shape[0] == 0: return torch.tensor(0.0, device=pred_x.device)
+        if px.shape[0] == 0: return torch.tensor(0.0, device=pred_x.device, dtype=pred_x.dtype)
         
         lx = F.cross_entropy(px, tx, label_smoothing=0.1)
         ly = F.cross_entropy(py, ty, label_smoothing=0.1)
@@ -289,14 +298,14 @@ class CS2Loss(nn.Module):
         # Multi-label BCE
         bits = torch.arange(5, device=pred.device)
         gt = (gt_byte.unsqueeze(-1) >> bits) & 1
-        return F.binary_cross_entropy_with_logits(pred, gt.float())
+        return F.binary_cross_entropy_with_logits(pred, gt.to(dtype=pred.dtype))
 
     @staticmethod
     def round_number(pred, gt_int):
         # MSE
         target = gt_int.float() / 30.0
         target = torch.clamp(target, 0.0, 1.0) 
-        return F.mse_loss(torch.sigmoid(pred).squeeze(-1), target)
+        return F.mse_loss(torch.sigmoid(pred).squeeze(-1), target.to(dtype=pred.dtype))
 
     @staticmethod
     def alive_count(pred, mask):

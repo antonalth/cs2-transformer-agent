@@ -28,9 +28,6 @@ from transformers import (
     Blip2QFormerConfig, Blip2QFormerModel, DacModel
 )
 
-# If ModelPrediction is defined in this file, we don't need to import it.
-# from model_loss import ModelPrediction 
-
 @dataclass
 class ModelConfig:
     use_flash_attention: bool = True

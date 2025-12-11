@@ -44,7 +44,7 @@ class DatasetConfig:
 
     epoch_gen_random_seed: int = 42
     epoch_windows_per_round: int = 3 #how many random windows
-    epoch_round_sample_length: int = 256 #number of frames per window
+    epoch_round_sample_length: int = 1024 #number of frames per window
     epoch_video_decoding_device: str = "cpu"
     audio_sample_rate: int = 24000
 

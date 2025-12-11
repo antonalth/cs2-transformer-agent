@@ -23,3 +23,4 @@ cache/
 tmp_dali_filelists/
 wandb/
 *.pickle
+checkpoints_fsdp/
