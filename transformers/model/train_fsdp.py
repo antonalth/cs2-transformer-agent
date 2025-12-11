@@ -41,6 +41,8 @@ from model_novibe import ModelConfig, GamePredictorBackbone
 from model_loss import CS2Loss
 import debug
 
+from config import TrainConfig
+
 # Initialize Logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TrainerFSDP")
@@ -49,29 +51,7 @@ logger = logging.getLogger("TrainerFSDP")
 # 1. Configuration
 # ==============================================================================
 
-@dataclass
-class TrainConfig:
-    # Experiment
-    project_name: str = "cs2-behavior-cloning"
-    run_name: str = "llama-dac-fsdp2"
-    output_dir: str = "./checkpoints_fsdp"
-    
-    # Data
-    data_root: str = "./cs2_dataset"
-    num_workers: int = 4
-    
-    # Optimization
-    batch_size: int = 1          # Per GPU
-    grad_accumulation_steps: int = 16 
-    max_epochs: int = 20
-    lr: float = 2e-4             
-    weight_decay: float = 0.05
-    warmup_steps: int = 2000
-    clip_grad_norm: float = 1.0
-    
-    # System
-    save_every: int = 1
-    mixed_precision: str = "bf16"
+
 
 # ==============================================================================
 # 2. Wrapper Module (Fix for FSDP2)

@@ -29,6 +29,8 @@ import torch.distributed as dist
 from torchcodec.decoders import VideoDecoder, AudioDecoder  # pip install torchcodec
 import torchaudio
 
+from config import DatasetConfig
+
 TICK_RATE = 64
 FRAME_RATE = 32
 TICKS_PER_FRAME = TICK_RATE // FRAME_RATE
@@ -36,17 +38,6 @@ TICKS_PER_FRAME = TICK_RATE // FRAME_RATE
 def ticks_to_framecount(start_tick: int, end_tick: int) -> int:
     if end_tick < start_tick: return 0
     return ((end_tick - start_tick) // TICKS_PER_FRAME) + 1
-
-@dataclass
-class DatasetConfig:
-    data_root: str #root dir of dataset
-    run_dir: str #directory for temp files, logs etc
-
-    epoch_gen_random_seed: int = 42
-    epoch_windows_per_round: int = 3 #how many random windows
-    epoch_round_sample_length: int = 1024 #number of frames per window
-    epoch_video_decoding_device: str = "cpu"
-    audio_sample_rate: int = 24000
 
 
 @dataclass

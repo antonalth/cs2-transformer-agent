@@ -28,47 +28,7 @@ from transformers import (
     Blip2QFormerConfig, Blip2QFormerModel, DacModel
 )
 
-@dataclass
-class ModelConfig:
-    use_flash_attention: bool = True
-    gradient_checkpointing: bool = True
-    tokens_per_frame: int = 6 # 5 player + 1 strategy
-
-    dtype: torch.dtype = torch.bfloat16
-    
-    vision_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-    vision_hidden_size: int = 768
-    vision_chunk_size: int = 16
-
-    audio_chunk_size: int = 1
-
-    # --- Fusion (Q-Former) ---
-    num_qformer_queries: int = 4  
-    qformer_hidden_size: int = 768
-    qformer_heads: int = 12
-    qformer_layers: int = 4
-
-    # Adapter
-    adapter_hidden_dim: int = 4096
-
-    # --- Backbone (Llama) ---
-    llama_hidden_size: int = 2048 
-    llama_layers: int = 24
-    llama_heads: int = 32
-    llama_kv_heads: int = 8       
-    llama_intermediate: int = 5632 
-    llama_max_pos_embeddings: int = 8192
-
-    # --- Output Head Dimensions (Added to prevent AttributeErrors) ---
-    keyboard_dim: int = 32
-    eco_dim: int = 256
-    inventory_dim: int = 128
-    weapon_dim: int = 128
-    round_state_dim: int = 5
-    round_number_dim: int = 1
-    bins_x: int = 256
-    bins_y: int = 256
-    bins_z: int = 32
+from config import ModelConfig
 
 @dataclass
 class ModelPrediction:
