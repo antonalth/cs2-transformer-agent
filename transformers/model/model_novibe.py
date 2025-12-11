@@ -1,24 +1,42 @@
+#!/usr/bin/env python3
+"""
+Copyright 2025 Anton Althoff
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+------------------------------------------------------------------------
+"""
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple, Any
+from typing import Tuple, Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import (
-    AutoModel, LlamaConfig, LlamaModel, 
-    Blip2QFormerConfig, Blip2QFormerModel
+    AutoModel, AutoImageProcessor, LlamaConfig, LlamaModel, 
+    Blip2QFormerConfig, Blip2QFormerModel, DacModel
 )
 
-from model_loss import ModelPrediction
+# If ModelPrediction is defined in this file, we don't need to import it.
+# from model_loss import ModelPrediction 
 
 @dataclass
 class ModelConfig:
     dtype: torch.dtype = torch.bfloat16
     use_flash_attention: bool = True
     gradient_checkpointing: bool = True
-    tokens_per_frame: int = 6 #5 player + 1 strategy
+    tokens_per_frame: int = 6 # 5 player + 1 strategy
     
     vision_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     vision_hidden_size: int = 768
@@ -40,6 +58,17 @@ class ModelConfig:
     llama_kv_heads: int = 8       
     llama_intermediate: int = 5632 
     llama_max_pos_embeddings: int = 8192
+
+    # --- Output Head Dimensions (Added to prevent AttributeErrors) ---
+    keyboard_dim: int = 32
+    eco_dim: int = 256
+    inventory_dim: int = 128
+    weapon_dim: int = 128
+    round_state_dim: int = 8 # Example dim, adjust as needed
+    round_number_dim: int = 1
+    bins_x: int = 256
+    bins_y: int = 256
+    bins_z: int = 32
 
 @dataclass
 class ModelPrediction:
@@ -133,6 +162,8 @@ class GameVideoEncoder(nn.Module):
                     images=chunk,
                     return_tensors="pt",
                     data_format="channels_first",
+                    do_resize=False, # Assuming data is already resized in dataset
+                    do_center_crop=False
                 )
                 pixel_values = proc["pixel_values"].to(
                     device=chunk.device,
@@ -140,7 +171,7 @@ class GameVideoEncoder(nn.Module):
                 )
                 del proc
                 vis_out = self.vision(pixel_values=pixel_values).last_hidden_state #[n, L_v, D_v]
-                del pixel_values  # optional
+                del pixel_values
 
             n = vis_out.size(0)
             queries = self.query_tokens.expand(n, -1, -1)  # [n, N_q, D_q]
@@ -153,11 +184,12 @@ class GameVideoEncoder(nn.Module):
             del vis_out, q_out, queries
 
         q_all = torch.cat(q_chunks, dim=0)  # [B*T*P, N_q, D_q]
-        q_all = q_all.view(B, T, P, self.cfg.num_qformer_queries, self.qformer_hidden_size)
+        q_all = q_all.view(B, T, P, self.cfg.num_qformer_queries, self.cfg.qformer_hidden_size)
         return q_all
 
 class GameAudioEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig):
+        super().__init__()
         self.cfg = cfg
         self.model = DacModel.from_pretrained("descript/dac_24khz")
         self.model.eval()
@@ -167,12 +199,16 @@ class GameAudioEncoder(nn.Module):
         self.output_dim = self.model.config.hidden_size 
 
     def forward(self, audio: torch.Tensor, target_frames: int) -> torch.Tensor:
+        """
+        audio: [B, P, C=2, S]
+        """
         B, P, C, S = audio.shape
         flat_audio = audio.view(B * P * C, 1, S)
         with torch.no_grad():
-            features = self.model.encode(flat_audio).latents
-        aligned = F.adaptive_avg_pool1d(features, target_frames)  # [B*P*C, 1024?, T]
-        aligned = aligned.permute(0, 2, 1) # [B*P*C, T, 1024?]
+            features = self.model.encode(flat_audio).latents # [B*P*C, 1024, Time]
+        
+        aligned = F.adaptive_avg_pool1d(features, target_frames)  # [B*P*C, 1024, T]
+        aligned = aligned.permute(0, 2, 1) # [B*P*C, T, 1024]
         out = aligned.view(B, P, C, target_frames, -1) # [B, P, C, T, H]
         out = out.permute(0, 3, 1, 2, 4) # [B, T, P, C, H]
         return out
@@ -205,6 +241,7 @@ class ModelOutputHeads(nn.Module):
         self.enemy_pos_z = nn.Linear(d, cfg.bins_z, dtype=dt)
 
     def forward_player(self, x: torch.Tensor):
+        # x: [N, D]
         return {
             "mouse_delta": self.mouse(x),
             "keyboard_logits": self.keyboard(x),
@@ -218,6 +255,7 @@ class ModelOutputHeads(nn.Module):
         }
 
     def forward_global(self, x: torch.Tensor):
+        # x: [N, D]
         out = {
             "round_state_logits": self.round_state(x),
             "round_num_logit": self.round_number(x),
@@ -225,26 +263,38 @@ class ModelOutputHeads(nn.Module):
             "enemy_alive_logits": self.enemy_alive(x),
         }
         B = x.shape[0]
+        # Expand 1 strategy token -> 5 enemy tokens per sequence
         enemy_feats = self.enemy_expander(x).view(B, 5, -1)
-        out["enemy_pos_x"] = self.enemy_pos_x(enemy_feats)
-        out["enemy_pos_y"] = self.enemy_pos_y(enemy_feats)
-        out["enemy_pos_z"] = self.enemy_pos_z(enemy_feats)
+        # We need to flatten enemy features again for the linear heads to work
+        # [B, 5, D] -> [B*5, D]
+        flat_enemy = enemy_feats.view(-1, x.shape[-1])
+        
+        out["enemy_pos_x"] = self.enemy_pos_x(flat_enemy)
+        out["enemy_pos_y"] = self.enemy_pos_y(flat_enemy)
+        out["enemy_pos_z"] = self.enemy_pos_z(flat_enemy)
         return out
 
 class GamePredictorBackbone(nn.Module):
     def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
         self.video = GameVideoEncoder(cfg)
         self.audio = GameAudioEncoder(cfg)
         
-        adapter_dim_in = (cfg.qformer_hidden_size * cfg.num_qformer_queries) + self.audio.output_dim
+        # FIX: Audio output is [C, H]. Since dataset is stereo, C=2.
+        # We concat these in the forward pass, so input dim must account for both channels.
+        adapter_dim_in = (cfg.qformer_hidden_size * cfg.num_qformer_queries) + (self.audio.output_dim * 2)
+        
         self.adapter = nn.Sequential(
-            nn.Linear(adapter_dim_in, cfg.adapter_hidden_dim),
+            nn.Linear(adapter_dim_in, cfg.adapter_hidden_dim, dtype=cfg.dtype),
             nn.GELU(),
-            nn.Linear(cfg.adapter_dim_in, cfg.llama_hidden_size),
-            nn.LayerNorm(cfg.llama_hidden_size) #i guess? 
+            nn.Linear(cfg.adapter_hidden_dim, cfg.llama_hidden_size, dtype=cfg.dtype),
+            nn.LayerNorm(cfg.llama_hidden_size, dtype=cfg.dtype) 
         )
         
         self.strat_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
+
+        use_cache = not cfg.gradient_checkpointing
 
         llama_conf = LlamaConfig(
             vocab_size=1, 
@@ -255,7 +305,7 @@ class GamePredictorBackbone(nn.Module):
             num_key_value_heads=cfg.llama_kv_heads,
             max_position_embeddings=cfg.llama_max_pos_embeddings,
             use_cache=use_cache,
-            torch_dtype=cfg.torch_dtype,
+            torch_dtype=cfg.dtype,
             attn_implementation="flash_attention_2" if cfg.use_flash_attention else "eager"
         )
         self.backbone = LlamaModel(llama_conf)
@@ -266,36 +316,61 @@ class GamePredictorBackbone(nn.Module):
         
 
     def forward(self, images: torch.Tensor, audio: torch.Tensor):
-        B, T, P = images.shape[:3] #images: [B, T, P, C, H, W]
-        video_features = self.video(images) # [B, T, P, N_q, D_q]
-        audio_features = self.audio(audio, T) #[B, T, P, C, Aud_Hidden]
-        del images, audio # does something?
-
-        vid_flat = video_features.reshape(B, T, P, -1) # [B, T, P, N_q * D_q]
-        aud_flat = audio_features.reshape(B, T, P, -1) # [B, T, P, C*Aud_Hidden]
-        fused = torch.cat([vid_flat, aud_flat], dim=-1) # [B, T, P, (N_q * D_q) + (C * Aud_Hidden)]
-        del video_features, audio_features #probably does nothing?
+        B, T, P = images.shape[:3] # images: [B, T, P, C, H, W]
         
-        adapted = checkpoint(self.adapter,fused) # [B, T, P, D_llama]
+        video_features = self.video(images) # [B, T, P, N_q, D_q]
+        audio_features = self.audio(audio, T) # [B, T, P, C, Aud_Hidden]
+        del images, audio 
 
+        # Flatten modalities
+        vid_flat = video_features.reshape(B, T, P, -1) # [B, T, P, N_q * D_q]
+        aud_flat = audio_features.reshape(B, T, P, -1) # [B, T, P, C * Aud_Hidden]
+        
+        # Fuse
+        fused = torch.cat([vid_flat, aud_flat], dim=-1) # [B, T, P, (N_q * D_q) + (2 * Aud_Hidden)]
+        del video_features, audio_features
+        
+        # Adapter projection
+        # Checkpoint requires input to require grad, usually safe in training
+        if self.training and self.cfg.gradient_checkpointing:
+             adapted = checkpoint(self.adapter, fused, use_reentrant=False) # [B, T, P, D_llama]
+        else:
+             adapted = self.adapter(fused)
+
+        # Append Strategy Token
         strat = self.strat_token.expand(B, T, -1, -1) # [B, T, 1, D_llama]
-        frame_seq = torch.cat([adapted, strat], dim=2) # [B, T, P+1, D_llama]?
+        frame_seq = torch.cat([adapted, strat], dim=2) # [B, T, P+1, D_llama]
+        
+        # Flatten for Llama Backbone [Batch, Sequence Length, Hidden]
+        # Sequence Length = Time * (Players + Strategy)
         frame_seq_flat = frame_seq.view(B, T * self.cfg.tokens_per_frame, -1)
-        del adapted, strat #does this do anything? 
+        del adapted, strat
 
         outputs = self.backbone(inputs_embeds=frame_seq_flat)
-        hidden_states = outputs.last_hidden_state
+        hidden_states = outputs.last_hidden_state # [B, T * (P+1), D]
 
-        hidden_frames = hidden_stats.view(B, T, self.cfg.tokens_per_frame, -1) # [B, T, P+1, D_llama]
-        p_hidden = hidden_frames[..., :5, :]
-        s_hidden = hidden_frammes[..., 5, :]
+        # Reshape back to separate players and strategy
+        hidden_frames = hidden_states.view(B, T, self.cfg.tokens_per_frame, -1) # [B, T, P+1, D]
+        p_hidden = hidden_frames[..., :5, :] # [B, T, 5, D]
+        s_hidden = hidden_frames[..., 5, :]  # [B, T, D]
+
+        # FIX: Heads expect [N, D], not [B, T, P, D]
+        p_flat = p_hidden.reshape(-1, self.cfg.llama_hidden_size)
+        s_flat = s_hidden.reshape(-1, self.cfg.llama_hidden_size)
 
         p_preds = self.heads.forward_player(p_flat)
         s_preds = self.heads.forward_global(s_flat)
         
         def rs(x, is_player=True):
-            if is_player: return x.view(B, T, 5, *x.shape[1:])
-            else: return x.view(B, T, *x.shape[1:])
+            if is_player: 
+                # x is [B*T*5, Dim] -> [B, T, 5, Dim]
+                return x.view(B, T, 5, *x.shape[1:])
+            else: 
+                # x is [B*T, Dim] -> [B, T, Dim]
+                # Special case for enemy pos which is [B*T*5, Dim] but coming from strategy token
+                if x.shape[0] == B * T * 5:
+                    return x.view(B, T, 5, *x.shape[1:])
+                return x.view(B, T, *x.shape[1:])
         
         return ModelPrediction(
             mouse_delta=rs(p_preds["mouse_delta"]),
@@ -307,9 +382,12 @@ class GamePredictorBackbone(nn.Module):
             player_pos_x=rs(p_preds["player_pos_x"]),
             player_pos_y=rs(p_preds["player_pos_y"]),
             player_pos_z=rs(p_preds["player_pos_z"]),
-            enemy_pos_x=rs(s_preds["enemy_pos_x"], is_player=False),
+            
+            # Enemy preds come from s_preds but were expanded to 5
+            enemy_pos_x=rs(s_preds["enemy_pos_x"], is_player=False), 
             enemy_pos_y=rs(s_preds["enemy_pos_y"], is_player=False),
             enemy_pos_z=rs(s_preds["enemy_pos_z"], is_player=False),
+            
             round_state_logits=rs(s_preds["round_state_logits"], is_player=False),
             round_num_logit=rs(s_preds["round_num_logit"], is_player=False),
             team_alive_logits=rs(s_preds["team_alive_logits"], is_player=False),
