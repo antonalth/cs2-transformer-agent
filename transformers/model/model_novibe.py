@@ -37,11 +37,13 @@ class ModelConfig:
     gradient_checkpointing: bool = True
     tokens_per_frame: int = 6 # 5 player + 1 strategy
 
-    dtype: torch.dtype = torch.float32  #keep in float32, down with autocast
+    dtype: torch.dtype = torch.bfloat16
     
     vision_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     vision_hidden_size: int = 768
     vision_chunk_size: int = 16
+
+    audio_chunk_size: int = 1
 
     # --- Fusion (Q-Former) ---
     num_qformer_queries: int = 4  
@@ -193,6 +195,8 @@ class GameAudioEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.model = DacModel.from_pretrained("descript/dac_24khz")
+        self.model.to(dtype=cfg.dtype)
+
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
@@ -205,14 +209,24 @@ class GameAudioEncoder(nn.Module):
         """
         B, P, C, S = audio.shape
         flat_audio = audio.view(B * P * C, 1, S)
+        N = flat_audio.shape[0]
+        chunk_size = self.cfg.audio_chunk_size
+        feat_chunks = []
         with torch.no_grad():
-            features = self.model.encode(flat_audio).projected_latents # [B*P*C, 1024, Time]
-        
+            for i in range(0, N, chunk_size):
+                chunk = flat_audio[i : i + chunk_size]  # [n, 1, S]
+                feats = self.model.encode(chunk).projected_latents  # [n, 1024, Time]
+                feat_chunks.append(feats)
+                del feats, chunk
+
+        features = torch.cat(feat_chunks, dim=0)  # [B*P*C, 1024, Time]
+        del feat_chunks
+
         aligned = F.adaptive_avg_pool1d(features, target_frames)  # [B*P*C, 1024, T]
-        aligned = aligned.permute(0, 2, 1) # [B*P*C, T, 1024]
-        out = aligned.view(B, P, C, target_frames, -1) # [B, P, C, T, H]
-        out = out.permute(0, 3, 1, 2, 4) # [B, T, P, C, H]
-        out.to(dtype=self.cfg.dtype) # to bf16
+        aligned = aligned.permute(0, 2, 1)                        # [B*P*C, T, 1024]
+        out = aligned.view(B, P, C, target_frames, -1)            # [B, P, C, T, H]
+        out = out.permute(0, 3, 1, 2, 4)                          # [B, T, P, C, H]
+        out = out.to(dtype=self.cfg.dtype) # to bf16
         return out
 
 class ModelOutputHeads(nn.Module):
@@ -339,6 +353,7 @@ class GamePredictorBackbone(nn.Module):
         else:
              adapted = self.adapter(fused)
 
+        adapted = adapted.to(dtype=self.cfg.dtype) #undo LN upcast?
         # Append Strategy Token
         strat = self.strat_token.expand(B, T, -1, -1) # [B, T, 1, D_llama]
         frame_seq = torch.cat([adapted, strat], dim=2) # [B, T, P+1, D_llama]
