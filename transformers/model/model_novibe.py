@@ -64,7 +64,7 @@ class ModelConfig:
     eco_dim: int = 256
     inventory_dim: int = 128
     weapon_dim: int = 128
-    round_state_dim: int = 8 # Example dim, adjust as needed
+    round_state_dim: int = 5
     round_number_dim: int = 1
     bins_x: int = 256
     bins_y: int = 256
@@ -196,7 +196,7 @@ class GameAudioEncoder(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
-        self.output_dim = self.model.config.hidden_size 
+        self.output_dim = 256 #trust me bro
 
     def forward(self, audio: torch.Tensor, target_frames: int) -> torch.Tensor:
         """
@@ -205,7 +205,7 @@ class GameAudioEncoder(nn.Module):
         B, P, C, S = audio.shape
         flat_audio = audio.view(B * P * C, 1, S)
         with torch.no_grad():
-            features = self.model.encode(flat_audio).latents # [B*P*C, 1024, Time]
+            features = self.model.encode(flat_audio).projected_latents # [B*P*C, 1024, Time]
         
         aligned = F.adaptive_avg_pool1d(features, target_frames)  # [B*P*C, 1024, T]
         aligned = aligned.permute(0, 2, 1) # [B*P*C, T, 1024]

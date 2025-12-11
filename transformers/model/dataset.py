@@ -69,9 +69,7 @@ class TrainingSample:
     _roundsample: RoundSample # internal reference back
     images: torch.Tensor # [T, P=5, C, H, W]
     audio: torch.Tensor # raw waveform in [P=5, 2, samples]
-    audio_sample_rate: int #sample rate of audio
     truth: GroundTruth # GT for sample
-    length: int # number of frames in sample (e.g. T)
 
 @dataclass
 class Game:
@@ -182,12 +180,11 @@ class Epoch(torch.utils.data.Dataset):
         target_samples = int(round(window_secs * self.config.audio_sample_rate))
 
         for pov in sample.round.pov_audio:
-            decoder = AudioDecoder(pov)
+            decoder = AudioDecoder(pov, sample_rate = int(self.config.audio_sample_rate))
             try:
                 waveform = decoder.get_samples_played_in_range(
                     start_seconds=sample.start_time,
                     stop_seconds=sample.end_time,
-                    sample_rate = int(self.config.audio_sample_rate)
                 ).data  # [2, S]
             except RuntimeError:
                 waveform = torch.empty(0)
@@ -291,9 +288,7 @@ class Epoch(torch.utils.data.Dataset):
             images=images,
             audio=audio,
             truth=gt,
-            _roundsample = s, 
-            length = self.config.epoch_round_sample_length,
-            audio_sample_rate = self.config.audio_sample_rate
+            _roundsample = s,
         )
 
 class DatasetRoot:

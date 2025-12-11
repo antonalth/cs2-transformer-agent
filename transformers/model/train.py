@@ -26,17 +26,16 @@ from typing import Any, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-# Use standard torch.amp for compatibility
 from torch.amp import GradScaler, autocast
 
 import wandb
 
 # --- Local Imports ---
 from dataset import DatasetConfig, DatasetRoot, TrainingSample, GroundTruth
-from model import CS2Config, CS2BehaviorModel
+# NOTE: Renamed imports to match model_novibe.py structure
+from model_novibe import ModelConfig, GamePredictorBackbone
 from model_loss import CS2Loss
 import debug
 
@@ -51,7 +50,7 @@ logger = logging.getLogger("Trainer")
 class TrainConfig:
     # Experiment
     project_name: str = "cs2-behavior-cloning"
-    run_name: str = "llama-dinov3-baseline"
+    run_name: str = "llama-dac-baseline" # Updated name
     output_dir: str = "./checkpoints"
     
     # Data
@@ -102,34 +101,40 @@ def recursive_to_device(obj: Any, device: torch.device, non_blocking: bool = Tru
 def cs2_collate_fn(batch: List[TrainingSample]) -> TrainingSample:
     """
     Custom collate to stack TrainingSample fields and fix dimensions.
+    
+    Dataset output for a single sample:
+    - Images: [T, P, C, H, W]
+    - Audio: [P, 2, Samples] (Raw Waveform)
+    
+    Model expects batch shape:
+    - Images: [B, T, P, C, H, W]
+    - Audio: [B, P, 2, Samples]
     """
-    # 1. Images: Dataset gives [T, P, H, W, C] (if from dataset.py logic) or [T, P, C, H, W]
-    # Assuming dataset output is [T, P, H, W, C], we reshape to [B, T, P, C, H, W]
-    imgs = torch.stack([s.images for s in batch]) # [B, T, P, H, W, C]
-    imgs = imgs.permute(0, 1, 2, 5, 3, 4).contiguous() # [B, T, P, C, H, W]
     
-    # 2. Audio: Dataset gives [T, P, 2, 128, 1]
-    # Model expects [B, T, P, 2, 128, 32]
-    audio_raw = torch.stack([s.audio for s in batch]) 
+    # 1. Images: Dataset gives [T, P, C, H, W]. Stack to [B, T, P, C, H, W]
+    # NOTE: The original logic assumed [T, P, H, W, C] and permuted. 
+    # Since dataset.py now returns NCHW -> [T, P, C, H, W], we just stack.
+    imgs = torch.stack([s.images for s in batch]) # [B, T, P, C, H, W]
     
-    # FIX: Use expand() instead of F.pad() because F.pad 'replicate' mode doesn't support 6D tensors.
-    # Since the last dimension is 1, expanding it is mathematically equivalent to replication.
-    target_shape = list(audio_raw.shape)
-    target_shape[-1] = 32
-    audio_padded = audio_raw.expand(*target_shape).contiguous()
+    # 2. Audio: Dataset gives raw waveform [P, 2, Samples]. Stack to [B, P, 2, Samples]
+    audio_raw = torch.stack([s.audio for s in batch]) # [B, P, 2, Samples]
+    # NOTE: All previous audio padding/expansion logic is removed as the DAC model 
+    # in model_novibe.py expects the raw waveform in this format, and the dataset 
+    # handles truncation/padding internally to ensure a uniform 'Samples' length.
     
     # 3. Ground Truth: Recursively stack tensors
     first_gt = batch[0].truth
     gt_fields = {}
     for f in fields(first_gt):
+        # NOTE: Using getattr for safety, but typically all fields are tensors here
         gt_fields[f.name] = torch.stack([getattr(s.truth, f.name) for s in batch])
     batched_truth = GroundTruth(**gt_fields)
 
     # 4. Return batched sample
     return TrainingSample(
-        _roundsample=batch[0]._roundsample, 
+        _roundsample=batch[0]._roundsample, # Keep a single metadata copy
         images=imgs,
-        audio=audio_padded,
+        audio=audio_raw, # Use the correctly stacked audio
         truth=batched_truth
     )
 
@@ -165,6 +170,7 @@ def train_one_epoch(
     
     for batch_idx, sample in enumerate(loader):
         # 1. Move Data to GPU
+        # NOTE: sample.audio_sample_rate is not a tensor, so recursive_to_device safely skips it.
         sample = recursive_to_device(sample, cfg.device)
         
         # 2. Forward Pass
@@ -290,13 +296,17 @@ def main():
     
     # 3. Setup Model & Loss
     logger.info("Initializing Model & Loss...")
-    # NOTE: Set audio_time_steps to 32 to match our padded collate function
-    model_cfg = CS2Config(audio_time_steps=32)
-    model = CS2BehaviorModel(model_cfg).to(cfg.device)
+    
+    # Use the new ModelConfig from model_novibe
+    model_cfg = ModelConfig() 
+    
+    # Use the new model class from model_novibe
+    model = GamePredictorBackbone(model_cfg).to(cfg.device)
     criterion = CS2Loss().to(cfg.device)
 
     # 4. Setup Optimizer
     model_params = [p for p in model.parameters() if p.requires_grad]
+    # NOTE: CS2Loss (criterion) contains AutomaticWeightedLoss which has learnable params
     loss_params = [p for p in criterion.parameters() if p.requires_grad]
     
     optimizer = optim.AdamW(
@@ -310,6 +320,7 @@ def main():
     
     dummy_epoch = ds_root.build_epoch("train", 0)
     steps_per_epoch = len(dummy_epoch) // cfg.batch_size
+    # Calculate total steps for the scheduler
     total_steps = (steps_per_epoch // cfg.grad_accumulation_steps) * cfg.max_epochs
     
     scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, total_steps)
