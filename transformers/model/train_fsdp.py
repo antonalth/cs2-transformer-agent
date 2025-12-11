@@ -287,9 +287,20 @@ def main():
         grad_accumulation_steps=args.grad_accum
     )
     
+    # --- MOVED UP: Initialize Model & Loss BEFORE Accelerator ---
+    # We need the object instances to tell FSDP to ignore them
+    logger.info("Initializing Model & Loss (CPU)...")
+    model_cfg = ModelConfig() 
+    backbone = GamePredictorBackbone(model_cfg)
+    criterion = CS2Loss()
+    training_module = TrainingModule(backbone, criterion)
+
     # 2. Accelerator with FSDP2
+    # CRITICAL FIX: Add criterion to ignored_modules. 
+    # This prevents FSDP from sharding the tiny AWL parameters.
     fsdp_plugin = FullyShardedDataParallelPlugin(
         fsdp_version=2,
+        ignored_modules=[training_module.criterion] 
     )
 
     accelerator = Accelerator(
@@ -309,7 +320,6 @@ def main():
             config=cfg.__dict__,
             init_kwargs={"wandb": {"name": cfg.run_name}}
         )
-        logger.info(f"Accelerator initialized. FSDP Version: {fsdp_plugin.fsdp_version}")
 
     # 3. Data
     if accelerator.is_main_process:
@@ -317,34 +327,49 @@ def main():
     ds_config = DatasetConfig(data_root=cfg.data_root, run_dir="./runs")
     ds_root = DatasetRoot(ds_config)
     
-    # 4. Model & Loss (Wrapped)
-    if accelerator.is_main_process:
-        logger.info("Initializing Model & Loss...")
-    
-    model_cfg = ModelConfig() 
-    backbone = GamePredictorBackbone(model_cfg)
-    criterion = CS2Loss()
-    
-    # Wrap them together
-    training_module = TrainingModule(backbone, criterion)
+    training_module.criterion.to(accelerator.device)
 
-    # 5. Optimizer
-    # Initialize normally; Accelerate wraps it for sharding.
-    optimizer = optim.AdamW(
-        training_module.parameters(), 
-        lr=cfg.lr, 
-        weight_decay=cfg.weight_decay
-    )
+    # 4. Optimizer (With Grouping Fix)
+    backbone_params = []
+    awl_params = []
+
+    for name, param in training_module.named_parameters():
+        if "awl.params" in name:
+            awl_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer = optim.AdamW([
+        {
+            "params": backbone_params, 
+            "lr": cfg.lr, 
+            "weight_decay": cfg.weight_decay 
+        },
+        {
+            "params": awl_params, 
+            "lr": 1e-2,          # High LR
+            "weight_decay": 0.0  # 0 Weight Decay
+        }
+    ])
     
-    # 6. Scheduler
+    # 5. Scheduler
+    # Calculate steps
     dummy_epoch = ds_root.build_epoch("train", 0)
     steps_per_epoch = len(dummy_epoch) // cfg.batch_size
     steps_per_epoch = steps_per_epoch // accelerator.num_processes
     total_steps = (steps_per_epoch // cfg.grad_accumulation_steps) * cfg.max_epochs
     
-    scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, total_steps)
+    # FIX: Warmup Logic
+    # 2000 warmup steps is almost your entire training run (2080 steps). 
+    # This crushes your LR. Reducing to ~10% of training steps.
+    real_warmup = min(cfg.warmup_steps, int(0.1 * total_steps))
+    if accelerator.is_main_process:
+        logger.info(f"Total Steps: {total_steps}. Adjusted Warmup: {real_warmup}")
 
-    # 7. Prepare
+    scheduler = get_cosine_schedule_with_warmup(optimizer, real_warmup, total_steps)
+
+    # 6. Prepare
+    # Note: training_module is already created, passing it here wraps it
     training_module, optimizer, scheduler = accelerator.prepare(
         training_module, optimizer, scheduler
     )
@@ -352,7 +377,7 @@ def main():
     if accelerator.is_main_process:
         logger.info(f"Ready to train for {cfg.max_epochs} epochs (~{total_steps} updates).")
 
-    # 8. Loop
+    # 7. Loop (Unchanged)
     for epoch in range(cfg.max_epochs):
         train_ds = ds_root.build_epoch("train", epoch)
         val_ds = ds_root.build_epoch("val", epoch)

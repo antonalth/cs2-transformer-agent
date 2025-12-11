@@ -311,13 +311,13 @@ class DatasetRoot:
             return info
     
     def __init__(self, config: DatasetConfig):
+        self.config = config
         self.store = self.LmdbCache()
         self.dataset_path = os.path.abspath(config.data_root)
         manifest_path = os.path.join(self.dataset_path, "manifest.json")
         with open(manifest_path, "r", encoding="utf-8") as f: self.manifest = json.load(f)
         self.train = self.build_games("train")
         self.val = self.build_games("val")
-        self.config = config
         
     def build_games(self, split: str) -> List[Game]:
         games: List[Game] = []
@@ -334,7 +334,7 @@ class DatasetRoot:
             def _resolve(p): return os.path.abspath(os.path.join(self.dataset_path, "recordings", game.demo_name, p))
             videos, audio = [_resolve(pv) for pv in r["pov_videos"]], [_resolve(pa) for pa in r["pov_audio"]]
             if not all(os.path.exists(p) for p in videos + audio):
-                logging.warning(f"Skipping {game.demo_name}/{r['round_num']}: missing media file.")
+                if self.config.warn_skip: logging.warning(f"Skipping {game.demo_name}/{r['round_num']}: missing media file.")
                 continue
             round = Round(game=game, round_num=int(r["round_num"]),
                           team=str(r["team"]).upper(), start_tick=int(r["start_tick"]),
