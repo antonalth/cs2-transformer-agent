@@ -13,3 +13,4 @@ pyyaml
 bitsandbytes
 tensorboard
 wandb
+optuna
