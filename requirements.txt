@@ -14,3 +14,4 @@ bitsandbytes
 tensorboard
 wandb
 optuna
+accelerate

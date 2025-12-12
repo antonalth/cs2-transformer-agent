@@ -35,14 +35,14 @@ class AutomaticWeightedLoss(nn.Module):
     def __init__(self, num_losses: int):
         super().__init__()
         # Initialize to 0.0 (Variance = 1.0, Weight = 0.5)
-        self.params = nn.Parameter(torch.zeros(num_losses))
+        self.params = nn.Parameter(torch.zeros(num_losses, dtype=torch.bfloat16))
 
     def forward(self, loss_list: list[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         # Stack losses into [N]
         losses = torch.stack(loss_list)
         
         # Ensure params match the dtype of the incoming losses (e.g. BF16)
-        params = self.params.to(dtype=losses.dtype)
+        params = self.params #.to(dtype=losses.dtype)
 
         # Precision = 1 / (2 * sigma^2)
         precision = 0.5 * torch.exp(-params)
