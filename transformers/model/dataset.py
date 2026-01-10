@@ -331,7 +331,10 @@ class DatasetRoot:
         info = self.store.getinfo(game)
         for r in info["rounds"]:
             if len(r.get("pov_videos", [])) != 5 or len(r.get("pov_audio", [])) != 5: continue
-            def _resolve(p): return os.path.abspath(os.path.join(self.dataset_path, "recordings", game.demo_name, p))
+
+            def _resolve(p): 
+                return os.path.abspath(os.path.join(self.dataset_path, "recordings", game.demo_name, p))
+
             videos, audio = [_resolve(pv) for pv in r["pov_videos"]], [_resolve(pa) for pa in r["pov_audio"]]
             if not all(os.path.exists(p) for p in videos + audio):
                 if self.config.warn_skip: logging.warning(f"Skipping {game.demo_name}/{r['round_num']}: missing media file.")
@@ -360,8 +363,6 @@ class DatasetRoot:
                     )
         return Epoch(self.config, epoch_idx, samples)
 
-   # --- HELPER FUNCTION FOR DATALOADER ---
-# Must be defined at module level for 'spawn' multiprocessing
 def _collate_identity(batch):
     return batch[0]
 

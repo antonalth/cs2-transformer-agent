@@ -188,7 +188,7 @@ class CS2Loss(nn.Module):
         g_flat = gt_t.to(dtype=pred.dtype).view(-1, 32)[m_flat]
         
         if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.25, gamma=2.0, reduction='mean')
+        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.95, gamma=2.0, reduction='mean')
 
     @staticmethod
     def _unpack_chunks(chunks, num_chunks, target_dtype):
@@ -208,7 +208,7 @@ class CS2Loss(nn.Module):
         p_flat = pred.view(-1, 256)[m_flat]
         g_flat = gt_t.view(-1, 256)[m_flat]
         if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.25, gamma=2.0, reduction='mean')
+        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.95, gamma=2.0, reduction='mean')
 
     @staticmethod
     def inventory(pred, gt_chunks, mask):
@@ -218,7 +218,7 @@ class CS2Loss(nn.Module):
         p_flat = pred.view(-1, 128)[m_flat]
         g_flat = gt_t.view(-1, 128)[m_flat]
         if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.25, gamma=2.0, reduction='mean')
+        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.95, gamma=2.0, reduction='mean')
 
     @staticmethod
     def weapon(pred, gt_idx, mask):
