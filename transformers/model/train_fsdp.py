@@ -292,7 +292,7 @@ def main():
     logger.info("Initializing Model & Loss (CPU)...")
     model_cfg = ModelConfig() 
     backbone = GamePredictorBackbone(model_cfg)
-    criterion = CS2Loss()
+    criterion = CS2Loss(model_cfg)
     training_module = TrainingModule(backbone, criterion)
 
     # 2. Accelerator with FSDP2

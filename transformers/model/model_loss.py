@@ -287,18 +287,18 @@ class CS2Loss(nn.Module):
         return val_norm * max_val
 
     def _get_gaussian_targets(self, gt_values, bin_centers, bin_widths, sigma_bins=2.0):
-    # Clamp GT
-    gt = gt_values.float().clamp(bin_centers.min().float(), bin_centers.max().float())
-    centers = bin_centers.float()
+        # Clamp GT
+        gt = gt_values.float().clamp(bin_centers.min().float(), bin_centers.max().float())
+        centers = bin_centers.float()
 
-    # Find nearest bin index
-    idx = torch.argmin(torch.abs(centers.unsqueeze(0) - gt.unsqueeze(1)), dim=1)
+        # Find nearest bin index
+        idx = torch.argmin(torch.abs(centers.unsqueeze(0) - gt.unsqueeze(1)), dim=1)
 
-    # Look up pre-calculated sigma
-    sigma_val = (sigma_bins * bin_widths[idx]).unsqueeze(1)
+        # Look up pre-calculated sigma
+        sigma_val = (sigma_bins * bin_widths[idx]).unsqueeze(1)
 
-    dist = torch.exp(-0.5 * ((centers.unsqueeze(0) - gt.unsqueeze(1)) / sigma_val) ** 2)
-    return dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
+        dist = torch.exp(-0.5 * ((centers.unsqueeze(0) - gt.unsqueeze(1)) / sigma_val) ** 2)
+        return dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
 
 
     def mouse(self, pred_x, pred_y, gt_delta, mask):
