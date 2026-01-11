@@ -37,7 +37,8 @@ class ModelPrediction:
     Shape Convention: [Batch, Time, 5 (Players), ...Dimensions...]
     """
     # --- Action Heads ---
-    mouse_delta: torch.Tensor       # [B, T, 5, 256]   (Linear)
+    mouse_x: torch.Tensor       # [B, T, 5, 256]   (Linear)
+    mouse_y: torch.Tensor
     keyboard_logits: torch.Tensor   # [B, T, 5, 32]  (Logits)
     
     # --- Economy/Item Heads ---
@@ -347,7 +348,8 @@ class GamePredictorBackbone(nn.Module):
                 return x.view(B, T, *x.shape[1:])
         
         return ModelPrediction(
-            mouse_delta=rs(p_preds["mouse_delta"]),
+            mouse_x=rs(p_preds["mouse_x"]),
+            mouse_y=rs(p_preds["mouse_y"]),
             keyboard_logits=rs(p_preds["keyboard_logits"]),
             eco_logits=rs(p_preds["eco_logits"]),
             inventory_logits=rs(p_preds["inventory_logits"]),

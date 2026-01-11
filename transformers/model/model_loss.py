@@ -351,7 +351,8 @@ class CS2Loss(nn.Module):
     def keyboard(pred, gt, mask):
         # Focal Loss (Multi-label, sparse)
         # Expand 32-bit int mask
-        gt_t = (gt.unsqueeze(-1) >> torch.arange(32, device=pred.device)) & 1
+        gt_long = gt.long() 
+        gt_t = (gt_long.unsqueeze(-1) >> torch.arange(32, device=pred.device)) & 1
         m_flat = mask.view(-1)
         p_flat = pred.view(-1, 32)[m_flat]
         
