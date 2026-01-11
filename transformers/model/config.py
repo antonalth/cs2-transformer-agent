@@ -65,7 +65,13 @@ class ModelConfig:
     bins_z: int = 32
 
     # number of mouse bins for x, y
-    mouse_bins_count: int = 256 
+    mouse_bins_count: int = 256
+
+    # loss normalization
+    loss_scaler_warmup_steps: int = 2000
+    dwa_temperature: float = 2.0
+    dwa_momentum: float = 0.1
+    dwa_update_every: int = 200
 
 
 @dataclass

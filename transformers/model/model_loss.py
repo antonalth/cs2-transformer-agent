@@ -24,67 +24,80 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, Any
 
 from model_novibe import ModelPrediction
+from config import ModelConfig
 
 class DynamicLossScaler(nn.Module):
-    def __init__(self, num_losses: int, momentum: float = 0.001):
+    """
+    Normalize loss groups to comparable scale using an EMA during warmup,
+    then freeze the scale factors so easy tasks can naturally fade out.
+    """
+    def __init__(self, num_losses: int, momentum: float = 0.01, warmup_steps: int = 2000):
         super().__init__()
         self.momentum = momentum
-        # Store running magnitudes. Start at 1.0.
+        self.warmup_steps = warmup_steps
+
         self.register_buffer("running_magnitudes", torch.ones(num_losses))
+        self.register_buffer("base_magnitudes", torch.ones(num_losses))
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
 
     def forward(self, loss_list: list[torch.Tensor]):
-        # Stack raw losses (detach to stop gradient flow into the average)
-        raw_stack = torch.stack([l.detach() for l in loss_list])
-        
-        if self.training:
-            # Simple EMA: new = (1-m)*old + m*current
-            self.running_magnitudes = (
-                (1 - self.momentum) * self.running_magnitudes 
-                + self.momentum * raw_stack
-            )
+        raw = torch.stack([l.detach().float() for l in loss_list])  # float32 for stability
 
-        # Scale factor = 1 / (avg + eps)
-        scales = 1.0 / (self.running_magnitudes + 1e-5)
-        
-        scaled_losses = []
-        for i, loss in enumerate(loss_list):
-            scaled_losses.append(loss * scales[i])
-            
+        if self.training:
+            self.step += 1
+            if self.step <= self.warmup_steps:
+                self.running_magnitudes = (1 - self.momentum) * self.running_magnitudes + self.momentum * raw
+                self.base_magnitudes = self.running_magnitudes.clone()
+
+        scales = 1.0 / (self.base_magnitudes + 1e-5)  # constant after warmup
+        scaled_losses = [loss_list[i] * scales[i].to(loss_list[i].dtype) for i in range(len(loss_list))]
         return scaled_losses, scales
 
-class AutomaticWeightedLoss(nn.Module):
+class DynamicWeightAverage(nn.Module):
     """
-    Automatically weighs multiple loss terms using uncertainty weighting 
-    (Kendall & Gal, CVPR 2018).
-    
-    The model learns 'log_variance' parameters. High variance = Low Weight.
+    Dynamic Weight Averaging (DWA)
+    w_i(t) = K * softmax( r_i(t) / T )
+    r_i(t) = L_i(t-1) / (L_i(t-2) + eps)
+
+    We approximate epoch losses with windowed EMAs updated every `update_every` steps.
     """
-    def __init__(self, num_losses: int):
+    def __init__(self, num_losses: int, temperature: float = 2.0, momentum: float = 0.01, update_every: int = 200):
         super().__init__()
-        # Initialize to 0.0 (Variance = 1.0, Weight = 0.5)
-        self.params = nn.Parameter(torch.zeros(num_losses, dtype=torch.bfloat16))
+        self.num_losses = num_losses
+        self.temperature = temperature
+        self.momentum = momentum
+        self.update_every = update_every
 
-    def forward(self, loss_list: list[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
-        # Stack losses into [N]
-        losses = torch.stack(loss_list)
-        
-        # Ensure params match the dtype of the incoming losses (e.g. BF16)
-        params = self.params #.to(dtype=losses.dtype)
+        self.register_buffer("ema_window", torch.ones(num_losses))
+        self.register_buffer("ema_prev", torch.ones(num_losses))
+        self.register_buffer("ema_prev2", torch.ones(num_losses))
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
+        self.register_buffer("weights", torch.ones(num_losses))
 
-        # Precision = 1 / (2 * sigma^2)
-        precision = 0.5 * torch.exp(-params)
-        
-        # Loss = precision * loss + log(sigma)
-        # Note: 0.5 * params is equivalent to log(sigma) since params = log(sigma^2)
-        weighted_losses = (precision * losses) + (0.5 * params)
-        
-        # Return total loss and the raw scalar weights for logging
-        total_loss = weighted_losses.sum()
-        
-        # Calculate human-readable weights (1 / 2*sigma^2) for debugging
-        current_weights = precision.detach().float() 
-        
-        return total_loss, current_weights
+    def forward(self, loss_list: list[torch.Tensor]) -> torch.Tensor:
+        # Use raw detached losses; ratios are scale-invariant (good for mixed loss types).
+        raw = torch.stack([l.detach().float() for l in loss_list])
+
+        if not self.training:
+            return self.weights
+
+        self.step += 1
+        self.ema_window = (1 - self.momentum) * self.ema_window + self.momentum * raw
+
+        # Update DWA weights only every `update_every` steps
+        if (self.step % self.update_every) == 0:
+            self.ema_prev2 = self.ema_prev.clone()
+            self.ema_prev = self.ema_window.clone()
+
+            # Need two history windows before ratios mean anything
+            if self.step >= 2 * self.update_every:
+                r = self.ema_prev / (self.ema_prev2 + 1e-8)
+                logits = r / self.temperature
+                w = self.num_losses * torch.softmax(logits, dim=0)
+                self.weights = w
+
+        return self.weights
+
 
 class CS2Metrics:
     def __init__(self):
@@ -149,14 +162,31 @@ class CS2Loss(nn.Module):
         # We group losses into 6 distinct categories for weighting
         # 0: Mouse, 1: Keyboard, 2: Eco/Items, 3: Stats, 4: Position, 5: Global
         self.mouse_bins_count = cfg.mouse_bins_count
+        self.num_loss_groups = 6
 
-        self.register_buffer(
-            "mouse_bin_centers", 
-            self._generate_mu_law_bins(self.mouse_bins_count, min_val=-90.0, max_val=90.0, mu=255.0)
+    
+        centers = self._generate_mu_law_bins(self.mouse_bins_count, min_val=-90.0, max_val=90.0, mu=255.0)
+        self.register_buffer("mouse_bin_centers", centers)
+        
+        widths = torch.empty_like(centers)
+        widths[1:-1] = 0.5 * (centers[2:] - centers[:-2])
+        widths[0] = centers[1] - centers[0]
+        widths[-1] = centers[-1] - centers[-2]
+        self.register_buffer("mouse_bin_widths", widths.abs().clamp_min(1e-6))
+
+        self.scaler = DynamicLossScaler(
+            num_losses=self.num_loss_groups,
+            momentum=0.01,
+            warmup_steps=getattr(cfg, "loss_scale_warmup_steps", 2000),
         )
 
-        self.scaler = DynamicLossScaler(self.num_loss_groups, momentum=0.001)
-        self.awl = AutomaticWeightedLoss(num_losses=6)
+        self.dwa = DynamicWeightAverage(
+            num_losses=self.num_loss_groups,
+            temperature=cfg.dwa_temperature,
+            momentum=cfg.dwa_momentum,
+            update_every=cfg.dwa_update_every,
+        )
+
         self.metrics_calc = CS2Metrics()
 
     def forward(self, preds: ModelPrediction, truth: Any) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -199,47 +229,51 @@ class CS2Loss(nn.Module):
         l_group_glob = l_rnd_st + l_rnd_nm + l_t_alv + l_e_alv
 
         loss_list = [l_mouse, l_key, l_group_eco, l_stats, l_group_pos, l_group_glob]
-        loss_list_norm, scalers = self.scaler(loss_list)
+        loss_list_norm, scalers = self.scaler(loss_list) # norm magnitudes (for warmup phase only)
         
-        total_loss, weights = self.awl(loss_list_norm)
+        dwa_w = self.dwa(loss_list)  # tensor [6], float32
+
+        total_loss = 0.0
+        for i in range(self.num_loss_groups):
+            total_loss = total_loss + loss_list_norm[i] * dwa_w[i].to(loss_list_norm[i].dtype)
+        total_loss = total_loss / self.num_loss_groups
 
         metrics = self.metrics_calc.calculate(preds, truth, self.mouse_bin_centers)
 
         info = {
             "loss/total": total_loss.item(),
             
-            "raw/mouse": l_mouse.item(),
-            "raw/keyboard": l_key.item(),
-            "raw/eco_group": l_group_eco.item(),
-            "raw/stats": l_stats.item(),
-            "raw/pos_group": l_group_pos.item(),
-            "raw/global_group": l_group_glob.item(),
+            "raw_g/mouse": l_mouse.item(),
+            "raw_g/keyboard": l_key.item(),
+            "raw_g/eco": l_group_eco.item(),
+            "raw_g/stats": l_stats.item(),
+            "raw_g/pos": l_group_pos.item(),
+            "raw_g/global": l_group_glob.item(),
             
-            "debug/mouse": l_mouse.item(),
-            "debug/keyboard": l_key.item(),
+            "raw_s/mouse": l_mouse.item(),
+            "raw_s/keyboard": l_key.item(),
             
-            "debug/eco_bitmask": l_eco.item(),
-            "debug/inventory_bitmask": l_inv.item(),
-            "debug/active_weapon": l_wep.item(),
+            "raw_s/eco_bitmask": l_eco.item(),
+            "raw_s/inventory_bitmask": l_inv.item(),
+            "raw_s/active_weapon": l_wep.item(),
             
-            "debug/stats": l_stats.item(),
+            "raw_s/stats": l_stats.item(),
             
-            "debug/player_pos": l_p_pos.item(),
-            "debug/enemy_pos": l_e_pos.item(),
+            "raw_s/player_pos": l_p_pos.item(),
+            "raw_s/enemy_pos": l_e_pos.item(),
             
-            "debug/round_state": l_rnd_st.item(),
-            "debug/round_num": l_rnd_nm.item(),
-            "debug/team_alive_count": l_t_alv.item(),
-            "debug/enemy_alive_count": l_e_alv.item(),
-
-            # --- Learned Uncertainties ---
-            "sigma/mouse": weights[0].item(),
-            "sigma/key":   weights[1].item(),
-            "sigma/eco":   weights[2].item(),
-            "sigma/stats": weights[3].item(),
-            "sigma/pos":   weights[4].item(),
-            "sigma/glob":  weights[5].item(),
+            "raw_s/round_state": l_rnd_st.item(),
+            "raw_s/round_num": l_rnd_nm.item(),
+            "raw_s/team_alive_count": l_t_alv.item(),
+            "raw_s/enemy_alive_count": l_e_alv.item(),
         }
+
+        group_names = ["mouse", "key", "eco", "stats", "pos", "glob"]
+
+        for i, name in enumerate(group_names):
+            info[f"scale_g/{name}"] = float(scalers[i].item())
+            info[f"dwa_g/{name}"] = float(dwa_w[i].item())
+
         metrics.update(info)
 
         return total_loss, metrics
@@ -252,17 +286,20 @@ class CS2Loss(nn.Module):
         val_norm = torch.sign(t) * (1.0 / mu) * (torch.pow(1.0 + mu, torch.abs(t)) - 1.0)
         return val_norm * max_val
 
-    @staticmethod
-    def _get_gaussian_targets(gt_values, bin_centers, sigma=1.5):
-        """Creates Gaussian target distribution for Soft Labels."""
-        gt_expanded = gt_values.unsqueeze(1) # [N, 1]
-        bins_expanded = bin_centers.unsqueeze(0) # [1, Bins]
-        
-        # Gaussian PDF
-        dist = torch.exp(-0.5 * ((bins_expanded - gt_expanded) / sigma) ** 2)
-        # Normalize
-        targets = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
-        return targets
+    def _get_gaussian_targets(self, gt_values, bin_centers, bin_widths, sigma_bins=2.0):
+    # Clamp GT
+    gt = gt_values.float().clamp(bin_centers.min().float(), bin_centers.max().float())
+    centers = bin_centers.float()
+
+    # Find nearest bin index
+    idx = torch.argmin(torch.abs(centers.unsqueeze(0) - gt.unsqueeze(1)), dim=1)
+
+    # Look up pre-calculated sigma
+    sigma_val = (sigma_bins * bin_widths[idx]).unsqueeze(1)
+
+    dist = torch.exp(-0.5 * ((centers.unsqueeze(0) - gt.unsqueeze(1)) / sigma_val) ** 2)
+    return dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
+
 
     def mouse(self, pred_x, pred_y, gt_delta, mask):
         """
@@ -286,12 +323,12 @@ class CS2Loss(nn.Module):
 
         # 2. Generate Gaussian Soft Targets
         # Helper uses self.mouse_bin_centers to create bell curve around GT
-        tgt_x = self._get_gaussian_targets(g_x, self.mouse_bin_centers, sigma=1.5)
-        tgt_y = self._get_gaussian_targets(g_y, self.mouse_bin_centers, sigma=1.5)
+        tgt_x = self._get_gaussian_targets(g_x, self.mouse_bin_centers, self.mouse_bin_widths, sigma_bins=2.0)
+        tgt_y = self._get_gaussian_targets(g_y, self.mouse_bin_centers, self.mouse_bin_widths, sigma_bins=1.5)
         
         # 3. KL Divergence (Requires LogSoftmax input)
-        log_x = F.log_softmax(p_x, dim=-1)
-        log_y = F.log_softmax(p_y, dim=-1)
+        log_x = F.log_softmax(p_x.float(), dim=-1)
+        log_y = F.log_softmax(p_y.float(), dim=-1)
         
         # Calculate raw loss per sample
         loss_x_raw = F.kl_div(log_x, tgt_x, reduction='none').sum(dim=1)
