@@ -58,9 +58,14 @@ class ModelConfig:
     weapon_dim: int = 128
     round_state_dim: int = 5
     round_number_dim: int = 1
+
+    # bins for position
     bins_x: int = 256
     bins_y: int = 256
     bins_z: int = 32
+
+    # number of mouse bins for x, y
+    mouse_bins_count: int = 256 
 
 
 @dataclass

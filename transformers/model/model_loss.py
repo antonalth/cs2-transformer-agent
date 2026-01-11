@@ -25,6 +25,33 @@ from typing import Dict, Tuple, Any
 
 from model_novibe import ModelPrediction
 
+class DynamicLossScaler(nn.Module):
+    def __init__(self, num_losses: int, momentum: float = 0.001):
+        super().__init__()
+        self.momentum = momentum
+        # Store running magnitudes. Start at 1.0.
+        self.register_buffer("running_magnitudes", torch.ones(num_losses))
+
+    def forward(self, loss_list: list[torch.Tensor]):
+        # Stack raw losses (detach to stop gradient flow into the average)
+        raw_stack = torch.stack([l.detach() for l in loss_list])
+        
+        if self.training:
+            # Simple EMA: new = (1-m)*old + m*current
+            self.running_magnitudes = (
+                (1 - self.momentum) * self.running_magnitudes 
+                + self.momentum * raw_stack
+            )
+
+        # Scale factor = 1 / (avg + eps)
+        scales = 1.0 / (self.running_magnitudes + 1e-5)
+        
+        scaled_losses = []
+        for i, loss in enumerate(loss_list):
+            scaled_losses.append(loss * scales[i])
+            
+        return scaled_losses, scales
+
 class AutomaticWeightedLoss(nn.Module):
     """
     Automatically weighs multiple loss terms using uncertainty weighting 
@@ -59,9 +86,57 @@ class AutomaticWeightedLoss(nn.Module):
         
         return total_loss, current_weights
 
+class CS2Metrics:
+    def __init__(self):
+        self.epsilon = 1e-7
+
+    def calculate(self, preds: ModelPrediction, truth: Any, mouse_bin_centers: torch.Tensor) -> Dict[str, float]:
+        m = {}
+        device = preds.keyboard_logits.device
+        
+        # --- Keyboard F1 ---
+        kb_probs = torch.sigmoid(preds.keyboard_logits)
+        kb_pred_bin = (kb_probs > 0.5).long()
+        
+        gt_kb_bits = (truth.keyboard_mask.unsqueeze(-1) >> torch.arange(32, device=device)) & 1
+        
+        tp = (kb_pred_bin * gt_kb_bits).sum().float()
+        fp = (kb_pred_bin * (1 - gt_kb_bits)).sum().float()
+        fn = ((1 - kb_pred_bin) * gt_kb_bits).sum().float()
+        
+        precision = tp / (tp + fp + self.epsilon)
+        recall = tp / (tp + fn + self.epsilon)
+        f1 = 2 * (precision * recall) / (precision + recall + self.epsilon)
+        
+        m["metric/kb_f1"] = f1.item()
+        m["stat/kb_action_rate"] = kb_pred_bin.float().mean().item()
+
+        # --- Mouse MAE ---
+        idx_x = torch.argmax(preds.mouse_x, dim=-1)
+        idx_y = torch.argmax(preds.mouse_y, dim=-1)
+        
+        px_x = mouse_bin_centers[idx_x]
+        px_y = mouse_bin_centers[idx_y]
+        
+        mae_x = torch.abs(px_x - truth.mouse_delta[..., 0]).mean()
+        mae_y = torch.abs(px_y - truth.mouse_delta[..., 1]).mean()
+        
+        m["metric/mouse_mae_x"] = mae_x.item()
+        m["metric/mouse_mae_y"] = mae_y.item()
+        m["stat/mouse_move_rate"] = (idx_x != 128).float().mean().item()
+
+        # --- Stats MAE ---
+        stats_pred = torch.sigmoid(preds.stats_logits)
+        hp_err = torch.abs(stats_pred[..., 0] - (truth.stats[..., 0] / 100.0)).mean()
+        money_err = torch.abs(stats_pred[..., 2] - (truth.stats[..., 2] / 16000.0)).mean()
+        
+        m["metric/hp_mae"] = hp_err.item() * 100.0
+        m["metric/money_mae"] = money_err.item() * 16000.0
+        
+        return m
 
 class CS2Loss(nn.Module):
-    # Map constants
+    # Map dimensions/constants
     MAP_MIN = torch.tensor([-4000.0, -4000.0, -500.0])
     MAP_MAX = torch.tensor([ 4000.0,  4000.0,  2000.0])
     MAP_SIZE = MAP_MAX - MAP_MIN
@@ -69,11 +144,20 @@ class CS2Loss(nn.Module):
     BINS_Y = 256
     BINS_Z = 32
 
-    def __init__(self):
+    def __init__(self, cfg: ModelConfig = None):
         super().__init__()
         # We group losses into 6 distinct categories for weighting
         # 0: Mouse, 1: Keyboard, 2: Eco/Items, 3: Stats, 4: Position, 5: Global
+        self.mouse_bins_count = cfg.mouse_bins_count
+
+        self.register_buffer(
+            "mouse_bin_centers", 
+            self._generate_mu_law_bins(self.mouse_bins_count, min_val=-90.0, max_val=90.0, mu=255.0)
+        )
+
+        self.scaler = DynamicLossScaler(self.num_loss_groups, momentum=0.001)
         self.awl = AutomaticWeightedLoss(num_losses=6)
+        self.metrics_calc = CS2Metrics()
 
     def forward(self, preds: ModelPrediction, truth: Any) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
@@ -82,7 +166,7 @@ class CS2Loss(nn.Module):
         # --- 1. Compute Raw Losses ---
         
         # Group 0: Mouse
-        l_mouse = self.mouse(preds.mouse_delta, truth.mouse_delta, truth.alive_mask)
+        l_mouse = self.mouse(preds.mouse_x, preds.mouse_y, truth.mouse_delta, truth.alive_mask)
         
         # Group 1: Keyboard
         l_key = self.keyboard(preds.keyboard_logits, truth.keyboard_mask, truth.alive_mask)
@@ -114,18 +198,16 @@ class CS2Loss(nn.Module):
         l_e_alv  = self.alive_count(preds.enemy_alive_logits, truth.enemy_alive_mask)
         l_group_glob = l_rnd_st + l_rnd_nm + l_t_alv + l_e_alv
 
-        # --- 2. Apply Automatic Weighting ---
-        
-        # Must be in specific order matching __init__ logic
         loss_list = [l_mouse, l_key, l_group_eco, l_stats, l_group_pos, l_group_glob]
+        loss_list_norm, scalers = self.scaler(loss_list)
         
-        total_loss, weights = self.awl(loss_list)
+        total_loss, weights = self.awl(loss_list_norm)
 
-        # --- 3. Construct Metrics for Logging ---
-        metrics = {
+        metrics = self.metrics_calc.calculate(preds, truth, self.mouse_bin_centers)
+
+        info = {
             "loss/total": total_loss.item(),
             
-            # --- High Level Groups (Used for weighting) ---
             "raw/mouse": l_mouse.item(),
             "raw/keyboard": l_key.item(),
             "raw/eco_group": l_group_eco.item(),
@@ -133,7 +215,6 @@ class CS2Loss(nn.Module):
             "raw/pos_group": l_group_pos.item(),
             "raw/global_group": l_group_glob.item(),
             
-            # --- Granular Debugging (Every single loss term) ---
             "debug/mouse": l_mouse.item(),
             "debug/keyboard": l_key.item(),
             
@@ -159,23 +240,75 @@ class CS2Loss(nn.Module):
             "sigma/pos":   weights[4].item(),
             "sigma/glob":  weights[5].item(),
         }
+        metrics.update(info)
 
         return total_loss, metrics
 
-    # ==========================================================================
-    # STATIC MATH IMPLEMENTATIONS
-    # ==========================================================================
+    @staticmethod
+    def _generate_mu_law_bins(n_bins, min_val, max_val, mu):
+        """Generates bin centers concentrated near 0."""
+        t = torch.linspace(-1, 1, n_bins)
+        # Inverse Mu-Law
+        val_norm = torch.sign(t) * (1.0 / mu) * (torch.pow(1.0 + mu, torch.abs(t)) - 1.0)
+        return val_norm * max_val
 
     @staticmethod
-    def mouse(pred, gt, mask):
-        # Huber Loss for robustness against outliers (flicks)
+    def _get_gaussian_targets(gt_values, bin_centers, sigma=1.5):
+        """Creates Gaussian target distribution for Soft Labels."""
+        gt_expanded = gt_values.unsqueeze(1) # [N, 1]
+        bins_expanded = bin_centers.unsqueeze(0) # [1, Bins]
+        
+        # Gaussian PDF
+        dist = torch.exp(-0.5 * ((bins_expanded - gt_expanded) / sigma) ** 2)
+        # Normalize
+        targets = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
+        return targets
+
+    def mouse(self, pred_x, pred_y, gt_delta, mask):
+        """
+        Discretized Mouse Loss with Gaussian Smoothing + Imbalance Weighting.
+        pred_x, pred_y: [B, T, 5, 256]
+        gt_delta: [B, T, 5, 2]
+        mask: [B, T, 5]
+        """
+        # 1. Masking and Flattening
         m_flat = mask.view(-1)
-        p_flat = pred.view(-1, 2)[m_flat]
+        if m_flat.sum() == 0: 
+            return torch.tensor(0.0, device=pred_x.device, dtype=pred_x.dtype)
+
+        # pred_x: [N, 256] (Only alive players)
+        p_x = pred_x.reshape(-1, self.mouse_bins_count)[m_flat]
+        p_y = pred_y.reshape(-1, self.mouse_bins_count)[m_flat]
+
+        # gt: [N] (Only alive players)
+        g_x = gt_delta[..., 0].reshape(-1)[m_flat]
+        g_y = gt_delta[..., 1].reshape(-1)[m_flat]
+
+        # 2. Generate Gaussian Soft Targets
+        # Helper uses self.mouse_bin_centers to create bell curve around GT
+        tgt_x = self._get_gaussian_targets(g_x, self.mouse_bin_centers, sigma=1.5)
+        tgt_y = self._get_gaussian_targets(g_y, self.mouse_bin_centers, sigma=1.5)
         
-        g_flat = gt.view(-1, 2)[m_flat].to(dtype=pred.dtype)
+        # 3. KL Divergence (Requires LogSoftmax input)
+        log_x = F.log_softmax(p_x, dim=-1)
+        log_y = F.log_softmax(p_y, dim=-1)
         
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return F.huber_loss(p_flat, g_flat, delta=1.0)
+        # Calculate raw loss per sample
+        loss_x_raw = F.kl_div(log_x, tgt_x, reduction='none').sum(dim=1)
+        loss_y_raw = F.kl_div(log_y, tgt_y, reduction='none').sum(dim=1)
+        
+        # 4. Apply Weights for Class Imbalance
+        # If GT movement > 0.05, weight it 20x to punish 'camping' predictions
+        move_mask_x = torch.abs(g_x) > 0.05
+        move_mask_y = torch.abs(g_y) > 0.05
+        
+        w_x = torch.where(move_mask_x, 20.0, 1.0)
+        w_y = torch.where(move_mask_y, 20.0, 1.0)
+        
+        final_x = (loss_x_raw * w_x).mean()
+        final_y = (loss_y_raw * w_y).mean()
+        
+        return final_x + final_y
 
     @staticmethod
     def keyboard(pred, gt, mask):
@@ -231,21 +364,21 @@ class CS2Loss(nn.Module):
 
     @staticmethod
     def stats(pred, gt, mask):
-        # MSE with Normalization
+        # L1 LOSS + Log Money
         # gt: [Health, Armor, Money]
-        target = torch.stack([
-            gt[..., 0] / 100.0, 
-            gt[..., 1] / 100.0, 
-            gt[..., 2] / 16000.0
-        ], dim=-1)
-        
         m_flat = mask.view(-1)
+        if m_flat.sum() == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+        # Normalize GT
+        h_norm = gt[..., 0] / 100.0
+        a_norm = gt[..., 1] / 100.0
+        # Log Norm for Money: log(m+1) / log(16001)
+        mon_norm = torch.log1p(gt[..., 2]) / 9.68  # log(16001) ~ 9.68
+        
+        target = torch.stack([h_norm, a_norm, mon_norm], dim=-1).view(-1, 3)[m_flat].to(dtype=pred.dtype)
         p_flat = torch.sigmoid(pred).view(-1, 3)[m_flat]
         
-        g_flat = target.view(-1, 3)[m_flat].to(dtype=pred.dtype)
-        
-        if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return F.mse_loss(p_flat, g_flat)
+        return F.l1_loss(p_flat, target)
 
     @staticmethod
     def _positions_to_bins(pos, device):

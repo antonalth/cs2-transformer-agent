@@ -37,7 +37,7 @@ class ModelPrediction:
     Shape Convention: [Batch, Time, 5 (Players), ...Dimensions...]
     """
     # --- Action Heads ---
-    mouse_delta: torch.Tensor       # [B, T, 5, 2]   (Linear)
+    mouse_delta: torch.Tensor       # [B, T, 5, 256]   (Linear)
     keyboard_logits: torch.Tensor   # [B, T, 5, 32]  (Logits)
     
     # --- Economy/Item Heads ---
@@ -192,7 +192,8 @@ class ModelOutputHeads(nn.Module):
         d = cfg.llama_hidden_size
         dt = cfg.dtype
         
-        self.mouse = nn.Linear(d, 2, dtype=dt)
+        self.mouse_x = nn.Linear(d, cfg.mouse_bins_count, dtype=dt)
+        self.mouse_y = nn.Linear(d, cfg.mouse_bins_count, dtype=dt)
         self.keyboard = nn.Linear(d, cfg.keyboard_dim, dtype=dt)
         self.eco = nn.Linear(d, cfg.eco_dim, dtype=dt)
         self.inventory = nn.Linear(d, cfg.inventory_dim, dtype=dt)
@@ -216,7 +217,8 @@ class ModelOutputHeads(nn.Module):
     def forward_player(self, x: torch.Tensor):
         # x: [N, D]
         return {
-            "mouse_delta": self.mouse(x),
+            "mouse_x": self.mouse_x(x),
+            "mouse_y": self.mouse_y(x),
             "keyboard_logits": self.keyboard(x),
             "eco_logits": self.eco(x),
             "inventory_logits": self.inventory(x),
@@ -254,8 +256,6 @@ class GamePredictorBackbone(nn.Module):
         self.video = GameVideoEncoder(cfg)
         self.audio = GameAudioEncoder(cfg)
         
-        # FIX: Audio output is [C, H]. Since dataset is stereo, C=2.
-        # We concat these in the forward pass, so input dim must account for both channels.
         adapter_dim_in = (cfg.qformer_hidden_size * cfg.num_qformer_queries) + (self.audio.output_dim * 2)
         
         self.adapter = nn.Sequential(
