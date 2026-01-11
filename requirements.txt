@@ -2,16 +2,16 @@ transformers
 lmdb
 --no-binary=msgpack msgpack
 msgpack-numpy
-flash-attn
 matplotlib
 librosa
 opencv-python
 numpy<2.0
 tqdm
+ninja
 timm
 pyyaml
 bitsandbytes
 tensorboard
-torchcodec
-torchaudio
-torchvision==0.24.1
+wandb
+optuna
+accelerate
