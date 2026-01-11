@@ -47,41 +47,6 @@ from config import TrainConfig
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TrainerFSDP")
 
-# ==============================================================================
-# 1. Configuration
-# ==============================================================================
-
-
-
-# ==============================================================================
-# 2. Wrapper Module (Fix for FSDP2)
-# ==============================================================================
-
-class TrainingModule(nn.Module):
-    """
-    Wraps the Backbone and Loss into a single nn.Module for FSDP2 compatibility.
-    FSDP2 in Accelerate currently enforces a single model argument in `prepare()`.
-    """
-    def __init__(self, model: nn.Module, criterion: nn.Module):
-        super().__init__()
-        self.model = model
-        self.criterion = criterion
-
-    def forward(self, images, audio, truth=None):
-        # Forward pass through backbone
-        preds = self.model(images, audio)
-        
-        if truth is not None:
-            # Calculate loss if ground truth is provided
-            loss, metrics = self.criterion(preds, truth)
-            return loss, metrics, preds
-        
-        return preds
-
-# ==============================================================================
-# 3. Helpers
-# ==============================================================================
-
 def recursive_to_device(obj: Any, device: torch.device, non_blocking: bool = True):
     if torch.is_tensor(obj):
         return obj.to(device, non_blocking=non_blocking)
@@ -148,7 +113,8 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 # ==============================================================================
 
 def train_one_epoch(
-    training_module: nn.Module, 
+    model: nn.Module,
+    criterion: nn.Module,
     loader: DataLoader, 
     optimizer: optim.Optimizer, 
     scheduler: Any, 
@@ -156,7 +122,8 @@ def train_one_epoch(
     cfg: TrainConfig, 
     epoch: int
 ):
-    training_module.train()
+    model.train()
+    criterion.train()
     
     total_loss = 0.0
     steps_in_epoch = len(loader)
@@ -175,14 +142,10 @@ def train_one_epoch(
         sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
 
         # Accumulate gradients on the single wrapped module
-        with accelerator.accumulate(training_module):
+        with accelerator.accumulate(model):
             
-            # Forward pass via Wrapper
-            loss, metrics, _ = training_module(
-                images=sample.images, 
-                audio=sample.audio, 
-                truth=sample.truth
-            )
+            preds = model(sample.images, sample.audio)
+            loss, metrics = criterion(preds, sample.truth)
             
             # Manual normalization
             loss = loss / cfg.grad_accumulation_steps
@@ -192,7 +155,7 @@ def train_one_epoch(
 
             # Optimizer Step
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(training_module.parameters(), cfg.clip_grad_norm)
+                accelerator.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm)
                 
                 optimizer.step()
                 scheduler.step()
@@ -218,9 +181,10 @@ def train_one_epoch(
 
     return total_loss / steps_in_epoch
 
-def validate(training_module, loader, accelerator, cfg, epoch):
-    training_module.eval()
-    
+def validate(model, criterion, loader, accelerator, cfg, epoch):
+    model.eval()
+    criterion.eval()
+
     total_loss = 0.0
     agg_metrics = {}
     count = 0
@@ -238,12 +202,8 @@ def validate(training_module, loader, accelerator, cfg, epoch):
             # Ensure consistency in validation too
             sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
             
-            # Forward pass via Wrapper
-            loss, metrics, _ = training_module(
-                images=sample.images, 
-                audio=sample.audio, 
-                truth=sample.truth
-            )
+            preds = model(sample.images, sample.audio)
+            loss, metrics = criterion(preds, sample.truth)
             
             # Gather loss from all ranks
             avg_loss_across_gpus = accelerator.gather(loss).mean()
@@ -287,20 +247,13 @@ def main():
         grad_accumulation_steps=args.grad_accum
     )
     
-    # --- MOVED UP: Initialize Model & Loss BEFORE Accelerator ---
-    # We need the object instances to tell FSDP to ignore them
-    logger.info("Initializing Model & Loss (CPU)...")
+    logger.info("Initializing Model & Loss")
     model_cfg = ModelConfig() 
-    backbone = GamePredictorBackbone(model_cfg)
+    model = GamePredictorBackbone(model_cfg)
     criterion = CS2Loss(model_cfg)
-    training_module = TrainingModule(backbone, criterion)
 
-    # 2. Accelerator with FSDP2
-    # CRITICAL FIX: Add criterion to ignored_modules. 
-    # This prevents FSDP from sharding the tiny AWL parameters.
     fsdp_plugin = FullyShardedDataParallelPlugin(
         fsdp_version=2,
-        ignored_modules=[training_module.criterion] 
     )
 
     accelerator = Accelerator(
@@ -327,51 +280,28 @@ def main():
     ds_config = DatasetConfig(data_root=cfg.data_root, run_dir="./runs")
     ds_root = DatasetRoot(ds_config)
     
-    training_module.criterion.to(accelerator.device)
+    criterion.to(accelerator.device)
+    accelerator.register_for_checkpointing(criterion)
 
-    # 4. Optimizer (With Grouping Fix)
-    backbone_params = []
-    awl_params = []
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay
+    )
 
-    for name, param in training_module.named_parameters():
-        if "awl.params" in name:
-            awl_params.append(param)
-        else:
-            backbone_params.append(param)
-
-    optimizer = optim.AdamW([
-        {
-            "params": backbone_params, 
-            "lr": cfg.lr, 
-            "weight_decay": cfg.weight_decay 
-        },
-        {
-            "params": awl_params, 
-            "lr": 1e-2,          # High LR
-            "weight_decay": 0.0  # 0 Weight Decay
-        }
-    ])
-    
-    # 5. Scheduler
-    # Calculate steps
     dummy_epoch = ds_root.build_epoch("train", 0)
     steps_per_epoch = len(dummy_epoch) // cfg.batch_size
     steps_per_epoch = steps_per_epoch // accelerator.num_processes
     total_steps = (steps_per_epoch // cfg.grad_accumulation_steps) * cfg.max_epochs
-    
-    # FIX: Warmup Logic
-    # 2000 warmup steps is almost your entire training run (2080 steps). 
-    # This crushes your LR. Reducing to ~10% of training steps.
+
     real_warmup = min(cfg.warmup_steps, int(0.1 * total_steps))
     if accelerator.is_main_process:
         logger.info(f"Total Steps: {total_steps}. Adjusted Warmup: {real_warmup}")
 
     scheduler = get_cosine_schedule_with_warmup(optimizer, real_warmup, total_steps)
 
-    # 6. Prepare
-    # Note: training_module is already created, passing it here wraps it
-    training_module, optimizer, scheduler = accelerator.prepare(
-        training_module, optimizer, scheduler
+    model, optimizer, scheduler = accelerator.prepare(
+        model, optimizer, scheduler
     )
 
     if accelerator.is_main_process:
@@ -402,10 +332,10 @@ def main():
         train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
         
         train_loss = train_one_epoch(
-            training_module, train_loader, optimizer, scheduler, accelerator, cfg, epoch
+            model, criterion, train_loader, optimizer, scheduler, accelerator, cfg, epoch
         )
         
-        val_loss = validate(training_module, val_loader, accelerator, cfg, epoch)
+        val_loss = validate(model, criterion, val_loader, accelerator, cfg, epoch)
         
         if (epoch + 1) % cfg.save_every == 0:
             if accelerator.is_main_process:
@@ -416,3 +346,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+#accelerate launch     --num_processes 4     --use_fsdp     --fsdp_version 2     --mixed_precision bf16     --fsdp_cpu_ram_efficient_loading true     transformers/model/train_fsdp.py --data_root dataset0

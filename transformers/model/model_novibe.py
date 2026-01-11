@@ -265,8 +265,9 @@ class GamePredictorBackbone(nn.Module):
             nn.Linear(cfg.adapter_hidden_dim, cfg.llama_hidden_size, dtype=cfg.dtype),
             nn.LayerNorm(cfg.llama_hidden_size, dtype=cfg.dtype) 
         )
-        
-        self.strat_token = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
+    
+        self.strat_token = nn.Parameter(torch.empty(cfg.llama_hidden_size, dtype=cfg.dtype))
+        nn.init.normal_(self.strat_token, std=0.02)  # optional but good
 
         use_cache = not cfg.gradient_checkpointing
 
@@ -313,7 +314,7 @@ class GamePredictorBackbone(nn.Module):
 
         adapted = adapted.to(dtype=self.cfg.dtype) #undo LN upcast?
         # Append Strategy Token
-        strat = self.strat_token.expand(B, T, -1, -1) # [B, T, 1, D_llama]
+        strat = self.strat_token.view(1, 1, 1, -1).expand(B, T, 1, -1)  # [B,T,1,D]
         frame_seq = torch.cat([adapted, strat], dim=2) # [B, T, P+1, D_llama]
         
         # Flatten for Llama Backbone [Batch, Sequence Length, Hidden]
@@ -329,7 +330,6 @@ class GamePredictorBackbone(nn.Module):
         p_hidden = hidden_frames[..., :5, :] # [B, T, 5, D]
         s_hidden = hidden_frames[..., 5, :]  # [B, T, D]
 
-        # FIX: Heads expect [N, D], not [B, T, P, D]
         p_flat = p_hidden.reshape(-1, self.cfg.llama_hidden_size)
         s_flat = s_hidden.reshape(-1, self.cfg.llama_hidden_size)
 
