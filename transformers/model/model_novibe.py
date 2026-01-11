@@ -266,8 +266,9 @@ class GamePredictorBackbone(nn.Module):
             nn.LayerNorm(cfg.llama_hidden_size, dtype=cfg.dtype) 
         )
     
-        self.strat_token = nn.Parameter(torch.empty(cfg.llama_hidden_size, dtype=cfg.dtype))
-        nn.init.normal_(self.strat_token, std=0.02)  # optional but good
+        self.strat_node = nn.Embedding(1, cfg.llama_hidden_size, dtype=cfg.dtype)
+        nn.init.normal_(self.strat_node.weight, std=0.02)
+
 
         use_cache = not cfg.gradient_checkpointing
 
@@ -314,8 +315,10 @@ class GamePredictorBackbone(nn.Module):
 
         adapted = adapted.to(dtype=self.cfg.dtype) #undo LN upcast?
         # Append Strategy Token
-        strat = self.strat_token.view(1, 1, 1, -1).expand(B, T, 1, -1)  # [B,T,1,D]
-        frame_seq = torch.cat([adapted, strat], dim=2) # [B, T, P+1, D_llama]
+        ids = torch.zeros(B * T, dtype=torch.long, device=adapted.device)
+        strat = self.strat_node(ids).view(B, T, 1, -1)   # [B, T, 1, D]
+        frame_seq = torch.cat([adapted, strat], dim=2)
+
         
         # Flatten for Llama Backbone [Batch, Sequence Length, Hidden]
         # Sequence Length = Time * (Players + Strategy)
