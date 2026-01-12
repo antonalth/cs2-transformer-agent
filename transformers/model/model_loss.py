@@ -425,7 +425,7 @@ class CS2Loss(nn.Module):
 
     @staticmethod
     def stats(pred, gt, mask):
-        # L1 LOSS + Log Money
+        # Focal Loss for HP/Armor + L1 for Money
         # gt: [Health, Armor, Money]
         m_flat = mask.view(-1)
         if m_flat.sum() == 0: 
@@ -438,11 +438,24 @@ class CS2Loss(nn.Module):
         # Log Norm for Money: log(m+1) / log(16001)
         mon_norm = torch.log1p(gt[..., 2]) / 9.68  # log(16001) ~ 9.68
         
-        target = torch.stack([h_norm, a_norm, mon_norm], dim=-1).view(-1, 3)[m_flat].to(dtype=pred.dtype)
-        p_flat = torch.sigmoid(pred).view(-1, 3)[m_flat]
+        # Split predictions
+        p_flat = pred.view(-1, 3)[m_flat]
         
-        losses = F.l1_loss(p_flat, target, reduction='none').mean(dim=0)
-        return losses[0], losses[1], losses[2]
+        # HP/Armor: Focal Loss (Target is [0,1], pred is logits)
+        # Note: _focal_loss_norm expects logits and [0,1] targets
+        h_target = h_norm.view(-1)[m_flat].to(dtype=pred.dtype)
+        a_target = a_norm.view(-1)[m_flat].to(dtype=pred.dtype)
+        
+        l_hp = CS2Loss._focal_loss_norm(p_flat[:, 0], h_target, alpha=0.95, gamma=2.0)
+        l_armor = CS2Loss._focal_loss_norm(p_flat[:, 1], a_target, alpha=0.95, gamma=2.0)
+        
+        # Money: L1 Loss (Regression)
+        # Apply sigmoid to money pred to bound it [0,1] matching normalization
+        mon_pred = torch.sigmoid(p_flat[:, 2])
+        mon_target = mon_norm.view(-1)[m_flat].to(dtype=pred.dtype)
+        l_money = F.l1_loss(mon_pred, mon_target)
+        
+        return l_hp, l_armor, l_money
 
     @staticmethod
     def _positions_to_bins(pos, device):
