@@ -169,11 +169,13 @@ class CS2Loss(nn.Module):
 
     def __init__(self, cfg: ModelConfig = None):
         super().__init__()
-        # We group losses into 10 distinct categories for weighting
-        # 0: Mouse, 1: Keyboard, 2: Eco, 3: Inv, 4: Wep, 5: Stats, 6: Position 
-        # 7: Round, 8: Team Alive, 9: Enemy Alive
+        # We group losses into 15 distinct categories for weighting
+        # 0: MouseX, 1: MouseY, 2: Keyboard, 3: Eco, 4: Inv, 5: Wep
+        # 6: HP, 7: Armor, 8: Money
+        # 9: Player Pos, 10: Enemy Pos, 11: Round State, 12: Round Num
+        # 13: Team Alive, 14: Enemy Alive
         self.mouse_bins_count = cfg.mouse_bins_count
-        self.num_loss_groups = 10
+        self.num_loss_groups = 15
 
     
         centers = self._generate_mu_law_bins(self.mouse_bins_count, min_val=-90.0, max_val=90.0, mu=255.0)
@@ -206,21 +208,13 @@ class CS2Loss(nn.Module):
         """
         # --- 1. Compute Raw Losses ---
         
-        # Group 0: Mouse
-        l_mouse = self.mouse(preds.mouse_x, preds.mouse_y, truth.mouse_delta, truth.alive_mask)
-        
-        # Group 1: Keyboard
+        l_mouse_x, l_mouse_y = self.mouse(preds.mouse_x, preds.mouse_y, truth.mouse_delta, truth.alive_mask)
         l_key = self.keyboard(preds.keyboard_logits, truth.keyboard_mask, truth.alive_mask)
-        
-        # Group 2, 3, 4: Economy, Inventory, Weapon
         l_eco = self.eco(preds.eco_logits, truth.eco_mask, truth.alive_mask)
         l_inv = self.inventory(preds.inventory_logits, truth.inventory_mask, truth.alive_mask)
         l_wep = self.weapon(preds.weapon_logits, truth.active_weapon_idx, truth.alive_mask)
+        l_hp, l_armor, l_money = self.stats(preds.stats_logits, truth.stats, truth.alive_mask)
         
-        # Group 5: Stats
-        l_stats = self.stats(preds.stats_logits, truth.stats, truth.alive_mask)
-        
-        # Group 6: Position (Player + Enemy)
         l_p_pos = self.position(
             preds.player_pos_x, preds.player_pos_y, preds.player_pos_z, 
             truth.position, truth.alive_mask
@@ -229,23 +223,22 @@ class CS2Loss(nn.Module):
             preds.enemy_pos_x, preds.enemy_pos_y, preds.enemy_pos_z, 
             truth.enemy_positions, truth.enemy_alive_mask
         )
-        l_group_pos = l_p_pos + l_e_pos
-
-        # Group 7: Round (State + Number)
+        
         l_rnd_st = self.round_state(preds.round_state_logits, truth.round_state_mask)
         l_rnd_nm = self.round_number(preds.round_num_logit, truth.round_number)
-        l_group_rnd = l_rnd_st + l_rnd_nm
-
-        # Group 8: Team Alive
-        l_t_alv  = self.alive_count(preds.team_alive_logits, truth.alive_mask)
         
-        # Group 9: Enemy Alive
+        l_t_alv  = self.alive_count(preds.team_alive_logits, truth.alive_mask)
         l_e_alv  = self.alive_count(preds.enemy_alive_logits, truth.enemy_alive_mask)
         
-        loss_list = [l_mouse, l_key, l_eco, l_inv, l_wep, l_stats, l_group_pos, l_group_rnd, l_t_alv, l_e_alv]
+        # 15 losses
+        loss_list = [
+            l_mouse_x, l_mouse_y, l_key, l_eco, l_inv, l_wep, 
+            l_hp, l_armor, l_money,
+            l_p_pos, l_e_pos, l_rnd_st, l_rnd_nm, l_t_alv, l_e_alv
+        ]
+
         loss_list_norm, scalers = self.scaler(loss_list) # norm magnitudes (for warmup phase only)
-        
-        dwa_w = self.dwa(loss_list)  # tensor [10], float32
+        dwa_w = self.dwa(loss_list)  # tensor [15], float32
 
         total_loss = 0.0
         for i in range(self.num_loss_groups):
@@ -257,40 +250,36 @@ class CS2Loss(nn.Module):
         info = {
             "loss/total": total_loss.item(),
             
-            "raw_g/mouse": l_mouse.item(),
-            "raw_g/keyboard": l_key.item(),
-            "raw_g/eco": l_eco.item(),
-            "raw_g/inv": l_inv.item(),
-            "raw_g/wep": l_wep.item(),
-            "raw_g/stats": l_stats.item(),
-            "raw_g/pos": l_group_pos.item(),
-            "raw_g/round": l_group_rnd.item(),
-            "raw_g/team_alive": l_t_alv.item(),
-            "raw_g/enemy_alive": l_e_alv.item(),
+            "raw/mouse_x": l_mouse_x.item(),
+            "raw/mouse_y": l_mouse_y.item(),
+            "raw/keyboard": l_key.item(),
+            "raw/eco": l_eco.item(),
+            "raw/inv": l_inv.item(),
+            "raw/wep": l_wep.item(),
+            "raw/hp": l_hp.item(),
+            "raw/armor": l_armor.item(),
+            "raw/money": l_money.item(),
             
-            "raw_s/mouse": l_mouse.item(),
-            "raw_s/keyboard": l_key.item(),
+            "raw/player_pos": l_p_pos.item(),
+            "raw/enemy_pos": l_e_pos.item(),
             
-            "raw_s/eco_bitmask": l_eco.item(),
-            "raw_s/inventory_bitmask": l_inv.item(),
-            "raw_s/active_weapon": l_wep.item(),
+            "raw/round_state": l_rnd_st.item(),
+            "raw/round_num": l_rnd_nm.item(),
             
-            "raw_s/stats": l_stats.item(),
-            
-            "raw_s/player_pos": l_p_pos.item(),
-            "raw_s/enemy_pos": l_e_pos.item(),
-            
-            "raw_s/round_state": l_rnd_st.item(),
-            "raw_s/round_num": l_rnd_nm.item(),
-            "raw_s/team_alive_count": l_t_alv.item(),
-            "raw_s/enemy_alive_count": l_e_alv.item(),
+            "raw/team_alive": l_t_alv.item(),
+            "raw/enemy_alive": l_e_alv.item(),
         }
 
-        group_names = ["mouse", "key", "eco", "inv", "wep", "stats", "pos", "round", "talive", "ealive"]
+        group_names = [
+            "mouse_x", "mouse_y", "keyboard", "eco", "inv", "wep", 
+            "hp", "armor", "money", 
+            "player_pos", "enemy_pos", "round_state", "round_num", 
+            "team_alive", "enemy_alive"
+        ]
 
         for i, name in enumerate(group_names):
-            info[f"scale_g/{name}"] = float(scalers[i].item())
-            info[f"dwa_g/{name}"] = float(dwa_w[i].item())
+            info[f"scale/{name}"] = float(scalers[i].item())
+            info[f"dwa/{name}"] = float(dwa_w[i].item())
 
         metrics.update(info)
 
@@ -344,7 +333,8 @@ class CS2Loss(nn.Module):
         # 1. Masking and Flattening
         m_flat = mask.view(-1)
         if m_flat.sum() == 0: 
-            return torch.tensor(0.0, device=pred_x.device, dtype=pred_x.dtype)
+            z = torch.tensor(0.0, device=pred_x.device, dtype=pred_x.dtype)
+            return z, z
 
         # pred_x: [N, 256] (Only alive players)
         p_x = pred_x.reshape(-1, self.mouse_bins_count)[m_flat]
@@ -378,7 +368,7 @@ class CS2Loss(nn.Module):
         final_x = (loss_x_raw * w_x).mean()
         final_y = (loss_y_raw * w_y).mean()
         
-        return final_x + final_y
+        return final_x, final_y
 
     @staticmethod
     def keyboard(pred, gt, mask):
@@ -438,7 +428,9 @@ class CS2Loss(nn.Module):
         # L1 LOSS + Log Money
         # gt: [Health, Armor, Money]
         m_flat = mask.view(-1)
-        if m_flat.sum() == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        if m_flat.sum() == 0: 
+            z = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+            return z, z, z
 
         # Normalize GT
         h_norm = gt[..., 0] / 100.0
@@ -449,7 +441,8 @@ class CS2Loss(nn.Module):
         target = torch.stack([h_norm, a_norm, mon_norm], dim=-1).view(-1, 3)[m_flat].to(dtype=pred.dtype)
         p_flat = torch.sigmoid(pred).view(-1, 3)[m_flat]
         
-        return F.l1_loss(p_flat, target)
+        losses = F.l1_loss(p_flat, target, reduction='none').mean(dim=0)
+        return losses[0], losses[1], losses[2]
 
     @staticmethod
     def _positions_to_bins(pos, device):
