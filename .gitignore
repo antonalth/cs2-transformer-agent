@@ -7,11 +7,11 @@ big_training/**/ */
 *.db
 *.mp4
 *.wav
-gemini.md
 *.jpg
 *.png
-/scripts/node_modules
-/scripts/broker/node_modules
+/dataset_generation/recording/broker/node_modules
+/dataset_generation/recording/temp/
+/dataset_generation/logs/
 /cache/**/ */
 *.log
 *__pycache__

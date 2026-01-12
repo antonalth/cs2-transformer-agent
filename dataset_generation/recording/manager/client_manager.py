@@ -13,10 +13,10 @@ import argparse
 SANDBOXIE_EXE_PATH = r'C:\Program Files\Sandboxie-Plus\Start.exe'
 
 # Relative path to the broker script that starts the Node.js server.
-BROKER_SCRIPT_PATH = os.path.join('broker', 'broker_win.py') #go back to broker.py if no work
+BROKER_SCRIPT_PATH = os.path.join('..', 'broker', 'broker_win.py') #go back to broker.py if no work
 
 # Relative path to the batch file that launches CS2.
-CS2_BAT_PATH = 'start_cs2.bat'
+CS2_BAT_PATH = os.path.join('..', 'client', 'start_cs2.bat')
 
 # --- Global variable for the broker process ---
 broker_process = None
