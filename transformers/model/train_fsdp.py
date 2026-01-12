@@ -120,7 +120,8 @@ def train_one_epoch(
     scheduler: Any, 
     accelerator: Accelerator,
     cfg: TrainConfig, 
-    epoch: int
+    epoch: int,
+    global_step: int = 0
 ):
     model.train()
     criterion.train()
@@ -137,8 +138,6 @@ def train_one_epoch(
         sample = recursive_to_device(sample, accelerator.device)
         
         # FIX: Cast Truth to target dtype (BF16) if mixed precision is enabled
-        # This prevents the Loss function (which is inside FSDP) from promoting calculations 
-        # to FP32, which generates FP32 gradients that fail FSDP's backward dtype check.
         sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
 
         # Accumulate gradients on the single wrapped module
@@ -162,11 +161,17 @@ def train_one_epoch(
                 scheduler.step()
                 optimizer.zero_grad()
                 
+                global_step += 1
+                
                 if accelerator.is_main_process:
                     metrics["train/loss"] = loss.item() * cfg.grad_accumulation_steps
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
-                    metrics["train/step"] = (epoch * steps_in_epoch) + batch_idx
-                    wandb.log(metrics)
+                    metrics["train/epoch"] = epoch + (batch_idx / steps_in_epoch)
+                    # Global samples = batch_idx * processes * batch_size
+                    metrics["train/global_samples"] = (epoch * steps_in_epoch * accelerator.num_processes * cfg.batch_size) + (batch_idx * accelerator.num_processes * cfg.batch_size)
+                    
+                    # Log to wandb using the optimizer step as the X-axis
+                    wandb.log(metrics, step=global_step)
             
             total_loss += loss.item() * cfg.grad_accumulation_steps
             
@@ -175,12 +180,13 @@ def train_one_epoch(
                 t0 = time.time()
                 logger.info(
                     f"Ep {epoch} [{batch_idx}/{steps_in_epoch}] "
+                    f"Step: {global_step} | "
                     f"Loss: {loss.item()*cfg.grad_accumulation_steps:.4f} | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
                     f"Time/50: {elapsed:.1f}s"
                 )
 
-    return total_loss / steps_in_epoch
+    return total_loss / steps_in_epoch, global_step
 
 def validate(model, criterion, loader, accelerator, cfg, epoch):
     model.eval()
@@ -291,14 +297,17 @@ def main():
         weight_decay=cfg.weight_decay
     )
 
-    dummy_epoch = ds_root.build_epoch("train", 0)
-    steps_per_epoch = len(dummy_epoch) // cfg.batch_size
-    steps_per_epoch = steps_per_epoch // accelerator.num_processes
+    # Correct total_steps calculation using a prepared dummy loader
+    dummy_ds = ds_root.build_epoch("train", 0)
+    dummy_loader = DataLoader(dummy_ds, batch_size=cfg.batch_size)
+    dummy_loader = accelerator.prepare(dummy_loader)
+    
+    steps_per_epoch = len(dummy_loader)
     total_steps = (steps_per_epoch // cfg.grad_accumulation_steps) * cfg.max_epochs
 
     real_warmup = min(cfg.warmup_steps, int(0.1 * total_steps))
     if accelerator.is_main_process:
-        logger.info(f"Total Steps: {total_steps}. Adjusted Warmup: {real_warmup}")
+        logger.info(f"Total Optimizer Steps: {total_steps}. Adjusted Warmup: {real_warmup}")
 
     scheduler = get_cosine_schedule_with_warmup(optimizer, real_warmup, total_steps)
 
@@ -308,6 +317,8 @@ def main():
 
     if accelerator.is_main_process:
         logger.info(f"Ready to train for {cfg.max_epochs} epochs (~{total_steps} updates).")
+
+    global_step = 0
 
     # 7. Loop (Unchanged)
     for epoch in range(cfg.max_epochs):
@@ -333,8 +344,8 @@ def main():
         
         train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
         
-        train_loss = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler, accelerator, cfg, epoch
+        train_loss, global_step = train_one_epoch(
+            model, criterion, train_loader, optimizer, scheduler, accelerator, cfg, epoch, global_step
         )
         
         val_loss = validate(model, criterion, val_loader, accelerator, cfg, epoch)

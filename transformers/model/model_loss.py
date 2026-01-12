@@ -106,23 +106,27 @@ class CS2Metrics:
     def calculate(self, preds: ModelPrediction, truth: Any, mouse_bin_centers: torch.Tensor) -> Dict[str, float]:
         m = {}
         device = preds.keyboard_logits.device
+        alive_mask = truth.alive_mask
+        alive_count = alive_mask.sum().float() + self.epsilon
         
         # --- Keyboard F1 ---
         kb_probs = torch.sigmoid(preds.keyboard_logits)
         kb_pred_bin = (kb_probs > 0.5).long()
         
-        gt_kb_bits = (truth.keyboard_mask.unsqueeze(-1) >> torch.arange(32, device=device)) & 1
+        gt_kb_bits = (truth.keyboard_mask.unsqueeze(-1).long() >> torch.arange(32, device=device)) & 1
         
-        tp = (kb_pred_bin * gt_kb_bits).sum().float()
-        fp = (kb_pred_bin * (1 - gt_kb_bits)).sum().float()
-        fn = ((1 - kb_pred_bin) * gt_kb_bits).sum().float()
+        # Mask only alive players
+        alive_expanded = alive_mask.unsqueeze(-1)
+        tp = (kb_pred_bin * gt_kb_bits * alive_expanded).sum().float()
+        fp = (kb_pred_bin * (1 - gt_kb_bits) * alive_expanded).sum().float()
+        fn = ((1 - kb_pred_bin) * gt_kb_bits * alive_expanded).sum().float()
         
         precision = tp / (tp + fp + self.epsilon)
         recall = tp / (tp + fn + self.epsilon)
         f1 = 2 * (precision * recall) / (precision + recall + self.epsilon)
         
         m["metric/kb_f1"] = f1.item()
-        m["stat/kb_action_rate"] = kb_pred_bin.float().mean().item()
+        m["stat/kb_action_rate"] = (kb_pred_bin.float() * alive_expanded).sum().item() / (alive_count * 32)
 
         # --- Mouse MAE ---
         idx_x = torch.argmax(preds.mouse_x, dim=-1)
@@ -131,20 +135,26 @@ class CS2Metrics:
         px_x = mouse_bin_centers[idx_x]
         px_y = mouse_bin_centers[idx_y]
         
-        mae_x = torch.abs(px_x - truth.mouse_delta[..., 0]).mean()
-        mae_y = torch.abs(px_y - truth.mouse_delta[..., 1]).mean()
+        mae_x = (torch.abs(px_x - truth.mouse_delta[..., 0]) * alive_mask).sum() / alive_count
+        mae_y = (torch.abs(px_y - truth.mouse_delta[..., 1]) * alive_mask).sum() / alive_count
         
         m["metric/mouse_mae_x"] = mae_x.item()
         m["metric/mouse_mae_y"] = mae_y.item()
-        m["stat/mouse_move_rate"] = (idx_x != 128).float().mean().item()
+        # Movement rate: move > 0.1 deg
+        m["stat/mouse_move_rate"] = (( (torch.abs(px_x) > 0.1) | (torch.abs(px_y) > 0.1) ) * alive_mask).sum().item() / alive_count
 
         # --- Stats MAE ---
         stats_pred = torch.sigmoid(preds.stats_logits)
-        hp_err = torch.abs(stats_pred[..., 0] - (truth.stats[..., 0] / 100.0)).mean()
-        money_err = torch.abs(stats_pred[..., 2] - (truth.stats[..., 2] / 16000.0)).mean()
+        
+        hp_err = (torch.abs(stats_pred[..., 0] - (truth.stats[..., 0] / 100.0)) * alive_mask).sum() / alive_count
+        
+        # Money is normalized via log1p(m)/9.68 in CS2Loss.stats
+        # Denormalize to get actual money for metric
+        money_pred_actual = torch.expm1(stats_pred[..., 2] * 9.68)
+        money_err = (torch.abs(money_pred_actual - truth.stats[..., 2]) * alive_mask).sum() / alive_count
         
         m["metric/hp_mae"] = hp_err.item() * 100.0
-        m["metric/money_mae"] = money_err.item() * 16000.0
+        m["metric/money_mae"] = money_err.item()
         
         return m
 
@@ -324,7 +334,7 @@ class CS2Loss(nn.Module):
         # 2. Generate Gaussian Soft Targets
         # Helper uses self.mouse_bin_centers to create bell curve around GT
         tgt_x = self._get_gaussian_targets(g_x, self.mouse_bin_centers, self.mouse_bin_widths, sigma_bins=2.0)
-        tgt_y = self._get_gaussian_targets(g_y, self.mouse_bin_centers, self.mouse_bin_widths, sigma_bins=1.5)
+        tgt_y = self._get_gaussian_targets(g_y, self.mouse_bin_centers, self.mouse_bin_widths, sigma_bins=2.0)
         
         # 3. KL Divergence (Requires LogSoftmax input)
         log_x = F.log_softmax(p_x.float(), dim=-1)
@@ -335,12 +345,12 @@ class CS2Loss(nn.Module):
         loss_y_raw = F.kl_div(log_y, tgt_y, reduction='none').sum(dim=1)
         
         # 4. Apply Weights for Class Imbalance
-        # If GT movement > 0.05, weight it 20x to punish 'camping' predictions
+        # If GT movement > 0.05, weight it 10x to punish 'camping' predictions
         move_mask_x = torch.abs(g_x) > 0.05
         move_mask_y = torch.abs(g_y) > 0.05
         
-        w_x = torch.where(move_mask_x, 20.0, 1.0)
-        w_y = torch.where(move_mask_y, 20.0, 1.0)
+        w_x = torch.where(move_mask_x, 10.0, 1.0)
+        w_y = torch.where(move_mask_y, 10.0, 1.0)
         
         final_x = (loss_x_raw * w_x).mean()
         final_y = (loss_y_raw * w_y).mean()

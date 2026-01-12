@@ -65,7 +65,7 @@ class ModelConfig:
     bins_z: int = 32
 
     # number of mouse bins for x, y
-    mouse_bins_count: int = 256
+    mouse_bins_count: int = 257
 
     # loss normalization
     loss_scaler_warmup_steps: int = 2000

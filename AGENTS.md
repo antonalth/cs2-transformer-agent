@@ -22,6 +22,8 @@
 - Always read the important files mentioned above to have the required context for approaching bugs or implementing features
 - When asked to fix a bug, first reproduce the bug. Then iterate until the bug is fixed, then figure out what the actual fix was(the MINIMAL fix, removing uncessary intermediate steps), for example by re-running the training script
 - Do NOT commit fixes, a human must oversee the results first.
+- **Training Policy:** Any training restart that is not part of an immediate debugging loop (e.g., iterating to find errors) but affects a longer existing run MUST be confirmed by a human first.
+- **Long-term Training:** Always start long-term training runs inside a new tmux session **on the host machine** (wrapping the docker execution command) so they can be resumed and viewed later.
 
 ### Monitoring & Tools
 - **WandB Monitor**: CLI tool to track training progress without the web UI.
