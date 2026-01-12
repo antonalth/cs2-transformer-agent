@@ -1,1 +1,0 @@
-python orchestrator_win.py --visualize-data --jsondir data/jsons --datadir data/img_label --debug

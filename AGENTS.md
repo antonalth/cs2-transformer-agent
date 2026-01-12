@@ -22,3 +22,7 @@
 - Always read the important files mentioned above to have the required context for approaching bugs or implementing features
 - When asked to fix a bug, first reproduce the bug. Then iterate until the bug is fixed, then figure out what the actual fix was(the MINIMAL fix, removing uncessary intermediate steps), for example by re-running the training script
 - Do NOT commit fixes, a human must oversee the results first.
+
+### Monitoring & Tools
+- **WandB Monitor**: CLI tool to track training progress without the web UI.
+  - **Run command**: `docker exec <container_id> python3 tools/wandb_monitor.py [flags]`

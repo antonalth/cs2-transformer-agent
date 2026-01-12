@@ -1,1 +1,0 @@
-python .\tick_bbxdbg.py --demofile data\demos\parivision-vs-nexus-m1-mirage.dem
