@@ -169,10 +169,11 @@ class CS2Loss(nn.Module):
 
     def __init__(self, cfg: ModelConfig = None):
         super().__init__()
-        # We group losses into 6 distinct categories for weighting
-        # 0: Mouse, 1: Keyboard, 2: Eco/Items, 3: Stats, 4: Position, 5: Global
+        # We group losses into 10 distinct categories for weighting
+        # 0: Mouse, 1: Keyboard, 2: Eco, 3: Inv, 4: Wep, 5: Stats, 6: Position 
+        # 7: Round, 8: Team Alive, 9: Enemy Alive
         self.mouse_bins_count = cfg.mouse_bins_count
-        self.num_loss_groups = 6
+        self.num_loss_groups = 10
 
     
         centers = self._generate_mu_law_bins(self.mouse_bins_count, min_val=-90.0, max_val=90.0, mu=255.0)
@@ -211,16 +212,15 @@ class CS2Loss(nn.Module):
         # Group 1: Keyboard
         l_key = self.keyboard(preds.keyboard_logits, truth.keyboard_mask, truth.alive_mask)
         
-        # Group 2: Economy & Items
+        # Group 2, 3, 4: Economy, Inventory, Weapon
         l_eco = self.eco(preds.eco_logits, truth.eco_mask, truth.alive_mask)
         l_inv = self.inventory(preds.inventory_logits, truth.inventory_mask, truth.alive_mask)
         l_wep = self.weapon(preds.weapon_logits, truth.active_weapon_idx, truth.alive_mask)
-        l_group_eco = l_eco + l_inv + l_wep
-
-        # Group 3: Stats
+        
+        # Group 5: Stats
         l_stats = self.stats(preds.stats_logits, truth.stats, truth.alive_mask)
         
-        # Group 4: Position (Player + Enemy)
+        # Group 6: Position (Player + Enemy)
         l_p_pos = self.position(
             preds.player_pos_x, preds.player_pos_y, preds.player_pos_z, 
             truth.position, truth.alive_mask
@@ -231,17 +231,21 @@ class CS2Loss(nn.Module):
         )
         l_group_pos = l_p_pos + l_e_pos
 
-        # Group 5: Global State
+        # Group 7: Round (State + Number)
         l_rnd_st = self.round_state(preds.round_state_logits, truth.round_state_mask)
         l_rnd_nm = self.round_number(preds.round_num_logit, truth.round_number)
-        l_t_alv  = self.alive_count(preds.team_alive_logits, truth.alive_mask)
-        l_e_alv  = self.alive_count(preds.enemy_alive_logits, truth.enemy_alive_mask)
-        l_group_glob = l_rnd_st + l_rnd_nm + l_t_alv + l_e_alv
+        l_group_rnd = l_rnd_st + l_rnd_nm
 
-        loss_list = [l_mouse, l_key, l_group_eco, l_stats, l_group_pos, l_group_glob]
+        # Group 8: Team Alive
+        l_t_alv  = self.alive_count(preds.team_alive_logits, truth.alive_mask)
+        
+        # Group 9: Enemy Alive
+        l_e_alv  = self.alive_count(preds.enemy_alive_logits, truth.enemy_alive_mask)
+        
+        loss_list = [l_mouse, l_key, l_eco, l_inv, l_wep, l_stats, l_group_pos, l_group_rnd, l_t_alv, l_e_alv]
         loss_list_norm, scalers = self.scaler(loss_list) # norm magnitudes (for warmup phase only)
         
-        dwa_w = self.dwa(loss_list)  # tensor [6], float32
+        dwa_w = self.dwa(loss_list)  # tensor [10], float32
 
         total_loss = 0.0
         for i in range(self.num_loss_groups):
@@ -255,10 +259,14 @@ class CS2Loss(nn.Module):
             
             "raw_g/mouse": l_mouse.item(),
             "raw_g/keyboard": l_key.item(),
-            "raw_g/eco": l_group_eco.item(),
+            "raw_g/eco": l_eco.item(),
+            "raw_g/inv": l_inv.item(),
+            "raw_g/wep": l_wep.item(),
             "raw_g/stats": l_stats.item(),
             "raw_g/pos": l_group_pos.item(),
-            "raw_g/global": l_group_glob.item(),
+            "raw_g/round": l_group_rnd.item(),
+            "raw_g/team_alive": l_t_alv.item(),
+            "raw_g/enemy_alive": l_e_alv.item(),
             
             "raw_s/mouse": l_mouse.item(),
             "raw_s/keyboard": l_key.item(),
@@ -278,7 +286,7 @@ class CS2Loss(nn.Module):
             "raw_s/enemy_alive_count": l_e_alv.item(),
         }
 
-        group_names = ["mouse", "key", "eco", "stats", "pos", "glob"]
+        group_names = ["mouse", "key", "eco", "inv", "wep", "stats", "pos", "round", "talive", "ealive"]
 
         for i, name in enumerate(group_names):
             info[f"scale_g/{name}"] = float(scalers[i].item())
@@ -295,6 +303,21 @@ class CS2Loss(nn.Module):
         # Inverse Mu-Law
         val_norm = torch.sign(t) * (1.0 / mu) * (torch.pow(1.0 + mu, torch.abs(t)) - 1.0)
         return val_norm * max_val
+        
+    @staticmethod
+    def _focal_loss_norm(pred, gt, alpha=0.95, gamma=2.0):
+        """
+        Computes Focal Loss normalized by the number of positive targets.
+        This prevents loss washing out when data is extremely sparse (e.g. 99.9% zeros).
+        """
+        # Sum of focal loss over all elements
+        total_loss = sigmoid_focal_loss(pred, gt, alpha=alpha, gamma=gamma, reduction='sum')
+        
+        # Count positives
+        num_pos = gt.sum().float()
+        
+        # Normalize
+        return total_loss / (num_pos + 1.0)
 
     def _get_gaussian_targets(self, gt_values, bin_centers, bin_widths, sigma_bins=2.0):
         # Clamp GT
@@ -369,7 +392,7 @@ class CS2Loss(nn.Module):
         g_flat = gt_t.to(dtype=pred.dtype).view(-1, 32)[m_flat]
         
         if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.95, gamma=2.0, reduction='mean')
+        return CS2Loss._focal_loss_norm(p_flat, g_flat, alpha=0.95, gamma=2.0)
 
     @staticmethod
     def _unpack_chunks(chunks, num_chunks, target_dtype):
@@ -389,7 +412,7 @@ class CS2Loss(nn.Module):
         p_flat = pred.view(-1, 256)[m_flat]
         g_flat = gt_t.view(-1, 256)[m_flat]
         if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.95, gamma=2.0, reduction='mean')
+        return CS2Loss._focal_loss_norm(p_flat, g_flat, alpha=0.95, gamma=2.0)
 
     @staticmethod
     def inventory(pred, gt_chunks, mask):
@@ -399,7 +422,7 @@ class CS2Loss(nn.Module):
         p_flat = pred.view(-1, 128)[m_flat]
         g_flat = gt_t.view(-1, 128)[m_flat]
         if p_flat.shape[0] == 0: return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        return sigmoid_focal_loss(p_flat, g_flat, alpha=0.95, gamma=2.0, reduction='mean')
+        return CS2Loss._focal_loss_norm(p_flat, g_flat, alpha=0.95, gamma=2.0)
 
     @staticmethod
     def weapon(pred, gt_idx, mask):
