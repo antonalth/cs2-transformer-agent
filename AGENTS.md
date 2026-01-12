@@ -1,0 +1,24 @@
+# AGENTS.md
+
+## Project: Transformer-based Counter-Strike 2 agentic model
+- Goal: Train a model to control all 5 players on a single team in the game CS2
+- Training data: 1k hours recorded from pro-teams playing at majors/prize events
+- Model receives as input video frames from each player, audio samples
+- Model predicts keyboard presses, mouse deltas, player positions, enemy positions, money, health...
+
+### Repository structure
+- Most important directory is transformers/model/...
+- dataset.py: harness to work with dataset (epochs etc)
+- model_loss.py: defines loss functions for outputs, includes DynamicWeightScaler, DynamicWeightAveraging..
+- model_novibe.py: central model definition
+- config.py: contains central dataclass definitions for model, training etc.
+- train_fsdp.py: central training script, can be run with command, must be run INSIDE docker container
+"accelerate launch     --num_processes 4     --use_fsdp     --fsdp_version 2     --mixed_precision bf16     --fsdp_cpu_ram_efficient_loading true     transformers/model/train_fsdp.py --data_root dataset0"
+
+### Practical information
+- Actual testing/training must happen inside of docker (if not up use 'docker compose up -d' or 'docker compose start'), for more check out the docker-compose.yml
+- Make sure when you start for example the training script to work with the timeout command to not get stuck waiting for it to finish, and BEFORE running the command ALWAYS check if any remaining processes are left in the docker due to missing cleanup (happens with timeout), since they will cause errors if the training script is restarted (like no VRAM left, or port already occupied etc) - kill them and verify that they have been stopped
+- If you try many many changes to fix a bug, and nothing works, consider periodically reverting back to the state before any changes were made, for example using git to avoid changing too many variables at once
+- Always read the important files mentioned above to have the required context for approaching bugs or implementing features
+- When asked to fix a bug, first reproduce the bug. Then iterate until the bug is fixed, then figure out what the actual fix was(the MINIMAL fix, removing uncessary intermediate steps), for example by re-running the training script
+- Do NOT commit fixes, a human must oversee the results first.
