@@ -309,6 +309,7 @@ class GamePredictorBackbone(nn.Module):
         # Adapter projection
         # Checkpoint requires input to require grad, usually safe in training
         if self.training and self.cfg.gradient_checkpointing:
+             fused.requires_grad_(True)
              adapted = checkpoint(self.adapter, fused, use_reentrant=False) # [B, T, P, D_llama]
         else:
              adapted = self.adapter(fused)
@@ -350,7 +351,7 @@ class GamePredictorBackbone(nn.Module):
                     return x.view(B, T, 5, *x.shape[1:])
                 return x.view(B, T, *x.shape[1:])
         
-        return ModelPrediction(
+        mp = ModelPrediction(
             mouse_x=rs(p_preds["mouse_x"]),
             mouse_y=rs(p_preds["mouse_y"]),
             keyboard_logits=rs(p_preds["keyboard_logits"]),
@@ -372,3 +373,4 @@ class GamePredictorBackbone(nn.Module):
             team_alive_logits=rs(s_preds["team_alive_logits"], is_player=False),
             enemy_alive_logits=rs(s_preds["enemy_alive_logits"], is_player=False),
         )
+        return {k: getattr(mp, k) for k in mp.__dataclass_fields__}

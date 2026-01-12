@@ -37,7 +37,7 @@ from accelerate.utils import ProjectConfiguration
 
 # --- Local Imports ---
 from dataset import DatasetConfig, DatasetRoot, TrainingSample, GroundTruth
-from model_novibe import ModelConfig, GamePredictorBackbone
+from model_novibe import ModelConfig, GamePredictorBackbone, ModelPrediction
 from model_loss import CS2Loss
 import debug
 
@@ -144,7 +144,8 @@ def train_one_epoch(
         # Accumulate gradients on the single wrapped module
         with accelerator.accumulate(model):
             
-            preds = model(sample.images, sample.audio)
+            preds_dict = model(sample.images, sample.audio)
+            preds = ModelPrediction(**preds_dict)
             loss, metrics = criterion(preds, sample.truth)
             
             # Manual normalization
@@ -202,7 +203,8 @@ def validate(model, criterion, loader, accelerator, cfg, epoch):
             # Ensure consistency in validation too
             sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
             
-            preds = model(sample.images, sample.audio)
+            preds_dict = model(sample.images, sample.audio)
+            preds = ModelPrediction(**preds_dict)
             loss, metrics = criterion(preds, sample.truth)
             
             # Gather loss from all ranks
