@@ -27,3 +27,4 @@ checkpoints_fsdp/
 .cache/
 GEMINI.md
 CLAUDE.md
+.idea/
