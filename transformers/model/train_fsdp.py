@@ -241,6 +241,7 @@ def main():
     parser.add_argument("--run_name", type=str, default="cs2_fsdp2_run")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--debug", action="store_true", help="Enable memory profiling")
     args = parser.parse_args()
 
@@ -315,13 +316,31 @@ def main():
         model, optimizer, scheduler
     )
 
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume_from_checkpoint:
+        if accelerator.is_main_process:
+            logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        accelerator.load_state(args.resume_from_checkpoint)
+        
+        # Infer epoch from checkpoint path name if possible (e.g. checkpoint_ep2)
+        try:
+            folder_name = os.path.basename(os.path.normpath(args.resume_from_checkpoint))
+            if "checkpoint_ep" in folder_name:
+                ep_str = folder_name.split("checkpoint_ep")[-1]
+                start_epoch = int(ep_str) + 1
+                if accelerator.is_main_process:
+                    logger.info(f" inferred start_epoch = {start_epoch} from folder name")
+        except ValueError:
+            pass
+
     if accelerator.is_main_process:
-        logger.info(f"Ready to train for {cfg.max_epochs} epochs (~{total_steps} updates).")
+        logger.info(f"Ready to train for {cfg.max_epochs} epochs (~{total_steps} updates). Starting at epoch {start_epoch}")
 
     global_step = 0
 
     # 7. Loop (Unchanged)
-    for epoch in range(cfg.max_epochs):
+    for epoch in range(start_epoch, cfg.max_epochs):
         train_ds = ds_root.build_epoch("train", epoch)
         val_ds = ds_root.build_epoch("val", epoch)
         

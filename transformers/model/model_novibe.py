@@ -110,7 +110,7 @@ class GameVideoEncoder(nn.Module):
         returns: [B, T, P=5, N_q, D_q]
         """
         B, T, P, C, H, W = images.shape
-        flat_imgs = images.view(-1, C, H, W)  # [B*T*P, C, H, W]
+        flat_imgs = images.reshape(-1, C, H, W)  # [B*T*P, C, H, W]
         N = flat_imgs.shape[0]
         chunk_size = self.cfg.vision_chunk_size
 
@@ -166,7 +166,7 @@ class GameAudioEncoder(nn.Module):
         audio: [B, P, C=2, S]
         """
         B, P, C, S = audio.shape
-        flat_audio = audio.view(B * P * C, 1, S)
+        flat_audio = audio.reshape(B * P * C, 1, S)
         N = flat_audio.shape[0]
         chunk_size = self.cfg.audio_chunk_size
         feat_chunks = []
