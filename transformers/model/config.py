@@ -83,7 +83,7 @@ class TrainConfig:
     
     # Data
     data_root: str = "./dataset0"
-    num_workers: int = 4
+    num_workers: int = 8
     
     # Optimization
     batch_size: int = 1          # Per GPU
