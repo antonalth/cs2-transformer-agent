@@ -15,7 +15,7 @@ class DatasetConfig:
 
     epoch_gen_random_seed: int = 42
     epoch_windows_per_round: int = 1  # how many random windows
-    epoch_round_sample_length: int = 1024  # number of frames per window
+    epoch_round_sample_length: int = 512  # number of frames per window
     epoch_video_decoding_device: str = "cpu"
     audio_sample_rate: int = 24000
 
@@ -90,9 +90,9 @@ class ModelConfig:
                 "health": 1.0, "armor": 1.0, "money": 1.0,
                 "round_state": 1.0, "round_num": 1.0,
                 "team_alive": 1.0, "enemy_alive": 1.0,
-                "active_weapon": 1.0, "eco_buy": 1.0, "eco_purchase": 1.0,
-                "player_pos": 1.0, "enemy_pos": 1.0, # grouped x,y,z
-                "keyboard": 1.0, "mouse": 1.0
+                "active_weapon": 10.0, "eco_buy": 1.0, "eco_purchase": 1.0,
+                "player_pos": 0.5, "enemy_pos": 0.5, # grouped x,y,z
+                "keyboard": 100.0, "mouse": 10.0
             }
         if self.loss_enabled is None:
             self.loss_enabled = {k: True for k in self.loss_weights.keys()}

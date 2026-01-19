@@ -23,10 +23,15 @@ from config import GlobalConfig
 from dataset import GroundTruth
 from model import ModelPrediction
 
-def mu_law_encode(x, mu=255.0, max_val=30.0):
+def mu_law_encode(x, mu=255.0, max_val=30.0, bins=256):
     """
-    Encode signal x (range -max_val to max_val) to mu-law bins (0 to mu).
+    Encode signal x (range -max_val to max_val) to mu-law bins (0 to bins-1).
+    mu: compression parameter (defines curve)
+    bins: number of quantization levels
     """
+    # Handle NaNs
+    x = torch.nan_to_num(x, nan=0.0)
+    
     # Clip to range
     x = torch.clamp(x, -max_val, max_val)
     # Normalize to [-1, 1]
@@ -34,22 +39,25 @@ def mu_law_encode(x, mu=255.0, max_val=30.0):
     # Mu-law transform
     sign = torch.sign(x_norm)
     encoded = sign * torch.log1p(mu * torch.abs(x_norm)) / torch.log1p(torch.tensor(mu))
-    # Map [-1, 1] to [0, mu]
-    # [-1, 1] -> [0, 2] -> [0, 1] * mu
-    encoded = (encoded + 1) / 2 * mu
-    return encoded.long()
+    # Map [-1, 1] to [0, bins-1]
+    # [-1, 1] -> [0, 2] -> [0, 1] -> [0, bins-1]
+    encoded = (encoded + 1) / 2 * (bins - 1e-5)
+    return encoded.long().clamp(0, bins - 1)
 
 def bin_value(x, min_val, max_val, num_bins):
     """
     Bin a continuous value x into num_bins buckets.
     """
+    # Handle NaNs
+    x = torch.nan_to_num(x, nan=min_val)
+    
     # Normalized 0-1
     norm = (x - min_val) / (max_val - min_val)
     norm = torch.clamp(norm, 0.0, 1.0)
     # Scale to bins (0 to num_bins-1)
     # If num_bins is 11 (0..10), we multiply by 10.999 to get floor 0..10
     bins = (norm * (num_bins - 1e-5)).long()
-    return bins
+    return bins.clamp(0, num_bins - 1)
 
 class ModelLoss(nn.Module):
     def __init__(self, cfg: GlobalConfig):
@@ -94,8 +102,8 @@ class ModelLoss(nn.Module):
             my = gt.mouse_delta[..., 1].view(-1)
             
             # Encode
-            mx_bin = mu_law_encode(mx, self.model_cfg.mouse_mu, self.model_cfg.mouse_max)
-            my_bin = mu_law_encode(my, self.model_cfg.mouse_mu, self.model_cfg.mouse_max)
+            mx_bin = mu_law_encode(mx, self.model_cfg.mouse_mu, self.model_cfg.mouse_max, self.model_cfg.mouse_bins_count)
+            my_bin = mu_law_encode(my, self.model_cfg.mouse_mu, self.model_cfg.mouse_max, self.model_cfg.mouse_bins_count)
             
             # Pred: [B, T, 5, Bins] -> [N, Bins]
             pred_mx = pred.mouse_x.view(-1, self.model_cfg.mouse_bins_count)
@@ -176,6 +184,7 @@ class ModelLoss(nn.Module):
             # Safe indexing for -1 (set to 0, masked out anyway)
             safe_tgt = w_tgt.clone()
             safe_tgt[safe_tgt == -1] = 0
+            safe_tgt = safe_tgt.clamp(0, self.model_cfg.weapon_dim - 1)
             
             l_w = (self.ce(pred_w, safe_tgt) * w_mask).sum() / num_w
             losses["active_weapon"] = l_w
@@ -208,6 +217,7 @@ class ModelLoss(nn.Module):
             # Safe indexing for -1 (set to 0, masked out)
             safe_buy_tgt = buy_tgt.clone()
             safe_buy_tgt[safe_buy_tgt == -1] = 0
+            safe_buy_tgt = safe_buy_tgt.clamp(0, self.model_cfg.eco_dim - 1)
             
             pred_buy_class = pred.eco_buy_logits.view(-1, self.model_cfg.eco_dim)
             
@@ -253,6 +263,7 @@ class ModelLoss(nn.Module):
         if self.enabled.get("round_state", True):
             # gt.round_state_mask: [B, T] (uint8)
             rs_tgt = gt.round_state_mask.view(-1).long()
+            rs_tgt = rs_tgt.clamp(0, self.model_cfg.round_state_dim - 1)
             # pred: [B, T, 1, 5] -> [N, 5] (broadcast)
             pred_rs = pred.round_state_logits.view(-1, self.model_cfg.round_state_dim)
             l_rs = self.ce(pred_rs, rs_tgt).mean()
@@ -262,7 +273,7 @@ class ModelLoss(nn.Module):
         # 10. Round Num (CE)
         if self.enabled.get("round_num", True):
             rn_tgt = gt.round_number.view(-1).long()
-            rn_tgt = rn_tgt.clamp(0, 30) # Cap at 30
+            rn_tgt = rn_tgt.clamp(0, self.model_cfg.round_num_bins - 1) # Cap at max bin
             pred_rn = pred.round_num_logits.view(-1, self.model_cfg.round_num_bins)
             l_rn = self.ce(pred_rn, rn_tgt).mean()
             losses["round_num"] = l_rn
@@ -273,6 +284,7 @@ class ModelLoss(nn.Module):
         if self.enabled.get("team_alive", True):
             # gt.alive_mask [B, T, 5] -> count sum dim 2
             ta_tgt = gt.alive_mask.sum(dim=-1).view(-1).long() # [B*T]
+            ta_tgt = ta_tgt.clamp(0, self.model_cfg.alive_bins - 1)
             pred_ta = pred.team_alive_logits.view(-1, self.model_cfg.alive_bins)
             l_ta = self.ce(pred_ta, ta_tgt).mean()
             losses["team_alive"] = l_ta
@@ -281,6 +293,7 @@ class ModelLoss(nn.Module):
         if self.enabled.get("enemy_alive", True):
             # gt.enemy_alive_mask [B, T, 5]
             ea_tgt = gt.enemy_alive_mask.sum(dim=-1).view(-1).long()
+            ea_tgt = ea_tgt.clamp(0, self.model_cfg.alive_bins - 1)
             pred_ea = pred.enemy_alive_logits.view(-1, self.model_cfg.alive_bins)
             l_ea = self.ce(pred_ea, ea_tgt).mean()
             losses["enemy_alive"] = l_ea
