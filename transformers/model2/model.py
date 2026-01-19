@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoModel, AutoImageProcessor, LlamaConfig, LlamaModel, 
-    Blip2QFormerConfig, Blip2QFormerModel, DacModel
+    DacModel
 )
 
 from config import ModelConfig
@@ -64,12 +64,131 @@ class ModelPrediction:
     round_num_logit: torch.Tensor    # [B, T, 1]     (Logit -> Sigmoid)
     team_alive_logits: torch.Tensor  # [B, T, 6]     (Logits, Classes 0-5)
     enemy_alive_logits: torch.Tensor # [B, T, 6]     (Logits, Classes 0-5)
+    
+class _CrossAttentionBlock(nn.Module):
+    def __init__(self, latent_dim: int, input_dim: int, num_heads: int, dropout: float, dtype):
+        super().__init__()
+        self.q_norm = nn.LayerNorm(latent_dim, dtype=dtype)
+        self.kv_norm = nn.LayerNorm(input_dim, dtype=dtype)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+            kdim=input_dim,
+            vdim=input_dim,
+        )
+        self.out_norm = nn.LayerNorm(latent_dim, dtype=dtype)
+
+    def forward(self, latents, inputs, inputs_key_padding_mask=None):
+        q = self.q_norm(latents)
+        kv = self.kv_norm(inputs)
+        out, _ = self.attn(q, kv, kv, key_padding_mask=inputs_key_padding_mask, need_weights=False)
+        latents = latents + out
+        return self.out_norm(latents)
+
+
+class _SelfAttentionFFNBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float, dtype):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, dtype=dtype)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, dtype=dtype)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, dim, dtype=dtype),
+        )
+
+    def forward(self, x):
+        x_norm = self.norm1(x)
+        out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
+        x = x + out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
 
 class PatchCompressor(nn.Module):
-  def __init__(self, cfg: ModelConfig):
-    super().__init__()
-    self.cfg = cfg
-    self.layers 
+    """
+    Perceiver-style iterative latent attention:
+      repeat num_blocks times:
+        1) cross-attn: latents -> patch tokens
+        2) latent self-attn tower (num_self_attends_per_block layers)
+
+    Output: [B, Nq, Dq]
+    """
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        dt = cfg.dtype
+
+        # Keep your naming so adapter doesn't change:
+        self.num_latents = cfg.num_perceiver_queries
+        self.latent_dim = cfg.perceiver_hidden_size
+        self.input_dim = cfg.vision_hidden_size
+
+        # Perceiver-like knobs (add these to cfg if you want; safe defaults):
+        self.num_blocks = int(getattr(cfg, "patch_compressor_num_blocks", 4))  # how many times to re-query inputs
+        self.num_self_attends_per_block = int(getattr(cfg, "patch_compressor_self_attends_per_block", 2))
+        self.mlp_ratio = float(getattr(cfg, "patch_compressor_mlp_ratio", 4.0))
+        self.dropout = float(getattr(cfg, "patch_compressor_dropout", 0.0))
+
+        # Weight sharing (paper discusses optional sharing) :contentReference[oaicite:3]{index=3}
+        self.share_cross = bool(getattr(cfg, "patch_compressor_share_cross", True))
+        self.share_self = bool(getattr(cfg, "patch_compressor_share_self", True))
+
+        self.latents = nn.Parameter(
+            torch.randn(1, self.num_latents, self.latent_dim, dtype=dt) * 0.02
+        )
+
+        if self.share_cross:
+            self.cross_blocks = nn.ModuleList([
+                _CrossAttentionBlock(self.latent_dim, self.input_dim, cfg.perceiver_heads, self.dropout, dt)
+            ])
+        else:
+            self.cross_blocks = nn.ModuleList([
+                _CrossAttentionBlock(self.latent_dim, self.input_dim, cfg.perceiver_heads, self.dropout, dt)
+                for _ in range(self.num_blocks)
+            ])
+
+        if self.share_self:
+            self.self_tower = nn.ModuleList([
+                _SelfAttentionFFNBlock(self.latent_dim, cfg.perceiver_heads, self.mlp_ratio, self.dropout, dt)
+                for _ in range(self.num_self_attends_per_block)
+            ])
+        else:
+            self.self_tower_per_block = nn.ModuleList([
+                nn.ModuleList([
+                    _SelfAttentionFFNBlock(self.latent_dim, cfg.perceiver_heads, self.mlp_ratio, self.dropout, dt)
+                    for _ in range(self.num_self_attends_per_block)
+                ])
+                for _ in range(self.num_blocks)
+            ])
+
+        self.use_checkpointing = bool(getattr(cfg, "gradient_checkpointing", False))
+
+    def _ckpt(self, fn, *args):
+        if self.training and self.use_checkpointing:
+            return checkpoint(lambda *a: fn(*a), *args, use_reentrant=False)
+        return fn(*args)
+
+    def forward(self, patch_tokens: torch.Tensor, patch_key_padding_mask: Optional[torch.Tensor] = None):
+        B = patch_tokens.shape[0]
+        latents = self.latents.expand(B, -1, -1)  # [B, Nq, Dq]
+
+        for b in range(self.num_blocks):
+            cross = self.cross_blocks[0] if self.share_cross else self.cross_blocks[b]
+            latents = self._ckpt(cross, latents, patch_tokens, patch_key_padding_mask)
+
+            if self.share_self:
+                for layer in self.self_tower:
+                    latents = self._ckpt(layer, latents)
+            else:
+                for layer in self.self_tower_per_block[b]:
+                    latents = self._ckpt(layer, latents)
+
+        return latents
 
 class GameVideoEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -89,26 +208,8 @@ class GameVideoEncoder(nn.Module):
         for p in self.vision.parameters():
             p.requires_grad = False
 
-        q_config = Blip2QFormerConfig(
-            hidden_size=cfg.qformer_hidden_size,
-            num_hidden_layers=cfg.qformer_layers,
-            num_attention_heads=cfg.qformer_heads,
-            encoder_hidden_size=cfg.vision_hidden_size,
-            vocab_size=1,
-            dtype=cfg.dtype,
-        )
-        self.qformer = Blip2QFormerModel(q_config)
-        if cfg.gradient_checkpointing:
-            self.qformer.gradient_checkpointing_enable()
+        self.compressor = PatchCompressor(cfg)
 
-        self.query_tokens = nn.Parameter(
-            torch.randn(
-                1,
-                cfg.num_qformer_queries,
-                cfg.qformer_hidden_size,
-                dtype=cfg.dtype,
-            )
-        )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -143,15 +244,13 @@ class GameVideoEncoder(nn.Module):
             n = vis_out.size(0)
             queries = self.query_tokens.expand(n, -1, -1)  # [n, N_q, D_q]
 
-            q_out = self.qformer(
-                query_embeds=queries,
-                encoder_hidden_states=vis_out,
-            ).last_hidden_state  # [n, N_q, D_q]
+            q_out = self.compressor(vis_out)  # [n, N_q, D_q]
+
             q_chunks.append(q_out)
             del vis_out, q_out, queries
 
         q_all = torch.cat(q_chunks, dim=0)  # [B*T*P, N_q, D_q]
-        q_all = q_all.view(B, T, P, self.cfg.num_qformer_queries, self.cfg.qformer_hidden_size)
+        q_all = q_all.view(B, T, P, self.cfg.num_perceiver_queries, self.cfg.perceiver_hidden_size)
         return q_all
 
 class GameAudioEncoder(nn.Module):
@@ -263,7 +362,7 @@ class GamePredictorBackbone(nn.Module):
         self.video = GameVideoEncoder(cfg)
         self.audio = GameAudioEncoder(cfg)
         
-        adapter_dim_in = (cfg.qformer_hidden_size * cfg.num_qformer_queries) + (self.audio.output_dim * 2)
+        adapter_dim_in = (cfg.perceiver_hidden_size * cfg.num_perceiver_queries) + (self.audio.output_dim * 2)
         
         self.adapter = nn.Sequential(
             nn.Linear(adapter_dim_in, cfg.adapter_hidden_dim, dtype=cfg.dtype),

@@ -30,15 +30,19 @@ class ModelConfig:
     
     vision_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     vision_hidden_size: int = 768
-    vision_chunk_size: int = 16  # how many images go through vit+qformer at a time
+    vision_chunk_size: int = 16  # how many images go through vit+perceiver at a time
 
     audio_chunk_size: int = 1  # how many audio chunks go through audio encoder at a time
 
     # --- Fusion (Q-Former) ---
-    num_qformer_queries: int = 4
-    qformer_hidden_size: int = 768
-    qformer_heads: int = 12
-    qformer_layers: int = 4
+    num_perceiver_queries: int = 4
+    perceiver_hidden_size: int = 768
+    perceiver_heads: int = 12
+    perceiver_layers: int = 4
+    patch_compressor_num_blocks: int = 4
+    patch_compressor_self_attends_per_block: int = 2
+    patch_compressor_mlp_ratio: float = 4.0
+    patch_compressor_dropout: float = 0.0
 
     # Adapter
     adapter_hidden_dim: int = 4096
@@ -65,13 +69,7 @@ class ModelConfig:
     bins_z: int = 32
 
     # number of mouse bins for x, y
-    mouse_bins_count: int = 257
-
-    # loss normalization
-    loss_scale_warmup_steps: int = 100
-    dwa_temperature: float = 2.0
-    dwa_momentum: float = 0.1
-    dwa_update_every: int = 50
+    mouse_bins_count: int = 33
 
 
 @dataclass
