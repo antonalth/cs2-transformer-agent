@@ -114,8 +114,9 @@ class ModelLoss(nn.Module):
             l_my = self.ce(pred_my, my_bin)
             
             l_mouse = (l_mx * mask).sum() / num_valid + (l_my * mask).sum() / num_valid
-            losses["mouse"] = l_mouse
-            total_loss += l_mouse * self.weights.get("mouse", 1.0)
+            w_mouse = l_mouse * self.weights.get("mouse", 1.0)
+            losses["mouse"] = w_mouse
+            total_loss += w_mouse
 
         # --- 2. Keyboard (BCE) ---
         if self.enabled.get("keyboard", True):
@@ -132,8 +133,9 @@ class ModelLoss(nn.Module):
             
             l_kb = self.bce(pred_k, k_multi_hot).mean(dim=1) # avg over keys
             l_kb = (l_kb * mask).sum() / num_valid
-            losses["keyboard"] = l_kb
-            total_loss += l_kb * self.weights.get("keyboard", 1.0)
+            w_kb = l_kb * self.weights.get("keyboard", 1.0)
+            losses["keyboard"] = w_kb
+            total_loss += w_kb
             
         # --- 3. Health (CE) ---
         if self.enabled.get("health", True):
@@ -143,8 +145,9 @@ class ModelLoss(nn.Module):
             pred_h = pred.health_logits.view(-1, self.model_cfg.health_bins)
             
             l_h = (self.ce(pred_h, h_bin) * mask).sum() / num_valid
-            losses["health"] = l_h
-            total_loss += l_h * self.weights.get("health", 1.0)
+            w_h = l_h * self.weights.get("health", 1.0)
+            losses["health"] = w_h
+            total_loss += w_h
 
         # --- 4. Armor (CE) ---
         if self.enabled.get("armor", True):
@@ -154,8 +157,9 @@ class ModelLoss(nn.Module):
             pred_a = pred.armor_logits.view(-1, self.model_cfg.armor_bins)
             
             l_a = (self.ce(pred_a, a_bin) * mask).sum() / num_valid
-            losses["armor"] = l_a
-            total_loss += l_a * self.weights.get("armor", 1.0)
+            w_a = l_a * self.weights.get("armor", 1.0)
+            losses["armor"] = w_a
+            total_loss += w_a
 
         # --- 5. Money (CE) ---
         if self.enabled.get("money", True):
@@ -165,8 +169,9 @@ class ModelLoss(nn.Module):
             pred_m = pred.money_logits.view(-1, self.model_cfg.money_bins)
             
             l_m = (self.ce(pred_m, m_bin) * mask).sum() / num_valid
-            losses["money"] = l_m
-            total_loss += l_m * self.weights.get("money", 1.0)
+            w_m = l_m * self.weights.get("money", 1.0)
+            losses["money"] = w_m
+            total_loss += w_m
 
         # --- 6. Active Weapon (CE) ---
         if self.enabled.get("active_weapon", True):
@@ -187,8 +192,9 @@ class ModelLoss(nn.Module):
             safe_tgt = safe_tgt.clamp(0, self.model_cfg.weapon_dim - 1)
             
             l_w = (self.ce(pred_w, safe_tgt) * w_mask).sum() / num_w
-            losses["active_weapon"] = l_w
-            total_loss += l_w * self.weights.get("active_weapon", 1.0)
+            w_active_w = l_w * self.weights.get("active_weapon", 1.0)
+            losses["active_weapon"] = w_active_w
+            total_loss += w_active_w
 
         # --- 7. Eco (Buy + Purchase) ---
         # "only count purchase loss if purchase is predicted" -> We interpreted as GT masking.
@@ -204,8 +210,9 @@ class ModelLoss(nn.Module):
             pred_buy = pred.eco_purchase_logits.view(-1, 1) # [N, 1]
             
             l_buy_event = (self.bce(pred_buy, tgt_buy).squeeze() * mask).sum() / num_valid
-            losses["eco_purchase"] = l_buy_event
-            total_loss += l_buy_event * self.weights.get("eco_purchase", 1.0)
+            w_buy_event = l_buy_event * self.weights.get("eco_purchase", 1.0)
+            losses["eco_purchase"] = w_buy_event
+            total_loss += w_buy_event
             
             # --- Buy Class (CE) ---
             # Only count loss if a purchase actually happened in GT
@@ -222,8 +229,9 @@ class ModelLoss(nn.Module):
             pred_buy_class = pred.eco_buy_logits.view(-1, self.model_cfg.eco_dim)
             
             l_buy_class = (self.ce(pred_buy_class, safe_buy_tgt) * buy_mask).sum() / num_buys
-            losses["eco_buy"] = l_buy_class
-            total_loss += l_buy_class * self.weights.get("eco_buy", 1.0)
+            w_buy_class = l_buy_class * self.weights.get("eco_buy", 1.0)
+            losses["eco_buy"] = w_buy_class
+            total_loss += w_buy_class
 
         # --- 8. Position (CE) ---
         if self.enabled.get("player_pos", True):
@@ -249,8 +257,9 @@ class ModelLoss(nn.Module):
             l_pz = (self.ce(pred_pz, bz) * mask).sum() / num_valid
             
             l_pos = l_px + l_py + l_pz
-            losses["player_pos"] = l_pos
-            total_loss += l_pos * self.weights.get("player_pos", 1.0)
+            w_pos = l_pos * self.weights.get("player_pos", 1.0)
+            losses["player_pos"] = w_pos
+            total_loss += w_pos
 
         # --- Global Losses ---
         # For global, we mask if round is valid? 
@@ -267,8 +276,9 @@ class ModelLoss(nn.Module):
             # pred: [B, T, 1, 5] -> [N, 5] (broadcast)
             pred_rs = pred.round_state_logits.view(-1, self.model_cfg.round_state_dim)
             l_rs = self.ce(pred_rs, rs_tgt).mean()
-            losses["round_state"] = l_rs
-            total_loss += l_rs * self.weights.get("round_state", 1.0)
+            w_rs = l_rs * self.weights.get("round_state", 1.0)
+            losses["round_state"] = w_rs
+            total_loss += w_rs
 
         # 10. Round Num (CE)
         if self.enabled.get("round_num", True):
@@ -276,8 +286,9 @@ class ModelLoss(nn.Module):
             rn_tgt = rn_tgt.clamp(0, self.model_cfg.round_num_bins - 1) # Cap at max bin
             pred_rn = pred.round_num_logits.view(-1, self.model_cfg.round_num_bins)
             l_rn = self.ce(pred_rn, rn_tgt).mean()
-            losses["round_num"] = l_rn
-            total_loss += l_rn * self.weights.get("round_num", 1.0)
+            w_rn = l_rn * self.weights.get("round_num", 1.0)
+            losses["round_num"] = w_rn
+            total_loss += w_rn
             
         # 11. Team/Enemy Alive (CE 0-5)
         # We need to count bits in alive masks
@@ -287,8 +298,9 @@ class ModelLoss(nn.Module):
             ta_tgt = ta_tgt.clamp(0, self.model_cfg.alive_bins - 1)
             pred_ta = pred.team_alive_logits.view(-1, self.model_cfg.alive_bins)
             l_ta = self.ce(pred_ta, ta_tgt).mean()
-            losses["team_alive"] = l_ta
-            total_loss += l_ta * self.weights.get("team_alive", 1.0)
+            w_ta = l_ta * self.weights.get("team_alive", 1.0)
+            losses["team_alive"] = w_ta
+            total_loss += w_ta
             
         if self.enabled.get("enemy_alive", True):
             # gt.enemy_alive_mask [B, T, 5]
@@ -296,8 +308,9 @@ class ModelLoss(nn.Module):
             ea_tgt = ea_tgt.clamp(0, self.model_cfg.alive_bins - 1)
             pred_ea = pred.enemy_alive_logits.view(-1, self.model_cfg.alive_bins)
             l_ea = self.ce(pred_ea, ea_tgt).mean()
-            losses["enemy_alive"] = l_ea
-            total_loss += l_ea * self.weights.get("enemy_alive", 1.0)
+            w_ea = l_ea * self.weights.get("enemy_alive", 1.0)
+            losses["enemy_alive"] = w_ea
+            total_loss += w_ea
             
         # 12. Enemy Pos (CE)
         # GT: [B, T, 5, 3]. Pred: [B, T, 5, 3] (Expanded from strategy)
@@ -324,8 +337,9 @@ class ModelLoss(nn.Module):
             l_ez = (self.ce(p_ez, ebz) * emask).sum() / e_num
             
             l_epos = l_ex + l_ey + l_ez
-            losses["enemy_pos"] = l_epos
-            total_loss += l_epos * self.weights.get("enemy_pos", 1.0)
+            w_epos = l_epos * self.weights.get("enemy_pos", 1.0)
+            losses["enemy_pos"] = w_epos
+            total_loss += w_epos
 
         losses["total"] = total_loss
         return losses
