@@ -199,24 +199,21 @@ class ModelLoss(nn.Module):
             total_loss += l_buy_event * self.weights.get("eco_purchase", 1.0)
             
             # --- Buy Class (CE) ---
-            # Only if did_buy is True
-            # We need to extract the index of the item bought.
-            # Simplified: Assume first set bit.
-            # eco_tensor is 4x int64. Flatten to 256 bits?
-            # Doing this in python loop for the mask is slow, but converting bitmask tensor to index in torch is tricky.
-            # We'll use a simplified approach assuming the dataset can provide index or we skip for now if too complex without helpers.
-            # Actually, `GroundTruth` doesn't provide eco index.
-            # I will skip the "what" loss computation if I can't easily decode the bitmask to an index on GPU.
-            # BUT, I can try a rough approximation or assume `eco_mask` isn't fully supported yet for training "what".
-            # The prompt says "eco (what a player buys is CE...".
-            # I'll implement a placeholder that assumes we can get the index, but warn/comment.
-            # Or better: Just check `dataset._bitmask_to_weapon_index` logic.
-            # Since I can't easily replicate that on GPU tensors efficiently without a kernel, 
-            # I will mark `eco_buy` as 0.0 loss for now and log a warning, OR rely on a future dataset update.
-            # WAITING: For now, I'll calculate it but rely on `did_buy` mask.
-            # Since I can't extract index efficiently:
-            losses["eco_buy"] = torch.tensor(0.0, device=mask.device)
-            # (User note: Dataset update recommended to provide `eco_buy_idx` pre-calculated)
+            # Only count loss if a purchase actually happened in GT
+            buy_mask = mask * did_buy # [N]
+            num_buys = buy_mask.sum().clamp(min=1.0)
+            
+            # Target: eco_buy_idx [B, T, 5]
+            buy_tgt = gt.eco_buy_idx.view(-1)
+            # Safe indexing for -1 (set to 0, masked out)
+            safe_buy_tgt = buy_tgt.clone()
+            safe_buy_tgt[safe_buy_tgt == -1] = 0
+            
+            pred_buy_class = pred.eco_buy_logits.view(-1, self.model_cfg.eco_dim)
+            
+            l_buy_class = (self.ce(pred_buy_class, safe_buy_tgt) * buy_mask).sum() / num_buys
+            losses["eco_buy"] = l_buy_class
+            total_loss += l_buy_class * self.weights.get("eco_buy", 1.0)
 
         # --- 8. Position (CE) ---
         if self.enabled.get("player_pos", True):

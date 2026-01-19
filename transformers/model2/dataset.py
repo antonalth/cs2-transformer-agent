@@ -48,6 +48,7 @@ class GroundTruth:
     position: torch.FloatTensor       # [T, 5, 3]
     keyboard_mask: torch.IntTensor    # [T, 5]
     eco_mask: torch.LongTensor        # [T, 5, 4]
+    eco_buy_idx: torch.LongTensor     # [T, 5] (The first item bought this frame, if any)
     inventory_mask: torch.LongTensor  # [T, 5, 2]
     active_weapon_idx: torch.IntTensor# [T, 5]
     round_number: torch.IntTensor     # [T]
@@ -132,6 +133,19 @@ class Epoch(torch.utils.data.Dataset):
                 return i
         return -1
 
+    @staticmethod
+    def _bitmask_to_item_index(mask: np.ndarray) -> int:
+        """Converts a [4] uint64 bitmask to a single item index (0-255)."""
+        if mask.sum() == 0:
+            return -1
+        # mask is [4] uint64
+        for i in range(4):
+            if mask[i] == 0: continue
+            for bit in range(64):
+                if (mask[i] >> np.uint64(bit)) & np.uint64(1):
+                    return i * 64 + bit
+        return -1
+
     def pad_or_truncate_to(self, x: torch.Tensor, T: int, dim: int = 0) -> torch.Tensor:
         """
         Pad or truncate `x` along dimension `dim` to length `T` using zeros.
@@ -206,6 +220,7 @@ class Epoch(torch.utils.data.Dataset):
         pos   = np.zeros((T, 5, 3), dtype=np.float32)
         kbd   = np.zeros((T, 5),     dtype=np.uint32)
         eco   = np.zeros((T, 5, 4),  dtype=np.uint64)
+        eco_idx = np.full((T, 5), -1, dtype=np.int32)
         inv   = np.zeros((T, 5, 2),  dtype=np.uint64)
         wep   = np.full((T, 5), -1,  dtype=np.int32)
         rnd_num   = np.full((T,), r.round_num, dtype=np.int32)
@@ -248,6 +263,7 @@ class Epoch(torch.utils.data.Dataset):
                         pos[f, p_idx]   = p["pos"]
                         kbd[f, p_idx]   = p["keyboard_bitmask"]
                         eco[f, p_idx]   = p["eco_bitmask"]
+                        eco_idx[f, p_idx] = self._bitmask_to_item_index(p["eco_bitmask"])
                         inv[f, p_idx]   = p["inventory_bitmask"]
                         wep[f, p_idx]   = self._bitmask_to_weapon_index(p["active_weapon_bitmask"])
 
@@ -259,6 +275,7 @@ class Epoch(torch.utils.data.Dataset):
             position          = torch.from_numpy(pos),                      # float32
             keyboard_mask     = torch.from_numpy(kbd.astype(np.int32)),     # int32
             eco_mask          = torch.from_numpy(eco.astype(np.int64)),     # int64
+            eco_buy_idx       = torch.from_numpy(eco_idx.astype(np.int64)), # int64
             inventory_mask    = torch.from_numpy(inv.astype(np.int64)),     # int64
             active_weapon_idx = torch.from_numpy(wep),                      # int32
             round_number      = torch.from_numpy(rnd_num),                  # int32

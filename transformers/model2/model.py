@@ -400,11 +400,9 @@ class GamePredictorBackbone(nn.Module):
         self.audio_proj = nn.Linear(self.audio.output_dim, cfg.perceiver_hidden_size, dtype=cfg.dtype)
         
         # Initial Queries
-        # 1 learned vector for players (will be expanded to 5)
-        # "Start off our hidden state with 5x the same learned player query vector"
-        self.player_query = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
-        # 1 learned vector for strategy
-        self.strat_query = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
+        # Use Embedding(1, D) to avoid FSDP issues with standalone parameters
+        self.player_query = nn.Embedding(1, cfg.llama_hidden_size, dtype=cfg.dtype)
+        self.strat_query = nn.Embedding(1, cfg.llama_hidden_size, dtype=cfg.dtype)
         
         # Split Llama
         assert cfg.llama_layers % cfg.backbone_splits == 0, "llama_layers must be divisible by backbone_splits"
@@ -470,9 +468,13 @@ class GamePredictorBackbone(nn.Module):
         # --- Prepare Initial Hidden State ---
         # Players: [B, T, 5, D]
         # Expand 1 query -> 5 players
-        p_q = self.player_query.expand(B, T*5, -1).view(B, T, 5, -1)
-        # Strat: [B, T, 1, D]
-        s_q = self.strat_query.expand(B, T, -1).view(B, T, 1, -1)
+        
+        dummy_idx = torch.zeros(1, dtype=torch.long, device=context_flat.device)
+        p_vec = self.player_query(dummy_idx).view(1, 1, 1, -1) # [1, 1, 1, D]
+        s_vec = self.strat_query(dummy_idx).view(1, 1, 1, -1)  # [1, 1, 1, D]
+        
+        p_q = p_vec.expand(B, T, 5, -1)
+        s_q = s_vec.expand(B, T, 1, -1)
         
         current_hidden_p = p_q.reshape(B*T*5, 1, self.cfg.llama_hidden_size)
         current_hidden_s = s_q.reshape(B*T, 1, self.cfg.llama_hidden_size)

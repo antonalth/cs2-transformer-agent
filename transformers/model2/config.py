@@ -141,7 +141,7 @@ class GlobalConfig:
         train_dict = asdict(self.train)
 
         # Handle non-JSON types (torch.dtype) explicitly
-        model_dict["dtype"] = self.model.dtype.name  # e.g. "bfloat16"
+        model_dict["dtype"] = str(self.model.dtype).split('.')[-1]  # e.g. "bfloat16"
 
         data = {
             "dataset": dataset_dict,
