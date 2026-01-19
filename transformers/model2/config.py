@@ -35,7 +35,7 @@ class ModelConfig:
     audio_chunk_size: int = 1  # how many audio chunks go through audio encoder at a time
 
     # --- Fusion (Q-Former) ---
-    num_perceiver_queries: int = 4
+    num_perceiver_queries: int = 50
     perceiver_hidden_size: int = 768
     perceiver_heads: int = 12
     perceiver_layers: int = 4
@@ -48,6 +48,7 @@ class ModelConfig:
     adapter_hidden_dim: int = 4096
 
     # --- Backbone (Llama) ---
+    backbone_splits: int = 4
     llama_hidden_size: int = 2048
     llama_layers: int = 24
     llama_heads: int = 32
@@ -61,15 +62,40 @@ class ModelConfig:
     inventory_dim: int = 128
     weapon_dim: int = 128
     round_state_dim: int = 5
-    round_number_dim: int = 1
+    
+    # New/Updated Head Configs
+    health_bins: int = 11      # 0-100 in steps of 10
+    armor_bins: int = 11       # 0-100 in steps of 10
+    money_bins: int = 33       # 0-16000 in steps of 500
+    round_num_bins: int = 31   # 0-30
+    alive_bins: int = 6        # 0-5
 
     # bins for position
     bins_x: int = 256
     bins_y: int = 256
     bins_z: int = 32
 
-    # number of mouse bins for x, y
+    # mouse config
     mouse_bins_count: int = 33
+    mouse_mu: int = 255
+    mouse_max: float = 30.0
+
+    # Loss Configuration
+    loss_weights: dict = None
+    loss_enabled: dict = None
+
+    def __post_init__(self):
+        if self.loss_weights is None:
+            self.loss_weights = {
+                "health": 1.0, "armor": 1.0, "money": 1.0,
+                "round_state": 1.0, "round_num": 1.0,
+                "team_alive": 1.0, "enemy_alive": 1.0,
+                "active_weapon": 1.0, "eco_buy": 1.0, "eco_purchase": 1.0,
+                "player_pos": 1.0, "enemy_pos": 1.0, # grouped x,y,z
+                "keyboard": 1.0, "mouse": 1.0
+            }
+        if self.loss_enabled is None:
+            self.loss_enabled = {k: True for k in self.loss_weights.keys()}
 
 
 @dataclass

@@ -30,41 +30,57 @@ from transformers import (
 
 from config import ModelConfig
 
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim, dtype):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, in_dim, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(in_dim, out_dim, dtype=dtype)
+        )
+    def forward(self, x):
+        return self.net(x)
+
 @dataclass
 class ModelPrediction:
     """
     Container for all output heads of the model.
     Shape Convention: [Batch, Time, 5 (Players), ...Dimensions...]
+    Global heads (from strategy) are broadcasted or kept as [B, T, 1/5, ...] depending on usage.
     """
     # --- Action Heads ---
-    mouse_x: torch.Tensor       # [B, T, 5, 256]   (Linear)
-    mouse_y: torch.Tensor
-    keyboard_logits: torch.Tensor   # [B, T, 5, 32]  (Logits)
+    mouse_x: torch.Tensor       # [B, T, 5, 33] (Logits)
+    mouse_y: torch.Tensor       # [B, T, 5, 33] (Logits)
+    keyboard_logits: torch.Tensor   # [B, T, 5, 32] (Logits)
     
     # --- Economy/Item Heads ---
-    eco_logits: torch.Tensor        # [B, T, 5, 256] (Logits)
-    inventory_logits: torch.Tensor  # [B, T, 5, 128] (Logits)
-    weapon_logits: torch.Tensor     # [B, T, 5, 128] (Logits)
+    eco_buy_logits: torch.Tensor    # [B, T, 5, 256] (Logits) - What to buy
+    eco_purchase_logits: torch.Tensor # [B, T, 5, 1] (Logits) - Whether to buy
+    active_weapon_logits: torch.Tensor # [B, T, 5, 128] (Logits)
     
     # --- Stats Heads ---
-    stats_logits: torch.Tensor      # [B, T, 5, 3]   (Logits -> Sigmoid in loss)
+    health_logits: torch.Tensor     # [B, T, 5, 11] (Logits)
+    armor_logits: torch.Tensor      # [B, T, 5, 11] (Logits)
+    money_logits: torch.Tensor      # [B, T, 5, 33] (Logits)
     
     # --- Spatial Heads (Player) ---
-    player_pos_x: torch.Tensor      # [B, T, 5, 256] (Logits)
-    player_pos_y: torch.Tensor      # [B, T, 5, 256] (Logits)
-    player_pos_z: torch.Tensor      # [B, T, 5, 32]  (Logits)
+    player_pos_x: torch.Tensor      # [B, T, 5, bins_x] (Logits)
+    player_pos_y: torch.Tensor      # [B, T, 5, bins_y] (Logits)
+    player_pos_z: torch.Tensor      # [B, T, 5, bins_z] (Logits)
 
-    # --- Spatial Heads (Enemy - Sorted/Canonical) ---
-    enemy_pos_x: torch.Tensor       # [B, T, 5, 256] (Logits)
-    enemy_pos_y: torch.Tensor       # [B, T, 5, 256] (Logits)
-    enemy_pos_z: torch.Tensor       # [B, T, 5, 32]  (Logits)
-
-    # --- Global Game State Heads ---
-    round_state_logits: torch.Tensor # [B, T, 5]     (Logits)
-    round_num_logit: torch.Tensor    # [B, T, 1]     (Logit -> Sigmoid)
-    team_alive_logits: torch.Tensor  # [B, T, 6]     (Logits, Classes 0-5)
-    enemy_alive_logits: torch.Tensor # [B, T, 6]     (Logits, Classes 0-5)
+    # --- Global/Enemy Heads (Strategy Token) ---
+    # Global state
+    round_state_logits: torch.Tensor # [B, T, 1, 5] (Logits)
+    round_num_logits: torch.Tensor   # [B, T, 1, 31] (Logits)
+    team_alive_logits: torch.Tensor  # [B, T, 1, 6] (Logits)
+    enemy_alive_logits: torch.Tensor # [B, T, 1, 6] (Logits)
     
+    # Enemy Spatial (Expanded to 5 enemies)
+    enemy_pos_x: torch.Tensor       # [B, T, 5, bins_x] (Logits)
+    enemy_pos_y: torch.Tensor       # [B, T, 5, bins_y] (Logits)
+    enemy_pos_z: torch.Tensor       # [B, T, 5, bins_z] (Logits)
+
+
 class _CrossAttentionBlock(nn.Module):
     def __init__(self, latent_dim: int, input_dim: int, num_heads: int, dropout: float, dtype):
         super().__init__()
@@ -166,27 +182,20 @@ class PatchCompressor(nn.Module):
                 for _ in range(self.num_blocks)
             ])
 
-        self.use_checkpointing = bool(getattr(cfg, "gradient_checkpointing", False))
-
-    def _ckpt(self, fn, *args):
-        if self.training and self.use_checkpointing:
-            return checkpoint(lambda *a: fn(*a), *args, use_reentrant=False)
-        return fn(*args)
-
     def forward(self, patch_tokens: torch.Tensor, patch_key_padding_mask: Optional[torch.Tensor] = None):
         B = patch_tokens.shape[0]
         latents = self.latents.expand(B, -1, -1)  # [B, Nq, Dq]
 
         for b in range(self.num_blocks):
             cross = self.cross_blocks[0] if self.share_cross else self.cross_blocks[b]
-            latents = self._ckpt(cross, latents, patch_tokens, patch_key_padding_mask)
+            latents = cross(latents, patch_tokens, patch_key_padding_mask)
 
             if self.share_self:
                 for layer in self.self_tower:
-                    latents = self._ckpt(layer, latents)
+                    latents = layer(latents)
             else:
                 for layer in self.self_tower_per_block[b]:
-                    latents = self._ckpt(layer, latents)
+                    latents = layer(latents)
 
         return latents
 
@@ -209,11 +218,37 @@ class GameVideoEncoder(nn.Module):
             p.requires_grad = False
 
         self.compressor = PatchCompressor(cfg)
+        
+        # We need to know the device of the vision model for the chunk processor
+        self.dummy_param = nn.Parameter(torch.empty(0))
 
+    def _forward_chunk(self, chunk_cpu: torch.Tensor) -> torch.Tensor:
+        # chunk_cpu: [N, C, H, W] (likely uint8 or float32 on CPU)
+        
+        device = self.vision.device
+        dtype = self.cfg.dtype
+        
+        with torch.no_grad():
+            # Run processor on the chunk (it handles moving to tensor/normalization)
+            # We assume chunk_cpu is proper input for the processor.
+            proc = self.vision_processor(
+                images=chunk_cpu,
+                return_tensors="pt",
+                data_format="channels_first",
+                do_resize=False, 
+                do_center_crop=False
+            )
+            pixel_values = proc["pixel_values"].to(device=device, dtype=dtype)
+            
+            # Run ViT (Frozen)
+            vis_out = self.vision(pixel_values=pixel_values).last_hidden_state
+        
+        # Run Compressor (Requires Grad)
+        return self.compressor(vis_out)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
-        images: [B, T, P=5, C, H, W]
+        images: [B, T, P=5, C, H, W] (Preferred on CPU)
         returns: [B, T, P=5, N_q, D_q]
         """
         B, T, P, C, H, W = images.shape
@@ -222,32 +257,20 @@ class GameVideoEncoder(nn.Module):
         chunk_size = self.cfg.vision_chunk_size
 
         q_chunks = []
+        
+        # Checkpoint if training and enabled
+        use_ckpt = self.training and self.cfg.gradient_checkpointing
 
         for i in range(0, N, chunk_size):
             chunk = flat_imgs[i : i + chunk_size]  # [n, C, H, W]
-            with torch.no_grad():
-                proc = self.vision_processor(
-                    images=chunk,
-                    return_tensors="pt",
-                    data_format="channels_first",
-                    do_resize=False, # Assuming data is already resized in dataset
-                    do_center_crop=False
-                )
-                pixel_values = proc["pixel_values"].to(
-                    device=chunk.device,
-                    dtype=self.cfg.dtype,
-                )
-                del proc
-                vis_out = self.vision(pixel_values=pixel_values).last_hidden_state #[n, L_v, D_v]
-                del pixel_values
-
-            n = vis_out.size(0)
-            queries = self.query_tokens.expand(n, -1, -1)  # [n, N_q, D_q]
-
-            q_out = self.compressor(vis_out)  # [n, N_q, D_q]
-
+            
+            if use_ckpt:
+                # checkpoint requires inputs to have requires_grad=True OR use_reentrant=False
+                q_out = checkpoint(self._forward_chunk, chunk, use_reentrant=False)
+            else:
+                q_out = self._forward_chunk(chunk)
+                
             q_chunks.append(q_out)
-            del vis_out, q_out, queries
 
         q_all = torch.cat(q_chunks, dim=0)  # [B*T*P, N_q, D_q]
         q_all = q_all.view(B, T, P, self.cfg.num_perceiver_queries, self.cfg.perceiver_hidden_size)
@@ -292,33 +315,40 @@ class GameAudioEncoder(nn.Module):
         out = out.to(dtype=self.cfg.dtype) # to bf16
         return out
 
+
 class ModelOutputHeads(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         d = cfg.llama_hidden_size
         dt = cfg.dtype
         
-        self.mouse_x = nn.Linear(d, cfg.mouse_bins_count, dtype=dt)
-        self.mouse_y = nn.Linear(d, cfg.mouse_bins_count, dtype=dt)
-        self.keyboard = nn.Linear(d, cfg.keyboard_dim, dtype=dt)
-        self.eco = nn.Linear(d, cfg.eco_dim, dtype=dt)
-        self.inventory = nn.Linear(d, cfg.inventory_dim, dtype=dt)
-        self.weapon = nn.Linear(d, cfg.weapon_dim, dtype=dt)
-        self.stats = nn.Sequential(nn.Linear(d, d, dtype=dt), nn.GELU(), nn.Linear(d, 3, dtype=dt))
+        # Player Heads
+        self.mouse_x = MLP(d, cfg.mouse_bins_count, dtype=dt)
+        self.mouse_y = MLP(d, cfg.mouse_bins_count, dtype=dt)
+        self.keyboard = MLP(d, cfg.keyboard_dim, dtype=dt)
         
-        self.player_pos_x = nn.Linear(d, cfg.bins_x, dtype=dt)
-        self.player_pos_y = nn.Linear(d, cfg.bins_y, dtype=dt)
-        self.player_pos_z = nn.Linear(d, cfg.bins_z, dtype=dt)
+        self.eco_buy = MLP(d, cfg.eco_dim, dtype=dt)
+        self.eco_purchase = MLP(d, 1, dtype=dt)
+        self.active_weapon = MLP(d, cfg.weapon_dim, dtype=dt)
+        
+        self.health = MLP(d, cfg.health_bins, dtype=dt)
+        self.armor = MLP(d, cfg.armor_bins, dtype=dt)
+        self.money = MLP(d, cfg.money_bins, dtype=dt)
+        
+        self.player_pos_x = MLP(d, cfg.bins_x, dtype=dt)
+        self.player_pos_y = MLP(d, cfg.bins_y, dtype=dt)
+        self.player_pos_z = MLP(d, cfg.bins_z, dtype=dt)
 
-        self.round_state = nn.Linear(d, cfg.round_state_dim, dtype=dt)
-        self.round_number = nn.Linear(d, cfg.round_number_dim, dtype=dt)
-        self.team_alive = nn.Linear(d, 6, dtype=dt) 
-        self.enemy_alive = nn.Linear(d, 6, dtype=dt)
+        # Global/Strategy Heads
+        self.round_state = MLP(d, cfg.round_state_dim, dtype=dt)
+        self.round_num = MLP(d, cfg.round_num_bins, dtype=dt)
+        self.team_alive = MLP(d, cfg.alive_bins, dtype=dt) 
+        self.enemy_alive = MLP(d, cfg.alive_bins, dtype=dt)
 
-        self.enemy_expander = nn.Linear(d, 5 * d, dtype=dt)
-        self.enemy_pos_x = nn.Linear(d, cfg.bins_x, dtype=dt)
-        self.enemy_pos_y = nn.Linear(d, cfg.bins_y, dtype=dt)
-        self.enemy_pos_z = nn.Linear(d, cfg.bins_z, dtype=dt)
+        self.enemy_expander = MLP(d, 5 * d, dtype=dt)
+        self.enemy_pos_x = MLP(d, cfg.bins_x, dtype=dt)
+        self.enemy_pos_y = MLP(d, cfg.bins_y, dtype=dt)
+        self.enemy_pos_z = MLP(d, cfg.bins_z, dtype=dt)
 
     def forward_player(self, x: torch.Tensor):
         # x: [N, D]
@@ -326,28 +356,31 @@ class ModelOutputHeads(nn.Module):
             "mouse_x": self.mouse_x(x),
             "mouse_y": self.mouse_y(x),
             "keyboard_logits": self.keyboard(x),
-            "eco_logits": self.eco(x),
-            "inventory_logits": self.inventory(x),
-            "weapon_logits": self.weapon(x),
-            "stats_logits": self.stats(x),
+            "eco_buy_logits": self.eco_buy(x),
+            "eco_purchase_logits": self.eco_purchase(x),
+            "active_weapon_logits": self.active_weapon(x),
+            "health_logits": self.health(x),
+            "armor_logits": self.armor(x),
+            "money_logits": self.money(x),
             "player_pos_x": self.player_pos_x(x),
             "player_pos_y": self.player_pos_y(x),
             "player_pos_z": self.player_pos_z(x),
         }
 
     def forward_global(self, x: torch.Tensor):
-        # x: [N, D]
+        # x: [N, D] where N = B*T
         out = {
             "round_state_logits": self.round_state(x),
-            "round_num_logit": self.round_number(x),
+            "round_num_logits": self.round_num(x),
             "team_alive_logits": self.team_alive(x),
             "enemy_alive_logits": self.enemy_alive(x),
         }
-        B = x.shape[0]
+        B = x.shape[0] # Actually N
         # Expand 1 strategy token -> 5 enemy tokens per sequence
+        # Here x is [B*T, D]
+        # expander -> [B*T, 5*D] -> [B*T, 5, D]
         enemy_feats = self.enemy_expander(x).view(B, 5, -1)
-        # We need to flatten enemy features again for the linear heads to work
-        # [B, 5, D] -> [B*5, D]
+        # Flatten: [B*T*5, D]
         flat_enemy = enemy_feats.view(-1, x.shape[-1])
         
         out["enemy_pos_x"] = self.enemy_pos_x(flat_enemy)
@@ -362,86 +395,123 @@ class GamePredictorBackbone(nn.Module):
         self.video = GameVideoEncoder(cfg)
         self.audio = GameAudioEncoder(cfg)
         
-        adapter_dim_in = (cfg.perceiver_hidden_size * cfg.num_perceiver_queries) + (self.audio.output_dim * 2)
+        # Audio Projection
+        # Project audio to match vision dimension for concatenation
+        self.audio_proj = nn.Linear(self.audio.output_dim, cfg.perceiver_hidden_size, dtype=cfg.dtype)
         
-        self.adapter = nn.Sequential(
-            nn.Linear(adapter_dim_in, cfg.adapter_hidden_dim, dtype=cfg.dtype),
-            nn.GELU(),
-            nn.Linear(cfg.adapter_hidden_dim, cfg.llama_hidden_size, dtype=cfg.dtype),
-            nn.LayerNorm(cfg.llama_hidden_size, dtype=cfg.dtype) 
-        )
-    
-        self.strat_node = nn.Embedding(1, cfg.llama_hidden_size, dtype=cfg.dtype)
-        nn.init.normal_(self.strat_node.weight, std=0.02)
-
-
-        use_cache = not cfg.gradient_checkpointing
-
+        # Initial Queries
+        # 1 learned vector for players (will be expanded to 5)
+        # "Start off our hidden state with 5x the same learned player query vector"
+        self.player_query = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
+        # 1 learned vector for strategy
+        self.strat_query = nn.Parameter(torch.randn(1, 1, cfg.llama_hidden_size, dtype=cfg.dtype))
+        
+        # Split Llama
+        assert cfg.llama_layers % cfg.backbone_splits == 0, "llama_layers must be divisible by backbone_splits"
+        layers_per_split = cfg.llama_layers // cfg.backbone_splits
+        
+        self.blocks = nn.ModuleList()
+        
         llama_conf = LlamaConfig(
             vocab_size=1, 
             hidden_size=cfg.llama_hidden_size,
             intermediate_size=cfg.llama_intermediate, 
-            num_hidden_layers=cfg.llama_layers,
+            num_hidden_layers=layers_per_split,
             num_attention_heads=cfg.llama_heads, 
             num_key_value_heads=cfg.llama_kv_heads,
             max_position_embeddings=cfg.llama_max_pos_embeddings,
-            use_cache=use_cache,
+            use_cache=False, 
             dtype=cfg.dtype,
             attn_implementation="flash_attention_2" if cfg.use_flash_attention else "eager"
         )
-        self.backbone = LlamaModel(llama_conf)
-        if cfg.gradient_checkpointing:
-            self.backbone.gradient_checkpointing_enable()
-        
+
+        for i in range(cfg.backbone_splits):
+            cross = _CrossAttentionBlock(
+                latent_dim=cfg.llama_hidden_size,
+                input_dim=cfg.perceiver_hidden_size,
+                num_heads=cfg.llama_heads, 
+                dropout=0.0,
+                dtype=cfg.dtype
+            )
+            
+            part = LlamaModel(llama_conf)
+            if cfg.gradient_checkpointing:
+                part.gradient_checkpointing_enable()
+            
+            # Remove norm for all but last
+            if i < cfg.backbone_splits - 1:
+                part.norm = nn.Identity()
+                
+            self.blocks.append(nn.ModuleDict({"cross": cross, "llama": part}))
+            
         self.heads = ModelOutputHeads(cfg)
-        
 
     def forward(self, images: torch.Tensor, audio: torch.Tensor):
-        B, T, P = images.shape[:3] # images: [B, T, P, C, H, W]
+        B, T, P = images.shape[:3]
         
-        video_features = self.video(images) # [B, T, P, N_q, D_q]
-        audio_features = self.audio(audio, T) # [B, T, P, C, Aud_Hidden]
-        del images, audio 
-
-        # Flatten modalities
-        vid_flat = video_features.reshape(B, T, P, -1) # [B, T, P, N_q * D_q]
-        aud_flat = audio_features.reshape(B, T, P, -1) # [B, T, P, C * Aud_Hidden]
+        # --- Perception ---
+        # Checkpointing is handled inside GameVideoEncoder's compressor
+        vid_feats = self.video(images) # [B, T, P, 50, 768]
+        aud_feats = self.audio(audio, T) # [B, T, P, C, 256]
+        del images, audio
         
-        # Fuse
-        fused = torch.cat([vid_flat, aud_flat], dim=-1) # [B, T, P, (N_q * D_q) + (2 * Aud_Hidden)]
-        del video_features, audio_features
+        # --- Prepare Context (Keys/Values) ---
+        aud_feats = self.audio_proj(aud_feats) # [B, T, P, C, 768]
         
-        # Adapter projection
-        # Checkpoint requires input to require grad, usually safe in training
-        if self.training and self.cfg.gradient_checkpointing:
-             fused.requires_grad_(True)
-             adapted = checkpoint(self.adapter, fused, use_reentrant=False) # [B, T, P, D_llama]
-        else:
-             adapted = self.adapter(fused)
-
-        adapted = adapted.to(dtype=self.cfg.dtype) #undo LN upcast?
-        # Append Strategy Token
-        ids = torch.zeros(B * T, dtype=torch.long, device=adapted.device)
-        strat = self.strat_node(ids).view(B, T, 1, -1)   # [B, T, 1, D]
-        frame_seq = torch.cat([adapted, strat], dim=2)
-
+        # Concat per player
+        # vid: [B, T, P, 50, 768]
+        # aud: [B, T, P, C, 768]
+        context = torch.cat([vid_feats, aud_feats], dim=3) # [B, T, P, 50+C, 768]
+        del vid_feats, aud_feats
         
-        # Flatten for Llama Backbone [Batch, Sequence Length, Hidden]
-        # Sequence Length = Time * (Players + Strategy)
-        frame_seq_flat = frame_seq.view(B, T * self.cfg.tokens_per_frame, -1)
-        del adapted, strat
-
-        outputs = self.backbone(inputs_embeds=frame_seq_flat)
-        hidden_states = outputs.last_hidden_state # [B, T * (P+1), D]
-
-        # Reshape back to separate players and strategy
-        hidden_frames = hidden_states.view(B, T, self.cfg.tokens_per_frame, -1) # [B, T, P+1, D]
-        p_hidden = hidden_frames[..., :5, :] # [B, T, 5, D]
-        s_hidden = hidden_frames[..., 5, :]  # [B, T, D]
-
-        p_flat = p_hidden.reshape(-1, self.cfg.llama_hidden_size)
-        s_flat = s_hidden.reshape(-1, self.cfg.llama_hidden_size)
-
+        # Reshape context for cross attention: [B*T*P, Tokens, Dim]
+        context_flat = context.view(B*T*P, -1, self.cfg.perceiver_hidden_size)
+        
+        # --- Prepare Initial Hidden State ---
+        # Players: [B, T, 5, D]
+        # Expand 1 query -> 5 players
+        p_q = self.player_query.expand(B, T*5, -1).view(B, T, 5, -1)
+        # Strat: [B, T, 1, D]
+        s_q = self.strat_query.expand(B, T, -1).view(B, T, 1, -1)
+        
+        current_hidden_p = p_q.reshape(B*T*5, 1, self.cfg.llama_hidden_size)
+        current_hidden_s = s_q.reshape(B*T, 1, self.cfg.llama_hidden_size)
+        
+        for block in self.blocks:
+            # 1. Cross Attention (Players only)
+            # Query: current_hidden_p [N_players, 1, D]
+            # Key: context_flat [N_players, K, D_v]
+            
+            p_out = block["cross"](current_hidden_p, context_flat) # [N_players, 1, D]
+            current_hidden_p = p_out
+            
+            # 2. Combine for Llama
+            # Reassemble [B, T, 6, D]
+            p_view = current_hidden_p.view(B, T, 5, -1)
+            s_view = current_hidden_s.view(B, T, 1, -1)
+            
+            seq = torch.cat([p_view, s_view], dim=2) # [B, T, 6, D]
+            seq_flat = seq.view(B, T * 6, -1) # [B, L, D]
+            
+            # 3. Llama
+            # Llama expects [Batch, Seq, Dim]
+            llama_out = block["llama"](inputs_embeds=seq_flat).last_hidden_state # [B, L, D]
+            
+            # 4. Split back
+            out_frames = llama_out.view(B, T, 6, -1)
+            p_view = out_frames[:, :, :5, :]
+            s_view = out_frames[:, :, 5:, :]
+            
+            current_hidden_p = p_view.reshape(B*T*5, 1, -1)
+            current_hidden_s = s_view.reshape(B*T, 1, -1)
+            
+        # --- Final Heads ---
+        # p_view: [B, T, 5, D]
+        # s_view: [B, T, 1, D]
+        
+        p_flat = p_view.reshape(-1, self.cfg.llama_hidden_size)
+        s_flat = s_view.reshape(-1, self.cfg.llama_hidden_size)
+        
         p_preds = self.heads.forward_player(p_flat)
         s_preds = self.heads.forward_global(s_flat)
         
@@ -460,10 +530,15 @@ class GamePredictorBackbone(nn.Module):
             mouse_x=rs(p_preds["mouse_x"]),
             mouse_y=rs(p_preds["mouse_y"]),
             keyboard_logits=rs(p_preds["keyboard_logits"]),
-            eco_logits=rs(p_preds["eco_logits"]),
-            inventory_logits=rs(p_preds["inventory_logits"]),
-            weapon_logits=rs(p_preds["weapon_logits"]),
-            stats_logits=rs(p_preds["stats_logits"]),
+            
+            eco_buy_logits=rs(p_preds["eco_buy_logits"]),
+            eco_purchase_logits=rs(p_preds["eco_purchase_logits"]),
+            active_weapon_logits=rs(p_preds["active_weapon_logits"]),
+            
+            health_logits=rs(p_preds["health_logits"]),
+            armor_logits=rs(p_preds["armor_logits"]),
+            money_logits=rs(p_preds["money_logits"]),
+            
             player_pos_x=rs(p_preds["player_pos_x"]),
             player_pos_y=rs(p_preds["player_pos_y"]),
             player_pos_z=rs(p_preds["player_pos_z"]),
@@ -474,7 +549,7 @@ class GamePredictorBackbone(nn.Module):
             enemy_pos_z=rs(s_preds["enemy_pos_z"], is_player=False),
             
             round_state_logits=rs(s_preds["round_state_logits"], is_player=False),
-            round_num_logit=rs(s_preds["round_num_logit"], is_player=False),
+            round_num_logits=rs(s_preds["round_num_logits"], is_player=False),
             team_alive_logits=rs(s_preds["team_alive_logits"], is_player=False),
             enemy_alive_logits=rs(s_preds["enemy_alive_logits"], is_player=False),
         )
