@@ -20,7 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import GlobalConfig
-from dataset import GroundTruth, ModelPrediction
+from dataset import GroundTruth
+from model import ModelPrediction
 
 def mu_law_encode(x, mu=255.0, max_val=30.0):
     """
