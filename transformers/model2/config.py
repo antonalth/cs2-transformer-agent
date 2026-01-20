@@ -87,12 +87,12 @@ class ModelConfig:
     def __post_init__(self):
         if self.loss_weights is None:
             self.loss_weights = {
-                "health": 1.0, "armor": 1.0, "money": 1.0,
-                "round_state": 1.0, "round_num": 1.0,
-                "team_alive": 1.0, "enemy_alive": 1.0,
-                "active_weapon": 10.0, "eco_buy": 1.0, "eco_purchase": 1.0,
-                "player_pos": 0.5, "enemy_pos": 0.5, # grouped x,y,z
-                "keyboard": 100.0, "mouse": 10.0
+                "health": 0.4, "armor": 0.5, "money": 0.4,
+                "round_state": 0.6, "round_num": 0.3,
+                "team_alive": 0.6, "enemy_alive": 0.7,
+                "active_weapon": 0.3, "eco_buy": 1.2, "eco_purchase": 1.2,
+                "player_pos": 0.2, "enemy_pos": 0.1, # grouped x,y,z
+                "keyboard": 10.0, "mouse": 0.25
             }
         if self.loss_enabled is None:
             self.loss_enabled = {k: True for k in self.loss_weights.keys()}
@@ -107,7 +107,7 @@ class TrainConfig:
     
     # Data
     data_root: str = "./dataset0"
-    num_workers: int = 4
+    num_workers: int = 8
     
     # Optimization
     batch_size: int = 1          # Per GPU

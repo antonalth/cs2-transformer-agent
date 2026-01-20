@@ -253,7 +253,7 @@ def validate(model, criterion, loader, accelerator, cfg, epoch):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--run_name", type=str, default="cs2_fsdp2_run")
+    parser.add_argument("--run_name", type=str, default="unnamed-run")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume from")
