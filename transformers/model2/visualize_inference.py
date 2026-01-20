@@ -298,9 +298,14 @@ def render_player_panel(frame, gt_data, pred_data, player_idx=0):
 
 def render_global_panel(h, w, gt_gs, pred_gs):
     panel = np.zeros((h, w, 3), dtype=np.uint8)
-    cv2.putText(panel, "GAME STATE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS['white'], 2)
     
-    # GT Lines
+    # Split panel into two columns: GT (Left) | Pred (Right)
+    col_w = w // 2
+    
+    cv2.putText(panel, "GAME STATE (GT)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS['gt'], 2)
+    cv2.putText(panel, "GAME STATE (PRED)", (col_w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS['pred'], 2)
+    
+    # --- GT Column ---
     r_state = decode_round_state(gt_gs['round_state'])
     t_alive = gt_gs.get('team_alive', 0)
     e_alive = gt_gs.get('enemy_alive', 0)
@@ -308,33 +313,103 @@ def render_global_panel(h, w, gt_gs, pred_gs):
     gt_lines = [
         f"Tick: {gt_gs.get('tick', '?')}",
         f"State: {r_state}",
-        f"T Alive Mask: {bin(t_alive)[2:].zfill(5)}",
-        f"E Alive Mask: {bin(e_alive)[2:].zfill(5)}",
-        "Enemies (GT):"
+        f"T Mask: {bin(t_alive)[2:].zfill(5)}",
+        f"E Mask: {bin(e_alive)[2:].zfill(5)}",
+        "Enemies:"
     ]
-    for i, pos in enumerate(gt_gs['enemy_pos']):
-        if (e_alive >> i) & 1:
-             gt_lines.append(f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}")
-
-    next_y = draw_text_lines(panel, gt_lines, 10, 60, COLORS['gt'], scale=0.5)
     
-    # Pred Lines
+    ep_bins = gt_gs.get('enemy_pos_bins', [None]*5)
+    for i, pos in enumerate(gt_gs['enemy_pos']):
+        # Show if alive or just all for debug
+        if (e_alive >> i) & 1:
+            line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
+            if ep_bins[i] is not None:
+                line += f" ({ep_bins[i][0]},{ep_bins[i][1]},{ep_bins[i][2]})"
+            gt_lines.append(line)
+
+    draw_text_lines(panel, gt_lines, 10, 60, COLORS['gt'], scale=0.5)
+    
+    # --- Pred Column ---
     if pred_gs:
         pr_state = decode_round_state(pred_gs['round_state'])
         pred_lines = [
-            "",
-            "Prediction:",
+            f"Tick: {gt_gs.get('tick', '?')}", # Same tick
             f"State: {pr_state}",
             f"T Count: {pred_gs['team_alive_count']}",
             f"E Count: {pred_gs['enemy_alive_count']}",
-            "Enemies (Pred):"
+            "Enemies:"
         ]
+        
+        ep_bins_p = pred_gs.get('enemy_pos_bins', [None]*5)
         for i, pos in enumerate(pred_gs['enemy_pos']):
-            pred_lines.append(f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}")
+            line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
+            if ep_bins_p[i] is not None:
+                line += f" ({ep_bins_p[i][0]},{ep_bins_p[i][1]},{ep_bins_p[i][2]})"
+            pred_lines.append(line)
             
-        draw_text_lines(panel, pred_lines, 10, next_y + 10, COLORS['pred'], scale=0.5)
+        draw_text_lines(panel, pred_lines, col_w + 10, 60, COLORS['pred'], scale=0.5)
 
     return panel
+
+def run_inference_and_video(model, loader, output_path, global_cfg, num_samples, device):
+    """
+    Reusable inference loop that generates a video.
+    """
+    writer = None
+    processed = 0
+    
+    with torch.no_grad():
+        for i, sample in enumerate(loader):
+            if processed >= num_samples: break
+            
+            images = sample.images.to(device)
+            audio = sample.audio.to(device)
+            
+            preds_dict = model(images, audio)
+            preds = ModelPrediction(**preds_dict)
+            
+            B, T, P, C, H, W = images.shape
+            
+            if writer is None:
+                grid_w, grid_h = W * 3, H * 2
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                writer = cv2.VideoWriter(output_path, fourcc, 32, (grid_w, grid_h))
+            
+            imgs_cpu = images.cpu()
+            if imgs_cpu.dtype.is_floating_point:
+                imgs_cpu = (imgs_cpu * 255).byte()
+            else:
+                imgs_cpu = imgs_cpu.byte()
+                
+            for t in range(T):
+                gt_data = convert_gt_to_viz(sample.truth, t, batch_idx=0, cfg=global_cfg.model)
+                pred_data = convert_pred_to_viz(preds, t, batch_idx=0, cfg=global_cfg.model)
+                
+                frames = []
+                for p in range(5):
+                    frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
+                    frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
+                    frames.append(frm)
+                    
+                panels = []
+                for p in range(5):
+                    panels.append(render_player_panel(frames[p], gt_data['player_data'][p], pred_data['player_data'][p], p))
+                
+                panels.append(render_global_panel(H, W, gt_data['game_state'], pred_data['game_state']))
+                
+                row1 = np.hstack(panels[0:3])
+                row2 = np.hstack(panels[3:6])
+                combined = np.vstack([row1, row2])
+                
+                writer.write(combined)
+            
+            processed += 1
+            print(f"Viz sample {processed}/{num_samples} done.")
+            
+    if writer:
+        writer.release()
+    print(f"Video saved to {output_path}")
 
 # =============================================================================
 # MAIN
@@ -389,81 +464,8 @@ def main():
         val_ds, batch_size=1, collate_fn=cs2_collate_fn, shuffle=True
     )
     
-    # 4. Loop
-    print(f"Processing {args.num_samples} samples...")
-    
-    # Setup Video
-    writer = None
-    
-    with torch.no_grad():
-        for i, sample in enumerate(loader):
-            if i >= args.num_samples: break
-            
-            # Move to device
-            images = sample.images.to(accelerator.device) # [B, T, 5, C, H, W]
-            audio = sample.audio.to(accelerator.device)
-            
-            # Inference
-            preds_dict = model(images, audio)
-            preds = ModelPrediction(**preds_dict)
-            
-            # Render Loop
-            B, T, P, C, H, W = images.shape
-            # Assuming B=1
-            
-            # Init Writer once we know H, W
-            if writer is None:
-                grid_w, grid_h = W * 3, H * 2
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(args.output, fourcc, 32, (grid_w, grid_h)) # 32 FPS hardcoded
-            
-            # Convert images to uint8 numpy for drawing
-            # images is [1, T, 5, C, H, W] (Float or Int?)
-            # Dataset returns float normalized? No, it returns what `decoder` gives.
-            # `dataset.py` _decode_video returns decoder output. TorchCodec returns uint8 usually?
-            # Let's check. If float, scale. If uint8, good.
-            # Actually dataset.py pad_or_truncate_to preserves dtype.
-            
-            imgs_cpu = images.cpu()
-            if imgs_cpu.dtype.is_floating_point:
-                imgs_cpu = (imgs_cpu * 255).byte()
-            else:
-                imgs_cpu = imgs_cpu.byte()
-                
-            for t in range(T):
-                # Get Data dicts
-                gt_data = convert_gt_to_viz(sample.truth, t, batch_idx=0, cfg=global_cfg.model)
-                pred_data = convert_pred_to_viz(preds, t, batch_idx=0, cfg=global_cfg.model)
-                
-                # Get Frames
-                # imgs_cpu: [1, T, 5, C, H, W]
-                # Need [5, H, W, C] BGR for opencv
-                frames = []
-                for p in range(5):
-                    # C, H, W -> H, W, C
-                    frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
-                    frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
-                    frames.append(frm)
-                    
-                # Render
-                # Stitch
-                panels = []
-                for p in range(5):
-                    panels.append(render_player_panel(frames[p], gt_data['player_data'][p], pred_data['player_data'][p], p))
-                
-                panels.append(render_global_panel(H, W, gt_data['game_state'], pred_data['game_state']))
-                
-                row1 = np.hstack(panels[0:3])
-                row2 = np.hstack(panels[3:6])
-                combined = np.vstack([row1, row2])
-                
-                writer.write(combined)
-            
-            print(f"Sample {i+1} done.")
-            
-    if writer:
-        writer.release()
-    print(f"Video saved to {args.output}")
+    # 4. Run
+    run_inference_and_video(model, loader, args.output, global_cfg, args.num_samples, accelerator.device)
 
 if __name__ == "__main__":
     main()

@@ -121,6 +121,10 @@ class TrainConfig:
     # System
     save_every: int = 1
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32", ...
+    
+    # Visualization
+    viz_every_steps: int = 0      # 0 to disable
+    viz_num_samples: int = 1      # Number of samples to render
 
 
 # ---------- GlobalConfig with read/write ----------

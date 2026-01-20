@@ -42,6 +42,11 @@ from model import GamePredictorBackbone, ModelPrediction
 from model_loss import ModelLoss
 import debug
 
+try:
+    from visualize_inference import run_inference_and_video
+except ImportError:
+    run_inference_and_video = None
+
 # Initialize Logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TrainerFSDP")
@@ -118,9 +123,11 @@ def train_one_epoch(
     optimizer: optim.Optimizer, 
     scheduler: Any, 
     accelerator: Accelerator,
-    cfg: TrainConfig, 
+    cfg: TrainConfig,
+    global_cfg: GlobalConfig,
     epoch: int,
-    global_step: int = 0
+    global_step: int = 0,
+    viz_loader: DataLoader = None
 ):
     model.train()
     criterion.train()
@@ -134,6 +141,21 @@ def train_one_epoch(
     target_dtype = dtype_map.get(cfg.mixed_precision, torch.float32)
 
     for batch_idx, sample in enumerate(loader):
+        # Viz Step
+        if cfg.viz_every_steps > 0 and global_step > 0 and global_step % cfg.viz_every_steps == 0:
+            if accelerator.is_main_process and viz_loader is not None and run_inference_and_video is not None:
+                logger.info(f"Running Visualization at step {global_step}...")
+                model.eval()
+                viz_out = os.path.join(cfg.output_dir, f"viz_ep{epoch}_step{global_step}.mp4")
+                try:
+                    run_inference_and_video(
+                        model, viz_loader, viz_out, global_cfg, cfg.viz_num_samples, accelerator.device
+                    )
+                except Exception as e:
+                    logger.error(f"Visualization failed: {e}")
+                model.train()
+            accelerator.wait_for_everyone()
+
         sample = recursive_to_device(sample, accelerator.device)
         
         # Cast Truth to target dtype (BF16) if mixed precision is enabled
@@ -256,6 +278,9 @@ def main():
     parser.add_argument("--run_name", type=str, default="unnamed-run")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--max_epochs", type=int, default=20)
+    parser.add_argument("--viz_every_steps", type=int, default=0)
+    parser.add_argument("--viz_num_samples", type=int, default=1)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--output_dir", type=str, default="./checkpoints_fsdp", help="Directory to save checkpoints")
     parser.add_argument("--debug", action="store_true", help="Enable memory profiling")
@@ -271,6 +296,9 @@ def main():
         run_name=args.run_name,
         batch_size=args.batch_size,
         grad_accumulation_steps=args.grad_accum,
+        max_epochs=args.max_epochs,
+        viz_every_steps=args.viz_every_steps,
+        viz_num_samples=args.viz_num_samples,
         output_dir=args.output_dir
     )
     m_cfg = ModelConfig() 
@@ -388,9 +416,22 @@ def main():
         )
         
         train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
+
+        viz_loader = None
+        if t_cfg.viz_every_steps > 0:
+            # Create a separate loader for viz to ensure clean state
+            # Use val_ds
+            viz_loader = DataLoader(
+                val_ds,
+                batch_size=1, # Viz script expects 1
+                shuffle=True, # Random samples
+                num_workers=t_cfg.num_workers,
+                collate_fn=cs2_collate_fn
+            )
+            viz_loader = accelerator.prepare(viz_loader)
         
         train_loss, global_step = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler, accelerator, t_cfg, epoch, global_step
+            model, criterion, train_loader, optimizer, scheduler, accelerator, t_cfg, global_cfg, epoch, global_step, viz_loader
         )
         
         val_loss = validate(model, criterion, val_loader, accelerator, t_cfg, epoch)
