@@ -24,7 +24,7 @@
 - Do NOT commit fixes, a human must oversee the results first.
 - **Training Policy:** Any training restart that is not part of an immediate debugging loop (e.g., iterating to find errors) but affects a longer existing run MUST be confirmed by a human first.
 - **Long-term Training:** Always start long-term training runs inside a new tmux session **on the host machine** (wrapping the docker execution command) so they can be resumed and viewed later, as can be done like so: 
-`tmux new-session -d -s train 'docker exec -it cs2-model-training-dev-1 accelerate launch --num_processes 4 --use_fsdp --fsdp_version 2 --mixed_precision bf16 --fsdp_cpu_ram_efficient_loading true transformers/model2/train_fsdp.py --data_root dataset0'`
+`docker exec cs2-model-training-dev-1 pkill -9 -f "train_fsdp.py" && sleep 5 && tmux new-session -d -s train 'docker exec -it cs2-model-training-dev-1 accelerate launch --num_processes 4 --use_fsdp --fsdp_version 2 --mixed_precision bf16 --fsdp_cpu_ram_efficient_loading true transformers/model2/train_fsdp.py --data_root dataset0'`
 
 ### Training Loss Monitoring
 - **WandB Monitor**: CLI tool to track training progress and losses.

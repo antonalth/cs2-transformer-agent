@@ -71,9 +71,9 @@ class ModelConfig:
     alive_bins: int = 6        # 0-5
 
     # bins for position
-    bins_x: int = 256
-    bins_y: int = 256
-    bins_z: int = 32
+    bins_x: int = 20
+    bins_y: int = 20
+    bins_z: int = 20
 
     # mouse config
     mouse_bins_count: int = 33
