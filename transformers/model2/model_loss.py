@@ -59,6 +59,31 @@ def bin_value(x, min_val, max_val, num_bins):
     bins = (norm * (num_bins - 1e-5)).long()
     return bins.clamp(0, num_bins - 1)
 
+def mu_law_decode(y, mu=255.0, max_val=30.0, bins=256):
+    """
+    Decode mu-law encoded bins (0 to bins-1) back to continuous signal (-max_val to max_val).
+    """
+    # Normalize to [-1, 1]
+    y = y.float()
+    y_norm = (y / (bins - 1)) * 2 - 1
+    
+    # Inverse Mu-law
+    # x = sign(y) * (1/mu) * ((1+mu)^|y| - 1)
+    x_abs = (1 / mu) * (torch.pow(1 + mu, torch.abs(y_norm)) - 1)
+    x_norm = torch.sign(y_norm) * x_abs
+    
+    # Scale back
+    return x_norm * max_val
+
+def unbin_value(b, min_val, max_val, num_bins):
+    """
+    Decode a bin index b back to a continuous value.
+    We assume linear mapping where 0 -> min_val and bins-1 -> max_val.
+    """
+    b = b.float()
+    t = b / (num_bins - 1)
+    return min_val + t * (max_val - min_val)
+
 class ModelLoss(nn.Module):
     def __init__(self, cfg: GlobalConfig):
         super().__init__()

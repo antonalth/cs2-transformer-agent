@@ -29,4 +29,4 @@ GEMINI.md
 CLAUDE.md
 .idea/
 experiments/
-checkpoints_experiment_mkb_fsdp/
+checkpoints*
