@@ -30,3 +30,4 @@ CLAUDE.md
 .idea/
 experiments/
 checkpoints*
+.env
