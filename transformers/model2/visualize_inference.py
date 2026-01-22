@@ -373,7 +373,8 @@ def run_inference_and_video(model, loader, output_path, global_cfg, num_samples,
             if writer is None:
                 grid_w, grid_h = W * 3, H * 2
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                if os.path.dirname(output_path):
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 writer = cv2.VideoWriter(output_path, fourcc, 32, (grid_w, grid_h))
             
             imgs_cpu = images.cpu()
@@ -441,15 +442,21 @@ def main():
     
     # 2. Model
     model = GamePredictorBackbone(global_cfg.model)
+    # Ensure model is in bfloat16 to match training
+    model.to(dtype=torch.bfloat16)
     
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        fsdp_version=2,
-    )
-    accelerator = Accelerator(fsdp_plugin=fsdp_plugin)
+    # Auto-detect if we need FSDP based on checkpoint structure or just default to DDP/Single
+    # For inference on single GPU, we don't strictly need FSDP plugin if we load the state dict correctly.
+    # However, if the checkpoint was saved with FSDP, accelerate might expect it.
+    # But usually accelerator.load_state handles this if the folder structure is standard.
+    
+    accelerator = Accelerator()
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # Important: Prepare model with FSDP before loading state
     model, optimizer = accelerator.prepare(model, optimizer)
     
+    # accelerator.load_state expects the directory containing sharded files
     accelerator.load_state(args.checkpoint)
     model.eval()
     

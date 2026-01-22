@@ -42,11 +42,6 @@ from model import GamePredictorBackbone, ModelPrediction
 from model_loss import ModelLoss
 import debug
 
-try:
-    from visualize_inference import run_inference_and_video
-except ImportError:
-    run_inference_and_video = None
-
 # Initialize Logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TrainerFSDP")
@@ -141,21 +136,6 @@ def train_one_epoch(
     target_dtype = dtype_map.get(cfg.mixed_precision, torch.float32)
 
     for batch_idx, sample in enumerate(loader):
-        # Viz Step
-        if cfg.viz_every_steps > 0 and global_step > 0 and global_step % cfg.viz_every_steps == 0:
-            if accelerator.is_main_process and viz_loader is not None and run_inference_and_video is not None:
-                logger.info(f"Running Visualization at step {global_step}...")
-                model.eval()
-                viz_out = os.path.join(cfg.output_dir, f"viz_ep{epoch}_step{global_step}.mp4")
-                try:
-                    run_inference_and_video(
-                        model, viz_loader, viz_out, global_cfg, cfg.viz_num_samples, accelerator.device
-                    )
-                except Exception as e:
-                    logger.error(f"Visualization failed: {e}")
-                model.train()
-            accelerator.wait_for_everyone()
-
         sample = recursive_to_device(sample, accelerator.device)
         
         # Cast Truth to target dtype (BF16) if mixed precision is enabled
@@ -204,7 +184,7 @@ def train_one_epoch(
             
             total_loss += loss.item() * cfg.grad_accumulation_steps
             
-            if batch_idx % 50 == 0 and accelerator.is_main_process:
+            if batch_idx % 10 == 0 and accelerator.is_main_process:
                 elapsed = time.time() - t0
                 t0 = time.time()
                 logger.info(
@@ -212,8 +192,23 @@ def train_one_epoch(
                     f"Step: {global_step} | "
                     f"Loss: {loss.item()*cfg.grad_accumulation_steps:.4f} | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                    f"Time/50: {elapsed:.1f}s"
+                    f"Time/10: {elapsed:.1f}s"
                 )
+            
+            # Check for external checkpoint trigger
+            if os.path.exists("CHECKPOINT"):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    logger.info(f"External CHECKPOINT trigger found at step {global_step}. Saving checkpoint...")
+                    try:
+                        os.remove("CHECKPOINT")
+                    except OSError:
+                        pass
+                
+                ckpt_dir = os.path.join(cfg.output_dir, f"checkpoint_manual_step{global_step}")
+                accelerator.save_state(output_dir=ckpt_dir)
+                if accelerator.is_main_process:
+                    logger.info(f"Manual checkpoint saved to {ckpt_dir}")
 
     return total_loss / steps_in_epoch, global_step
 
@@ -416,22 +411,9 @@ def main():
         )
         
         train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
-
-        viz_loader = None
-        if t_cfg.viz_every_steps > 0:
-            # Create a separate loader for viz to ensure clean state
-            # Use val_ds
-            viz_loader = DataLoader(
-                val_ds,
-                batch_size=1, # Viz script expects 1
-                shuffle=True, # Random samples
-                num_workers=t_cfg.num_workers,
-                collate_fn=cs2_collate_fn
-            )
-            viz_loader = accelerator.prepare(viz_loader)
         
         train_loss, global_step = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler, accelerator, t_cfg, global_cfg, epoch, global_step, viz_loader
+            model, criterion, train_loader, optimizer, scheduler, accelerator, t_cfg, global_cfg, epoch, global_step
         )
         
         val_loss = validate(model, criterion, val_loader, accelerator, t_cfg, epoch)

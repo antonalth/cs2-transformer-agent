@@ -14,7 +14,7 @@ class DatasetConfig:
     warn_skip: bool = False
 
     epoch_gen_random_seed: int = 42
-    epoch_windows_per_round: int = 1  # how many random windows
+    epoch_windows_per_round: int = 5  # how many random windows
     epoch_round_sample_length: int = 512  # number of frames per window
     epoch_video_decoding_device: str = "cpu"
     audio_sample_rate: int = 24000
@@ -35,9 +35,9 @@ class ModelConfig:
     audio_chunk_size: int = 1  # how many audio chunks go through audio encoder at a time
 
     # --- Fusion (Q-Former) ---
-    num_perceiver_queries: int = 50
-    perceiver_hidden_size: int = 768
-    perceiver_heads: int = 12
+    num_perceiver_queries: int = 32
+    perceiver_hidden_size: int = 512
+    perceiver_heads: int = 8
     perceiver_layers: int = 4
     patch_compressor_num_blocks: int = 4
     patch_compressor_self_attends_per_block: int = 2
@@ -45,15 +45,15 @@ class ModelConfig:
     patch_compressor_dropout: float = 0.0
 
     # Adapter
-    adapter_hidden_dim: int = 4096
+    adapter_hidden_dim: int = 2048
 
     # --- Backbone (Llama) ---
     backbone_splits: int = 4
-    llama_hidden_size: int = 2048
-    llama_layers: int = 24
-    llama_heads: int = 32
+    llama_hidden_size: int = 1024
+    llama_layers: int = 12
+    llama_heads: int = 16
     llama_kv_heads: int = 8
-    llama_intermediate: int = 5632
+    llama_intermediate: int = 2816
     llama_max_pos_embeddings: int = 8192
 
     # --- Output Head Dimensions ---
@@ -107,7 +107,7 @@ class TrainConfig:
     
     # Data
     data_root: str = "./dataset0"
-    num_workers: int = 8
+    num_workers: int = 4
     
     # Optimization
     batch_size: int = 1          # Per GPU
@@ -115,16 +115,12 @@ class TrainConfig:
     max_epochs: int = 20
     lr: float = 2e-4
     weight_decay: float = 0.05
-    warmup_steps: int = 2000
+    warmup_steps: int = 200
     clip_grad_norm: float = 1.0
     
     # System
     save_every: int = 1
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32", ...
-    
-    # Visualization
-    viz_every_steps: int = 0      # 0 to disable
-    viz_num_samples: int = 1      # Number of samples to render
 
 
 # ---------- GlobalConfig with read/write ----------
