@@ -122,7 +122,6 @@ def train_one_epoch(
     global_cfg: GlobalConfig,
     epoch: int,
     global_step: int = 0,
-    viz_loader: DataLoader = None
 ):
     model.train()
     criterion.train()
@@ -263,6 +262,35 @@ def validate(model, criterion, loader, accelerator, cfg, epoch):
     
     return avg_loss
 
+def configure_optimizers(model, weight_decay, learning_rate):
+    """
+    Separate parameters into those that should have weight decay applied (>= 2 params)
+    and those that shouldn't (biases, layernorms, embed weights if 1D, etc).
+    """
+    # Filter out frozen parameters
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    
+    decay_params = []
+    nodecay_params = []
+    
+    for n, p in param_dict.items():
+        if p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            nodecay_params.append(p)
+            
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    
+    num_decay = sum(p.numel() for p in decay_params)
+    num_nodecay = sum(p.numel() for p in nodecay_params)
+    logger.info(f"Optimizer Configured: {len(decay_params)} decay params ({num_decay} elements), {len(nodecay_params)} no-decay params ({num_nodecay} elements)")
+    
+    optimizer = optim.AdamW(optim_groups, lr=learning_rate)
+    return optimizer
+
 # ==============================================================================
 # 5. Main Driver
 # ==============================================================================
@@ -270,12 +298,7 @@ def validate(model, criterion, loader, accelerator, cfg, epoch):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--run_name", type=str, default="unnamed-run")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=16)
-    parser.add_argument("--max_epochs", type=int, default=20)
-    parser.add_argument("--viz_every_steps", type=int, default=0)
-    parser.add_argument("--viz_num_samples", type=int, default=1)
+    parser.add_argument("--run_name", type=str, default="unnamed")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--output_dir", type=str, default="./checkpoints_fsdp", help="Directory to save checkpoints")
     parser.add_argument("--debug", action="store_true", help="Enable memory profiling")
@@ -289,11 +312,6 @@ def main():
     t_cfg = TrainConfig(
         data_root=args.data_root,
         run_name=args.run_name,
-        batch_size=args.batch_size,
-        grad_accumulation_steps=args.grad_accum,
-        max_epochs=args.max_epochs,
-        viz_every_steps=args.viz_every_steps,
-        viz_num_samples=args.viz_num_samples,
         output_dir=args.output_dir
     )
     m_cfg = ModelConfig() 
@@ -341,11 +359,7 @@ def main():
     # Loss is small params (weights), maybe no FSDP needed, but good practice if it has learnable params (none here really)
     # accelerator.register_for_checkpointing(criterion) 
 
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=t_cfg.lr,
-        weight_decay=t_cfg.weight_decay
-    )
+    optimizer = configure_optimizers(model, t_cfg.weight_decay, t_cfg.lr)
 
     # Correct total_steps calculation using a prepared dummy loader
     dummy_ds = ds_root.build_epoch("train", 0)

@@ -222,7 +222,7 @@ class GameVideoEncoder(nn.Module):
         # We need to know the device of the vision model for the chunk processor
         self.dummy_param = nn.Parameter(torch.empty(0))
 
-    def _forward_chunk(self, chunk_cpu: torch.Tensor) -> torch.Tensor:
+    def _forward_vision(self, chunk_cpu: torch.Tensor) -> torch.Tensor:
         # chunk_cpu: [N, C, H, W] (likely uint8 or float32 on CPU)
         
         device = self.vision.device
@@ -243,8 +243,7 @@ class GameVideoEncoder(nn.Module):
             # Run ViT (Frozen)
             vis_out = self.vision(pixel_values=pixel_values).last_hidden_state
         
-        # Run Compressor (Requires Grad)
-        return self.compressor(vis_out)
+        return vis_out
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -264,11 +263,16 @@ class GameVideoEncoder(nn.Module):
         for i in range(0, N, chunk_size):
             chunk = flat_imgs[i : i + chunk_size]  # [n, C, H, W]
             
+            # 1. Run ViT (Frozen, No Checkpoint needed as we want to cache output)
+            vis_out = self._forward_vision(chunk)
+
+            # 2. Run Compressor (Checkpointed if needed)
             if use_ckpt:
+                # vis_out is already on device.
                 # checkpoint requires inputs to have requires_grad=True OR use_reentrant=False
-                q_out = checkpoint(self._forward_chunk, chunk, use_reentrant=False)
+                q_out = checkpoint(self.compressor, vis_out, use_reentrant=False)
             else:
-                q_out = self._forward_chunk(chunk)
+                q_out = self.compressor(vis_out)
                 
             q_chunks.append(q_out)
 

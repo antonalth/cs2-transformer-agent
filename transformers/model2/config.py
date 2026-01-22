@@ -15,7 +15,7 @@ class DatasetConfig:
 
     epoch_gen_random_seed: int = 42
     epoch_windows_per_round: int = 5  # how many random windows
-    epoch_round_sample_length: int = 512  # number of frames per window
+    epoch_round_sample_length: int = 900  # number of frames per window
     epoch_video_decoding_device: str = "cpu"
     audio_sample_rate: int = 24000
 
@@ -102,7 +102,7 @@ class ModelConfig:
 class TrainConfig:
     # Experiment
     project_name: str = "cs2-behavior-cloning"
-    run_name: str = "llama-dac-fsdp2"
+    run_name: str = "unnamed"
     output_dir: str = "./checkpoints_fsdp"
     
     # Data
@@ -114,7 +114,7 @@ class TrainConfig:
     grad_accumulation_steps: int = 16
     max_epochs: int = 20
     lr: float = 2e-4
-    weight_decay: float = 0.05
+    weight_decay: float = 0.01
     warmup_steps: int = 200
     clip_grad_norm: float = 1.0
     
