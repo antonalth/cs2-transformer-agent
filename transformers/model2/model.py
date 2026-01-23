@@ -18,6 +18,7 @@ limitations under the License.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Any, Optional
+import math
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,52 @@ from transformers import (
 )
 
 from config import ModelConfig
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False, device=None, dtype=torch.float32):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size_h*grid_size_w, embed_dim] or [1+grid_size_h*grid_size_w, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = torch.arange(grid_size_h, dtype=dtype, device=device)
+    grid_w = torch.arange(grid_size_w, dtype=dtype, device=device)
+    grid = torch.meshgrid(grid_w, grid_h, indexing='xy')
+    grid = torch.stack(grid, dim=0)
+
+    grid = grid.reshape([2, 1, grid_size_h, grid_size_w])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token:
+        pos_embed = torch.cat([torch.zeros([1, embed_dim], dtype=dtype, device=device), pos_embed], dim=0)
+    return pos_embed
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
+    return emb
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: [H, W] positions to encode
+    return: [H*W, embed_dim]
+    """
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=pos.dtype, device=pos.device)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = torch.einsum('m,d->md', pos, omega)  # (M, D/2)
+
+    emb_sin = torch.sin(out) # (M, D/2)
+    emb_cos = torch.cos(out) # (M, D/2)
+
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    return emb
 
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim, dtype):
@@ -93,13 +140,14 @@ class _CrossAttentionBlock(nn.Module):
             batch_first=True,
             kdim=input_dim,
             vdim=input_dim,
+            dtype=dtype,
         )
         self.out_norm = nn.LayerNorm(latent_dim, dtype=dtype)
 
-    def forward(self, latents, inputs, inputs_key_padding_mask=None):
+    def forward(self, latents, inputs, inputs_key_padding_mask=None, attn_mask=None):
         q = self.q_norm(latents)
         kv = self.kv_norm(inputs)
-        out, _ = self.attn(q, kv, kv, key_padding_mask=inputs_key_padding_mask, need_weights=False)
+        out, _ = self.attn(q, kv, kv, key_padding_mask=inputs_key_padding_mask, attn_mask=attn_mask, need_weights=False)
         latents = latents + out
         return self.out_norm(latents)
 
@@ -108,7 +156,7 @@ class _SelfAttentionFFNBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float, dtype):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, dtype=dtype)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True, dtype=dtype)
         self.norm2 = nn.LayerNorm(dim, dtype=dtype)
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -157,6 +205,22 @@ class PatchCompressor(nn.Module):
         self.latents = nn.Parameter(
             torch.randn(1, self.num_latents, self.latent_dim, dtype=dt) * 0.02
         )
+        
+        # Spatial Logic
+        self.grid_h = getattr(cfg, "perceiver_grid_h", 0)
+        self.grid_w = getattr(cfg, "perceiver_grid_w", 0)
+        self.global_count = getattr(cfg, "perceiver_global_count", 0)
+        
+        # Check if we should enable spatial masking
+        self.use_spatial_mask = False
+        if self.grid_h > 0 and self.grid_w > 0:
+            expected_total = self.grid_h * self.grid_w + self.global_count
+            if expected_total == self.num_latents:
+                self.use_spatial_mask = True
+                mask = self._generate_spatial_mask(30, 40) # Assuming 480x640 / 16
+                self.register_buffer("spatial_mask", mask)
+            else:
+                print(f"WARNING: PatchCompressor config mismatch. Queries={self.num_latents} != {self.grid_h}x{self.grid_w}+{self.global_count}. Spatial masking disabled.")
 
         if self.share_cross:
             self.cross_blocks = nn.ModuleList([
@@ -182,13 +246,95 @@ class PatchCompressor(nn.Module):
                 for _ in range(self.num_blocks)
             ])
 
+    def _generate_spatial_mask(self, H, W):
+        num_patches = H * W
+        num_local = self.grid_h * self.grid_w
+        total_latents = num_local + self.global_count
+        
+        # 0.0 for include, -inf for exclude
+        mask = torch.full((total_latents, num_patches), float('-inf'))
+        
+        block_h = H // self.grid_h
+        block_w = W // self.grid_w
+        
+        for i in range(self.grid_h):
+            for j in range(self.grid_w):
+                latent_idx = i * self.grid_w + j
+                
+                row_start = i * block_h
+                row_end = (i + 1) * block_h
+                col_start = j * block_w
+                col_end = (j + 1) * block_w
+                
+                for r in range(row_start, row_end):
+                    for c in range(col_start, col_end):
+                        patch_idx = r * W + c
+                        if patch_idx < num_patches:
+                            mask[latent_idx, patch_idx] = 0.0
+                            
+        # Global tokens attend to everything
+        for k in range(self.global_count):
+            latent_idx = num_local + k
+            mask[latent_idx, :] = 0.0
+            
+        return mask
+
     def forward(self, patch_tokens: torch.Tensor, patch_key_padding_mask: Optional[torch.Tensor] = None):
-        B = patch_tokens.shape[0]
+        B, N, D = patch_tokens.shape
         latents = self.latents.expand(B, -1, -1)  # [B, Nq, Dq]
+
+        # 1. Add PE to Latents (Queries)
+        if self.use_spatial_mask: 
+            num_spatial = self.grid_h * self.grid_w
+            # Generate PE for the latent grid (e.g. 6x8)
+            # Use same dtype/device as latents
+            pe_latents = get_2d_sincos_pos_embed(
+                self.latent_dim, 
+                self.grid_h, 
+                self.grid_w, 
+                cls_token=False, 
+                device=latents.device, 
+                dtype=latents.dtype
+            ) # [48, 512]
+            
+            # Add to the spatial part of latents
+            # latents is [B, 58, 512]
+            spatial_latents = latents[:, :num_spatial, :] + pe_latents.unsqueeze(0)
+            global_latents = latents[:, num_spatial:, :]
+            latents = torch.cat([spatial_latents, global_latents], dim=1)
+
+        # 2. Add PE to Patches (Keys/Values)
+        # Target patches: 30x40 = 1200
+        num_patches = 30 * 40
+        
+        if N >= num_patches:
+            diff = N - num_patches
+            # Generate PE for 30x40 grid
+            pe = get_2d_sincos_pos_embed(self.input_dim, 30, 40, cls_token=False, device=patch_tokens.device, dtype=patch_tokens.dtype)
+            pe = pe.unsqueeze(0) # [1, 1200, D]
+            
+            if diff > 0:
+                # Add to the patch part only
+                patches = patch_tokens[:, diff:, :] + pe
+                patch_tokens = torch.cat([patch_tokens[:, :diff, :], patches], dim=1)
+            else:
+                patch_tokens = patch_tokens + pe
+        
+        # Handle Mask
+        mask = None
+        if self.use_spatial_mask:
+            mask = self.spatial_mask # [58, 1200]
+            if N > num_patches:
+                diff = N - num_patches
+                # Prepend zeros (allow attention to CLS/Regs)
+                # mask device/dtype should match expectations of MultiheadAttention (usually float/bool)
+                # Our mask is float -inf/0.0
+                prefix = torch.zeros((mask.shape[0], diff), device=mask.device, dtype=mask.dtype)
+                mask = torch.cat([prefix, mask], dim=1)
 
         for b in range(self.num_blocks):
             cross = self.cross_blocks[0] if self.share_cross else self.cross_blocks[b]
-            latents = cross(latents, patch_tokens, patch_key_padding_mask)
+            latents = cross(latents, patch_tokens, patch_key_padding_mask, attn_mask=mask)
 
             if self.share_self:
                 for layer in self.self_tower:

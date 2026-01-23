@@ -351,7 +351,7 @@ def render_global_panel(h, w, gt_gs, pred_gs):
 
     return panel
 
-def run_inference_and_video(model, loader, output_path, global_cfg, num_samples, device):
+def run_inference_and_video(model, loader, output_path, global_cfg, num_samples, device, accelerator):
     """
     Reusable inference loop that generates a video.
     """
@@ -362,55 +362,84 @@ def run_inference_and_video(model, loader, output_path, global_cfg, num_samples,
         for i, sample in enumerate(loader):
             if processed >= num_samples: break
             
+            # All ranks must run forward pass for FSDP
             images = sample.images.to(device)
             audio = sample.audio.to(device)
             
             preds_dict = model(images, audio)
             preds = ModelPrediction(**preds_dict)
             
-            B, T, P, C, H, W = images.shape
-            
-            if writer is None:
-                grid_w, grid_h = W * 3, H * 2
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                if os.path.dirname(output_path):
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                writer = cv2.VideoWriter(output_path, fourcc, 32, (grid_w, grid_h))
-            
-            imgs_cpu = images.cpu()
-            if imgs_cpu.dtype.is_floating_point:
-                imgs_cpu = (imgs_cpu * 255).byte()
-            else:
-                imgs_cpu = imgs_cpu.byte()
+            # Only main process writes video
+            if accelerator.is_main_process:
+                B, T, P, C, H, W = images.shape
                 
-            for t in range(T):
-                gt_data = convert_gt_to_viz(sample.truth, t, batch_idx=0, cfg=global_cfg.model)
-                pred_data = convert_pred_to_viz(preds, t, batch_idx=0, cfg=global_cfg.model)
+                if writer is None:
+                    grid_w, grid_h = W * 3, H * 2
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    if os.path.dirname(output_path):
+                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    writer = cv2.VideoWriter(output_path, fourcc, 32, (grid_w, grid_h))
                 
-                frames = []
-                for p in range(5):
-                    frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
-                    frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
-                    frames.append(frm)
+                imgs_cpu = images.cpu()
+                if imgs_cpu.dtype.is_floating_point:
+                    imgs_cpu = (imgs_cpu * 255).byte()
+                else:
+                    imgs_cpu = imgs_cpu.byte()
                     
-                panels = []
-                for p in range(5):
-                    panels.append(render_player_panel(frames[p], gt_data['player_data'][p], pred_data['player_data'][p], p))
+                for t in range(T):
+                    gt_data = convert_gt_to_viz(sample.truth, t, batch_idx=0, cfg=global_cfg.model)
+                    pred_data = convert_pred_to_viz(preds, t, batch_idx=0, cfg=global_cfg.model)
+                    
+                    frames = []
+                    for p in range(5):
+                        frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
+                        frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
+                        frames.append(frm)
+                        
+                    panels = []
+                    for p in range(5):
+                        panels.append(render_player_panel(frames[p], gt_data['player_data'][p], pred_data['player_data'][p], p))
+                    
+                    panels.append(render_global_panel(H, W, gt_data['game_state'], pred_data['game_state']))
+                    
+                    row1 = np.hstack(panels[0:3])
+                    row2 = np.hstack(panels[3:6])
+                    combined = np.vstack([row1, row2])
+                    
+                    writer.write(combined)
                 
-                panels.append(render_global_panel(H, W, gt_data['game_state'], pred_data['game_state']))
-                
-                row1 = np.hstack(panels[0:3])
-                row2 = np.hstack(panels[3:6])
-                combined = np.vstack([row1, row2])
-                
-                writer.write(combined)
-            
             processed += 1
-            print(f"Viz sample {processed}/{num_samples} done.")
+            if accelerator.is_main_process:
+                print(f"Viz sample {processed}/{num_samples} done.")
             
     if writer:
         writer.release()
-    print(f"Video saved to {output_path}")
+        print(f"Video saved to {output_path}")
+
+def configure_optimizers(model, weight_decay, learning_rate):
+    """
+    Separate parameters into those that should have weight decay applied (>= 2 params)
+    and those that shouldn't (biases, layernorms, embed weights if 1D, etc).
+    """
+    # Filter out frozen parameters
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    
+    decay_params = []
+    nodecay_params = []
+    
+    for n, p in param_dict.items():
+        if p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            nodecay_params.append(p)
+            
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate)
+    return optimizer
 
 # =============================================================================
 # MAIN
@@ -445,14 +474,11 @@ def main():
     # Ensure model is in bfloat16 to match training
     model.to(dtype=torch.bfloat16)
     
-    # Auto-detect if we need FSDP based on checkpoint structure or just default to DDP/Single
-    # For inference on single GPU, we don't strictly need FSDP plugin if we load the state dict correctly.
-    # However, if the checkpoint was saved with FSDP, accelerate might expect it.
-    # But usually accelerator.load_state handles this if the folder structure is standard.
-    
     accelerator = Accelerator()
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # Reconstruct optimizer exactly as in training to satisfy FSDP loading
+    optimizer = configure_optimizers(model, weight_decay=global_cfg.train.weight_decay, learning_rate=global_cfg.train.lr)
+    
     # Important: Prepare model with FSDP before loading state
     model, optimizer = accelerator.prepare(model, optimizer)
     
@@ -472,7 +498,7 @@ def main():
     )
     
     # 4. Run
-    run_inference_and_video(model, loader, args.output, global_cfg, args.num_samples, accelerator.device)
+    run_inference_and_video(model, loader, args.output, global_cfg, args.num_samples, accelerator.device, accelerator)
 
 if __name__ == "__main__":
     main()

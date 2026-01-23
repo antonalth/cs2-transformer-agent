@@ -35,7 +35,11 @@ class ModelConfig:
     audio_chunk_size: int = 1  # how many audio chunks go through audio encoder at a time
 
     # --- Fusion (Q-Former) ---
-    num_perceiver_queries: int = 32
+    num_perceiver_queries: int = 58
+    perceiver_grid_h: int = 6
+    perceiver_grid_w: int = 8
+    perceiver_global_count: int = 10
+    
     perceiver_hidden_size: int = 512
     perceiver_heads: int = 8
     perceiver_layers: int = 4

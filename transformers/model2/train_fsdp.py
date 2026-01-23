@@ -134,6 +134,10 @@ def train_one_epoch(
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
     target_dtype = dtype_map.get(cfg.mixed_precision, torch.float32)
 
+    accum_loss = {}
+    accum_count = 0
+    last_avg_loss = None
+
     for batch_idx, sample in enumerate(loader):
         sample = recursive_to_device(sample, accelerator.device)
         
@@ -156,6 +160,12 @@ def train_one_epoch(
             # Backward
             accelerator.backward(loss)
 
+            # Accumulate unscaled losses for logging
+            for k, v in loss_dict.items():
+                val = v.item() if torch.is_tensor(v) else float(v)
+                accum_loss[k] = accum_loss.get(k, 0.0) + val
+            accum_count += 1
+
             # Optimizer Step
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm)
@@ -166,12 +176,15 @@ def train_one_epoch(
                 
                 global_step += 1
                 
+                avg_loss = accum_loss.get("total", 0.0) / max(accum_count, 1)
+                last_avg_loss = avg_loss
+
                 if accelerator.is_main_process:
-                    metrics = {"train/loss": loss.item() * cfg.grad_accumulation_steps}
+                    metrics = {"train/loss": avg_loss}
                     # Add component losses
-                    for k, v in loss_dict.items():
+                    for k, v in accum_loss.items():
                         if k != "total":
-                            metrics[f"train/loss_{k}"] = v.item() if torch.is_tensor(v) else v
+                            metrics[f"train/loss_{k}"] = v / max(accum_count, 1)
                             
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
                     metrics["train/epoch"] = epoch + (batch_idx / steps_in_epoch)
@@ -180,16 +193,20 @@ def train_one_epoch(
                     
                     # Log to wandb using the optimizer step as the X-axis
                     wandb.log(metrics, step=global_step)
+
+                    accum_loss = {}
+                    accum_count = 0
             
             total_loss += loss.item() * cfg.grad_accumulation_steps
             
-            if batch_idx % 10 == 0 and accelerator.is_main_process:
+            if accelerator.sync_gradients and accelerator.is_main_process:
+                display_loss = last_avg_loss if last_avg_loss is not None else loss.item() * cfg.grad_accumulation_steps
                 elapsed = time.time() - t0
                 t0 = time.time()
                 logger.info(
                     f"Ep {epoch} [{batch_idx}/{steps_in_epoch}] "
                     f"Step: {global_step} | "
-                    f"Loss: {loss.item()*cfg.grad_accumulation_steps:.4f} | "
+                    f"Loss: {display_loss:.4f} | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
                     f"Time/10: {elapsed:.1f}s"
                 )

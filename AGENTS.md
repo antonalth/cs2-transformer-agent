@@ -29,3 +29,7 @@
 ### Training Loss Monitoring
 - **WandB Monitor**: CLI tool to track training progress and losses.
   - **Run command**: `docker exec <container_id> python3 tools/wandb_monitor.py [flags]`
+
+### Inference Visualization
+- **Video Generation**: Generate a side-by-side GT vs Prediction video from a sharded FSDP checkpoint.
+  - **Run command**: `docker exec <container_id> accelerate launch --num_processes 4 --use_fsdp --fsdp_version 2 --mixed_precision bf16 transformers/model2/visualize_inference.py --checkpoint <path_to_checkpoint> --output <filename>.mp4`
