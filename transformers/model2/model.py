@@ -218,7 +218,7 @@ class PatchCompressor(nn.Module):
             if expected_total == self.num_latents:
                 self.use_spatial_mask = True
                 mask = self._generate_spatial_mask(30, 40) # Assuming 480x640 / 16
-                self.register_buffer("spatial_mask", mask)
+                self.register_buffer("spatial_mask", mask, persistent=False)
             else:
                 print(f"WARNING: PatchCompressor config mismatch. Queries={self.num_latents} != {self.grid_h}x{self.grid_w}+{self.global_count}. Spatial masking disabled.")
 
@@ -331,6 +331,9 @@ class PatchCompressor(nn.Module):
                 # Our mask is float -inf/0.0
                 prefix = torch.zeros((mask.shape[0], diff), device=mask.device, dtype=mask.dtype)
                 mask = torch.cat([prefix, mask], dim=1)
+            
+            # Ensure mask matches latents dtype (important for mixed precision)
+            mask = mask.to(dtype=latents.dtype)
 
         for b in range(self.num_blocks):
             cross = self.cross_blocks[0] if self.share_cross else self.cross_blocks[b]
