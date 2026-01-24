@@ -378,6 +378,7 @@ class DatasetRoot:
                             length_frames = length_frames
                         )
                     )
+        rnd.shuffle(samples)
         return Epoch(self.config, epoch_idx, samples)
 
 def _collate_identity(batch):

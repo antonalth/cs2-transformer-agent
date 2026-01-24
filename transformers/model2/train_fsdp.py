@@ -115,6 +115,7 @@ def train_one_epoch(
     model: nn.Module,
     criterion: nn.Module,
     loader: DataLoader, 
+    val_loader: DataLoader,
     optimizer: optim.Optimizer, 
     scheduler: Any, 
     accelerator: Accelerator,
@@ -196,6 +197,13 @@ def train_one_epoch(
 
                     accum_loss = {}
                     accum_count = 0
+                
+                # Validation Trigger
+                if global_step % cfg.val_every_steps == 0:
+                    validate(model, criterion, val_loader, accelerator, cfg, epoch, limit_samples=cfg.val_samples_limit)
+                    # Return to training mode
+                    model.train()
+                    criterion.train()
             
             total_loss += loss.item() * cfg.grad_accumulation_steps
             
@@ -208,7 +216,7 @@ def train_one_epoch(
                     f"Step: {global_step} | "
                     f"Loss: {display_loss:.4f} | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                    f"Time/10: {elapsed:.1f}s"
+                    f"Time/gradaccum: {elapsed:.1f}s"
                 )
             
             # Check for external checkpoint trigger
@@ -228,7 +236,7 @@ def train_one_epoch(
 
     return total_loss / steps_in_epoch, global_step
 
-def validate(model, criterion, loader, accelerator, cfg, epoch):
+def validate(model, criterion, loader, accelerator, cfg, epoch, limit_samples=None):
     model.eval()
     criterion.eval()
 
@@ -236,15 +244,25 @@ def validate(model, criterion, loader, accelerator, cfg, epoch):
     agg_metrics = {}
     count = 0
     
+    # Calculate max steps if limit is set
+    max_steps = None
+    if limit_samples is not None:
+        # Round up
+        batch_size_global = cfg.batch_size * accelerator.num_processes
+        max_steps = math.ceil(limit_samples / batch_size_global)
+
     # Determine target dtype
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
     target_dtype = dtype_map.get(cfg.mixed_precision, torch.float32)
 
     if accelerator.is_main_process:
-        logger.info("Starting Validation...")
+        logger.info(f"Starting Validation (Limit: {limit_samples if limit_samples else 'All'} samples)...")
     
     with torch.no_grad():
-        for sample in loader:
+        for i, sample in enumerate(loader):
+            if max_steps is not None and i >= max_steps:
+                break
+
             sample = recursive_to_device(sample, accelerator.device)
             # Ensure consistency in validation too
             sample.truth = recursive_apply_to_floats(sample.truth, lambda t: t.to(dtype=target_dtype))
@@ -444,10 +462,8 @@ def main():
         train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
         
         train_loss, global_step = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler, accelerator, t_cfg, global_cfg, epoch, global_step
+            model, criterion, train_loader, val_loader, optimizer, scheduler, accelerator, t_cfg, global_cfg, epoch, global_step
         )
-        
-        val_loss = validate(model, criterion, val_loader, accelerator, t_cfg, epoch)
         
         if (epoch + 1) % t_cfg.save_every == 0:
             if accelerator.is_main_process:

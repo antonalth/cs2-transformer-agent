@@ -35,18 +35,13 @@ class ModelConfig:
     audio_chunk_size: int = 1  # how many audio chunks go through audio encoder at a time
 
     # --- Fusion (Q-Former) ---
-    num_perceiver_queries: int = 58
-    perceiver_grid_h: int = 6
-    perceiver_grid_w: int = 8
-    perceiver_global_count: int = 10
+    qformer_num_queries: int = 64
+    qformer_hidden_size: int = 768
+    qformer_num_hidden_layers: int = 4
+    qformer_num_attention_heads: int = 12
+    qformer_intermediate_size: int = 3072
     
-    perceiver_hidden_size: int = 512
-    perceiver_heads: int = 8
-    perceiver_layers: int = 4
-    patch_compressor_num_blocks: int = 4
-    patch_compressor_self_attends_per_block: int = 2
-    patch_compressor_mlp_ratio: float = 4.0
-    patch_compressor_dropout: float = 0.0
+    vision_num_patches: int = 1205
 
     # Adapter
     adapter_hidden_dim: int = 2048
@@ -125,6 +120,10 @@ class TrainConfig:
     # System
     save_every: int = 1
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32", ...
+    
+    # Validation
+    val_samples_limit: int = 300
+    val_every_steps: int = 2000
 
 
 # ---------- GlobalConfig with read/write ----------

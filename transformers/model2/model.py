@@ -26,56 +26,10 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoModel, AutoImageProcessor, LlamaConfig, LlamaModel, 
-    DacModel
+    DacModel, Blip2QFormerConfig, Blip2QFormerModel
 )
 
 from config import ModelConfig
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False, device=None, dtype=torch.float32):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size_h*grid_size_w, embed_dim] or [1+grid_size_h*grid_size_w, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = torch.arange(grid_size_h, dtype=dtype, device=device)
-    grid_w = torch.arange(grid_size_w, dtype=dtype, device=device)
-    grid = torch.meshgrid(grid_w, grid_h, indexing='xy')
-    grid = torch.stack(grid, dim=0)
-
-    grid = grid.reshape([2, 1, grid_size_h, grid_size_w])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = torch.cat([torch.zeros([1, embed_dim], dtype=dtype, device=device), pos_embed], dim=0)
-    return pos_embed
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
-    return emb
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: [H, W] positions to encode
-    return: [H*W, embed_dim]
-    """
-    assert embed_dim % 2 == 0
-    omega = torch.arange(embed_dim // 2, dtype=pos.dtype, device=pos.device)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = torch.einsum('m,d->md', pos, omega)  # (M, D/2)
-
-    emb_sin = torch.sin(out) # (M, D/2)
-    emb_cos = torch.cos(out) # (M, D/2)
-
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
-    return emb
 
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim, dtype):
@@ -152,201 +106,65 @@ class _CrossAttentionBlock(nn.Module):
         return self.out_norm(latents)
 
 
-class _SelfAttentionFFNBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float, dtype):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim, dtype=dtype)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True, dtype=dtype)
-        self.norm2 = nn.LayerNorm(dim, dtype=dtype)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(hidden, dim, dtype=dtype),
-        )
-
-    def forward(self, x):
-        x_norm = self.norm1(x)
-        out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
-        x = x + out
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
 class PatchCompressor(nn.Module):
     """
-    Perceiver-style iterative latent attention:
-      repeat num_blocks times:
-        1) cross-attn: latents -> patch tokens
-        2) latent self-attn tower (num_self_attends_per_block layers)
-
-    Output: [B, Nq, Dq]
+    Blip2QFormer-based compressor.
+    Input: [B, N_patches, D_vision]
+    Output: [B, N_queries, D_qformer]
     """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        dt = cfg.dtype
-
-        # Keep your naming so adapter doesn't change:
-        self.num_latents = cfg.num_perceiver_queries
-        self.latent_dim = cfg.perceiver_hidden_size
-        self.input_dim = cfg.vision_hidden_size
-
-        # Perceiver-like knobs (add these to cfg if you want; safe defaults):
-        self.num_blocks = int(getattr(cfg, "patch_compressor_num_blocks", 4))  # how many times to re-query inputs
-        self.num_self_attends_per_block = int(getattr(cfg, "patch_compressor_self_attends_per_block", 2))
-        self.mlp_ratio = float(getattr(cfg, "patch_compressor_mlp_ratio", 4.0))
-        self.dropout = float(getattr(cfg, "patch_compressor_dropout", 0.0))
-
-        # Weight sharing (paper discusses optional sharing) :contentReference[oaicite:3]{index=3}
-        self.share_cross = bool(getattr(cfg, "patch_compressor_share_cross", True))
-        self.share_self = bool(getattr(cfg, "patch_compressor_share_self", True))
-
-        self.latents = nn.Parameter(
-            torch.randn(1, self.num_latents, self.latent_dim, dtype=dt) * 0.02
+        
+        vision_dim = cfg.vision_hidden_size
+        qformer_dim = cfg.qformer_hidden_size
+        num_queries = cfg.qformer_num_queries
+        num_patches = cfg.vision_num_patches
+        
+        # 1. Instantiate the Configuration
+        config = Blip2QFormerConfig(
+            hidden_size=qformer_dim,
+            encoder_hidden_size=vision_dim,
+            num_hidden_layers=cfg.qformer_num_hidden_layers,
+            num_attention_heads=cfg.qformer_num_attention_heads,
+            intermediate_size=cfg.qformer_intermediate_size,
         )
         
-        # Spatial Logic
-        self.grid_h = getattr(cfg, "perceiver_grid_h", 0)
-        self.grid_w = getattr(cfg, "perceiver_grid_w", 0)
-        self.global_count = getattr(cfg, "perceiver_global_count", 0)
+        # 2. Instantiate the Model
+        self.qformer = Blip2QFormerModel(config)
+        self.qformer.to(dtype=cfg.dtype)
         
-        # Check if we should enable spatial masking
-        self.use_spatial_mask = False
-        if self.grid_h > 0 and self.grid_w > 0:
-            expected_total = self.grid_h * self.grid_w + self.global_count
-            if expected_total == self.num_latents:
-                self.use_spatial_mask = True
-                mask = self._generate_spatial_mask(30, 40) # Assuming 480x640 / 16
-                self.register_buffer("spatial_mask", mask, persistent=False)
-            else:
-                print(f"WARNING: PatchCompressor config mismatch. Queries={self.num_latents} != {self.grid_h}x{self.grid_w}+{self.global_count}. Spatial masking disabled.")
-
-        if self.share_cross:
-            self.cross_blocks = nn.ModuleList([
-                _CrossAttentionBlock(self.latent_dim, self.input_dim, cfg.perceiver_heads, self.dropout, dt)
-            ])
-        else:
-            self.cross_blocks = nn.ModuleList([
-                _CrossAttentionBlock(self.latent_dim, self.input_dim, cfg.perceiver_heads, self.dropout, dt)
-                for _ in range(self.num_blocks)
-            ])
-
-        if self.share_self:
-            self.self_tower = nn.ModuleList([
-                _SelfAttentionFFNBlock(self.latent_dim, cfg.perceiver_heads, self.mlp_ratio, self.dropout, dt)
-                for _ in range(self.num_self_attends_per_block)
-            ])
-        else:
-            self.self_tower_per_block = nn.ModuleList([
-                nn.ModuleList([
-                    _SelfAttentionFFNBlock(self.latent_dim, cfg.perceiver_heads, self.mlp_ratio, self.dropout, dt)
-                    for _ in range(self.num_self_attends_per_block)
-                ])
-                for _ in range(self.num_blocks)
-            ])
-
-    def _generate_spatial_mask(self, H, W):
-        num_patches = H * W
-        num_local = self.grid_h * self.grid_w
-        total_latents = num_local + self.global_count
+        # 3. Create the Learned Query Tokens
+        self.query_tokens = nn.Parameter(torch.randn(1, num_queries, qformer_dim, dtype=cfg.dtype))
         
-        # 0.0 for include, -inf for exclude
-        mask = torch.full((total_latents, num_patches), float('-inf'))
-        
-        block_h = H // self.grid_h
-        block_w = W // self.grid_w
-        
-        for i in range(self.grid_h):
-            for j in range(self.grid_w):
-                latent_idx = i * self.grid_w + j
-                
-                row_start = i * block_h
-                row_end = (i + 1) * block_h
-                col_start = j * block_w
-                col_end = (j + 1) * block_w
-                
-                for r in range(row_start, row_end):
-                    for c in range(col_start, col_end):
-                        patch_idx = r * W + c
-                        if patch_idx < num_patches:
-                            mask[latent_idx, patch_idx] = 0.0
-                            
-        # Global tokens attend to everything
-        for k in range(self.global_count):
-            latent_idx = num_local + k
-            mask[latent_idx, :] = 0.0
-            
-        return mask
+        # 4. Learned Position Embeddings for Patches
+        # Simple learned embeddings added to input patches
+        self.patch_pos_embed = nn.Parameter(torch.randn(1, num_patches, vision_dim, dtype=cfg.dtype) * 0.02)
 
-    def forward(self, patch_tokens: torch.Tensor, patch_key_padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, patch_tokens: torch.Tensor):
+        # patch_tokens: [B, N, D]
         B, N, D = patch_tokens.shape
-        latents = self.latents.expand(B, -1, -1)  # [B, Nq, Dq]
-
-        # 1. Add PE to Latents (Queries)
-        if self.use_spatial_mask: 
-            num_spatial = self.grid_h * self.grid_w
-            # Generate PE for the latent grid (e.g. 6x8)
-            # Use same dtype/device as latents
-            pe_latents = get_2d_sincos_pos_embed(
-                self.latent_dim, 
-                self.grid_h, 
-                self.grid_w, 
-                cls_token=False, 
-                device=latents.device, 
-                dtype=latents.dtype
-            ) # [48, 512]
-            
-            # Add to the spatial part of latents
-            # latents is [B, 58, 512]
-            spatial_latents = latents[:, :num_spatial, :] + pe_latents.unsqueeze(0)
-            global_latents = latents[:, num_spatial:, :]
-            latents = torch.cat([spatial_latents, global_latents], dim=1)
-
-        # 2. Add PE to Patches (Keys/Values)
-        # Target patches: 30x40 = 1200
-        num_patches = 30 * 40
         
-        if N >= num_patches:
-            diff = N - num_patches
-            # Generate PE for 30x40 grid
-            pe = get_2d_sincos_pos_embed(self.input_dim, 30, 40, cls_token=False, device=patch_tokens.device, dtype=patch_tokens.dtype)
-            pe = pe.unsqueeze(0) # [1, 1200, D]
-            
-            if diff > 0:
-                # Add to the patch part only
-                patches = patch_tokens[:, diff:, :] + pe
-                patch_tokens = torch.cat([patch_tokens[:, :diff, :], patches], dim=1)
-            else:
-                patch_tokens = patch_tokens + pe
+        # Add position embeddings to tokens (patches + extra tokens like CLS/Registers)
+        # Slice or broadcast position embeddings to match input token count N
+        if N <= self.patch_pos_embed.shape[1]:
+            patch_tokens = patch_tokens + self.patch_pos_embed[:, :N, :]
+        else:
+            # Fallback if N is somehow larger than our pre-allocated embeddings
+            patch_tokens[:, :self.patch_pos_embed.shape[1], :] = \
+                patch_tokens[:, :self.patch_pos_embed.shape[1], :] + self.patch_pos_embed
         
-        # Handle Mask
-        mask = None
-        if self.use_spatial_mask:
-            mask = self.spatial_mask # [58, 1200]
-            if N > num_patches:
-                diff = N - num_patches
-                # Prepend zeros (allow attention to CLS/Regs)
-                # mask device/dtype should match expectations of MultiheadAttention (usually float/bool)
-                # Our mask is float -inf/0.0
-                prefix = torch.zeros((mask.shape[0], diff), device=mask.device, dtype=mask.dtype)
-                mask = torch.cat([prefix, mask], dim=1)
-            
-            # Ensure mask matches latents dtype (important for mixed precision)
-            mask = mask.to(dtype=latents.dtype)
+        # Expand learned queries
+        query_embeds = self.query_tokens.expand(B, -1, -1)
+        
+        # Forward Pass
+        outputs = self.qformer(
+            query_embeds=query_embeds,
+            encoder_hidden_states=patch_tokens,
+        )
+        
+        return outputs.last_hidden_state
 
-        for b in range(self.num_blocks):
-            cross = self.cross_blocks[0] if self.share_cross else self.cross_blocks[b]
-            latents = cross(latents, patch_tokens, patch_key_padding_mask, attn_mask=mask)
-
-            if self.share_self:
-                for layer in self.self_tower:
-                    latents = layer(latents)
-            else:
-                for layer in self.self_tower_per_block[b]:
-                    latents = layer(latents)
-
-        return latents
 
 class GameVideoEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -426,7 +244,7 @@ class GameVideoEncoder(nn.Module):
             q_chunks.append(q_out)
 
         q_all = torch.cat(q_chunks, dim=0)  # [B*T*P, N_q, D_q]
-        q_all = q_all.view(B, T, P, self.cfg.num_perceiver_queries, self.cfg.perceiver_hidden_size)
+        q_all = q_all.view(B, T, P, self.cfg.qformer_num_queries, self.cfg.qformer_hidden_size)
         return q_all
 
 class GameAudioEncoder(nn.Module):
@@ -550,7 +368,8 @@ class GamePredictorBackbone(nn.Module):
         
         # Audio Projection
         # Project audio to match vision dimension for concatenation
-        self.audio_proj = nn.Linear(self.audio.output_dim, cfg.perceiver_hidden_size, dtype=cfg.dtype)
+        # Use qformer_hidden_size instead of perceiver_hidden_size
+        self.audio_proj = nn.Linear(self.audio.output_dim, cfg.qformer_hidden_size, dtype=cfg.dtype)
         
         # Initial Queries
         # Use Embedding(1, D) to avoid FSDP issues with standalone parameters
@@ -577,15 +396,16 @@ class GamePredictorBackbone(nn.Module):
         )
 
         for i in range(cfg.backbone_splits):
+            # Cross attention accepts qformer_hidden_size now
             cross = _CrossAttentionBlock(
                 latent_dim=cfg.llama_hidden_size,
-                input_dim=cfg.perceiver_hidden_size,
+                input_dim=cfg.qformer_hidden_size,
                 num_heads=cfg.llama_heads, 
                 dropout=0.0,
                 dtype=cfg.dtype
             )
             
-            part = LlamaModel(llama_conf)
+            part = LlamaModel(llama_conf).to(dtype=cfg.dtype)
             if cfg.gradient_checkpointing:
                 part.gradient_checkpointing_enable()
             
@@ -616,7 +436,7 @@ class GamePredictorBackbone(nn.Module):
         del vid_feats, aud_feats
         
         # Reshape context for cross attention: [B*T*P, Tokens, Dim]
-        context_flat = context.view(B*T*P, -1, self.cfg.perceiver_hidden_size)
+        context_flat = context.view(B*T*P, -1, self.cfg.qformer_hidden_size)
         
         # --- Prepare Initial Hidden State ---
         # Players: [B, T, 5, D]
