@@ -123,7 +123,7 @@ class TrainConfig:
     
     # Validation
     val_samples_limit: int = 300
-    val_every_steps: int = 2000
+    val_every_steps: int = 100
 
 
 # ---------- GlobalConfig with read/write ----------
