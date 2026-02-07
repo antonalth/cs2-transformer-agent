@@ -48,12 +48,21 @@ def main():
     )
     
     # Checkpoint every epoch
-    checkpoint_callback = ModelCheckpoint(
+    checkpoint_callback_epoch = ModelCheckpoint(
         dirpath=t_cfg.output_dir,
         filename="checkpoint_ep{epoch}",
         save_top_k=-1, 
         every_n_epochs=t_cfg.save_every,
         save_on_train_epoch_end=True,
+        save_weights_only=False
+    )
+
+    # Checkpoint every N steps (intra-epoch)
+    checkpoint_callback_step = ModelCheckpoint(
+        dirpath=t_cfg.output_dir,
+        filename="checkpoint_step{step}",
+        save_top_k=-1, # Keep all step checkpoints (or use a monitor if you want top K)
+        every_n_train_steps=t_cfg.checkpoint_every_n_steps,
         save_weights_only=False
     )
     
@@ -84,6 +93,8 @@ def main():
     if t_cfg.val_samples_limit is not None:
         global_batch_size = t_cfg.batch_size * num_devices
         val_limit_batches = math.ceil(t_cfg.val_samples_limit / max(1, global_batch_size))
+    else:
+        val_limit_batches = 1.0 # Full validation set
 
     # 5. Trainer
     trainer = pl.Trainer(
@@ -94,7 +105,7 @@ def main():
         strategy=strategy,
         precision=precision,
         logger=logger,
-        callbacks=[checkpoint_callback, lr_monitor],
+        callbacks=[checkpoint_callback_epoch, checkpoint_callback_step, lr_monitor],
         accumulate_grad_batches=t_cfg.grad_accumulation_steps,
         gradient_clip_val=None, # Disabled to avoid FSDP MisconfigurationException
         

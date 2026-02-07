@@ -13,8 +13,8 @@ class DatasetConfig:
 
     warn_skip: bool = False
 
-    epoch_gen_random_seed: int = 42
-    epoch_windows_per_round: int = 5  # how many random windows
+    # Sliding window configuration
+    sample_stride: int = 256  # step size for sliding window
     epoch_round_sample_length: int = 512  # number of frames per window
     epoch_video_decoding_device: str = "cpu"
     audio_sample_rate: int = 24000
@@ -111,7 +111,7 @@ class TrainConfig:
     # Optimization
     batch_size: int = 1          # Per GPU
     grad_accumulation_steps: int = 16
-    max_epochs: int = 20
+    max_epochs: int = 8
     lr: float = 2e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
@@ -119,11 +119,12 @@ class TrainConfig:
     
     # System
     save_every: int = 1
+    checkpoint_every_n_steps: int = 1000 # Checkpoint every N steps
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32", ...
     
     # Validation
-    val_samples_limit: int = 300
-    val_every_steps: int = 100
+    val_samples_limit: int = None # Use full validation set
+    val_every_steps: int = 1000
 
 
 # ---------- GlobalConfig with read/write ----------

@@ -118,15 +118,13 @@ class RoundSample:
 
 
 class Epoch(torch.utils.data.Dataset):
-    epoch_idx: int
     samples: List[RoundSample]
     config: DatasetConfig
     temp_dir: str
     lmdb_envs: dict[str, lmdb.Environment]
 
-    def __init__(self, config: DatasetConfig, epoch_idx: int, samples: List[RoundSample]):
+    def __init__(self, config: DatasetConfig, samples: List[RoundSample]):
         self.config = config
-        self.epoch_idx = epoch_idx
         self.samples = samples
         self.lmdb_envs: dict[str, lmdb.Environment] = {}
 
@@ -379,25 +377,45 @@ class DatasetRoot:
                           end_tick=int(r["end_tick"]), pov_video=videos, pov_audio=audio)
             game.rounds.append(round)
 
-    def build_epoch(self, split: str, epoch_idx: int) -> Epoch:
-        rnd = random.Random(self.config.epoch_gen_random_seed + epoch_idx)
+    def build_dataset(self, split: str) -> Epoch:
         samples: List[RoundSample] = []
         games = self.train if split == "train" else self.val
+        stride = self.config.sample_stride
+        length = self.config.epoch_round_sample_length
+        
         for g in games:
             for r in g.rounds:
-                for _ in range(self.config.epoch_windows_per_round):
-                    start_f = rnd.randint(0, max(0, r.frame_count - self.config.epoch_round_sample_length))
-                    length_frames = self.config.epoch_round_sample_length if r.frame_count >= self.config.epoch_round_sample_length else r.frame_count
+                # Sliding window over the round
+                # Ensure we cover the round effectively
+                max_start_frame = max(0, r.frame_count - length)
+                
+                # Create windows
+                for start_f in range(0, max_start_frame + 1, stride):
                     samples.append(
                         RoundSample(
                             round = r,
                             start_tick = r.start_tick + TICKS_PER_FRAME * start_f,
                             start_frame = start_f,
-                            length_frames = length_frames
+                            length_frames = min(length, r.frame_count) # handle very short rounds if any
                         )
                     )
-        rnd.shuffle(samples)
-        return Epoch(self.config, epoch_idx, samples)
+                    
+                # Ensure the last window covers the end if stride leaves a gap > some threshold?
+                # For simplicity, standard sliding window is usually enough. 
+                # If we want to guarantee the last frame is included:
+                if (max_start_frame % stride) != 0 and r.frame_count >= length:
+                     samples.append(
+                        RoundSample(
+                            round = r,
+                            start_tick = r.start_tick + TICKS_PER_FRAME * max_start_frame,
+                            start_frame = max_start_frame,
+                            length_frames = length
+                        )
+                    )
+
+        # No shuffling here for deterministic dataset creation. 
+        # Shuffling will be handled by DataLoader(shuffle=True).
+        return Epoch(self.config, samples)
 
 def _collate_identity(batch):
     return batch[0]
