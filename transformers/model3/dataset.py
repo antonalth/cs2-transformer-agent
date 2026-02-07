@@ -18,8 +18,8 @@ limitations under the License.
 from __future__ import annotations
 
 import os, json, random, logging, argparse
-from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from dataclasses import dataclass, field, fields
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 
 import lmdb, msgpack, numpy as np, msgpack_numpy as mpnp
@@ -58,10 +58,28 @@ class GroundTruth:
 
 @dataclass
 class TrainingSample:
-    _roundsample: RoundSample # internal reference back
     images: torch.Tensor # [T, P=5, C, H, W]
     audio: torch.Tensor # raw waveform in [P=5, 2, samples]
     truth: GroundTruth # GT for sample
+    _roundsample: Optional[RoundSample] = None # internal reference back
+
+def cs2_collate_fn(batch: List[TrainingSample]) -> TrainingSample:
+    imgs = torch.stack([s.images for s in batch])
+    audio_raw = torch.stack([s.audio for s in batch])
+    
+    first_gt = batch[0].truth
+    gt_fields = {}
+    for f in fields(first_gt):
+        gt_fields[f.name] = torch.stack([getattr(s.truth, f.name) for s in batch])
+    batched_truth = GroundTruth(**gt_fields)
+
+    # We drop _roundsample in the batch to avoid cyclic deepcopy issues in PL/FSDP
+    return TrainingSample(
+        images=imgs,
+        audio=audio_raw,
+        truth=batched_truth,
+        _roundsample=None 
+    )
 
 @dataclass
 class Game:
@@ -584,9 +602,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "DatasetConfig"
+    "DatasetConfig",
     "DatasetRoot",
     "TrainingSample",
     "GroundTruth",
     "Epoch",
+    "cs2_collate_fn",
 ]
