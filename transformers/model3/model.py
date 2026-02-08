@@ -186,9 +186,7 @@ class GameVideoEncoder(nn.Module):
 
         self.compressor = PatchCompressor(cfg)
         
-        # We need to know the device of the vision model for the chunk processor
-        self.dummy_param = nn.Parameter(torch.empty(0, dtype=cfg.dtype))
-
+        
     def _forward_vision(self, chunk_cpu: torch.Tensor) -> torch.Tensor:
         # chunk_cpu: [N, C, H, W] (likely uint8 or float32 on CPU)
         

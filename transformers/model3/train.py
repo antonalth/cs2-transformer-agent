@@ -3,6 +3,9 @@ import os
 import math
 import torch
 import pytorch_lightning as pl
+
+torch.set_float32_matmul_precision('high')
+
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.strategies import FSDPStrategy

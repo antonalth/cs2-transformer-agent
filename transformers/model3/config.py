@@ -119,11 +119,11 @@ class TrainConfig:
     
     # System
     save_every: int = 1
-    checkpoint_every_n_steps: int = 1000 # Checkpoint every N steps
+    checkpoint_every_n_steps: int = 200 # Checkpoint every N (GLOBAL) steps (*16)
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32", ...
     
     # Validation
-    val_samples_limit: int = None # Use full validation set
+    val_samples_limit: int = 300 # Limit validation for speed (nonglobal steps) *1
     val_every_steps: int = 1000
 
 
