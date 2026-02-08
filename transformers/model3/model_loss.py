@@ -91,6 +91,14 @@ class ModelLoss(nn.Module):
         self.model_cfg = cfg.model
         self.weights = cfg.model.loss_weights
         self.enabled = cfg.model.loss_enabled
+        self.mouse_center_bin = int(
+            mu_law_encode(
+                torch.tensor([0.0]),
+                self.model_cfg.mouse_mu,
+                self.model_cfg.mouse_max,
+                self.model_cfg.mouse_bins_count,
+            ).item()
+        )
         
         # Loss Functions
         self.ce = nn.CrossEntropyLoss(reduction='none')
@@ -133,10 +141,17 @@ class ModelLoss(nn.Module):
             # Pred: [B, T, 5, Bins] -> [N, Bins]
             pred_mx = pred.mouse_x.view(-1, self.model_cfg.mouse_bins_count)
             pred_my = pred.mouse_y.view(-1, self.model_cfg.mouse_bins_count)
+
+            mouse_bin_weights = torch.ones(
+                self.model_cfg.mouse_bins_count,
+                device=pred_mx.device,
+                dtype=pred_mx.dtype,
+            )
+            mouse_bin_weights[self.mouse_center_bin] = self.model_cfg.mouse_center_bin_weight
             
             # Loss (Masked)
-            l_mx = self.ce(pred_mx, mx_bin)
-            l_my = self.ce(pred_my, my_bin)
+            l_mx = F.cross_entropy(pred_mx, mx_bin, weight=mouse_bin_weights, reduction='none')
+            l_my = F.cross_entropy(pred_my, my_bin, weight=mouse_bin_weights, reduction='none')
             
             l_mouse = (l_mx * mask).sum() / num_valid + (l_my * mask).sum() / num_valid
             w_mouse = l_mouse * self.weights.get("mouse", 1.0)

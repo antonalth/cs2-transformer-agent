@@ -78,6 +78,7 @@ class ModelConfig:
     mouse_bins_count: int = 33
     mouse_mu: int = 255
     mouse_max: float = 30.0
+    mouse_center_bin_weight: float = 0.3
 
     # Loss Configuration
     loss_weights: dict = None
@@ -91,7 +92,7 @@ class ModelConfig:
                 "team_alive": 0.6, "enemy_alive": 0.7,
                 "active_weapon": 0.3, "eco_buy": 1.2, "eco_purchase": 1.2,
                 "player_pos": 0.2, "enemy_pos": 0.1, # grouped x,y,z
-                "keyboard": 10.0, "mouse": 0.25
+                "keyboard": 10.0, "mouse": 0.4
             }
         if self.loss_enabled is None:
             self.loss_enabled = {k: True for k in self.loss_weights.keys()}
