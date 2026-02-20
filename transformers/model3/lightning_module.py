@@ -138,7 +138,12 @@ class CS2PredictorModule(pl.LightningModule):
         if total_steps < warmup_steps:
              warmup_steps = int(0.1 * total_steps)
 
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            warmup_steps,
+            total_steps,
+            min_lr_ratio=self.global_cfg.train.min_lr_ratio,
+        )
         
         return {
             "optimizer": optimizer,

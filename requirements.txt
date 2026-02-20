@@ -14,5 +14,7 @@ bitsandbytes
 tensorboard
 wandb
 optuna
+optuna-integration
+lightning
 accelerate
 pytorch-lightning

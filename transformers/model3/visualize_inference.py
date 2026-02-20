@@ -2,7 +2,7 @@
 """
 visualize_inference.py
 
-Loads a trained model checkpoint, runs inference on validation data,
+Loads a trained PyTorch Lightning model checkpoint, runs inference on validation data,
 and produces a side-by-side visualization video of GT vs Prediction.
 """
 
@@ -17,10 +17,13 @@ from pathlib import Path
 from dataclasses import dataclass, fields, is_dataclass
 from typing import List, Any
 
-from accelerate import Accelerator, FullyShardedDataParallelPlugin
-
 from config import GlobalConfig, DatasetConfig, ModelConfig, TrainConfig
 from dataset import DatasetRoot, GroundTruth, TrainingSample
+
+# Import Lightning Module
+from lightning_module import CS2PredictorModule
+from model import ModelPrediction
+from model_loss import mu_law_decode, unbin_value, mu_law_encode, bin_value
 
 def cs2_collate_fn(batch: List[TrainingSample]) -> TrainingSample:
     imgs = torch.stack([s.images for s in batch])
@@ -38,9 +41,6 @@ def cs2_collate_fn(batch: List[TrainingSample]) -> TrainingSample:
         audio=audio_raw,
         truth=batched_truth
     )
-
-from model import GamePredictorBackbone, ModelPrediction
-from model_loss import mu_law_decode, unbin_value, mu_law_encode, bin_value
 
 # =============================================================================
 # MAPPINGS (Must match injection_mold.py exactly)
@@ -90,54 +90,67 @@ def decode_keyboard(mask: int) -> str:
 
 def decode_round_state(mask: int) -> str:
     states = []
-    if (mask >> 0) & 1: states.append("FREEZE")
-    if (mask >> 1) & 1: states.append("LIVE")
-    if (mask >> 2) & 1: states.append("PLANT")
-    if (mask >> 3) & 1: states.append("T_WIN")
-    if (mask >> 4) & 1: states.append("CT_WIN")
-    return "|".join(states) if states else "NONE"
+    if mask == 0: return "FREEZE" # Assuming 0 is freeze if 1-hot or similar? 
+    # Check if mask is index or bitmask. The code passed it as int index in previous version?
+    # Actually ModelLoss uses it as index for CE.
+    # But in visualization we might receive the raw value.
+    # Let's assume standard mapping:
+    # 0: Freeze, 1: Live, 2: Plant, 3: T_Win, 4: CT_Win
+    mapping = {0: "FREEZE", 1: "LIVE", 2: "PLANT", 3: "T_WIN", 4: "CT_WIN"}
+    return mapping.get(mask, f"UNK({mask})")
 
 def convert_gt_to_viz(gt: GroundTruth, t: int, batch_idx: int = 0, cfg: ModelConfig = None) -> dict:
     """
     Extracts GT data for batch element `batch_idx` at time `t`.
     """
+    # Global
+    r_state = int(gt.round_state_mask[batch_idx, t].item())
+    r_num = int(gt.round_number[batch_idx, t].item())
+    
+    # Alive masks
+    alive_t = gt.alive_mask[batch_idx, t]
+    alive_e = gt.enemy_alive_mask[batch_idx, t]
+    
+    team_alive_count = alive_t.sum().item()
+    enemy_alive_count = alive_e.sum().item()
+    
     gs = {
         'tick': t * 2,
-        'round_state': int(gt.round_state_mask[batch_idx, t].item()),
-        'team_alive': 0,
-        'enemy_alive': 0,
+        'round_state': r_state,
+        'round_num': r_num,
+        'team_alive_count': team_alive_count,
+        'enemy_alive_count': enemy_alive_count,
         'enemy_pos': gt.enemy_positions[batch_idx, t].tolist()
     }
 
     pd = []
-    team_alive_mask = 0;
-    enemy_alive_mask = 0;
-    alive_t = gt.alive_mask[batch_idx, t];
-    alive_e = gt.enemy_alive_mask[batch_idx, t];
 
     for p in range(5):
-        if alive_t[p].item(): team_alive_mask |= (1 << p);
-        if alive_e[p].item(): enemy_alive_mask |= (1 << p);
-        
-        stats = gt.stats[batch_idx, t, p].tolist();
-        pos = gt.position[batch_idx, t, p];
-        mouse = gt.mouse_delta[batch_idx, t, p];
+        stats = gt.stats[batch_idx, t, p].tolist()
+        pos = gt.position[batch_idx, t, p]
+        mouse = gt.mouse_delta[batch_idx, t, p]
         
         # Calculate Bins for GT if cfg is provided
-        m_bins = [None, None];
-        p_bins = [None, None, None];
+        m_bins = [None, None]
+        p_bins = [None, None, None]
         if cfg:
             m_bins = [
                 mu_law_encode(mouse[0], cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item(),
                 mu_law_encode(mouse[1], cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item()
-            ];
-            PMIN, PMAX = -4096.0, 4096.0;
+            ]
+            PMIN, PMAX = -4096.0, 4096.0
             p_bins = [
                 bin_value(pos[0], PMIN, PMAX, cfg.bins_x).item(),
                 bin_value(pos[1], PMIN, PMAX, cfg.bins_y).item(),
                 bin_value(pos[2], PMIN, PMAX, cfg.bins_z).item()
-            ];
+            ]
 
+        # Eco
+        eco_idx = int(gt.eco_buy_idx[batch_idx, t, p].item())
+        # Check purchase bit (logic: if any bit in eco_mask is set, they bought something)
+        # But for Viz we usually just want to know if they are pressing buy.
+        # Let's rely on eco_buy_idx being valid.
+        
         p_dict = {
             'health': int(stats[0]),
             'armor': int(stats[1]),
@@ -147,20 +160,24 @@ def convert_gt_to_viz(gt: GroundTruth, t: int, batch_idx: int = 0, cfg: ModelCon
             'mouse': mouse.tolist(),
             'mouse_bins': m_bins,
             'keyboard_bitmask': int(gt.keyboard_mask[batch_idx, t, p].item()),
-            'active_weapon_idx': int(gt.active_weapon_idx[batch_idx, t, p].item())
-        };
-        pd.append(p_dict);
+            'active_weapon_idx': int(gt.active_weapon_idx[batch_idx, t, p].item()),
+            'eco_buy_idx': eco_idx,
+            'eco_purchase': False # GT doesn't have a direct "buying now" boolean easily accessible without parsing mask, will skip for now or assume idx > -1?
+        }
+        pd.append(p_dict)
         
-    gs['team_alive'] = team_alive_mask;
-    gs['enemy_alive'] = enemy_alive_mask;
     return {'game_state': gs, 'player_data': pd}
 
 def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: ModelConfig = None) -> dict:
     """
     Converts raw logits from ModelPrediction to visualized values.
     """
-    rs_logits = pred.round_state_logits[batch_idx, t, 0]
+    # Global
+    rs_logits = pred.round_state_logits[batch_idx, t, 0] # [5]
     rs_idx = torch.argmax(rs_logits).item()
+    
+    rn_logits = pred.round_num_logits[batch_idx, t, 0] # [31]
+    rn_idx = torch.argmax(rn_logits).item()
     
     ta_logits = pred.team_alive_logits[batch_idx, t, 0]
     ea_logits = pred.enemy_alive_logits[batch_idx, t, 0]
@@ -181,6 +198,7 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
     gs = {
         'tick': t * 2,
         'round_state': rs_idx,
+        'round_num': rn_idx,
         'team_alive_count': ta_count,
         'enemy_alive_count': ea_count,
         'enemy_pos': e_pos
@@ -188,6 +206,7 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
 
     pd = []
     for p in range(5):
+        # Stats
         h_bin = torch.argmax(pred.health_logits[batch_idx, t, p])
         a_bin = torch.argmax(pred.armor_logits[batch_idx, t, p])
         m_bin = torch.argmax(pred.money_logits[batch_idx, t, p])
@@ -196,6 +215,7 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
         a = unbin_value(a_bin, 0, 100, cfg.armor_bins).item()
         m = unbin_value(m_bin, 0, 16000, cfg.money_bins).item()
         
+        # Pos
         pbx = torch.argmax(pred.player_pos_x[batch_idx, t, p])
         pby = torch.argmax(pred.player_pos_y[batch_idx, t, p])
         pbz = torch.argmax(pred.player_pos_z[batch_idx, t, p])
@@ -204,19 +224,27 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
         py = unbin_value(pby, PMIN, PMAX, cfg.bins_y).item()
         pz = unbin_value(pbz, PMIN, PMAX, cfg.bins_z).item()
         
+        # Mouse
         mbx = torch.argmax(pred.mouse_x[batch_idx, t, p])
         mby = torch.argmax(pred.mouse_y[batch_idx, t, p])
         
         mx = mu_law_decode(mbx, cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item()
         my = mu_law_decode(mby, cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item()
         
+        # Weapon
         w_idx = torch.argmax(pred.active_weapon_logits[batch_idx, t, p]).item()
         
+        # Keyboard
         k_logits = pred.keyboard_logits[batch_idx, t, p]
         k_mask = 0
         for k_i in range(32):
             if torch.sigmoid(k_logits[k_i]) > 0.5:
                 k_mask |= (1 << k_i)
+                
+        # Eco
+        eco_idx = torch.argmax(pred.eco_buy_logits[batch_idx, t, p]).item()
+        eco_pur_logit = pred.eco_purchase_logits[batch_idx, t, p].item()
+        eco_pur = torch.sigmoid(torch.tensor(eco_pur_logit)).item() > 0.5
                 
         p_dict = {
             'health': int(h),
@@ -227,7 +255,10 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
             'mouse': [mx, my],
             'mouse_bins': [mbx.item(), mby.item()],
             'keyboard_bitmask': k_mask,
-            'active_weapon_idx': w_idx
+            'active_weapon_idx': w_idx,
+            'eco_buy_idx': eco_idx,
+            'eco_purchase': eco_pur,
+            'eco_purchase_prob': torch.sigmoid(torch.tensor(eco_pur_logit)).item()
         }
         pd.append(p_dict)
         
@@ -260,30 +291,30 @@ def render_player_panel(frame, gt_data, pred_data, player_idx=0):
     def get_lines(data, prefix=""):
         hp, arm, mon = data['health'], data['armor'], data['money']
         idx = data.get('active_weapon_idx', -1)
-        wep_str = ITEM_NAMES[idx] if 0 <= idx < len(ITEM_NAMES) else "Knife/None"
+        wep_str = ITEM_NAMES[idx] if 0 <= idx < len(ITEM_NAMES) else f"UNK({idx})"
+        
         pos = data['pos']
         mouse = data['mouse']
         keys = decode_keyboard(data['keyboard_bitmask'])
         
-        # Get Bins if available (for Pred)
-        mouse_bins = data.get('mouse_bins', [None, None])
-        pos_bins = data.get('pos_bins', [None, None, None])
+        # Eco
+        eco_idx = data.get('eco_buy_idx', -1)
+        eco_str = ITEM_NAMES[eco_idx] if 0 <= eco_idx < len(ITEM_NAMES) else ""
+        is_buying = data.get('eco_purchase', False)
         
-        m_str = f"{mouse[0]:.1f}, {mouse[1]:.1f}"
-        if mouse_bins[0] is not None:
-            m_str += f" (bins: {mouse_bins[0]},{mouse_bins[1]})"
-            
-        p_str = f"{pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
-        if pos_bins[0] is not None:
-            p_str += f" (bins: {pos_bins[0]},{pos_bins[1]},{pos_bins[2]})"
-
-        return [
+        lines = [
             f"{prefix} P{player_idx}: HP {hp} | AP {arm} | ${mon}",
             f"   Wep: {wep_str}",
-            f"   Pos: {p_str}",
-            f"   Aim: {m_str}",
+            f"   Pos: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}",
+            f"   Aim: {mouse[0]:.1f}, {mouse[1]:.1f}",
             f"   Key: {keys}"
         ]
+        
+        if is_buying and eco_str:
+            prob = data.get('eco_purchase_prob', 1.0)
+            lines.append(f"   BUY: {eco_str} ({prob:.2f})")
+            
+        return lines
 
     # Draw GT
     gt_lines = get_lines(gt_data, "GT")
@@ -307,139 +338,110 @@ def render_global_panel(h, w, gt_gs, pred_gs):
     
     # --- GT Column ---
     r_state = decode_round_state(gt_gs['round_state'])
-    t_alive = gt_gs.get('team_alive', 0)
-    e_alive = gt_gs.get('enemy_alive', 0)
+    r_num = gt_gs.get('round_num', '?')
+    t_alive = gt_gs.get('team_alive_count', 0)
+    e_alive = gt_gs.get('enemy_alive_count', 0)
     
     gt_lines = [
         f"Tick: {gt_gs.get('tick', '?')}",
-        f"State: {r_state}",
-        f"T Mask: {bin(t_alive)[2:].zfill(5)}",
-        f"E Mask: {bin(e_alive)[2:].zfill(5)}",
+        f"State: {r_state} | R: {r_num}",
+        f"T Alive: {t_alive}",
+        f"E Alive: {e_alive}",
         "Enemies:"
     ]
     
-    ep_bins = gt_gs.get('enemy_pos_bins', [None]*5)
     for i, pos in enumerate(gt_gs['enemy_pos']):
-        # Show if alive or just all for debug
-        if (e_alive >> i) & 1:
-            line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
-            if ep_bins[i] is not None:
-                line += f" ({ep_bins[i][0]},{ep_bins[i][1]},{ep_bins[i][2]})"
-            gt_lines.append(line)
+        line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
+        gt_lines.append(line)
 
     draw_text_lines(panel, gt_lines, 10, 60, COLORS['gt'], scale=0.5)
     
     # --- Pred Column ---
     if pred_gs:
         pr_state = decode_round_state(pred_gs['round_state'])
+        pr_num = pred_gs.get('round_num', '?')
+        
         pred_lines = [
-            f"Tick: {gt_gs.get('tick', '?')}", # Same tick
-            f"State: {pr_state}",
-            f"T Count: {pred_gs['team_alive_count']}",
-            f"E Count: {pred_gs['enemy_alive_count']}",
+            f"Tick: {gt_gs.get('tick', '?')}", 
+            f"State: {pr_state} | R: {pr_num}",
+            f"T Alive: {pred_gs['team_alive_count']}",
+            f"E Alive: {pred_gs['enemy_alive_count']}",
             "Enemies:"
         ]
         
-        ep_bins_p = pred_gs.get('enemy_pos_bins', [None]*5)
         for i, pos in enumerate(pred_gs['enemy_pos']):
             line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
-            if ep_bins_p[i] is not None:
-                line += f" ({ep_bins_p[i][0]},{ep_bins_p[i][1]},{ep_bins_p[i][2]})"
             pred_lines.append(line)
             
         draw_text_lines(panel, pred_lines, col_w + 10, 60, COLORS['pred'], scale=0.5)
 
     return panel
 
-def run_inference_and_video(model, loader, output_path, global_cfg, num_samples, device, accelerator):
+def run_inference_and_video(model, loader, output_path, global_cfg, num_samples, device):
     """
     Reusable inference loop that generates a video.
     """
     writer = None
     processed = 0
     
+    model.eval()
+    
     with torch.no_grad():
         for i, sample in enumerate(loader):
             if processed >= num_samples: break
             
-            # All ranks must run forward pass for FSDP
-            images = sample.images.to(device)
-            audio = sample.audio.to(device)
+            # Move to device and cast to model's dtype
+            sample.images = sample.images.to(device=device, dtype=model.model.cfg.dtype)
+            sample.audio = sample.audio.to(device=device, dtype=model.model.cfg.dtype)
+            # sample.truth does not need to be on device for viz conversion unless we use it for loss
             
-            preds_dict = model(images, audio)
+            # Forward
+            preds_dict = model(sample.images, sample.audio)
             preds = ModelPrediction(**preds_dict)
             
-            # Only main process writes video
-            if accelerator.is_main_process:
-                B, T, P, C, H, W = images.shape
+            B, T, P, C, H, W = sample.images.shape
+            
+            if writer is None:
+                grid_w, grid_h = W * 3, H * 2
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                if os.path.dirname(output_path):
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                writer = cv2.VideoWriter(output_path, fourcc, 32, (grid_w, grid_h))
+            
+            imgs_cpu = sample.images.float().cpu()
+            if imgs_cpu.max() <= 1.0:
+                 imgs_cpu = (imgs_cpu * 255).byte()
+            else:
+                 imgs_cpu = imgs_cpu.clamp(0, 255).byte()
                 
-                if writer is None:
-                    grid_w, grid_h = W * 3, H * 2
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    if os.path.dirname(output_path):
-                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                    writer = cv2.VideoWriter(output_path, fourcc, 32, (grid_w, grid_h))
+            for t in range(T):
+                gt_data = convert_gt_to_viz(sample.truth, t, batch_idx=0, cfg=global_cfg.model)
+                pred_data = convert_pred_to_viz(preds, t, batch_idx=0, cfg=global_cfg.model)
                 
-                imgs_cpu = images.cpu()
-                if imgs_cpu.dtype.is_floating_point:
-                    imgs_cpu = (imgs_cpu * 255).byte()
-                else:
-                    imgs_cpu = imgs_cpu.byte()
+                frames = []
+                for p in range(5):
+                    frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
+                    # frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
+                    frames.append(frm)
                     
-                for t in range(T):
-                    gt_data = convert_gt_to_viz(sample.truth, t, batch_idx=0, cfg=global_cfg.model)
-                    pred_data = convert_pred_to_viz(preds, t, batch_idx=0, cfg=global_cfg.model)
-                    
-                    frames = []
-                    for p in range(5):
-                        frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
-                        frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
-                        frames.append(frm)
-                        
-                    panels = []
-                    for p in range(5):
-                        panels.append(render_player_panel(frames[p], gt_data['player_data'][p], pred_data['player_data'][p], p))
-                    
-                    panels.append(render_global_panel(H, W, gt_data['game_state'], pred_data['game_state']))
-                    
-                    row1 = np.hstack(panels[0:3])
-                    row2 = np.hstack(panels[3:6])
-                    combined = np.vstack([row1, row2])
-                    
-                    writer.write(combined)
+                panels = []
+                for p in range(5):
+                    panels.append(render_player_panel(frames[p], gt_data['player_data'][p], pred_data['player_data'][p], p))
                 
+                panels.append(render_global_panel(H, W, gt_data['game_state'], pred_data['game_state']))
+                
+                row1 = np.hstack(panels[0:3])
+                row2 = np.hstack(panels[3:6])
+                combined = np.vstack([row1, row2])
+                
+                writer.write(combined)
+            
             processed += 1
-            if accelerator.is_main_process:
-                print(f"Viz sample {processed}/{num_samples} done.")
+            print(f"Viz sample {processed}/{num_samples} done.")
             
     if writer:
         writer.release()
         print(f"Video saved to {output_path}")
-
-def configure_optimizers(model, weight_decay, learning_rate):
-    """
-    Separate parameters into those that should have weight decay applied (>= 2 params)
-    and those that shouldn't (biases, layernorms, embed weights if 1D, etc).
-    """
-    # Filter out frozen parameters
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    
-    decay_params = []
-    nodecay_params = []
-    
-    for n, p in param_dict.items():
-        if p.dim() >= 2:
-            decay_params.append(p)
-        else:
-            nodecay_params.append(p)
-            
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-    
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate)
-    return optimizer
 
 # =============================================================================
 # MAIN
@@ -447,7 +449,7 @@ def configure_optimizers(model, weight_decay, learning_rate):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint directory")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to lightning .ckpt file")
     parser.add_argument("--data_root", type=str, default="./dataset0")
     parser.add_argument("--output", type=str, default="inference_vis.mp4")
     parser.add_argument("--num_samples", type=int, default=1)
@@ -455,50 +457,53 @@ def main():
     args = parser.parse_args()
     
     # 1. Load Config
-    # Assuming config is in the checkpoint folder or we construct default
-    config_path = os.path.join(args.checkpoint, "config.json")
-    if os.path.exists(config_path):
+    # Attempt to find config.json in checkpoint directory or parent
+    ckpt_path = Path(args.checkpoint)
+    config_path = ckpt_path.parent / "config.json"
+    
+    if config_path.exists():
         global_cfg = GlobalConfig.from_file(config_path)
+        print(f"Loaded config from {config_path}")
     else:
-        print("Warning: config.json not found in checkpoint, using defaults.")
-        d_cfg = DatasetConfig(data_root=args.data_root, run_dir="./runs")
-        m_cfg = ModelConfig()
-        t_cfg = TrainConfig()
-        global_cfg = GlobalConfig(d_cfg, m_cfg, t_cfg)
+        # Check grandparent (if checkpoint is in 'checkpoints/' subdir)
+        config_path = ckpt_path.parent.parent / "config.json"
+        if config_path.exists():
+            global_cfg = GlobalConfig.from_file(config_path)
+            print(f"Loaded config from {config_path}")
+        else:
+            print("Warning: config.json not found near checkpoint, using defaults.")
+            d_cfg = DatasetConfig(data_root=args.data_root, run_dir="./runs")
+            m_cfg = ModelConfig()
+            t_cfg = TrainConfig()
+            global_cfg = GlobalConfig(d_cfg, m_cfg, t_cfg)
         
     # Override data root if provided
     global_cfg.dataset.data_root = args.data_root
     
     # 2. Model
-    model = GamePredictorBackbone(global_cfg.model)
-    # Ensure model is in bfloat16 to match training
-    model.to(dtype=torch.bfloat16)
+    print(f"Loading model from {args.checkpoint}...")
+    # Load from PL checkpoint
+    # We pass global_cfg to __init__ because it's required and strict_loading might fail if params mismatch,
+    # but more importantly, the model needs the config structure.
+    model = CS2PredictorModule.load_from_checkpoint(args.checkpoint, global_cfg=global_cfg, strict=False)
     
-    accelerator = Accelerator()
-    
-    # Reconstruct optimizer exactly as in training to satisfy FSDP loading
-    optimizer = configure_optimizers(model, weight_decay=global_cfg.train.weight_decay, learning_rate=global_cfg.train.lr)
-    
-    # Important: Prepare model with FSDP before loading state
-    model, optimizer = accelerator.prepare(model, optimizer)
-    
-    # accelerator.load_state expects the directory containing sharded files
-    accelerator.load_state(args.checkpoint)
+    device = torch.device(args.device)
+    model.to(device)
     model.eval()
     
     # 3. Data
     ds_root = DatasetRoot(global_cfg.dataset)
-    val_ds = ds_root.build_epoch("val", 0) # epoch 0
+    val_ds = ds_root.build_dataset("val") # Build validation dataset
     if len(val_ds) == 0:
         print("Validation set empty! Falling back to train.")
-        val_ds = ds_root.build_epoch("train", 0)
+        val_ds = ds_root.build_dataset("train")
         
     loader = torch.utils.data.DataLoader(
         val_ds, batch_size=1, collate_fn=cs2_collate_fn, shuffle=True
     )
     
     # 4. Run
-    run_inference_and_video(model, loader, args.output, global_cfg, args.num_samples, accelerator.device, accelerator)
+    run_inference_and_video(model, loader, args.output, global_cfg, args.num_samples, device)
 
 if __name__ == "__main__":
     main()

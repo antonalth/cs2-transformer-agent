@@ -116,6 +116,7 @@ class TrainConfig:
     lr: float = 2e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
+    min_lr_ratio: float = 0.01
     clip_grad_norm: float = 1.0
     
     # System

@@ -30,6 +30,16 @@
 - **WandB Monitor**: CLI tool to track training progress and losses.
   - **Run command**: `docker exec <container_id> python3 tools/wandb_monitor.py [flags]`
 
+### Optuna HPO (model3)
+- Use `transformers/model3/tune_optuna.py` as the controller; it spawns one worker process per trial via `transformers/model3/tune_worker.py`.
+- Run HPO from a host `tmux` session for long runs. Worker training still runs inside docker.
+- Per-trial timeout is controlled by `--trial_timeout` (seconds). Example for 24h: `--trial_timeout 86400`.
+- Trial artifacts are saved under `--output_root/trial_XXXXX/`:
+  - `params.json` sampled params
+  - `result.json` objective/status
+  - `worker.log` full training log
+- `--max_steps` is an optimizer-step early-stop target for trials; regular scheduler horizon still follows normal dataset/epoch logic.
+
 ### Inference Visualization
 - **Video Generation**: Generate a side-by-side GT vs Prediction video from a sharded FSDP checkpoint.
   - **Run command**: `docker exec <container_id> accelerate launch --num_processes 4 --use_fsdp --fsdp_version 2 --mixed_precision bf16 transformers/model2/visualize_inference.py --checkpoint <path_to_checkpoint> --output <filename>.mp4`
