@@ -34,14 +34,31 @@ class ModelConfig:
 
     audio_chunk_size: int = 1  # how many audio chunks go through audio encoder at a time
 
+    compressor_type: str = "qformer"  # "qformer" or "perceiver"
+
     # --- Fusion (Q-Former) ---
-    qformer_num_queries: int = 64
+    qformer_num_queries: int = 32
     qformer_hidden_size: int = 768
-    qformer_num_hidden_layers: int = 4
+    qformer_num_hidden_layers: int = 6
     qformer_num_attention_heads: int = 12
     qformer_intermediate_size: int = 3072
     
     vision_num_patches: int = 1205
+
+    # --- Fusion (Perceiver) ---
+    num_perceiver_queries: int = 58
+    perceiver_grid_h: int = 6
+    perceiver_grid_w: int = 8
+    perceiver_global_count: int = 10
+    perceiver_hidden_size: int = 512
+    perceiver_heads: int = 8
+    patch_compressor_num_blocks: int = 4
+    patch_compressor_self_attends_per_block: int = 2
+    patch_compressor_mlp_ratio: float = 4.0
+    patch_compressor_dropout: float = 0.0
+    perceiver_patch_grid_h: int = 30
+    perceiver_patch_grid_w: int = 40
+    perceiver_pos_embedding: str = "sincos"  # "none", "sincos", "learned"
 
     # Adapter
     adapter_hidden_dim: int = 2048
@@ -85,6 +102,10 @@ class ModelConfig:
     loss_enabled: dict = None
 
     def __post_init__(self):
+        if self.compressor_type not in {"qformer", "perceiver"}:
+            raise ValueError(f"Unsupported compressor_type: {self.compressor_type}")
+        if self.perceiver_pos_embedding not in {"none", "sincos", "learned"}:
+            raise ValueError(f"Unsupported perceiver_pos_embedding: {self.perceiver_pos_embedding}")
         if self.loss_weights is None:
             self.loss_weights = {
                 "health": 0.4, "armor": 0.5, "money": 0.4,
@@ -97,6 +118,18 @@ class ModelConfig:
         if self.loss_enabled is None:
             self.loss_enabled = {k: True for k in self.loss_weights.keys()}
 
+    @property
+    def compressor_hidden_size(self) -> int:
+        if self.compressor_type == "perceiver":
+            return self.perceiver_hidden_size
+        return self.qformer_hidden_size
+
+    @property
+    def compressor_num_queries(self) -> int:
+        if self.compressor_type == "perceiver":
+            return self.num_perceiver_queries
+        return self.qformer_num_queries
+
 
 @dataclass
 class TrainConfig:
@@ -107,14 +140,14 @@ class TrainConfig:
     
     # Data
     data_root: str = "./dataset0"
-    num_workers: int = 4
+    num_workers: int = 2
     
     # Optimization
     batch_size: int = 1          # Per GPU
-    grad_accumulation_steps: int = 16
+    grad_accumulation_steps: int = 8
     max_epochs: int = 8
-    lr: float = 2e-4
-    weight_decay: float = 0.01
+    lr: float = 1.7259793100656096e-04
+    weight_decay: float = 0.0013399060561509793
     warmup_steps: int = 200
     min_lr_ratio: float = 0.01
     clip_grad_norm: float = 1.0

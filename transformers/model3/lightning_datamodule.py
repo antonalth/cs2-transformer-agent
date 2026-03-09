@@ -37,7 +37,7 @@ class CS2DataModule(pl.LightningDataModule):
             num_workers=self.global_cfg.train.num_workers,
             collate_fn=cs2_collate_fn,
             pin_memory=True,
-            persistent_workers=self.global_cfg.train.num_workers > 0
+            persistent_workers=False
         )
 
     def val_dataloader(self):
@@ -53,5 +53,5 @@ class CS2DataModule(pl.LightningDataModule):
             num_workers=self.global_cfg.train.num_workers,
             collate_fn=cs2_collate_fn,
             pin_memory=True,
-             persistent_workers=self.global_cfg.train.num_workers > 0
+            persistent_workers=False
         )

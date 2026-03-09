@@ -1,4 +1,4 @@
-transformers
+transformers==4.57.3
 lmdb
 --no-binary=msgpack msgpack
 msgpack-numpy
@@ -12,6 +12,8 @@ timm
 pyyaml
 bitsandbytes
 tensorboard
+jupyterlab
+ipywidgets
 wandb
 optuna
 optuna-integration

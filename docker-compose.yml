@@ -1,6 +1,7 @@
 services:
   dev:
     image: pytorch/pytorch:2.9.1-cuda12.8-cudnn9-devel
+      #image: pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -13,8 +14,8 @@ services:
       # Torch / timm / torch.hub cache
       - ./cache/torch:/workspace/.cache/torch
     ports:
-      - "6006:6006"   # TensorBoard
-      - "8888:8888" # (optional) Jupyter
+      - "127.0.0.1:6006:6006"   # TensorBoard (localhost only)
+      - "127.0.0.1:8888:8888" # (optional) Jupyter (localhost only)
     stdin_open: true
     tty: true
     ipc: host
@@ -35,9 +36,9 @@ services:
     gpus: all
     entrypoint: ["/bin/bash", "-lc"]
     command: >
-      "apt update -y && apt upgrade -y && apt install libgl1 ffmpeg -y && python -m pip install --upgrade pip setuptools wheel &&
-       if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && 
-       pip install -r requirements2.txt && MAX_JOBS=32 pip install flash-attn --no-build-isolation &&
+      "apt update -y && apt upgrade -y && apt install libgl1 ffmpeg -y && python -m pip install --break-system-packages --upgrade pip setuptools wheel &&
+       if [ -f requirements.txt ]; then pip install --break-system-packages -r requirements.txt; fi && 
+       pip install --break-system-packages -r requirements2.txt && MAX_JOBS=16 pip install --break-system-packages flash-attn --no-build-isolation &&
        echo '✅ Environment ready. Caches are mounted at HF_HOME and TORCH_HOME.' &&
        exec bash"
 

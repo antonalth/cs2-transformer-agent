@@ -31,6 +31,61 @@ from transformers import (
 
 from config import ModelConfig
 
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False, device=None, dtype=torch.float32):
+    # Compute the trigonometric basis in fp32 for numerical stability, then cast at the end.
+    base_dtype = torch.float32
+    grid_h = torch.arange(grid_size_h, dtype=base_dtype, device=device)
+    grid_w = torch.arange(grid_size_w, dtype=base_dtype, device=device)
+    grid = torch.meshgrid(grid_w, grid_h, indexing='xy')
+    grid = torch.stack(grid, dim=0)
+    grid = grid.reshape([2, 1, grid_size_h, grid_size_w])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    expected = grid_size_h * grid_size_w
+    if pos_embed.shape != (expected, embed_dim):
+        raise AssertionError(
+            f"2D sincos shape mismatch: got {tuple(pos_embed.shape)}, expected {(expected, embed_dim)}"
+        )
+    if cls_token:
+        pos_embed = torch.cat([torch.zeros([1, embed_dim], dtype=base_dtype, device=device), pos_embed], dim=0)
+    return pos_embed.to(dtype=dtype)
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+    # With indexing='xy', grid[0] is width/x and grid[1] is height/y.
+    emb_x = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_y = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return torch.cat([emb_x, emb_y], dim=1)
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=pos.dtype, device=pos.device)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega
+    pos = pos.reshape(-1)
+    out = torch.einsum('m,d->md', pos, omega)
+    emb_sin = torch.sin(out)
+    emb_cos = torch.cos(out)
+    return torch.cat([emb_sin, emb_cos], dim=1)
+
+
+def validate_2d_sincos_axis_convention(device=None):
+    # With indexing='xy', width changes fastest in the flattened sequence while height stays fixed.
+    pe = get_2d_sincos_pos_embed(8, 2, 3, device=device, dtype=torch.float32)
+    if torch.allclose(pe[0, :4], pe[1, :4]):
+        raise AssertionError("2D sincos axis convention mismatch: x component did not change across columns")
+    if not torch.allclose(pe[0, 4:], pe[1, 4:]):
+        raise AssertionError("2D sincos axis convention mismatch: y component changed across columns")
+    if not torch.allclose(pe[0, :4], pe[3, :4]):
+        raise AssertionError("2D sincos axis convention mismatch: x component changed across rows")
+    if torch.allclose(pe[0, 4:], pe[3, 4:]):
+        raise AssertionError("2D sincos axis convention mismatch: y component did not change across rows")
+
+
+validate_2d_sincos_axis_convention()
+
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim, dtype):
         super().__init__()
@@ -106,7 +161,28 @@ class _CrossAttentionBlock(nn.Module):
         return self.out_norm(latents)
 
 
-class PatchCompressor(nn.Module):
+class _SelfAttentionFFNBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float, dtype):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, dtype=dtype)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True, dtype=dtype)
+        self.norm2 = nn.LayerNorm(dim, dtype=dtype)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden, dim, dtype=dtype),
+        )
+
+    def forward(self, x):
+        x_norm = self.norm1(x)
+        out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
+        x = x + out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class QFormerPatchCompressor(nn.Module):
     """
     Blip2QFormer-based compressor.
     Input: [B, N_patches, D_vision]
@@ -164,6 +240,192 @@ class PatchCompressor(nn.Module):
         )
         
         return outputs.last_hidden_state
+
+
+class PerceiverPatchCompressor(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        dt = cfg.dtype
+
+        self.num_latents = cfg.num_perceiver_queries
+        self.latent_dim = cfg.perceiver_hidden_size
+        self.input_dim = cfg.vision_hidden_size
+        self.num_blocks = cfg.patch_compressor_num_blocks
+        self.num_self_attends_per_block = cfg.patch_compressor_self_attends_per_block
+        self.mlp_ratio = cfg.patch_compressor_mlp_ratio
+        self.dropout = cfg.patch_compressor_dropout
+        self.patch_grid_h = cfg.perceiver_patch_grid_h
+        self.patch_grid_w = cfg.perceiver_patch_grid_w
+        self.num_patch_positions = self.patch_grid_h * self.patch_grid_w
+        self.pos_embedding = cfg.perceiver_pos_embedding
+
+        self.latents = nn.Parameter(torch.randn(1, self.num_latents, self.latent_dim, dtype=dt) * 0.02)
+        self.grid_h = cfg.perceiver_grid_h
+        self.grid_w = cfg.perceiver_grid_w
+        self.global_count = cfg.perceiver_global_count
+        self.use_spatial_mask = False
+        if self.grid_h > 0 and self.grid_w > 0:
+            expected_total = self.grid_h * self.grid_w + self.global_count
+            if expected_total == self.num_latents:
+                self.use_spatial_mask = True
+                mask = self._generate_spatial_mask(self.patch_grid_h, self.patch_grid_w)
+                self.register_buffer("spatial_mask", mask, persistent=False)
+
+        if self.pos_embedding == "learned":
+            self.patch_pos_embed = nn.Parameter(
+                torch.randn(1, self.num_patch_positions, self.input_dim, dtype=dt) * 0.02
+            )
+            if self.use_spatial_mask:
+                num_spatial = self.grid_h * self.grid_w
+                self.latent_pos_embed = nn.Parameter(
+                    torch.randn(1, num_spatial, self.latent_dim, dtype=dt) * 0.02
+                )
+
+        self._validate_config()
+
+        self.cross_blocks = nn.ModuleList([
+            _CrossAttentionBlock(self.latent_dim, self.input_dim, cfg.perceiver_heads, self.dropout, dt)
+            for _ in range(self.num_blocks)
+        ])
+        self.self_tower_per_block = nn.ModuleList([
+            nn.ModuleList([
+                _SelfAttentionFFNBlock(self.latent_dim, cfg.perceiver_heads, self.mlp_ratio, self.dropout, dt)
+                for _ in range(self.num_self_attends_per_block)
+            ])
+            for _ in range(self.num_blocks)
+        ])
+
+    def _validate_config(self):
+        if self.patch_grid_h <= 0 or self.patch_grid_w <= 0:
+            raise ValueError(
+                f"Perceiver patch grid must be positive, got {self.patch_grid_h}x{self.patch_grid_w}"
+            )
+        if self.num_patch_positions <= 0:
+            raise ValueError("Perceiver patch grid must contain at least one position")
+        if self.use_spatial_mask:
+            if self.patch_grid_h % self.grid_h != 0 or self.patch_grid_w % self.grid_w != 0:
+                raise ValueError(
+                    "Perceiver spatial mask requires patch grid to divide evenly by latent grid: "
+                    f"patch={self.patch_grid_h}x{self.patch_grid_w}, latent={self.grid_h}x{self.grid_w}"
+                )
+
+    def _generate_spatial_mask(self, height: int, width: int):
+        num_patches = height * width
+        num_local = self.grid_h * self.grid_w
+        total_latents = num_local + self.global_count
+        mask = torch.full((total_latents, num_patches), float('-inf'))
+        block_h = height // self.grid_h
+        block_w = width // self.grid_w
+
+        for i in range(self.grid_h):
+            for j in range(self.grid_w):
+                latent_idx = i * self.grid_w + j
+                row_start = i * block_h
+                row_end = (i + 1) * block_h
+                col_start = j * block_w
+                col_end = (j + 1) * block_w
+                for r in range(row_start, row_end):
+                    for c in range(col_start, col_end):
+                        patch_idx = r * width + c
+                        if patch_idx < num_patches:
+                            mask[latent_idx, patch_idx] = 0.0
+
+        for k in range(self.global_count):
+            mask[num_local + k, :] = 0.0
+        return mask
+
+    def _apply_latent_positional_embedding(self, latents: torch.Tensor) -> torch.Tensor:
+        if not self.use_spatial_mask or self.pos_embedding == "none":
+            return latents
+
+        num_spatial = self.grid_h * self.grid_w
+        if self.pos_embedding == "learned":
+            spatial_latents = latents[:, :num_spatial, :] + self.latent_pos_embed
+        else:
+            pe_latents = get_2d_sincos_pos_embed(
+                self.latent_dim,
+                self.grid_h,
+                self.grid_w,
+                cls_token=False,
+                device=latents.device,
+                dtype=latents.dtype,
+            )
+            spatial_latents = latents[:, :num_spatial, :] + pe_latents.unsqueeze(0)
+        global_latents = latents[:, num_spatial:, :]
+        return torch.cat([spatial_latents, global_latents], dim=1)
+
+    def _apply_patch_positional_embedding(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        if self.pos_embedding == "none":
+            return patch_tokens
+
+        _, num_tokens, _ = patch_tokens.shape
+        if num_tokens < self.num_patch_positions:
+            raise AssertionError(
+                f"Patch token count {num_tokens} is smaller than configured patch grid "
+                f"{self.num_patch_positions} ({self.patch_grid_h}x{self.patch_grid_w})"
+            )
+
+        prefix_len = num_tokens - self.num_patch_positions
+        if self.pos_embedding == "learned":
+            patch_pos = self.patch_pos_embed
+        else:
+            patch_pos = get_2d_sincos_pos_embed(
+                self.input_dim,
+                self.patch_grid_h,
+                self.patch_grid_w,
+                cls_token=False,
+                device=patch_tokens.device,
+                dtype=patch_tokens.dtype,
+            ).unsqueeze(0)
+
+        if prefix_len > 0:
+            patches = patch_tokens[:, prefix_len:, :] + patch_pos
+            return torch.cat([patch_tokens[:, :prefix_len, :], patches], dim=1)
+        return patch_tokens + patch_pos
+
+    def _get_attention_mask(self, num_tokens: int, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if not self.use_spatial_mask:
+            return None
+        if num_tokens < self.num_patch_positions:
+            raise AssertionError(
+                f"Spatial mask requires at least {self.num_patch_positions} tokens, got {num_tokens}"
+            )
+
+        mask = self.spatial_mask
+        prefix_len = num_tokens - self.num_patch_positions
+        if prefix_len > 0:
+            prefix = torch.zeros((mask.shape[0], prefix_len), device=mask.device, dtype=mask.dtype)
+            mask = torch.cat([prefix, mask], dim=1)
+        if mask.shape != (self.num_latents, num_tokens):
+            raise AssertionError(
+                f"Attention mask shape mismatch: got {tuple(mask.shape)}, expected {(self.num_latents, num_tokens)}"
+            )
+        return mask.to(dtype=dtype)
+
+    def forward(self, patch_tokens: torch.Tensor):
+        latents = self.latents.expand(patch_tokens.shape[0], -1, -1)
+        latents = self._apply_latent_positional_embedding(latents)
+        patch_tokens = self._apply_patch_positional_embedding(patch_tokens)
+        attn_mask = self._get_attention_mask(patch_tokens.shape[1], latents.dtype)
+
+        for block_idx, cross in enumerate(self.cross_blocks):
+            latents = cross(latents, patch_tokens, attn_mask=attn_mask)
+            for layer in self.self_tower_per_block[block_idx]:
+                latents = layer(latents)
+        return latents
+
+
+class PatchCompressor(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        if cfg.compressor_type == "perceiver":
+            self.impl = PerceiverPatchCompressor(cfg)
+        else:
+            self.impl = QFormerPatchCompressor(cfg)
+
+    def forward(self, patch_tokens: torch.Tensor):
+        return self.impl(patch_tokens)
 
 
 class GameVideoEncoder(nn.Module):
@@ -242,7 +504,7 @@ class GameVideoEncoder(nn.Module):
             q_chunks.append(q_out)
 
         q_all = torch.cat(q_chunks, dim=0)  # [B*T*P, N_q, D_q]
-        q_all = q_all.view(B, T, P, self.cfg.qformer_num_queries, self.cfg.qformer_hidden_size)
+        q_all = q_all.view(B, T, P, self.cfg.compressor_num_queries, self.cfg.compressor_hidden_size)
         return q_all
 
 class GameAudioEncoder(nn.Module):
@@ -366,8 +628,7 @@ class GamePredictorBackbone(nn.Module):
         
         # Audio Projection
         # Project audio to match vision dimension for concatenation
-        # Use qformer_hidden_size instead of perceiver_hidden_size
-        self.audio_proj = nn.Linear(self.audio.output_dim, cfg.qformer_hidden_size, dtype=cfg.dtype)
+        self.audio_proj = nn.Linear(self.audio.output_dim, cfg.compressor_hidden_size, dtype=cfg.dtype)
         
         # Initial Queries
         # Use Embedding(1, D) to avoid FSDP issues with standalone parameters
@@ -394,10 +655,9 @@ class GamePredictorBackbone(nn.Module):
         )
 
         for i in range(cfg.backbone_splits):
-            # Cross attention accepts qformer_hidden_size now
             cross = _CrossAttentionBlock(
                 latent_dim=cfg.llama_hidden_size,
-                input_dim=cfg.qformer_hidden_size,
+                input_dim=cfg.compressor_hidden_size,
                 num_heads=cfg.llama_heads, 
                 dropout=0.0,
                 dtype=cfg.dtype
@@ -434,7 +694,7 @@ class GamePredictorBackbone(nn.Module):
         del vid_feats, aud_feats
         
         # Reshape context for cross attention: [B*T*P, Tokens, Dim]
-        context_flat = context.view(B*T*P, -1, self.cfg.qformer_hidden_size)
+        context_flat = context.view(B*T*P, -1, self.cfg.compressor_hidden_size)
         
         # --- Prepare Initial Hidden State ---
         # Players: [B, T, 5, D]

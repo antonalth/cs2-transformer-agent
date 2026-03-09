@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default="unnamed")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints_fsdp")
+    parser.add_argument("--compressor_type", choices=["qformer", "perceiver"], default=None)
+    parser.add_argument("--perceiver_pos_embedding", choices=["none", "sincos", "learned"], default=None)
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
@@ -213,6 +215,10 @@ def main():
         run_name=args.run_name,
         output_dir=args.output_dir,
     )
+    if args.compressor_type is not None:
+        global_cfg.model.compressor_type = args.compressor_type
+    if args.perceiver_pos_embedding is not None:
+        global_cfg.model.perceiver_pos_embedding = args.perceiver_pos_embedding
     run_training(
         global_cfg=global_cfg,
         resume_from_checkpoint=args.resume_from_checkpoint,

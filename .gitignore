@@ -31,3 +31,6 @@ CLAUDE.md
 experiments/
 checkpoints*
 .env
+requirements.txt
+unrelated*
+tmp*

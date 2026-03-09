@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -25,8 +26,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", type=int, default=4, help="Devices used by each spawned trial process")
     parser.add_argument("--val_every_steps", type=int, default=200)
     parser.add_argument("--val_samples_limit", type=int, default=300)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--grad_accumulation_steps", type=int, default=None)
+    parser.add_argument("--lr_min", type=float, default=1e-4)
+    parser.add_argument("--lr_max", type=float, default=6e-4)
+    parser.add_argument("--weight_decay_min", type=float, default=1e-3)
+    parser.add_argument("--weight_decay_max", type=float, default=2e-2)
+    parser.add_argument(
+        "--qformer_num_queries",
+        type=str,
+        default="32,64,96",
+        help="Comma-separated choices, e.g. '32,64,96' or a single value like '32'.",
+    )
+    parser.add_argument("--qformer_num_hidden_layers", type=int, default=None)
+    parser.add_argument("--llama_layers", type=int, default=None)
     parser.add_argument("--monitor", type=str, default="val/loss")
     parser.add_argument("--disable_wandb", action="store_true")
     parser.add_argument("--wandb_group", type=str, default=None, help="Defaults to --study_name.")
@@ -43,14 +56,30 @@ def default_storage_url(output_root: Path, study_name: str) -> str:
 
 
 def sample_params(trial: optuna.Trial, args: argparse.Namespace) -> Dict[str, Any]:
+    query_choices = [int(x.strip()) for x in args.qformer_num_queries.split(",") if x.strip()]
+    if not query_choices:
+        raise ValueError("--qformer_num_queries must include at least one integer choice.")
+
     params: Dict[str, Any] = {
-        "train.lr": trial.suggest_float("train.lr", 1e-4, 6e-4, log=True),
-        "train.weight_decay": trial.suggest_float("train.weight_decay", 1e-3, 2e-2, log=True),
-        "model.qformer_num_queries": trial.suggest_categorical("model.qformer_num_queries", [32, 64, 96]),
-        "model.qformer_num_hidden_layers": trial.suggest_categorical("model.qformer_num_hidden_layers", [2, 4, 6]),
-        # Must stay divisible by backbone_splits=4 in current model config.
-        "model.llama_layers": trial.suggest_categorical("model.llama_layers", [8, 12]),
+        "train.lr": trial.suggest_float("train.lr", args.lr_min, args.lr_max, log=True),
+        "train.weight_decay": trial.suggest_float(
+            "train.weight_decay", args.weight_decay_min, args.weight_decay_max, log=True
+        ),
+        "model.qformer_num_queries": trial.suggest_categorical("model.qformer_num_queries", query_choices),
     }
+
+    if args.qformer_num_hidden_layers is not None:
+        params["model.qformer_num_hidden_layers"] = args.qformer_num_hidden_layers
+    else:
+        params["model.qformer_num_hidden_layers"] = trial.suggest_categorical(
+            "model.qformer_num_hidden_layers", [2, 4, 6]
+        )
+
+    if args.llama_layers is not None:
+        params["model.llama_layers"] = args.llama_layers
+    else:
+        # Must stay divisible by backbone_splits=4 in current model config.
+        params["model.llama_layers"] = trial.suggest_categorical("model.llama_layers", [8, 12])
 
     if args.grad_accumulation_steps is not None:
         params["train.grad_accumulation_steps"] = args.grad_accumulation_steps
@@ -73,6 +102,15 @@ def format_trial_run_name(study_name: str, trial_number: int, params: Dict[str, 
         f"{study_name}_t{trial_number:05d}"
         f"_lr{lr:.1e}_wd{wd:.1e}_q{q}_ql{ql}_l{ll}_ga{ga}"
     )
+
+
+def sanitize_wandb_tag(tag: str, max_len: int = 64) -> str:
+    """WandB tag length must be <= 64 chars."""
+    if len(tag) <= max_len:
+        return tag
+    digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:8]
+    keep = max_len - len(digest) - 1
+    return f"{tag[:keep]}-{digest}"
 
 
 def build_worker_cmd(
@@ -136,6 +174,20 @@ def main() -> None:
         raise ValueError("--max_steps must be > 0.")
     if args.val_every_steps <= 0:
         raise ValueError("--val_every_steps must be > 0.")
+    if args.lr_min <= 0 or args.lr_max <= 0 or args.lr_min >= args.lr_max:
+        raise ValueError("Require 0 < --lr_min < --lr_max for log-uniform LR search.")
+    if (
+        args.weight_decay_min <= 0
+        or args.weight_decay_max <= 0
+        or args.weight_decay_min >= args.weight_decay_max
+    ):
+        raise ValueError(
+            "Require 0 < --weight_decay_min < --weight_decay_max for log-uniform weight decay search."
+        )
+    if args.qformer_num_hidden_layers is not None and args.qformer_num_hidden_layers not in (2, 4, 6):
+        raise ValueError("--qformer_num_hidden_layers must be one of: 2, 4, 6")
+    if args.llama_layers is not None and args.llama_layers not in (8, 12):
+        raise ValueError("--llama_layers must be one of: 8, 12")
 
     # val_check_interval counts training batches, while max_steps counts optimizer steps.
     # Ensure each trial can emit at least one validation metric.
@@ -179,7 +231,16 @@ def main() -> None:
         wandb_group = args.wandb_group or args.study_name
         base_tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
         base_tags.extend([f"study:{args.study_name}", f"trial:{trial.number}"])
-        wandb_tags = ",".join(base_tags)
+        safe_tags = [sanitize_wandb_tag(t) for t in base_tags]
+        # Keep order while removing duplicates.
+        seen = set()
+        deduped_tags = []
+        for t in safe_tags:
+            if t in seen:
+                continue
+            seen.add(t)
+            deduped_tags.append(t)
+        wandb_tags = ",".join(deduped_tags)
 
         cmd = build_worker_cmd(
             args=args,

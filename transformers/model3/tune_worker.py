@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--result_json", type=str, required=True)
     parser.add_argument("--max_steps", type=int, required=True, help="Early-stop target in optimizer steps.")
     parser.add_argument("--devices", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_every_steps", type=int, default=200)
     parser.add_argument("--val_samples_limit", type=int, default=300)
     parser.add_argument("--monitor", type=str, default="val/loss")
