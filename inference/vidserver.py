@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import queue
 import select
 import socket
@@ -92,24 +93,44 @@ class LibeiInjector:
         self.pointer_rel = None
         self.keyboard = None
         self.last_abs = (0.5, 0.5)
-        self._bootstrap()
+        try:
+            self._bootstrap()
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _event_type_value(ev) -> int:
+        return ei.libei.event_get_type(ev._cobject)
+
+    def close(self) -> None:
+        fd = getattr(self.ctx, "_fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self.ctx._fd = None
+        self.ctx = None
 
     def _drain(self, timeout: float = 0.1) -> None:
+        if self.ctx is None:
+            return
         rlist, _, _ = select.select([self.ctx.fd], [], [], timeout)
         if not rlist:
             return
         self.ctx.dispatch()
         events = list(self.ctx.events)
         for ev in events:
-            et = ev.event_type
-            if et == ei.EventType.SEAT_ADDED:
+            et = self._event_type_value(ev)
+            if et == ei.EventType.SEAT_ADDED.value:
                 ev.seat.bind((
                     ei.DeviceCapability.POINTER,
                     ei.DeviceCapability.POINTER_ABSOLUTE,
                     ei.DeviceCapability.BUTTON,
                     ei.DeviceCapability.KEYBOARD,
                 ))
-            elif et == ei.EventType.DEVICE_ADDED:
+            elif et == ei.EventType.DEVICE_ADDED.value:
                 dev = ev.device
                 caps = set(dev.capabilities)
                 if ei.DeviceCapability.KEYBOARD in caps and self.keyboard is None:
@@ -121,7 +142,7 @@ class LibeiInjector:
                 elif ei.DeviceCapability.POINTER in caps and self.pointer_rel is None:
                     self.pointer_rel = dev
                     self.pointer_rel.start_emulating()
-            elif et == ei.EventType.DEVICE_RESUMED:
+            elif et == ei.EventType.DEVICE_RESUMED.value:
                 if ev.device is not None:
                     ev.device.start_emulating()
 
@@ -357,6 +378,7 @@ def main() -> None:
         pass
     finally:
         streamer.stop()
+        injector.close()
 
 
 if __name__ == "__main__":
