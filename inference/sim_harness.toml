@@ -1,0 +1,92 @@
+[web]
+host = "0.0.0.0"
+port = 8080
+browser_fps = 1
+auto_start_slots = false
+
+[recording]
+output_dir = "./recordings"
+composite_fps = 10
+codec = "h264_nvenc"
+crf = 23
+
+[runtime]
+runas_path = "/usr/local/bin/runas"
+discovery_timeout_s = 20.0
+discovery_poll_interval_s = 0.25
+restart_backoff_s = 2.0
+
+[[slots]]
+name = "steam1"
+user = "steam1"
+tmux_session = "cs2-steam1"
+launch_command = ["steam", "steam://rungameid/730"]
+gamescope_args = ["--backend", "headless"]
+width = 1280
+height = 720
+capture_fps = 30
+jpeg_quality = 80
+video_port = 5500
+input_port = 5501
+inspect_fps = 1
+startup_grace_s = 2.0
+
+[[slots]]
+name = "steam2"
+user = "steam2"
+tmux_session = "cs2-steam2"
+launch_command = ["steam", "steam://rungameid/730"]
+gamescope_args = ["--backend", "headless"]
+width = 1280
+height = 720
+capture_fps = 30
+jpeg_quality = 80
+video_port = 5510
+input_port = 5511
+inspect_fps = 1
+startup_grace_s = 2.0
+
+[[slots]]
+name = "steam3"
+user = "steam3"
+tmux_session = "cs2-steam3"
+launch_command = ["steam", "steam://rungameid/730"]
+gamescope_args = ["--backend", "headless"]
+width = 1280
+height = 720
+capture_fps = 30
+jpeg_quality = 80
+video_port = 5520
+input_port = 5521
+inspect_fps = 1
+startup_grace_s = 2.0
+
+[[slots]]
+name = "steam4"
+user = "steam4"
+tmux_session = "cs2-steam4"
+launch_command = ["steam", "steam://rungameid/730"]
+gamescope_args = ["--backend", "headless"]
+width = 1280
+height = 720
+capture_fps = 30
+jpeg_quality = 80
+video_port = 5530
+input_port = 5531
+inspect_fps = 1
+startup_grace_s = 2.0
+
+[[slots]]
+name = "steam5"
+user = "steam5"
+tmux_session = "cs2-steam5"
+launch_command = ["steam", "steam://rungameid/730"]
+gamescope_args = ["--backend", "headless"]
+width = 1280
+height = 720
+capture_fps = 30
+jpeg_quality = 80
+video_port = 5540
+input_port = 5541
+inspect_fps = 1
+startup_grace_s = 2.0
