@@ -34,3 +34,5 @@ checkpoints*
 requirements.txt
 unrelated*
 tmp*
+*.pem
+*.cnf

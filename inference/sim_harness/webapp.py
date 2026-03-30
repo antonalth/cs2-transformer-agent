@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+import time
+from typing import Any
 
 from .config import load_config
+from .remote_protocol import decode_stream_text, encode_stream_ack, encode_stream_error, encode_stream_pong
 from .supervisor import HarnessSupervisor
+
+try:
+    from fastapi import WebSocket
+except ModuleNotFoundError:
+    WebSocket = Any
 
 
 INDEX_HTML = """<!doctype html>
@@ -44,6 +53,9 @@ INDEX_HTML = """<!doctype html>
     .control-surface.armed { outline: 2px solid #6ab7d6; }
     .control-hint { position: absolute; left: 12px; bottom: 12px; background: rgba(0, 0, 0, 0.55); padding: 6px 8px; font-size: 12px; }
     .event-log { background: #0f1518; border: 1px solid #2b3338; min-height: 120px; max-height: 300px; overflow: auto; padding: 8px; white-space: pre-wrap; }
+    .type-row { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; margin-top: 12px; }
+    .type-row input[type="password"], .type-row input[type="text"] { flex: 1 1 320px; background: #0f1518; color: #f2f4f5; border: 1px solid #2b3338; padding: 8px; }
+    .type-row button { margin: 0; }
   </style>
 </head>
 <body>
@@ -61,9 +73,11 @@ INDEX_HTML = """<!doctype html>
           <label for="refresh-fps">Refresh FPS</label>
           <input id="refresh-fps" type="number" min="0.1" max="30" step="0.1">
           <button onclick="refreshComposite()">refresh now</button>
+          <button onclick="cleanupAll()">cleanup all</button>
         </div>
         <img id="composite" src="/api/composite.jpg" alt="composite view">
         <div class="meta" id="composite-meta">waiting for refresh</div>
+        <div class="meta" id="system-meta">idle</div>
       </div>
       <div class="panel">
         <h2>Slots</h2>
@@ -82,12 +96,18 @@ INDEX_HTML = """<!doctype html>
             <label for="control-refresh-fps">View FPS</label>
             <input id="control-refresh-fps" type="number" min="0.1" max="30" step="0.1">
             <button id="arm-control" onclick="toggleControlArmed()">arm control</button>
-            <button onclick="calibrateTopLeft()">calibrate top-left</button>
+            <button id="toggle-audio" onclick="toggleAudioPlayback()">audio off</button>
             <button onclick="refreshControlFrame()">refresh now</button>
           </div>
           <div id="control-surface" class="control-surface" tabindex="0">
             <img id="control-frame" src="" alt="slot control view">
             <div class="control-hint" id="control-hint">disarmed</div>
+          </div>
+          <div class="type-row">
+            <input id="type-text" type="password" placeholder="type or paste text here">
+            <button id="toggle-type-visibility" onclick="toggleTypedTextVisibility()">show</button>
+            <button onclick="typeTextField()">type text</button>
+            <button onclick="clearTypeText()">clear</button>
           </div>
           <div class="meta" id="control-meta">select a slot</div>
         </div>
@@ -112,6 +132,95 @@ INDEX_HTML = """<!doctype html>
     let pressedKeys = new Set();
     let pressedButtons = new Set();
     let lastMouseSendMs = 0;
+    let pasteInFlight = false;
+    let audioEnabled = false;
+    let audioContext = null;
+    let audioWorkletNode = null;
+    let audioModuleReady = false;
+    let audioUseWorklet = false;
+    let audioPollTimer = null;
+    let audioPollInFlight = false;
+    let audioLastSeq = 0;
+    let audioFallbackPlayhead = 0;
+    const audioFrameHz = 32;
+    const audioPollMs = Math.max(8, Math.floor(1000 / (audioFrameHz * 2)));
+    const audioChannels = 2;
+    const audioSampleRate = 24000;
+    const audioWorkletSource = `
+class PcmPlayerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.queue = [];
+    this.current = null;
+    this.offset = 0;
+    this.primed = false;
+    this.targetFrames = 4096;
+    this.port.onmessage = (event) => {
+      const data = event.data || {};
+      if (data.t === 'reset') {
+        this.queue = [];
+        this.current = null;
+        this.offset = 0;
+        this.primed = false;
+        return;
+      }
+      if (data.t === 'chunk' && Array.isArray(data.channels)) {
+        const chunk = data.channels.map((buffer) => new Float32Array(buffer));
+        if (chunk.length > 0 && chunk[0].length > 0) {
+          this.queue.push(chunk);
+        }
+      }
+    };
+  }
+
+  queuedFrames() {
+    let total = 0;
+    if (this.current) {
+      total += this.current[0].length - this.offset;
+    }
+    for (const chunk of this.queue) {
+      total += chunk[0].length;
+    }
+    return total;
+  }
+
+  process(inputs, outputs) {
+    const output = outputs[0];
+    const frameCount = output[0].length;
+    for (let ch = 0; ch < output.length; ch += 1) {
+      output[ch].fill(0);
+    }
+    if (!this.primed) {
+      if (this.queuedFrames() < this.targetFrames) {
+        return true;
+      }
+      this.primed = true;
+    }
+    let pos = 0;
+    while (pos < frameCount) {
+      if (!this.current || this.offset >= this.current[0].length) {
+        this.current = this.queue.shift() || null;
+        this.offset = 0;
+        if (!this.current) {
+          this.primed = false;
+          break;
+        }
+      }
+      const available = this.current[0].length - this.offset;
+      const take = Math.min(frameCount - pos, available);
+      for (let ch = 0; ch < output.length; ch += 1) {
+        const src = this.current[Math.min(ch, this.current.length - 1)];
+        output[ch].set(src.subarray(this.offset, this.offset + take), pos);
+      }
+      this.offset += take;
+      pos += take;
+    }
+    return true;
+  }
+}
+
+registerProcessor('pcm-player', PcmPlayerProcessor);
+`;
     const browserKeyMap = {
       KeyA: 'a', KeyB: 'b', KeyC: 'c', KeyD: 'd', KeyE: 'e', KeyF: 'f', KeyG: 'g', KeyH: 'h',
       KeyI: 'i', KeyJ: 'j', KeyK: 'k', KeyL: 'l', KeyM: 'm', KeyN: 'n', KeyO: 'o', KeyP: 'p',
@@ -130,6 +239,36 @@ INDEX_HTML = """<!doctype html>
       F7: 'f7', F8: 'f8', F9: 'f9', F10: 'f10', F11: 'f11', F12: 'f12',
     };
     const mouseButtonMap = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5 };
+    const pastedCharMap = {
+      'a': ['a', false], 'b': ['b', false], 'c': ['c', false], 'd': ['d', false], 'e': ['e', false],
+      'f': ['f', false], 'g': ['g', false], 'h': ['h', false], 'i': ['i', false], 'j': ['j', false],
+      'k': ['k', false], 'l': ['l', false], 'm': ['m', false], 'n': ['n', false], 'o': ['o', false],
+      'p': ['p', false], 'q': ['q', false], 'r': ['r', false], 's': ['s', false], 't': ['t', false],
+      'u': ['u', false], 'v': ['v', false], 'w': ['w', false], 'x': ['x', false], 'y': ['y', false],
+      'z': ['z', false],
+      'A': ['a', true], 'B': ['b', true], 'C': ['c', true], 'D': ['d', true], 'E': ['e', true],
+      'F': ['f', true], 'G': ['g', true], 'H': ['h', true], 'I': ['i', true], 'J': ['j', true],
+      'K': ['k', true], 'L': ['l', true], 'M': ['m', true], 'N': ['n', true], 'O': ['o', true],
+      'P': ['p', true], 'Q': ['q', true], 'R': ['r', true], 'S': ['s', true], 'T': ['t', true],
+      'U': ['u', true], 'V': ['v', true], 'W': ['w', true], 'X': ['x', true], 'Y': ['y', true],
+      'Z': ['z', true],
+      '0': ['0', false], '1': ['1', false], '2': ['2', false], '3': ['3', false], '4': ['4', false],
+      '5': ['5', false], '6': ['6', false], '7': ['7', false], '8': ['8', false], '9': ['9', false],
+      ')': ['0', true], '!': ['1', true], '@': ['2', true], '#': ['3', true], '$': ['4', true],
+      '%': ['5', true], '^': ['6', true], '&': ['7', true], '*': ['8', true], '(': ['9', true],
+      ' ': ['space', false], '\\n': ['enter', false], '\\r': ['enter', false], '\\t': ['tab', false],
+      '-': ['minus', false], '_': ['minus', true],
+      '=': ['equals', false], '+': ['equals', true],
+      ',': ['comma', false], '<': ['comma', true],
+      '.': ['period', false], '>': ['period', true],
+      '/': ['slash', false], '?': ['slash', true],
+      ';': ['semicolon', false], ':': ['semicolon', true],
+      "'": ['apostrophe', false], '"': ['apostrophe', true],
+      '[': ['leftbracket', false], '{': ['leftbracket', true],
+      ']': ['rightbracket', false], '}': ['rightbracket', true],
+      '\\\\': ['backslash', false], '|': ['backslash', true],
+      '`': ['grave', false], '~': ['grave', true],
+    };
 
     function esc(value) {
       return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -198,6 +337,11 @@ INDEX_HTML = """<!doctype html>
       updateSlotTabs();
       updateSelectedSlotPanel();
       refreshControlFrame();
+      if (audioEnabled) {
+        audioLastSeq = 0;
+        resetAudioWorklet();
+        pollAudioChunk();
+      }
     }
 
     function selectedSlotSnapshot() {
@@ -250,13 +394,78 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
-    async function calibrateTopLeft() {
-      if (!selectedControlSlot) {
+    async function sendKeyStroke(keyName, useShift) {
+      if (useShift) {
+        await sendControlEvent({ t: 'key', key: 'lshift', down: true });
+      }
+      await sendControlEvent({ t: 'key', key: keyName, down: true });
+      await sendControlEvent({ t: 'key', key: keyName, down: false });
+      if (useShift) {
+        await sendControlEvent({ t: 'key', key: 'lshift', down: false });
+      }
+    }
+
+    async function typeClipboardText(text) {
+      if (pasteInFlight) {
         return;
       }
-      await sendControlEvent({ t: 'mouse_abs', x: 0.0, y: 0.0, visible: true });
-      logEvent(`calibrate top-left sent to ${selectedControlSlot}`);
-      refreshControlFrame();
+      pasteInFlight = true;
+      try {
+        let sent = 0;
+        let skipped = 0;
+        for (const ch of text) {
+          const spec = pastedCharMap[ch];
+          if (!spec) {
+            skipped += 1;
+            continue;
+          }
+          await sendKeyStroke(spec[0], spec[1]);
+          sent += 1;
+          await new Promise(resolve => setTimeout(resolve, 12));
+        }
+        logEvent(`paste typed: sent=${sent} skipped=${skipped}`);
+      } finally {
+        pasteInFlight = false;
+      }
+    }
+
+    function typedTextField() {
+      return document.getElementById('type-text');
+    }
+
+    function toggleTypedTextVisibility() {
+      const field = typedTextField();
+      const button = document.getElementById('toggle-type-visibility');
+      const showing = field.type === 'text';
+      field.type = showing ? 'password' : 'text';
+      button.textContent = showing ? 'show' : 'hide';
+    }
+
+    function clearTypeText() {
+      typedTextField().value = '';
+      logEvent('typed text field cleared');
+    }
+
+    async function typeTextField() {
+      const text = typedTextField().value;
+      if (!text) {
+        logEvent('type text ignored: field empty');
+        return;
+      }
+      logEvent(`type text requested: ${text.length} chars`);
+      await typeClipboardText(text);
+    }
+
+    async function pasteFromClipboardApi() {
+      if (!navigator.clipboard || !navigator.clipboard.readText) {
+        throw new Error('Clipboard API unavailable');
+      }
+      const text = await navigator.clipboard.readText();
+      if (!text) {
+        throw new Error('Clipboard text empty');
+      }
+      logEvent(`clipboard api read: ${text.length} chars`);
+      await typeClipboardText(text);
     }
 
     function releaseAllPressed() {
@@ -282,6 +491,10 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('control-surface').classList.toggle('armed', controlArmed);
     }
 
+    function updateAudioUi() {
+      document.getElementById('toggle-audio').textContent = audioEnabled ? 'audio on' : 'audio off';
+    }
+
     function toggleControlArmed() {
       controlArmed = !controlArmed;
       if (!controlArmed) {
@@ -290,6 +503,177 @@ INDEX_HTML = """<!doctype html>
         document.getElementById('control-surface').focus();
       }
       updateControlArmedUi();
+    }
+
+    async function ensureAudioContext() {
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+      if (audioContext.audioWorklet && !audioModuleReady) {
+        const blob = new Blob([audioWorkletSource], { type: 'text/javascript' });
+        const url = URL.createObjectURL(blob);
+        try {
+          await audioContext.audioWorklet.addModule(url);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+        audioModuleReady = true;
+      }
+      if (audioModuleReady && !audioWorkletNode) {
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-player', {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [audioChannels],
+        });
+        audioWorkletNode.connect(audioContext.destination);
+      }
+      audioUseWorklet = !!audioWorkletNode;
+    }
+
+    function resetAudioWorklet() {
+      if (audioWorkletNode) {
+        audioWorkletNode.port.postMessage({ t: 'reset' });
+      }
+      audioFallbackPlayhead = 0;
+    }
+
+    function pcm16ToPlanarFloat(pcmView, channels) {
+      const frameCount = Math.floor(pcmView.length / channels);
+      if (frameCount <= 0) {
+        return [];
+      }
+      const planar = Array.from({ length: channels }, () => new Float32Array(frameCount));
+      for (let i = 0; i < frameCount; i += 1) {
+        const base = i * channels;
+        for (let ch = 0; ch < channels; ch += 1) {
+          planar[ch][i] = pcmView[base + ch] / 32768.0;
+        }
+      }
+      return planar;
+    }
+
+    function resamplePlanar(planar, srcRate, dstRate) {
+      if (planar.length === 0 || srcRate === dstRate) {
+        return planar;
+      }
+      const srcFrames = planar[0].length;
+      const dstFrames = Math.max(1, Math.round(srcFrames * dstRate / srcRate));
+      return planar.map((channel) => {
+        const out = new Float32Array(dstFrames);
+        for (let i = 0; i < dstFrames; i += 1) {
+          const srcPos = i * srcRate / dstRate;
+          const idx0 = Math.floor(srcPos);
+          const idx1 = Math.min(idx0 + 1, srcFrames - 1);
+          const frac = srcPos - idx0;
+          const a = channel[Math.min(idx0, srcFrames - 1)];
+          const b = channel[idx1];
+          out[i] = a + (b - a) * frac;
+        }
+        return out;
+      });
+    }
+
+    async function pollAudioChunk() {
+      if (!audioEnabled || !selectedControlSlot || audioPollInFlight) {
+        return;
+      }
+      audioPollInFlight = true;
+      try {
+        const res = await fetch(`/api/slots/${selectedControlSlot}/audio.pcm?ts=${Date.now()}`);
+        if (res.status === 204) {
+          return;
+        }
+        if (!res.ok) {
+          logEvent(`audio error: http ${res.status}`);
+          return;
+        }
+        const seq = Number(res.headers.get('x-audio-seq') ?? '0');
+        if (!Number.isFinite(seq) || seq <= audioLastSeq) {
+          return;
+        }
+        const sampleRate = Number(res.headers.get('x-audio-sample-rate') ?? String(audioSampleRate));
+        const channels = Number(res.headers.get('x-audio-channels') ?? String(audioChannels));
+        audioLastSeq = seq;
+        const pcm = await res.arrayBuffer();
+        await ensureAudioContext();
+        const pcmView = new Int16Array(pcm);
+        if (!Number.isFinite(channels) || channels < 1 || pcmView.length === 0) {
+          return;
+        }
+        let planar = pcm16ToPlanarFloat(pcmView, channels);
+        if (planar.length === 0) {
+          return;
+        }
+        planar = resamplePlanar(planar, sampleRate, audioContext.sampleRate);
+        if (audioUseWorklet) {
+          audioWorkletNode.port.postMessage(
+            { t: 'chunk', channels: planar.map((channel) => channel.buffer) },
+            planar.map((channel) => channel.buffer),
+          );
+        } else {
+          const frameCount = planar[0]?.length ?? 0;
+          if (frameCount <= 0) {
+            return;
+          }
+          const audioBuffer = audioContext.createBuffer(planar.length, frameCount, audioContext.sampleRate);
+          for (let ch = 0; ch < planar.length; ch += 1) {
+            audioBuffer.copyToChannel(planar[ch], ch);
+          }
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(audioContext.destination);
+          const now = audioContext.currentTime;
+          if (audioFallbackPlayhead < now + 0.12) {
+            audioFallbackPlayhead = now + 0.12;
+          }
+          source.start(audioFallbackPlayhead);
+          audioFallbackPlayhead += audioBuffer.duration;
+        }
+      } catch (err) {
+        logEvent(`audio playback failed: ${err}`);
+      } finally {
+        audioPollInFlight = false;
+      }
+    }
+
+    function startAudioPolling() {
+      if (audioPollTimer !== null) {
+        clearInterval(audioPollTimer);
+      }
+      audioPollTimer = setInterval(() => {
+        pollAudioChunk();
+      }, audioPollMs);
+    }
+
+    function stopAudioPolling() {
+      if (audioPollTimer !== null) {
+        clearInterval(audioPollTimer);
+        audioPollTimer = null;
+      }
+      audioLastSeq = 0;
+      audioPollInFlight = false;
+      resetAudioWorklet();
+    }
+
+    async function toggleAudioPlayback() {
+      audioEnabled = !audioEnabled;
+      updateAudioUi();
+      if (!audioEnabled) {
+        stopAudioPolling();
+        return;
+      }
+      try {
+        await ensureAudioContext();
+        startAudioPolling();
+        pollAudioChunk();
+      } catch (err) {
+        audioEnabled = false;
+        updateAudioUi();
+        logEvent(`audio enable failed: ${err}`);
+      }
     }
 
     function scheduleControlRefresh() {
@@ -319,9 +703,17 @@ INDEX_HTML = """<!doctype html>
         `slot=${slot.name} | status=${slot.status} | refresh fps=${getControlRefreshFps().toFixed(1)} | last refresh=${new Date(ts).toLocaleTimeString()}`;
     }
 
+    function controlFrameRect() {
+      const frame = document.getElementById('control-frame');
+      const rect = frame.getBoundingClientRect();
+      if (rect.width > 1 && rect.height > 1) {
+        return rect;
+      }
+      return document.getElementById('control-surface').getBoundingClientRect();
+    }
+
     function controlSurfacePosition(event) {
-      const root = document.getElementById('control-surface');
-      const rect = root.getBoundingClientRect();
+      const rect = controlFrameRect();
       if (rect.width <= 1 || rect.height <= 1) {
         return null;
       }
@@ -372,6 +764,34 @@ INDEX_HTML = """<!doctype html>
       await reload();
       refreshComposite();
       refreshControlFrame();
+    }
+
+    async function cleanupAll() {
+      const meta = document.getElementById('system-meta');
+      meta.textContent = 'cleanup running...';
+      try {
+        const res = await fetch('/api/cleanup-all', { method: 'POST' });
+        if (!res.ok) {
+          let detail = `http ${res.status}`;
+          try {
+            const body = await res.json();
+            detail = body.detail ?? JSON.stringify(body);
+          } catch (_) {}
+          meta.textContent = `cleanup failed: ${detail}`;
+          return;
+        }
+        const body = await res.json();
+        const killed = (body.cleanup ?? []).map(item =>
+          `${item.slot}:${(item.killed ?? []).join(',') || 'none'}`
+        ).join(' | ');
+        const locks = (body.removed_global_locks ?? []).length;
+        meta.textContent = `cleanup complete | global locks removed=${locks} | ${killed}`;
+        await reload();
+        refreshComposite();
+        refreshControlFrame();
+      } catch (err) {
+        meta.textContent = `cleanup failed: ${err}`;
+      }
     }
     document.getElementById('refresh-fps').value = browserFps.toFixed(1);
     document.getElementById('control-refresh-fps').value = browserFps.toFixed(1);
@@ -441,6 +861,15 @@ INDEX_HTML = """<!doctype html>
       if (!controlArmed) {
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && event.code === 'KeyV') {
+        event.preventDefault();
+        logEvent(`paste shortcut detected for ${selectedControlSlot ?? 'no slot'}`);
+        pasteFromClipboardApi().catch((err) => {
+          logEvent(`clipboard api failed: ${err}`);
+          logEvent('use browser paste event as fallback');
+        });
+        return;
+      }
       const mapped = browserKeyMap[event.code];
       if (!mapped) {
         return;
@@ -469,10 +898,24 @@ INDEX_HTML = """<!doctype html>
         releaseAllPressed();
       }
     });
+    window.addEventListener('paste', (event) => {
+      if (!controlArmed || !selectedControlSlot) {
+        return;
+      }
+      event.preventDefault();
+      const text = event.clipboardData?.getData('text') ?? '';
+      if (!text) {
+        logEvent('paste ignored: clipboard text empty');
+        return;
+      }
+      logEvent(`paste event read: ${text.length} chars`);
+      typeClipboardText(text);
+    });
     reload();
     refreshComposite();
     refreshControlFrame();
     updateControlArmedUi();
+    updateAudioUi();
     setInterval(reload, 1000);
     scheduleCompositeRefresh();
     scheduleControlRefresh();
@@ -480,6 +923,73 @@ INDEX_HTML = """<!doctype html>
 </body>
 </html>
 """
+
+
+async def _run_model_stream(websocket, supervisor: HarnessSupervisor, stream_interval_s: float) -> None:
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    next_tick = loop.time()
+    try:
+        while True:
+            timeout = max(0.0, next_tick - loop.time())
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await websocket.send_bytes(await supervisor.observation_payload())
+                next_tick += stream_interval_s
+                if next_tick < loop.time():
+                    next_tick = loop.time()
+                continue
+
+            try:
+                message = decode_stream_text(raw)
+            except Exception as exc:
+                await websocket.send_text(encode_stream_error(code="bad_json", detail=str(exc)))
+                continue
+
+            op = str(message.get("op", ""))
+            if op == "actions":
+                actions = message.get("actions")
+                if not isinstance(actions, dict):
+                    await websocket.send_text(
+                        encode_stream_error(code="bad_actions", detail="actions must be an object")
+                    )
+                    continue
+                server_recv_ns = time.time_ns()
+                try:
+                    results = await supervisor.apply_actions(actions)
+                except KeyError as exc:
+                    await websocket.send_text(encode_stream_error(code="unknown_slot", detail=str(exc)))
+                    continue
+                await websocket.send_text(
+                    encode_stream_ack(
+                        client_send_ns=message.get("client_send_ns"),
+                        server_recv_ns=server_recv_ns,
+                        server_send_ns=time.time_ns(),
+                        results=results,
+                    )
+                )
+                continue
+
+            if op == "ping":
+                await websocket.send_text(encode_stream_pong(message.get("client_send_ns")))
+                continue
+
+            await websocket.send_text(
+                encode_stream_error(code="bad_op", detail=f"unsupported op: {op or '<missing>'}")
+            )
+    except Exception as exc:
+        if exc.__class__.__name__ in {"WebSocketDisconnect"}:
+            return
+        if isinstance(exc, RuntimeError):
+            return
+        raise
+
+
+async def model_stream_endpoint(websocket: WebSocket) -> None:
+    supervisor = websocket.app.state.supervisor
+    stream_interval_s = websocket.app.state.stream_interval_s
+    await _run_model_stream(websocket, supervisor, stream_interval_s)
 
 
 def create_app(config_path: str | Path = "sim_harness.toml"):
@@ -494,8 +1004,11 @@ def create_app(config_path: str | Path = "sim_harness.toml"):
 
     config = load_config(config_path)
     supervisor = HarnessSupervisor(config)
+    stream_hz = min((slot.audio_frame_hz for slot in config.slots), default=32)
+    stream_interval_s = 1.0 / max(1, stream_hz)
     app = FastAPI(title="cs2-sim-harness")
     app.state.supervisor = supervisor
+    app.state.stream_interval_s = stream_interval_s
 
     @app.on_event("startup")
     async def on_startup() -> None:
@@ -512,6 +1025,33 @@ def create_app(config_path: str | Path = "sim_harness.toml"):
     @app.get("/api/slots")
     async def list_slots():
         return JSONResponse(supervisor.list_slots())
+
+    @app.get("/api/model/observation.bin")
+    async def model_observation():
+        try:
+            payload = await supervisor.observation_payload()
+            return Response(payload, media_type="application/octet-stream")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/model/actions")
+    async def model_actions(payload: dict):
+        try:
+            actions = payload.get("actions")
+            if not isinstance(actions, dict):
+                raise HTTPException(status_code=400, detail="payload.actions must be an object")
+            return JSONResponse({"results": await supervisor.apply_actions(actions)})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    app.add_api_websocket_route("/api/model/ws", model_stream_endpoint)
+
+    @app.post("/api/cleanup-all")
+    async def cleanup_all():
+        try:
+            return JSONResponse(await supervisor.cleanup_all())
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/slots/{slot_name}/start")
     async def start_slot(slot_name: str):
@@ -554,6 +1094,28 @@ def create_app(config_path: str | Path = "sim_harness.toml"):
         if payload is None:
             return Response(status_code=204)
         return Response(payload, media_type="image/jpeg")
+
+    @app.get("/api/slots/{slot_name}/audio.pcm")
+    async def slot_audio(slot_name: str):
+        try:
+            worker = supervisor.get_worker(slot_name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        item = await worker.latest_audio_pcm()
+        if item is None:
+            return Response(status_code=204)
+        seq, ts_ns, payload = item
+        return Response(
+            payload,
+            media_type="application/octet-stream",
+            headers={
+                "x-audio-seq": str(seq),
+                "x-audio-time-ns": str(ts_ns),
+                "x-audio-sample-rate": "24000",
+                "x-audio-channels": "2",
+                "x-audio-format": "s16le",
+            },
+        )
 
     @app.get("/api/composite.jpg")
     async def composite():

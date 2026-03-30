@@ -20,6 +20,7 @@ TARGET_GID="$(id -g "$TARGET_USER")"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 RUNTIME_DIR="/run/user/${TARGET_UID}"
 BUS_PATH="${RUNTIME_DIR}/bus"
+TMP_DIR="${TARGET_HOME}/tmp"
 
 if [[ -z "${TARGET_HOME}" ]]; then
   echo "Could not determine home for user: ${TARGET_USER}" >&2
@@ -40,7 +41,8 @@ install -d -m 700 -o "${TARGET_UID}" -g "${TARGET_GID}" \
   "${TARGET_HOME}/.local" \
   "${TARGET_HOME}/.local/share" \
   "${TARGET_HOME}/.config" \
-  "${TARGET_HOME}/.cache"
+  "${TARGET_HOME}/.cache" \
+  "${TMP_DIR}"
 
 # Try to ensure a DBus session bus exists.
 if [[ ! -S "${BUS_PATH}" ]]; then
@@ -63,6 +65,7 @@ export USER="${TARGET_USER}"
 export LOGNAME="${TARGET_USER}"
 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${BUS_PATH}"
+export TMPDIR="${TMP_DIR}"
 
 # NVIDIA/gamescope env
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
@@ -79,6 +82,7 @@ exec runuser -u "${TARGET_USER}" -- env \
   LOGNAME="${LOGNAME}" \
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
   DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS}" \
+  TMPDIR="${TMPDIR}" \
   __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME}" \
   GBM_BACKEND="${GBM_BACKEND}" \
   __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD}" \

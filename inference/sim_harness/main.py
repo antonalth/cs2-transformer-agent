@@ -22,7 +22,19 @@ def main() -> None:
         ) from exc
 
     app = create_app(args.config)
-    uvicorn.run(app, host="0.0.0.0", port=app.state.supervisor.config.web.port)
+    web_cfg = app.state.supervisor.config.web
+    kwargs = {
+        "host": web_cfg.host,
+        "port": web_cfg.port,
+    }
+    certfile = web_cfg.ssl_certfile.strip()
+    keyfile = web_cfg.ssl_keyfile.strip()
+    if certfile or keyfile:
+        if not certfile or not keyfile:
+            raise RuntimeError("both web.ssl_certfile and web.ssl_keyfile must be set for HTTPS")
+        kwargs["ssl_certfile"] = certfile
+        kwargs["ssl_keyfile"] = keyfile
+    uvicorn.run(app, **kwargs)
 
 
 if __name__ == "__main__":

@@ -40,9 +40,25 @@ def send_input(slot: SlotConfig, payload: dict, timeout_s: float = 1.0) -> dict:
 
 
 def request_frame(slot: SlotConfig, timeout_s: float = 1.0) -> bytes | None:
+    item = request_frame_packet(slot, timeout_s)
+    if item is None:
+        return None
+    return item[2]
+
+
+def request_frame_packet(slot: SlotConfig, timeout_s: float = 1.0) -> tuple[int, int, bytes] | None:
     with socket.create_connection(("127.0.0.1", slot.video_port), timeout=timeout_s) as sock:
-        header = _recv_exact(sock, 4)
-        (size,) = struct.unpack("!I", header)
+        header = _recv_exact(sock, 20)
+        seq, ts_ns, size = struct.unpack("!QQI", header)
         if size == 0:
             return None
-        return _recv_exact(sock, size)
+        return seq, ts_ns, _recv_exact(sock, size)
+
+
+def request_audio(slot: SlotConfig, timeout_s: float = 1.0) -> tuple[int, int, bytes] | None:
+    with socket.create_connection(("127.0.0.1", slot.audio_port), timeout=timeout_s) as sock:
+        header = _recv_exact(sock, 20)
+        seq, ts_ns, size = struct.unpack("!QQI", header)
+        if size == 0:
+            return None
+        return seq, ts_ns, _recv_exact(sock, size)

@@ -201,6 +201,8 @@ class FrameStreamer:
         self.fps = fps
         self.jpeg_quality = jpeg_quality
         self.latest_jpeg: Optional[bytes] = None
+        self.latest_seq = 0
+        self.latest_time_ns = 0
         self.cursor_norm = (0.5, 0.5)
         self.cursor_visible = True
         self.lock = threading.Lock()
@@ -218,6 +220,23 @@ class FrameStreamer:
         self.pipeline = Gst.parse_launch(pipeline_desc)
         self.appsink = self.pipeline.get_by_name("appsink")
         self.appsink.connect("new-sample", self._on_sample)
+
+    def _estimate_capture_time_ns(self, buf) -> int:
+        now_ns = time.time_ns()
+        pts = int(buf.pts)
+        if pts < 0 or pts == int(Gst.CLOCK_TIME_NONE):
+            return now_ns
+        clock = self.pipeline.get_clock()
+        if clock is None:
+            return now_ns
+        try:
+            running_now_ns = int(clock.get_time() - self.pipeline.get_base_time())
+        except Exception:
+            return now_ns
+        if running_now_ns <= 0:
+            return now_ns
+        age_ns = max(0, running_now_ns - pts)
+        return max(0, now_ns - age_ns)
 
     def set_cursor(self, nx: float, ny: float, visible: bool) -> None:
         with self.lock:
@@ -245,6 +264,7 @@ class FrameStreamer:
     def _on_sample(self, sink):
         sample = sink.emit("pull-sample")
         buf = sample.get_buffer()
+        capture_time_ns = self._estimate_capture_time_ns(buf)
         caps = sample.get_caps()
         s = caps.get_structure(0)
         width = s.get_value("width")
@@ -265,6 +285,8 @@ class FrameStreamer:
             if ok2:
                 with self.lock:
                     self.latest_jpeg = enc.tobytes()
+                    self.latest_seq += 1
+                    self.latest_time_ns = capture_time_ns
         finally:
             buf.unmap(mapinfo)
 
@@ -279,6 +301,10 @@ class FrameStreamer:
     def get_latest(self) -> Optional[bytes]:
         with self.lock:
             return self.latest_jpeg
+
+    def get_latest_packet(self) -> tuple[int, int, Optional[bytes]]:
+        with self.lock:
+            return self.latest_seq, self.latest_time_ns, self.latest_jpeg
 
 
 def video_server(host: str, port: int, streamer: FrameStreamer) -> None:

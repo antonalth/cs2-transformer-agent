@@ -11,6 +11,8 @@ class WebConfig:
     port: int = 8080
     browser_fps: int = 1
     auto_start_slots: bool = False
+    ssl_certfile: str = ""
+    ssl_keyfile: str = ""
 
 
 @dataclass(slots=True)
@@ -42,8 +44,17 @@ class SlotConfig:
     jpeg_quality: int = 80
     video_port: int = 5500
     input_port: int = 5501
+    audio_port: int = 5502
+    audio_sample_rate: int = 24000
+    audio_channels: int = 2
+    audio_frame_hz: int = 32
+    audio_monitor_name: str = "auto_null.monitor"
     inspect_fps: int = 1
     startup_grace_s: float = 2.0
+
+    @property
+    def audio_frame_samples(self) -> int:
+        return max(1, self.audio_sample_rate // self.audio_frame_hz)
 
     def effective_gamescope_args(self) -> list[str]:
         args = list(self.gamescope_args)

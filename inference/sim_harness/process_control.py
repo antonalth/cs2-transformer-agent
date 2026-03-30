@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import time
 import shlex
 import subprocess
 
@@ -15,6 +16,10 @@ def run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
         stdout = (exc.stdout or "").strip()
         detail = stderr or stdout or str(exc)
         raise RuntimeError(detail) from exc
+
+
+def run_best_effort(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=False)
 
 
 def tmux_has_session(session_name: str) -> bool:
@@ -77,3 +82,51 @@ def launch_slot_session(harness: HarnessConfig, slot: SlotConfig) -> str:
         tmux_kill_session(slot.tmux_session)
     tmux_new_detached_session(slot.tmux_session, command)
     return command
+
+
+def cleanup_slot_processes(harness: HarnessConfig, slot: SlotConfig) -> dict:
+    runas = str(Path(harness.runtime.runas_path))
+    killed = []
+    exact_names = [
+        "gamescope",
+        "cs2",
+        "reaper",
+        "srt-bwrap",
+        "pv-adverb",
+        "steam",
+        "steamwebhelper",
+        "steam-runtime-launcher-service",
+    ]
+    for name in exact_names:
+        proc = run_best_effort(["sudo", "-n", runas, slot.user, "pkill", "-9", "-x", name])
+        if proc.returncode == 0:
+            killed.append(name)
+
+    shell_script = 'rm -f "${TMPDIR:-/tmp}"/source_engine_*.lock'
+    run_best_effort(["sudo", "-n", runas, slot.user, "bash", "-lc", shell_script])
+
+    return {
+        "slot": slot.name,
+        "user": slot.user,
+        "tmux_session": slot.tmux_session,
+        "killed": killed,
+        "timestamp": time(),
+    }
+
+
+def cleanup_global_source_locks(harness: HarnessConfig) -> list[str]:
+    runas = str(Path(harness.runtime.runas_path))
+    proc = run_best_effort(
+        [
+            "sudo",
+            "-n",
+            runas,
+            "root",
+            "bash",
+            "-lc",
+            'shopt -s nullglob; for f in /tmp/source_engine_*.lock; do echo "$f"; rm -f "$f"; done',
+        ]
+    )
+    if proc.returncode != 0:
+        return []
+    return [line for line in (proc.stdout or "").splitlines() if line.strip()]

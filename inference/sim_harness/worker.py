@@ -4,7 +4,7 @@ from dataclasses import asdict
 from time import time
 import asyncio
 
-from .agent_rpc import request_frame, request_status, request_stop, send_input
+from .agent_rpc import request_audio, request_frame, request_frame_packet, request_status, request_stop, send_input
 from .config import HarnessConfig, SlotConfig
 from .models import DiscoveredEndpoint, SlotSnapshot, SlotStatus
 from .process_control import launch_slot_session, tmux_kill_session
@@ -128,6 +128,18 @@ class SlotWorker:
     async def latest_jpeg(self) -> bytes | None:
         try:
             return await asyncio.to_thread(request_frame, self.slot, 1.0)
+        except Exception:
+            return None
+
+    async def latest_frame_packet(self) -> tuple[int, int, bytes] | None:
+        try:
+            return await asyncio.to_thread(request_frame_packet, self.slot, 1.0)
+        except Exception:
+            return None
+
+    async def latest_audio_pcm(self) -> tuple[int, int, bytes] | None:
+        try:
+            return await asyncio.to_thread(request_audio, self.slot, 1.0)
         except Exception:
             return None
 

@@ -137,13 +137,31 @@ class SlotAgent:
     async def handle_frame(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             self._refresh_child_state()
-            payload = None
+            item = None
             if self.capture is not None and self.status == SlotStatus.READY:
-                payload = await asyncio.to_thread(self.capture.latest_jpeg)
-            if payload is None:
-                writer.write(struct.pack("!I", 0))
+                item = await asyncio.to_thread(self.capture.latest_frame_packet)
+            if item is None:
+                writer.write(struct.pack("!QQI", 0, 0, 0))
             else:
-                writer.write(struct.pack("!I", len(payload)))
+                seq, ts_ns, payload = item
+                writer.write(struct.pack("!QQI", seq, ts_ns, len(payload)))
+                writer.write(payload)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def handle_audio(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            self._refresh_child_state()
+            item = None
+            if self.capture is not None and self.status == SlotStatus.READY:
+                item = await asyncio.to_thread(self.capture.latest_audio_pcm)
+            if item is None:
+                writer.write(struct.pack("!QQI", 0, 0, 0))
+            else:
+                seq, ts_ns, payload = item
+                writer.write(struct.pack("!QQI", seq, ts_ns, len(payload)))
                 writer.write(payload)
             await writer.drain()
         finally:
@@ -153,7 +171,8 @@ class SlotAgent:
     async def serve(self) -> None:
         control_server = await asyncio.start_server(self.handle_control, "127.0.0.1", self.slot.input_port)
         frame_server = await asyncio.start_server(self.handle_frame, "127.0.0.1", self.slot.video_port)
-        self._servers = [control_server, frame_server]
+        audio_server = await asyncio.start_server(self.handle_audio, "127.0.0.1", self.slot.audio_port)
+        self._servers = [control_server, frame_server, audio_server]
         await self.start()
         await self._stop_event.wait()
         for server in self._servers:
