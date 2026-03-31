@@ -41,5 +41,8 @@
 - `--max_steps` is an optimizer-step early-stop target for trials; regular scheduler horizon still follows normal dataset/epoch logic.
 
 ### Inference Visualization
-- **Video Generation**: Generate a side-by-side GT vs Prediction video from a sharded FSDP checkpoint.
-  - **Run command**: `docker exec <container_id> accelerate launch --num_processes 4 --use_fsdp --fsdp_version 2 --mixed_precision bf16 transformers/model2/visualize_inference.py --checkpoint <path_to_checkpoint> --output <filename>.mp4`
+- **Video Generation**: Generate a side-by-side GT vs Prediction video from a model3 Lightning checkpoint (`.ckpt`).
+  - **Working script**: `transformers/model3/visualize_inference.py`
+  - **Run command**: `docker exec <container_id> bash -lc "cd /workspace && timeout 180 python transformers/model3/visualize_inference.py --checkpoint <path_to_checkpoint.ckpt> --data_root dataset0 --output <filename>.mp4 --num_samples 1 --device cuda"`
+  - **Example**: `docker exec cs2-model-training-dev-1 bash -lc "cd /workspace && timeout 180 python transformers/model3/visualize_inference.py --checkpoint checkpoints_fsdp/model3_ga8_perceiver_learnedpe_20260308/checkpoint_stepstep=11200.ckpt --data_root dataset0 --output tmp/model3_vis_smoke.mp4 --num_samples 1 --device cuda"`
+  - The script loads `config.json` from the checkpoint directory automatically when present.

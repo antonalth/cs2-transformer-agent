@@ -21,11 +21,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--run_name", type=str, default="unnamed")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--load_weights_only_from", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints_fsdp")
+    parser.add_argument("--max_epochs", type=int, default=None)
     parser.add_argument("--compressor_type", choices=["qformer", "perceiver"], default=None)
     parser.add_argument("--perceiver_pos_embedding", choices=["none", "sincos", "learned"], default=None)
+    parser.add_argument(
+        "--enable_losses",
+        type=str,
+        default=None,
+        help="Comma-separated loss names to enable; all others are disabled.",
+    )
+    parser.add_argument(
+        "--disable_losses",
+        type=str,
+        default=None,
+        help="Comma-separated loss names to disable; all others keep their configured value.",
+    )
     parser.add_argument("--debug", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.resume_from_checkpoint and args.load_weights_only_from:
+        parser.error("--resume_from_checkpoint and --load_weights_only_from are mutually exclusive")
+    return args
 
 
 def create_global_config(
@@ -47,6 +64,39 @@ def save_config(global_cfg: GlobalConfig) -> None:
     t_cfg = global_cfg.train
     os.makedirs(t_cfg.output_dir, exist_ok=True)
     global_cfg.to_file(os.path.join(t_cfg.output_dir, "config.json"))
+
+
+def apply_loss_overrides(global_cfg: GlobalConfig, enable_losses: Optional[str], disable_losses: Optional[str]) -> None:
+    known = set(global_cfg.model.loss_weights.keys())
+
+    if enable_losses is not None:
+        enabled = {name.strip() for name in enable_losses.split(",") if name.strip()}
+        unknown = enabled.difference(known)
+        if unknown:
+            raise ValueError(f"Unknown losses in --enable_losses: {sorted(unknown)}")
+        global_cfg.model.loss_enabled = {
+            name: name in enabled for name in global_cfg.model.loss_weights.keys()
+        }
+
+    if disable_losses is not None:
+        disabled = {name.strip() for name in disable_losses.split(",") if name.strip()}
+        unknown = disabled.difference(known)
+        if unknown:
+            raise ValueError(f"Unknown losses in --disable_losses: {sorted(unknown)}")
+        for name in disabled:
+            global_cfg.model.loss_enabled[name] = False
+
+
+def load_weights_only(model: CS2PredictorModule, checkpoint_path: str) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict")
+    if state_dict is None:
+        raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"Warning: missing keys while loading weights-only checkpoint: {missing}")
+    if unexpected:
+        print(f"Warning: unexpected keys while loading weights-only checkpoint: {unexpected}")
 
 
 def create_logger(
@@ -176,6 +226,7 @@ def build_trainer(
 def run_training(
     global_cfg: GlobalConfig,
     resume_from_checkpoint: Optional[str] = None,
+    load_weights_only_from: Optional[str] = None,
     debug: bool = False,
     enable_wandb: bool = True,
     enable_checkpoints: bool = True,
@@ -188,6 +239,8 @@ def run_training(
 
     dm = CS2DataModule(global_cfg)
     model = CS2PredictorModule(global_cfg)
+    if load_weights_only_from is not None:
+        load_weights_only(model, load_weights_only_from)
     logger = create_logger(global_cfg, enable_wandb=enable_wandb, logger_kwargs=logger_kwargs)
     callbacks = create_callbacks(
         global_cfg,
@@ -215,13 +268,17 @@ def main():
         run_name=args.run_name,
         output_dir=args.output_dir,
     )
+    if args.max_epochs is not None:
+        global_cfg.train.max_epochs = args.max_epochs
     if args.compressor_type is not None:
         global_cfg.model.compressor_type = args.compressor_type
     if args.perceiver_pos_embedding is not None:
         global_cfg.model.perceiver_pos_embedding = args.perceiver_pos_embedding
+    apply_loss_overrides(global_cfg, args.enable_losses, args.disable_losses)
     run_training(
         global_cfg=global_cfg,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        load_weights_only_from=args.load_weights_only_from,
         debug=args.debug,
         enable_wandb=True,
         enable_checkpoints=True,

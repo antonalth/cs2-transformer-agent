@@ -89,13 +89,6 @@ def decode_keyboard(mask: int) -> str:
     return " ".join(active)
 
 def decode_round_state(mask: int) -> str:
-    states = []
-    if mask == 0: return "FREEZE" # Assuming 0 is freeze if 1-hot or similar? 
-    # Check if mask is index or bitmask. The code passed it as int index in previous version?
-    # Actually ModelLoss uses it as index for CE.
-    # But in visualization we might receive the raw value.
-    # Let's assume standard mapping:
-    # 0: Freeze, 1: Live, 2: Plant, 3: T_Win, 4: CT_Win
     mapping = {0: "FREEZE", 1: "LIVE", 2: "PLANT", 3: "T_WIN", 4: "CT_WIN"}
     return mapping.get(mask, f"UNK({mask})")
 
@@ -113,6 +106,8 @@ def convert_gt_to_viz(gt: GroundTruth, t: int, batch_idx: int = 0, cfg: ModelCon
     
     team_alive_count = alive_t.sum().item()
     enemy_alive_count = alive_e.sum().item()
+    enemy_pos = gt.enemy_positions[batch_idx, t]
+    enemy_pos_bins = [encode_position_bins(enemy, cfg) for enemy in enemy_pos] if cfg else [[None, None, None] for _ in range(5)]
     
     gs = {
         'tick': t * 2,
@@ -120,7 +115,10 @@ def convert_gt_to_viz(gt: GroundTruth, t: int, batch_idx: int = 0, cfg: ModelCon
         'round_num': r_num,
         'team_alive_count': team_alive_count,
         'enemy_alive_count': enemy_alive_count,
-        'enemy_pos': gt.enemy_positions[batch_idx, t].tolist()
+        'team_alive_mask': int(sum((1 << i) for i, alive in enumerate(alive_t.tolist()) if alive)),
+        'enemy_alive_mask': int(sum((1 << i) for i, alive in enumerate(alive_e.tolist()) if alive)),
+        'enemy_pos': enemy_pos.tolist(),
+        'enemy_pos_bins': enemy_pos_bins,
     }
 
     pd = []
@@ -130,20 +128,11 @@ def convert_gt_to_viz(gt: GroundTruth, t: int, batch_idx: int = 0, cfg: ModelCon
         pos = gt.position[batch_idx, t, p]
         mouse = gt.mouse_delta[batch_idx, t, p]
         
-        # Calculate Bins for GT if cfg is provided
         m_bins = [None, None]
         p_bins = [None, None, None]
         if cfg:
-            m_bins = [
-                mu_law_encode(mouse[0], cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item(),
-                mu_law_encode(mouse[1], cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item()
-            ]
-            PMIN, PMAX = -4096.0, 4096.0
-            p_bins = [
-                bin_value(pos[0], PMIN, PMAX, cfg.bins_x).item(),
-                bin_value(pos[1], PMIN, PMAX, cfg.bins_y).item(),
-                bin_value(pos[2], PMIN, PMAX, cfg.bins_z).item()
-            ]
+            m_bins = encode_mouse_bins(mouse, cfg)
+            p_bins = encode_position_bins(pos, cfg)
 
         # Eco
         eco_idx = int(gt.eco_buy_idx[batch_idx, t, p].item())
@@ -185,15 +174,16 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
     ea_count = torch.argmax(ea_logits).item()
     
     e_pos = []
-    PMIN, PMAX = -4096.0, 4096.0
+    enemy_pos_bins = []
     for e_idx in range(5):
         bx = torch.argmax(pred.enemy_pos_x[batch_idx, t, e_idx])
         by = torch.argmax(pred.enemy_pos_y[batch_idx, t, e_idx])
         bz = torch.argmax(pred.enemy_pos_z[batch_idx, t, e_idx])
-        ex = unbin_value(bx, PMIN, PMAX, cfg.bins_x).item()
-        ey = unbin_value(by, PMIN, PMAX, cfg.bins_y).item()
-        ez = unbin_value(bz, PMIN, PMAX, cfg.bins_z).item()
+        ex = unbin_value(bx, POSITION_MIN, POSITION_MAX, cfg.bins_x).item()
+        ey = unbin_value(by, POSITION_MIN, POSITION_MAX, cfg.bins_y).item()
+        ez = unbin_value(bz, POSITION_MIN, POSITION_MAX, cfg.bins_z).item()
         e_pos.append([ex, ey, ez])
+        enemy_pos_bins.append([bx.item(), by.item(), bz.item()])
 
     gs = {
         'tick': t * 2,
@@ -201,7 +191,8 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
         'round_num': rn_idx,
         'team_alive_count': ta_count,
         'enemy_alive_count': ea_count,
-        'enemy_pos': e_pos
+        'enemy_pos': e_pos,
+        'enemy_pos_bins': enemy_pos_bins,
     }
 
     pd = []
@@ -220,9 +211,9 @@ def convert_pred_to_viz(pred: ModelPrediction, t: int, batch_idx: int = 0, cfg: 
         pby = torch.argmax(pred.player_pos_y[batch_idx, t, p])
         pbz = torch.argmax(pred.player_pos_z[batch_idx, t, p])
         
-        px = unbin_value(pbx, PMIN, PMAX, cfg.bins_x).item()
-        py = unbin_value(pby, PMIN, PMAX, cfg.bins_y).item()
-        pz = unbin_value(pbz, PMIN, PMAX, cfg.bins_z).item()
+        px = unbin_value(pbx, POSITION_MIN, POSITION_MAX, cfg.bins_x).item()
+        py = unbin_value(pby, POSITION_MIN, POSITION_MAX, cfg.bins_y).item()
+        pz = unbin_value(pbz, POSITION_MIN, POSITION_MAX, cfg.bins_z).item()
         
         # Mouse
         mbx = torch.argmax(pred.mouse_x[batch_idx, t, p])
@@ -275,6 +266,40 @@ COLORS = {
     'white': (255, 255, 255)
 }
 
+POSITION_MIN = -4096.0
+POSITION_MAX = 4096.0
+
+
+def encode_position_bins(pos, cfg: ModelConfig):
+    return [
+        int(bin_value(pos[0], POSITION_MIN, POSITION_MAX, cfg.bins_x).item()),
+        int(bin_value(pos[1], POSITION_MIN, POSITION_MAX, cfg.bins_y).item()),
+        int(bin_value(pos[2], POSITION_MIN, POSITION_MAX, cfg.bins_z).item()),
+    ]
+
+
+def encode_mouse_bins(mouse, cfg: ModelConfig):
+    return [
+        int(mu_law_encode(mouse[0], cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item()),
+        int(mu_law_encode(mouse[1], cfg.mouse_mu, cfg.mouse_max, cfg.mouse_bins_count).item()),
+    ]
+
+
+def format_bin_triplet(bins):
+    return f"[{bins[0]},{bins[1]},{bins[2]}]"
+
+
+def format_bin_pair(bins):
+    return f"[{bins[0]},{bins[1]}]"
+
+
+def format_pos_continuous(pos):
+    return f"({pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f})"
+
+
+def format_mouse_continuous(mouse):
+    return f"({mouse[0]:.1f}, {mouse[1]:.1f})"
+
 def draw_text_lines(img, lines, x, y, color, scale=0.4, thickness=1):
     line_height = int(20 * (scale / 0.4))
     for i, line in enumerate(lines):
@@ -301,12 +326,19 @@ def render_player_panel(frame, gt_data, pred_data, player_idx=0):
         eco_idx = data.get('eco_buy_idx', -1)
         eco_str = ITEM_NAMES[eco_idx] if 0 <= eco_idx < len(ITEM_NAMES) else ""
         is_buying = data.get('eco_purchase', False)
+
+        if prefix == "GT":
+            pos_str = f"{format_bin_triplet(data['pos_bins'])} {format_pos_continuous(pos)}"
+            mouse_str = f"{format_bin_pair(data['mouse_bins'])} {format_mouse_continuous(mouse)}"
+        else:
+            pos_str = format_bin_triplet(data['pos_bins'])
+            mouse_str = f"{format_bin_pair(data['mouse_bins'])} {format_mouse_continuous(mouse)}"
         
         lines = [
             f"{prefix} P{player_idx}: HP {hp} | AP {arm} | ${mon}",
             f"   Wep: {wep_str}",
-            f"   Pos: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}",
-            f"   Aim: {mouse[0]:.1f}, {mouse[1]:.1f}",
+            f"   Pos: {pos_str}",
+            f"   Aim: {mouse_str}",
             f"   Key: {keys}"
         ]
         
@@ -337,40 +369,44 @@ def render_global_panel(h, w, gt_gs, pred_gs):
     cv2.putText(panel, "GAME STATE (PRED)", (col_w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS['pred'], 2)
     
     # --- GT Column ---
-    r_state = decode_round_state(gt_gs['round_state'])
+    r_state_idx = gt_gs['round_state']
+    r_state = decode_round_state(r_state_idx)
     r_num = gt_gs.get('round_num', '?')
     t_alive = gt_gs.get('team_alive_count', 0)
     e_alive = gt_gs.get('enemy_alive_count', 0)
+    t_mask = gt_gs.get('team_alive_mask', 0)
+    e_mask = gt_gs.get('enemy_alive_mask', 0)
     
     gt_lines = [
         f"Tick: {gt_gs.get('tick', '?')}",
-        f"State: {r_state} | R: {r_num}",
-        f"T Alive: {t_alive}",
-        f"E Alive: {e_alive}",
+        f"State: {r_state} [{r_state_idx}] | R: {r_num}",
+        f"T Alive: {t_alive} | Mask: {bin(t_mask)[2:].zfill(5)}",
+        f"E Alive: {e_alive} | Mask: {bin(e_mask)[2:].zfill(5)}",
         "Enemies:"
     ]
     
     for i, pos in enumerate(gt_gs['enemy_pos']):
-        line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
+        line = f" E{i}: {format_bin_triplet(gt_gs['enemy_pos_bins'][i])} {format_pos_continuous(pos)}"
         gt_lines.append(line)
 
     draw_text_lines(panel, gt_lines, 10, 60, COLORS['gt'], scale=0.5)
     
     # --- Pred Column ---
     if pred_gs:
-        pr_state = decode_round_state(pred_gs['round_state'])
+        pr_state_idx = pred_gs['round_state']
+        pr_state = decode_round_state(pr_state_idx)
         pr_num = pred_gs.get('round_num', '?')
         
         pred_lines = [
             f"Tick: {gt_gs.get('tick', '?')}", 
-            f"State: {pr_state} | R: {pr_num}",
+            f"State: {pr_state} [{pr_state_idx}] | R: {pr_num}",
             f"T Alive: {pred_gs['team_alive_count']}",
             f"E Alive: {pred_gs['enemy_alive_count']}",
             "Enemies:"
         ]
         
-        for i, pos in enumerate(pred_gs['enemy_pos']):
-            line = f" E{i}: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}"
+        for i, _ in enumerate(pred_gs['enemy_pos']):
+            line = f" E{i}: {format_bin_triplet(pred_gs['enemy_pos_bins'][i])}"
             pred_lines.append(line)
             
         draw_text_lines(panel, pred_lines, col_w + 10, 60, COLORS['pred'], scale=0.5)
@@ -421,7 +457,7 @@ def run_inference_and_video(model, loader, output_path, global_cfg, num_samples,
                 frames = []
                 for p in range(5):
                     frm = imgs_cpu[0, t, p].permute(1, 2, 0).numpy()
-                    # frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
+                    frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
                     frames.append(frm)
                     
                 panels = []
