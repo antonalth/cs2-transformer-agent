@@ -28,6 +28,7 @@ from transformers import (
     AutoModel, AutoImageProcessor, LlamaConfig, LlamaModel, 
     DacModel, Blip2QFormerConfig, Blip2QFormerModel
 )
+from transformers.cache_utils import Cache, DynamicCache
 
 from config import ModelConfig
 
@@ -135,6 +136,65 @@ class ModelPrediction:
     enemy_pos_x: torch.Tensor       # [B, T, 5, bins_x] (Logits)
     enemy_pos_y: torch.Tensor       # [B, T, 5, bins_y] (Logits)
     enemy_pos_z: torch.Tensor       # [B, T, 5, bins_z] (Logits)
+
+
+class RollingDynamicCache(DynamicCache):
+    """
+    Dynamic cache that keeps track of the absolute token offset of the first
+    retained key/value. This allows left-cropping while preserving causal mask
+    positions for subsequent autoregressive decoding.
+    """
+
+    def __init__(self, *args, position_offset: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.position_offset = int(position_offset)
+
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        if layer_idx >= len(self.layers):
+            return cache_position.shape[0], self.position_offset
+        return self.layers[layer_idx].get_seq_length() + cache_position.shape[0], self.position_offset
+
+    def crop(self, max_length: int):
+        if max_length < 0:
+            max_length = self.get_seq_length() - abs(max_length)
+
+        seq_length = self.get_seq_length()
+        if seq_length <= max_length:
+            return
+
+        trim = seq_length - max_length
+        for layer in self.layers:
+            max_cache_shape = layer.get_max_cache_shape()
+            if max_cache_shape not in (-1, None):
+                raise ValueError("RollingDynamicCache only supports non-sliding cache layers")
+            if not getattr(layer, "is_initialized", False) or layer.keys.numel() == 0:
+                continue
+            layer.keys = layer.keys[..., trim:, :]
+            layer.values = layer.values[..., trim:, :]
+        self.position_offset += trim
+
+
+@dataclass
+class AutoregressiveState:
+    split_caches: list[Optional[Cache]]
+    total_tokens_processed: int = 0
+    max_cache_frames: Optional[int] = None
+    tokens_per_frame: int = 6
+
+    @property
+    def cached_tokens(self) -> int:
+        for cache in self.split_caches:
+            if cache is not None:
+                return cache.get_seq_length()
+        return 0
+
+    @property
+    def total_frames_processed(self) -> int:
+        return self.total_tokens_processed // self.tokens_per_frame
+
+    @property
+    def cached_frames(self) -> int:
+        return self.cached_tokens // self.tokens_per_frame
 
 
 class _CrossAttentionBlock(nn.Module):
@@ -675,115 +735,214 @@ class GamePredictorBackbone(nn.Module):
             
         self.heads = ModelOutputHeads(cfg)
 
-    def forward(self, images: torch.Tensor, audio: torch.Tensor):
+    def _prepare_context(self, images: torch.Tensor, audio: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         B, T, P = images.shape[:3]
-        
-        # --- Perception ---
-        # Checkpointing is handled inside GameVideoEncoder's compressor
-        vid_feats = self.video(images) # [B, T, P, 50, 768]
-        aud_feats = self.audio(audio, T) # [B, T, P, C, 256]
-        del images, audio
-        
-        # --- Prepare Context (Keys/Values) ---
-        aud_feats = self.audio_proj(aud_feats) # [B, T, P, C, 768]
-        
-        # Concat per player
-        # vid: [B, T, P, 50, 768]
-        # aud: [B, T, P, C, 768]
-        context = torch.cat([vid_feats, aud_feats], dim=3) # [B, T, P, 50+C, 768]
-        del vid_feats, aud_feats
-        
-        # Reshape context for cross attention: [B*T*P, Tokens, Dim]
-        context_flat = context.view(B*T*P, -1, self.cfg.compressor_hidden_size)
-        
-        # --- Prepare Initial Hidden State ---
-        # Players: [B, T, 5, D]
-        # Expand 1 query -> 5 players
-        
-        dummy_idx = torch.zeros(1, dtype=torch.long, device=context_flat.device)
-        p_vec = self.player_query(dummy_idx).view(1, 1, 1, -1) # [1, 1, 1, D]
-        s_vec = self.strat_query(dummy_idx).view(1, 1, 1, -1)  # [1, 1, 1, D]
-        
+        vid_feats = self.video(images)  # [B, T, P, N_q, D]
+        aud_feats = self.audio(audio, T)  # [B, T, P, C, H]
+        aud_feats = self.audio_proj(aud_feats)  # [B, T, P, C, D]
+        context = torch.cat([vid_feats, aud_feats], dim=3)
+        context_flat = context.view(B * T * P, -1, self.cfg.compressor_hidden_size)
+        return context_flat, B, T
+
+    def _init_hidden_queries(self, B: int, T: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        dummy_idx = torch.zeros(1, dtype=torch.long, device=device)
+        p_vec = self.player_query(dummy_idx).view(1, 1, 1, -1)
+        s_vec = self.strat_query(dummy_idx).view(1, 1, 1, -1)
         p_q = p_vec.expand(B, T, 5, -1)
         s_q = s_vec.expand(B, T, 1, -1)
-        
-        current_hidden_p = p_q.reshape(B*T*5, 1, self.cfg.llama_hidden_size)
-        current_hidden_s = s_q.reshape(B*T, 1, self.cfg.llama_hidden_size)
-        
-        for block in self.blocks:
-            # 1. Cross Attention (Players only)
-            # Query: current_hidden_p [N_players, 1, D]
-            # Key: context_flat [N_players, K, D_v]
-            
-            p_out = block["cross"](current_hidden_p, context_flat) # [N_players, 1, D]
-            current_hidden_p = p_out
-            
-            # 2. Combine for Llama
-            # Reassemble [B, T, 6, D]
-            p_view = current_hidden_p.view(B, T, 5, -1)
-            s_view = current_hidden_s.view(B, T, 1, -1)
-            
-            seq = torch.cat([p_view, s_view], dim=2) # [B, T, 6, D]
-            seq_flat = seq.view(B, T * 6, -1) # [B, L, D]
-            
-            # 3. Llama
-            # Llama expects [Batch, Seq, Dim]
-            llama_out = block["llama"](inputs_embeds=seq_flat).last_hidden_state # [B, L, D]
-            
-            # 4. Split back
-            out_frames = llama_out.view(B, T, 6, -1)
-            p_view = out_frames[:, :, :5, :]
-            s_view = out_frames[:, :, 5:, :]
-            
-            current_hidden_p = p_view.reshape(B*T*5, 1, -1)
-            current_hidden_s = s_view.reshape(B*T, 1, -1)
-            
-        # --- Final Heads ---
-        # p_view: [B, T, 5, D]
-        # s_view: [B, T, 1, D]
-        
+        return (
+            p_q.reshape(B * T * 5, 1, self.cfg.llama_hidden_size),
+            s_q.reshape(B * T, 1, self.cfg.llama_hidden_size),
+        )
+
+    def _assemble_sequence(
+        self,
+        current_hidden_p: torch.Tensor,
+        current_hidden_s: torch.Tensor,
+        B: int,
+        T: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        p_view = current_hidden_p.view(B, T, 5, -1)
+        s_view = current_hidden_s.view(B, T, 1, -1)
+        seq = torch.cat([p_view, s_view], dim=2)
+        return p_view, s_view, seq.view(B, T * self.cfg.tokens_per_frame, -1)
+
+    def _build_prediction(
+        self,
+        p_view: torch.Tensor,
+        s_view: torch.Tensor,
+        B: int,
+        T: int,
+    ) -> dict[str, torch.Tensor]:
         p_flat = p_view.reshape(-1, self.cfg.llama_hidden_size)
         s_flat = s_view.reshape(-1, self.cfg.llama_hidden_size)
-        
+
         p_preds = self.heads.forward_player(p_flat)
         s_preds = self.heads.forward_global(s_flat)
-        
+
         def rs(x, is_player=True):
-            if is_player: 
-                # x is [B*T*5, Dim] -> [B, T, 5, Dim]
+            if is_player:
                 return x.view(B, T, 5, *x.shape[1:])
-            else: 
-                # x is [B*T, Dim] -> [B, T, Dim]
-                # Special case for enemy pos which is [B*T*5, Dim] but coming from strategy token
-                if x.shape[0] == B * T * 5:
-                    return x.view(B, T, 5, *x.shape[1:])
-                return x.view(B, T, *x.shape[1:])
-        
+            if x.shape[0] == B * T * 5:
+                return x.view(B, T, 5, *x.shape[1:])
+            return x.view(B, T, *x.shape[1:])
+
         mp = ModelPrediction(
             mouse_x=rs(p_preds["mouse_x"]),
             mouse_y=rs(p_preds["mouse_y"]),
             keyboard_logits=rs(p_preds["keyboard_logits"]),
-            
             eco_buy_logits=rs(p_preds["eco_buy_logits"]),
             eco_purchase_logits=rs(p_preds["eco_purchase_logits"]),
             active_weapon_logits=rs(p_preds["active_weapon_logits"]),
-            
             health_logits=rs(p_preds["health_logits"]),
             armor_logits=rs(p_preds["armor_logits"]),
             money_logits=rs(p_preds["money_logits"]),
-            
             player_pos_x=rs(p_preds["player_pos_x"]),
             player_pos_y=rs(p_preds["player_pos_y"]),
             player_pos_z=rs(p_preds["player_pos_z"]),
-            
-            # Enemy preds come from s_preds but were expanded to 5
-            enemy_pos_x=rs(s_preds["enemy_pos_x"], is_player=False), 
+            enemy_pos_x=rs(s_preds["enemy_pos_x"], is_player=False),
             enemy_pos_y=rs(s_preds["enemy_pos_y"], is_player=False),
             enemy_pos_z=rs(s_preds["enemy_pos_z"], is_player=False),
-            
             round_state_logits=rs(s_preds["round_state_logits"], is_player=False),
             round_num_logits=rs(s_preds["round_num_logits"], is_player=False),
             team_alive_logits=rs(s_preds["team_alive_logits"], is_player=False),
             enemy_alive_logits=rs(s_preds["enemy_alive_logits"], is_player=False),
         )
         return {k: getattr(mp, k) for k in mp.__dataclass_fields__}
+
+    def init_autoregressive_state(self, *, max_cache_frames: Optional[int] = None) -> AutoregressiveState:
+        if max_cache_frames is not None and max_cache_frames <= 0:
+            raise ValueError("max_cache_frames must be positive when provided")
+        return AutoregressiveState(
+            split_caches=[None for _ in range(len(self.blocks))],
+            total_tokens_processed=0,
+            max_cache_frames=max_cache_frames,
+            tokens_per_frame=self.cfg.tokens_per_frame,
+        )
+
+    def reset_autoregressive_state(self, *, max_cache_frames: Optional[int] = None) -> AutoregressiveState:
+        return self.init_autoregressive_state(max_cache_frames=max_cache_frames)
+
+    def crop_autoregressive_state(
+        self,
+        state: AutoregressiveState,
+        *,
+        max_cache_frames: Optional[int] = None,
+    ) -> AutoregressiveState:
+        resolved_max_frames = state.max_cache_frames if max_cache_frames is None else max_cache_frames
+        if resolved_max_frames is None:
+            return state
+        if resolved_max_frames <= 0:
+            raise ValueError("max_cache_frames must be positive when provided")
+
+        max_tokens = resolved_max_frames * self.cfg.tokens_per_frame
+        for cache in state.split_caches:
+            if cache is None:
+                continue
+            if not isinstance(cache, RollingDynamicCache):
+                raise TypeError("autoregressive cropping expects RollingDynamicCache instances")
+            cache.crop(max_tokens)
+        state.max_cache_frames = resolved_max_frames
+        return state
+
+    def _forward_from_context_flat(self, context_flat: torch.Tensor, B: int, T: int) -> dict[str, torch.Tensor]:
+        current_hidden_p, current_hidden_s = self._init_hidden_queries(B, T, context_flat.device)
+
+        for block in self.blocks:
+            p_out = block["cross"](current_hidden_p, context_flat)
+            current_hidden_p = p_out
+
+            _, _, seq_flat = self._assemble_sequence(current_hidden_p, current_hidden_s, B, T)
+            llama_out = block["llama"](inputs_embeds=seq_flat).last_hidden_state
+
+            out_frames = llama_out.view(B, T, self.cfg.tokens_per_frame, -1)
+            p_view = out_frames[:, :, :5, :]
+            s_view = out_frames[:, :, 5:, :]
+
+            current_hidden_p = p_view.reshape(B * T * 5, 1, -1)
+            current_hidden_s = s_view.reshape(B * T, 1, -1)
+
+        return self._build_prediction(p_view, s_view, B, T)
+
+    def _forward_step_from_context_flat(
+        self,
+        context_flat: torch.Tensor,
+        B: int,
+        T: int,
+        state: Optional[AutoregressiveState] = None,
+        *,
+        max_cache_frames: Optional[int] = None,
+    ) -> tuple[dict[str, torch.Tensor], AutoregressiveState]:
+        current_hidden_p, current_hidden_s = self._init_hidden_queries(B, T, context_flat.device)
+
+        if state is None:
+            state = self.init_autoregressive_state(max_cache_frames=max_cache_frames)
+        elif max_cache_frames is not None:
+            state.max_cache_frames = max_cache_frames
+
+        step_tokens = T * self.cfg.tokens_per_frame
+        if state.max_cache_frames is not None:
+            max_tokens = state.max_cache_frames * self.cfg.tokens_per_frame
+            keep_previous_tokens = max(0, max_tokens - step_tokens)
+            for cache in state.split_caches:
+                if cache is None:
+                    continue
+                if not isinstance(cache, RollingDynamicCache):
+                    raise TypeError("autoregressive cropping expects RollingDynamicCache instances")
+                cache.crop(keep_previous_tokens)
+
+        cache_position = torch.arange(
+            state.total_tokens_processed,
+            state.total_tokens_processed + step_tokens,
+            device=context_flat.device,
+            dtype=torch.long,
+        )
+
+        for block_idx, block in enumerate(self.blocks):
+            current_hidden_p = block["cross"](current_hidden_p, context_flat)
+
+            _, _, seq_flat = self._assemble_sequence(current_hidden_p, current_hidden_s, B, T)
+            cache = state.split_caches[block_idx]
+            if cache is None:
+                cache = RollingDynamicCache(config=block["llama"].config)
+            llama_outputs = block["llama"](
+                inputs_embeds=seq_flat,
+                past_key_values=cache,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+            state.split_caches[block_idx] = llama_outputs.past_key_values
+
+            out_frames = llama_outputs.last_hidden_state.view(B, T, self.cfg.tokens_per_frame, -1)
+            p_view = out_frames[:, :, :5, :]
+            s_view = out_frames[:, :, 5:, :]
+            current_hidden_p = p_view.reshape(B * T * 5, 1, -1)
+            current_hidden_s = s_view.reshape(B * T, 1, -1)
+
+        state.total_tokens_processed += step_tokens
+        self.crop_autoregressive_state(state)
+        return self._build_prediction(p_view, s_view, B, T), state
+
+    def forward_step(
+        self,
+        images: torch.Tensor,
+        audio: torch.Tensor,
+        state: Optional[AutoregressiveState] = None,
+        *,
+        max_cache_frames: Optional[int] = None,
+    ) -> tuple[dict[str, torch.Tensor], AutoregressiveState]:
+        if images.shape[1] != 1:
+            raise ValueError(f"forward_step expects a single-frame step (T=1), got T={images.shape[1]}")
+
+        context_flat, B, T = self._prepare_context(images, audio)
+        return self._forward_step_from_context_flat(
+            context_flat,
+            B,
+            T,
+            state,
+            max_cache_frames=max_cache_frames,
+        )
+
+    def forward(self, images: torch.Tensor, audio: torch.Tensor):
+        context_flat, B, T = self._prepare_context(images, audio)
+        return self._forward_from_context_flat(context_flat, B, T)

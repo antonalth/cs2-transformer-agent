@@ -26,6 +26,9 @@ def main() -> None:
     kwargs = {
         "host": web_cfg.host,
         "port": web_cfg.port,
+        "ws": "wsproto",
+        "ws_ping_interval": None,
+        "ws_ping_timeout": None,
     }
     certfile = web_cfg.ssl_certfile.strip()
     keyfile = web_cfg.ssl_keyfile.strip()

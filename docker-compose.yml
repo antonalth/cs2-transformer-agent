@@ -14,6 +14,7 @@ services:
       # Torch / timm / torch.hub cache
       - ./cache/torch:/workspace/.cache/torch
     ports:
+      - "8080:8080"             # model3 runtime UI
       - "127.0.0.1:6006:6006"   # TensorBoard (localhost only)
       - "127.0.0.1:8888:8888" # (optional) Jupyter (localhost only)
     stdin_open: true
