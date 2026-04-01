@@ -1,0 +1,17 @@
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.csproj.AssemblyReference.cache
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.GeneratedMSBuildEditorConfig.editorconfig
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.AssemblyInfoInputs.cache
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.AssemblyInfo.cs
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.csproj.CoreCompileInputs.cache
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.sourcelink.json
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/bin/Debug/net8.0/Cs2SimHarness.deps.json
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/bin/Debug/net8.0/Cs2SimHarness.dll
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/bin/Debug/net8.0/Cs2SimHarness.pdb
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/bin/Debug/net8.0/CounterStrikeSharp.API.dll
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/bin/Debug/net8.0/Microsoft.Extensions.Logging.Abstractions.dll
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/bin/Debug/net8.0/Microsoft.Extensions.Logging.dll
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHa.090437DE.Up2Date
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.dll
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/refint/Cs2SimHarness.dll
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/Cs2SimHarness.pdb
+/opt/steam-shared/cs2-transformer-agent/inference/server/plugins/Cs2SimHarness/obj/Debug/net8.0/ref/Cs2SimHarness.dll

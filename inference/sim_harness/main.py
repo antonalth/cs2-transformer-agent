@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 
 from .webapp import create_app
 
@@ -26,7 +27,7 @@ def main() -> None:
     kwargs = {
         "host": web_cfg.host,
         "port": web_cfg.port,
-        "ws": "wsproto",
+        "ws": _select_ws_backend(),
         "ws_ping_interval": None,
         "ws_ping_timeout": None,
     }
@@ -38,6 +39,14 @@ def main() -> None:
         kwargs["ssl_certfile"] = certfile
         kwargs["ssl_keyfile"] = keyfile
     uvicorn.run(app, **kwargs)
+
+
+def _select_ws_backend() -> str:
+    # Avoid uvicorn's legacy `websockets` backend on Python 3.14. Prefer wsproto
+    # when installed, otherwise use the sans-I/O backend that ships with uvicorn.
+    if importlib.util.find_spec("wsproto") is not None:
+        return "wsproto"
+    return "websockets-sansio"
 
 
 if __name__ == "__main__":

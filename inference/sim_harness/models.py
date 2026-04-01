@@ -43,3 +43,13 @@ class SlotSnapshot:
     eis_socket: str | None = None
     error: str | None = None
     updated_at: float = field(default_factory=time)
+
+
+@dataclass(slots=True)
+class ServerSnapshot:
+    status: str
+    user: str
+    tmux_session: str
+    connect_address: str
+    error: str | None = None
+    updated_at: float = field(default_factory=time)

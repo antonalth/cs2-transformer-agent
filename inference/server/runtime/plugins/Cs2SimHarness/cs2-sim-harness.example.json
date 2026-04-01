@@ -1,0 +1,138 @@
+{
+  "defaultScenario": "dust2_ct_rifles_vs_t_bots",
+  "scenarios": {
+    "dust2_ct_rifles_vs_t_bots": {
+      "map": "de_dust2",
+      "controlledTeam": "ct",
+      "botTeam": "t",
+      "botCount": 5,
+      "botDifficulty": 2,
+      "spectateUnassignedHumans": true,
+      "restartDelaySeconds": 0.25,
+      "assignments": [
+        {
+          "label": "steam1",
+          "spawnIndex": 0,
+          "primary": "weapon_m4a1",
+          "secondary": "weapon_hkp2000",
+          "armor": "helmet",
+          "defuser": true,
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_smokegrenade"
+          ],
+          "health": 100
+        },
+        {
+          "label": "steam2",
+          "spawnIndex": 1,
+          "primary": "weapon_m4a1",
+          "secondary": "weapon_hkp2000",
+          "armor": "helmet",
+          "defuser": false,
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_hegrenade"
+          ],
+          "health": 100
+        },
+        {
+          "label": "steam3",
+          "spawnIndex": 2,
+          "primary": "weapon_m4a1_silencer",
+          "secondary": "weapon_usp_silencer",
+          "armor": "helmet",
+          "defuser": false,
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_incgrenade"
+          ],
+          "health": 100
+        },
+        {
+          "label": "steam4",
+          "spawnIndex": 3,
+          "primary": "weapon_m4a1",
+          "secondary": "weapon_hkp2000",
+          "armor": "helmet",
+          "defuser": false,
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_molotov"
+          ],
+          "health": 100
+        },
+        {
+          "label": "steam5",
+          "spawnIndex": 4,
+          "primary": "weapon_awp",
+          "secondary": "weapon_deagle",
+          "armor": "helmet",
+          "defuser": false,
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_smokegrenade"
+          ],
+          "health": 100
+        }
+      ],
+      "botAssignments": [
+        {
+          "spawnIndex": 0,
+          "primary": "weapon_ak47",
+          "secondary": "weapon_glock",
+          "armor": "helmet",
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_smokegrenade"
+          ],
+          "health": 100
+        },
+        {
+          "spawnIndex": 1,
+          "primary": "weapon_ak47",
+          "secondary": "weapon_glock",
+          "armor": "helmet",
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_hegrenade"
+          ],
+          "health": 100
+        },
+        {
+          "spawnIndex": 2,
+          "primary": "weapon_ak47",
+          "secondary": "weapon_glock",
+          "armor": "helmet",
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_molotov"
+          ],
+          "health": 100
+        },
+        {
+          "spawnIndex": 3,
+          "primary": "weapon_ak47",
+          "secondary": "weapon_glock",
+          "armor": "helmet",
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_smokegrenade"
+          ],
+          "health": 100
+        },
+        {
+          "spawnIndex": 4,
+          "primary": "weapon_awp",
+          "secondary": "weapon_deagle",
+          "armor": "helmet",
+          "grenades": [
+            "weapon_flashbang",
+            "weapon_smokegrenade"
+          ],
+          "health": 100
+        }
+      ]
+    }
+  }
+}

@@ -32,6 +32,28 @@ class RuntimeConfig:
 
 
 @dataclass(slots=True)
+class ServerConfig:
+    enabled: bool = True
+    user: str = "server"
+    tmux_session: str = "cs2-ds"
+    start_command: list[str] = field(default_factory=lambda: ["./inference/server/start_server.sh"])
+    scenario_config_path: str = (
+        "/home/server/steam-lib/steamapps/common/Counter-Strike Global Offensive/"
+        "game/csgo/addons/counterstrikesharp/plugins/Cs2SimHarness/cs2-sim-harness.json"
+    )
+    connect_address: str = "127.0.0.1:27015"
+    console_toggle_key: str = "grave"
+    console_toggle_with_shift: bool = True
+    connect_command_template: str = "connect {address}"
+    connect_submit_key: str = "enter"
+    console_close_key: str = "esc"
+    connect_open_delay_s: float = 0.2
+    connect_keystroke_delay_s: float = 0.012
+    connect_post_enter_delay_s: float = 0.75
+    log_lines: int = 200
+
+
+@dataclass(slots=True)
 class SlotConfig:
     name: str
     user: str
@@ -76,6 +98,7 @@ class HarnessConfig:
     web: WebConfig = field(default_factory=WebConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    server: ServerConfig = field(default_factory=ServerConfig)
     slots: list[SlotConfig] = field(default_factory=list)
 
     def slot_map(self) -> dict[str, SlotConfig]:
@@ -94,6 +117,10 @@ def _load_runtime_config(data: dict) -> RuntimeConfig:
     return RuntimeConfig(**data) if data else RuntimeConfig()
 
 
+def _load_server_config(data: dict) -> ServerConfig:
+    return ServerConfig(**data) if data else ServerConfig()
+
+
 def _load_slots(data: list[dict]) -> list[SlotConfig]:
     return [SlotConfig(**slot) for slot in data]
 
@@ -106,5 +133,6 @@ def load_config(path: str | Path) -> HarnessConfig:
         web=_load_web_config(raw.get("web", {})),
         recording=_load_recording_config(raw.get("recording", {})),
         runtime=_load_runtime_config(raw.get("runtime", {})),
+        server=_load_server_config(raw.get("server", {})),
         slots=_load_slots(raw.get("slots", [])),
     )

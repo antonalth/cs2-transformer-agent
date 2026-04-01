@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Cs2SimHarness</AssemblyName>
+    <RootNamespace>Cs2SimHarness</RootNamespace>
+    <CounterStrikeSharpApiPath Condition="'$(CounterStrikeSharpApiPath)' == ''">/home/server/steam-lib/steamapps/common/Counter-Strike Global Offensive/game/csgo/addons/counterstrikesharp/api/CounterStrikeSharp.API.dll</CounterStrikeSharpApiPath>
+    <CounterStrikeSharpApiDir>$([System.IO.Path]::GetDirectoryName('$(CounterStrikeSharpApiPath)'))</CounterStrikeSharpApiDir>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(CounterStrikeSharpApiPath)')">
+    <Reference Include="CounterStrikeSharp.API">
+      <HintPath>$(CounterStrikeSharpApiPath)</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Logging.Abstractions" Condition="Exists('$(CounterStrikeSharpApiDir)/Microsoft.Extensions.Logging.Abstractions.dll')">
+      <HintPath>$(CounterStrikeSharpApiDir)/Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="!Exists('$(CounterStrikeSharpApiPath)')">
+    <PackageReference Include="CounterStrikeSharp.API" Version="1.0.364" />
+  </ItemGroup>
+</Project>

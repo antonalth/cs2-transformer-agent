@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import time
+import json
 import shlex
 import subprocess
 
-from .config import HarnessConfig, SlotConfig
+from .config import HarnessConfig, ServerConfig, SlotConfig
 
 
-def run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
+def run_checked(
+    args: list[str],
+    *,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(args, check=True, text=True, capture_output=True)
+        return subprocess.run(args, check=True, text=True, capture_output=True, cwd=cwd, env=env)
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         stdout = (exc.stdout or "").strip()
@@ -18,8 +24,13 @@ def run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
         raise RuntimeError(detail) from exc
 
 
-def run_best_effort(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, check=False)
+def run_best_effort(
+    args: list[str],
+    *,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=False, cwd=cwd, env=env)
 
 
 def tmux_has_session(session_name: str) -> bool:
@@ -38,6 +49,20 @@ def tmux_kill_session(session_name: str) -> None:
         capture_output=True,
         check=False,
     )
+
+
+def tmux_capture_pane(session_name: str, lines: int = 200) -> str:
+    proc = run_best_effort(["tmux", "capture-pane", "-pt", session_name, "-S", f"-{max(1, lines)}"])
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def tmux_send_keys(session_name: str, text: str, *, enter: bool = True) -> None:
+    args = ["tmux", "send-keys", "-t", session_name, text]
+    if enter:
+        args.append("C-m")
+    run_checked(args)
 
 
 def inference_root() -> Path:
@@ -130,3 +155,32 @@ def cleanup_global_source_locks(harness: HarnessConfig) -> list[str]:
     if proc.returncode != 0:
         return []
     return [line for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def read_text_via_runas(harness: HarnessConfig, user: str, path: str | Path) -> str:
+    runas = str(Path(harness.runtime.runas_path))
+    proc = run_checked(
+        ["sudo", "-n", runas, user, "cat", str(path)],
+    )
+    return proc.stdout
+
+
+def read_json_via_runas(harness: HarnessConfig, user: str, path: str | Path) -> dict:
+    return json.loads(read_text_via_runas(harness, user, path))
+
+
+def launch_server_session(harness: HarnessConfig) -> list[str]:
+    if not harness.server.enabled:
+        raise RuntimeError("server integration is disabled in config")
+    root = inference_root().parent
+    command = list(harness.server.start_command)
+    run_checked(command, cwd=root)
+    return command
+
+
+def stop_server_session(harness: HarnessConfig) -> None:
+    tmux_kill_session(harness.server.tmux_session)
+
+
+def server_session_running(server: ServerConfig) -> bool:
+    return tmux_has_session(server.tmux_session)

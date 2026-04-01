@@ -56,6 +56,13 @@ INDEX_HTML = """<!doctype html>
     .type-row { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; margin-top: 12px; }
     .type-row input[type="password"], .type-row input[type="text"] { flex: 1 1 320px; background: #0f1518; color: #f2f4f5; border: 1px solid #2b3338; padding: 8px; }
     .type-row button { margin: 0; }
+    .server-grid { display: grid; grid-template-columns: minmax(360px, 0.9fr) minmax(520px, 1.4fr); gap: 20px; align-items: start; }
+    .server-summary { white-space: pre-wrap; word-break: break-word; min-height: 120px; }
+    .log-view { background: #0f1518; border: 1px solid #2b3338; min-height: 440px; max-height: 70vh; overflow: auto; padding: 12px; white-space: pre-wrap; }
+    .scenario-list { display: grid; gap: 10px; margin-top: 12px; }
+    .scenario-card { background: #0f1518; border: 1px solid #2b3338; padding: 12px; }
+    .scenario-card h3 { margin: 0 0 8px 0; font-size: 14px; }
+    .scenario-card .meta { margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -63,6 +70,7 @@ INDEX_HTML = """<!doctype html>
   <div class="tabs">
     <button id="tab-overview" class="active" onclick="switchView('overview')">Overview</button>
     <button id="tab-control" onclick="switchView('control')">Control</button>
+    <button id="tab-server" onclick="switchView('server')">Server</button>
   </div>
 
   <div id="view-overview" class="view active">
@@ -121,12 +129,48 @@ INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id="view-server" class="view">
+    <div class="server-grid">
+      <div class="panel">
+        <h2>Server</h2>
+        <div class="toolbar">
+          <button onclick="serverAct('start')">start</button>
+          <button onclick="serverAct('restart')">restart</button>
+          <button onclick="serverAct('stop')">stop</button>
+          <button onclick="refreshServerLogs()">refresh logs</button>
+        </div>
+        <div class="mono server-summary" id="server-summary">loading...</div>
+        <div class="type-row">
+          <input id="server-command" type="text" placeholder="enter server console command">
+          <button onclick="sendServerCommand()">send</button>
+        </div>
+        <div class="type-row">
+          <input id="server-connect-address" type="text" placeholder="127.0.0.1:27015">
+          <button onclick="connectAllClients()">connect all clients</button>
+        </div>
+        <h2 style="margin-top:16px;">Scenarios</h2>
+        <div id="server-scenarios" class="scenario-list">loading...</div>
+        <div class="meta" id="server-meta">idle</div>
+      </div>
+      <div class="panel">
+        <h2>Server Logs</h2>
+        <div class="toolbar">
+          <label for="server-log-lines">Lines</label>
+          <input id="server-log-lines" type="number" min="20" max="2000" step="20">
+        </div>
+        <div class="log-view" id="server-logs">waiting for logs</div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const browserFps = __BROWSER_FPS__;
     let refreshTimer = null;
     let controlRefreshTimer = null;
     let currentView = 'overview';
     let latestSlots = [];
+    let latestServer = null;
+    let latestServerScenarios = null;
     let selectedControlSlot = null;
     let controlArmed = false;
     let pressedKeys = new Set();
@@ -315,10 +359,15 @@ registerProcessor('pcm-player', PcmPlayerProcessor);
       currentView = view;
       document.getElementById('view-overview').classList.toggle('active', view === 'overview');
       document.getElementById('view-control').classList.toggle('active', view === 'control');
+      document.getElementById('view-server').classList.toggle('active', view === 'server');
       document.getElementById('tab-overview').classList.toggle('active', view === 'overview');
       document.getElementById('tab-control').classList.toggle('active', view === 'control');
+      document.getElementById('tab-server').classList.toggle('active', view === 'server');
       if (view === 'control') {
         refreshControlFrame();
+      } else if (view === 'server') {
+        loadServerScenarios();
+        refreshServerLogs();
       }
     }
 
@@ -793,8 +842,195 @@ registerProcessor('pcm-player', PcmPlayerProcessor);
         meta.textContent = `cleanup failed: ${err}`;
       }
     }
+
+    function getServerLogLines() {
+      const raw = Number(document.getElementById('server-log-lines').value);
+      if (!Number.isFinite(raw)) {
+        return 200;
+      }
+      return Math.min(2000, Math.max(20, Math.floor(raw)));
+    }
+
+    function renderServerSummary(server) {
+      const summary = document.getElementById('server-summary');
+      if (!server) {
+        summary.textContent = 'server unavailable';
+        return;
+      }
+      summary.textContent = [
+        `status=${server.status}`,
+        `user=${server.user}`,
+        `tmux_session=${server.tmux_session}`,
+        `connect_address=${server.connect_address}`,
+        `error=${server.error ?? ''}`,
+      ].join('\\n');
+      const connectInput = document.getElementById('server-connect-address');
+      if (!connectInput.value) {
+        connectInput.value = server.connect_address ?? '';
+      }
+    }
+
+    async function loadServer() {
+      const res = await fetch('/api/server');
+      latestServer = await res.json();
+      renderServerSummary(latestServer);
+      const systemMeta = document.getElementById('system-meta');
+      systemMeta.textContent = `server=${latestServer.status} | connect=${latestServer.connect_address}`;
+    }
+
+    function renderServerScenarios(payload) {
+      const root = document.getElementById('server-scenarios');
+      latestServerScenarios = payload;
+      const scenarios = payload?.scenarios ?? [];
+      if (scenarios.length === 0) {
+        root.textContent = 'no scenarios configured';
+        return;
+      }
+      const defaultScenario = payload?.defaultScenario ?? '';
+      root.innerHTML = scenarios.map((scenario) => {
+        const encodedName = encodeURIComponent(scenario.name);
+        const isDefault = scenario.name === defaultScenario ? ' default' : '';
+        return `
+          <div class="scenario-card">
+            <h3>${esc(scenario.name)}${esc(isDefault)}</h3>
+            <div class="mono">map=${esc(scenario.map)}\ncontrolledTeam=${esc(scenario.controlledTeam)}\nbotTeam=${esc(scenario.botTeam)}\nbotCount=${esc(scenario.botCount)}\nassignments=${esc(scenario.assignments)}</div>
+            <div class="toolbar">
+              <button onclick="runServerScenario('${encodedName}', 'reset')">reset</button>
+              <button onclick="runServerScenario('${encodedName}', 'apply')">apply</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function loadServerScenarios() {
+      const root = document.getElementById('server-scenarios');
+      try {
+        const res = await fetch('/api/server/scenarios');
+        if (!res.ok) {
+          let detail = `http ${res.status}`;
+          try {
+            const body = await res.json();
+            detail = body.detail ?? JSON.stringify(body);
+          } catch (_) {}
+          root.textContent = `scenario load failed: ${detail}`;
+          return;
+        }
+        renderServerScenarios(await res.json());
+      } catch (err) {
+        root.textContent = `scenario load failed: ${err}`;
+      }
+    }
+
+    async function refreshServerLogs() {
+      const lines = getServerLogLines();
+      document.getElementById('server-log-lines').value = String(lines);
+      const res = await fetch(`/api/server/logs?lines=${lines}`);
+      const body = await res.json();
+      latestServer = body.snapshot;
+      renderServerSummary(latestServer);
+      document.getElementById('server-logs').textContent = body.logs || '(no tmux output)';
+    }
+
+    async function serverAct(op) {
+      const meta = document.getElementById('server-meta');
+      meta.textContent = `server ${op} running...`;
+      const res = await fetch(`/api/server/${op}`, { method: 'POST' });
+      if (!res.ok) {
+        let detail = `http ${res.status}`;
+        try {
+          const body = await res.json();
+          detail = body.detail ?? JSON.stringify(body);
+        } catch (_) {}
+        meta.textContent = `server ${op} failed: ${detail}`;
+        return;
+      }
+      latestServer = await res.json();
+      renderServerSummary(latestServer);
+      meta.textContent = `server ${op} ok`;
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      await loadServer();
+      await refreshServerLogs();
+    }
+
+    async function sendServerCommand() {
+      const input = document.getElementById('server-command');
+      const command = input.value.trim();
+      const meta = document.getElementById('server-meta');
+      if (!command) {
+        meta.textContent = 'server command ignored: empty';
+        return;
+      }
+      const res = await fetch('/api/server/command', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command }),
+      });
+      if (!res.ok) {
+        let detail = `http ${res.status}`;
+        try {
+          const body = await res.json();
+          detail = body.detail ?? JSON.stringify(body);
+        } catch (_) {}
+        meta.textContent = `server command failed: ${detail}`;
+        return;
+      }
+      input.value = '';
+      meta.textContent = `sent server command: ${command}`;
+      await new Promise(resolve => setTimeout(resolve, 400));
+      await refreshServerLogs();
+    }
+
+    async function connectAllClients() {
+      const address = document.getElementById('server-connect-address').value.trim();
+      const meta = document.getElementById('server-meta');
+      meta.textContent = `connecting all clients to ${address || '(default)' }...`;
+      const res = await fetch('/api/server/connect-all', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address }),
+      });
+      if (!res.ok) {
+        let detail = `http ${res.status}`;
+        try {
+          const body = await res.json();
+          detail = body.detail ?? JSON.stringify(body);
+        } catch (_) {}
+        meta.textContent = `connect all failed: ${detail}`;
+        return;
+      }
+      const body = await res.json();
+      const summary = Object.values(body.results ?? {}).map(item => {
+        if (item.ok) {
+          return `${item.slot}:ok`;
+        }
+        return `${item.slot}:error=${item.error ?? 'unknown'}`;
+      }).join(' | ');
+      meta.textContent = `connect all complete | ${summary}`;
+    }
+
+    async function runServerScenario(encodedName, op) {
+      const name = decodeURIComponent(encodedName);
+      const meta = document.getElementById('server-meta');
+      meta.textContent = `${op} scenario ${name}...`;
+      const res = await fetch(`/api/server/scenarios/${encodeURIComponent(name)}/${op}`, { method: 'POST' });
+      if (!res.ok) {
+        let detail = `http ${res.status}`;
+        try {
+          const body = await res.json();
+          detail = body.detail ?? JSON.stringify(body);
+        } catch (_) {}
+        meta.textContent = `scenario ${op} failed: ${detail}`;
+        return;
+      }
+      meta.textContent = `scenario ${op} queued: ${name}`;
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await refreshServerLogs();
+    }
+
     document.getElementById('refresh-fps').value = browserFps.toFixed(1);
     document.getElementById('control-refresh-fps').value = browserFps.toFixed(1);
+    document.getElementById('server-log-lines').value = '200';
     document.getElementById('refresh-fps').addEventListener('change', () => {
       document.getElementById('refresh-fps').value = getRefreshFps().toFixed(1);
       scheduleCompositeRefresh();
@@ -912,11 +1148,20 @@ registerProcessor('pcm-player', PcmPlayerProcessor);
       typeClipboardText(text);
     });
     reload();
+    loadServer();
+    loadServerScenarios();
     refreshComposite();
     refreshControlFrame();
     updateControlArmedUi();
     updateAudioUi();
-    setInterval(reload, 1000);
+    setInterval(() => {
+      reload();
+      loadServer();
+      if (currentView === 'server') {
+        loadServerScenarios();
+        refreshServerLogs();
+      }
+    }, 1000);
     scheduleCompositeRefresh();
     scheduleControlRefresh();
   </script>
@@ -1025,6 +1270,75 @@ def create_app(config_path: str | Path = "sim_harness.toml"):
     @app.get("/api/slots")
     async def list_slots():
         return JSONResponse(supervisor.list_slots())
+
+    @app.get("/api/server")
+    async def server_snapshot():
+        return JSONResponse(supervisor.server_snapshot())
+
+    @app.get("/api/server/logs")
+    async def server_logs(lines: int | None = None):
+        try:
+            return JSONResponse(await supervisor.server_logs(lines))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/server/start")
+    async def start_server():
+        try:
+            return JSONResponse(await supervisor.start_server())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/stop")
+    async def stop_server():
+        try:
+            return JSONResponse(await supervisor.stop_server())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/restart")
+    async def restart_server():
+        try:
+            return JSONResponse(await supervisor.restart_server())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/command")
+    async def server_command(payload: dict):
+        try:
+            command = str(payload.get("command", "")).strip()
+            return JSONResponse(await supervisor.send_server_command(command))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/connect-all")
+    async def connect_all_clients(payload: dict):
+        try:
+            address = str(payload.get("address", "")).strip() or None
+            return JSONResponse(await supervisor.connect_all_slots_to_server(address=address))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/server/scenarios")
+    async def server_scenarios():
+        try:
+            return JSONResponse(await supervisor.list_server_scenarios())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/scenarios/{scenario_name}/reset")
+    async def reset_server_scenario(scenario_name: str):
+        try:
+            return JSONResponse(await supervisor.run_server_scenario(scenario_name, op="reset"))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/scenarios/{scenario_name}/apply")
+    async def apply_server_scenario(scenario_name: str):
+        try:
+            return JSONResponse(await supervisor.run_server_scenario(scenario_name, op="apply"))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/model/observation.bin")
     async def model_observation():
