@@ -342,6 +342,11 @@ class DatasetRoot:
                 info = json.loads(blob.decode("utf-8"))
             self.info_cache[cache_key] = info
             return info
+
+        def close_all(self) -> None:
+            for env in self.opened.values():
+                env.close()
+            self.opened.clear()
     
     def __init__(self, config: DatasetConfig):
         self.config = config

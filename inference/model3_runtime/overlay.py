@@ -101,6 +101,8 @@ class RuntimeOverlayRenderer:
     ):
         panel = np.zeros((self.tile_height, self.tile_width, 3), dtype=np.uint8)
         ckpt_name = checkpoint_path.rsplit("/", 1)[-1]
+        last_timings = metrics.get("last_timings_ms", {}) or {}
+        avg_timings = metrics.get("avg_timings_ms", {}) or {}
         lines = [
             "MODEL3 RUNTIME",
             ckpt_name,
@@ -108,7 +110,26 @@ class RuntimeOverlayRenderer:
             f"recording={status.get('recording', False)}",
             f"cache_frames={cache.get('cached_frames', 0)}/{cache.get('max_cache_frames', 'no-drop')}",
             f"cache_tokens={cache.get('cached_tokens', 0)} total_frames={cache.get('total_frames_processed', 0)}",
-            f"infer_ms={float(metrics.get('last_inference_ms', 0.0)):.1f} avg={float(metrics.get('avg_inference_ms', 0.0)):.1f}",
+            f"model_ms={float(metrics.get('last_inference_ms', 0.0)):.1f} avg={float(metrics.get('avg_inference_ms', 0.0)):.1f}",
+            f"step_ms={float(metrics.get('last_step_ms', 0.0)):.1f} avg={float(metrics.get('avg_step_ms', 0.0)):.1f}",
+            (
+                "decode/prepare/model "
+                f"{float(last_timings.get('decode_ms', 0.0)):.1f}/"
+                f"{float(last_timings.get('prepare_ms', 0.0)):.1f}/"
+                f"{float(last_timings.get('model_ms', 0.0)):.1f}"
+            ),
+            (
+                "xfer/act/step "
+                f"{float(last_timings.get('transfer_ms', 0.0)):.1f}/"
+                f"{float(last_timings.get('action_decode_ms', 0.0)):.1f}/"
+                f"{float(last_timings.get('end_to_end_ms', 0.0)):.1f}"
+            ),
+            (
+                "avg decode/model/step "
+                f"{float(avg_timings.get('decode_ms', 0.0)):.1f}/"
+                f"{float(avg_timings.get('model_ms', 0.0)):.1f}/"
+                f"{float(avg_timings.get('end_to_end_ms', 0.0)):.1f}"
+            ),
             f"obs={metrics.get('observations_received', 0)} sent_events={metrics.get('actions_sent', 0)}",
         ]
         last_error = str(metrics.get("last_error", "") or "")

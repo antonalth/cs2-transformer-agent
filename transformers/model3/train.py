@@ -92,11 +92,35 @@ def load_weights_only(model: CS2PredictorModule, checkpoint_path: str) -> None:
     state_dict = checkpoint.get("state_dict")
     if state_dict is None:
         raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict")
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    model_state = model.state_dict()
+    filtered_state: Dict[str, torch.Tensor] = {}
+    skipped_shape: List[str] = []
+    for key, value in state_dict.items():
+        target = model_state.get(key)
+        if target is None:
+            continue
+        if target.shape != value.shape:
+            skipped_shape.append(key)
+            continue
+        filtered_state[key] = value
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    if skipped_shape:
+        print(
+            f"Warning: skipped {len(skipped_shape)} shape-mismatched tensors while loading weights-only from "
+            f"{checkpoint_path}"
+        )
     if missing:
-        print(f"Warning: missing keys while loading weights-only checkpoint: {missing}")
+        print(
+            f"Warning: initialized {len(missing)} model tensors from defaults while loading weights-only from "
+            f"{checkpoint_path}"
+        )
     if unexpected:
-        print(f"Warning: unexpected keys while loading weights-only checkpoint: {unexpected}")
+        print(
+            f"Warning: ignored {len(unexpected)} unexpected checkpoint tensors while loading weights-only from "
+            f"{checkpoint_path}"
+        )
 
 
 def create_logger(

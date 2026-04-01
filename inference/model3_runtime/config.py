@@ -22,4 +22,5 @@ class Model3RuntimeConfig:
     videos_dir: str = "./videos"
     browser_fps: float = 2.0
     recording_fps: float = 10.0
+    enable_fast_vision_preprocess: bool = True
     action_decode: ActionDecodeConfig = field(default_factory=ActionDecodeConfig)

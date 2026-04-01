@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoModel, AutoImageProcessor, LlamaConfig, LlamaModel, 
-    DacModel, Blip2QFormerConfig, Blip2QFormerModel
+    EncodecModel, Blip2QFormerConfig, Blip2QFormerModel
 )
 from transformers.cache_utils import Cache, DynamicCache
 
@@ -507,29 +507,80 @@ class GameVideoEncoder(nn.Module):
             p.requires_grad = False
 
         self.compressor = PatchCompressor(cfg)
-        
-        
+        self.fast_preprocess_enabled = False
+
+        do_rescale = bool(getattr(self.vision_processor, "do_rescale", False))
+        do_normalize = bool(getattr(self.vision_processor, "do_normalize", False))
+        image_mean = getattr(self.vision_processor, "image_mean", [0.0, 0.0, 0.0])
+        image_std = getattr(self.vision_processor, "image_std", [1.0, 1.0, 1.0])
+        rescale_factor = float(getattr(self.vision_processor, "rescale_factor", 1.0)) if do_rescale else 1.0
+
+        self.register_buffer(
+            "_vision_rescale_factor",
+            torch.tensor(rescale_factor, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_vision_image_mean",
+            torch.tensor(image_mean, dtype=torch.float32).view(1, -1, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_vision_image_std",
+            torch.tensor(image_std, dtype=torch.float32).view(1, -1, 1, 1),
+            persistent=False,
+        )
+        self._vision_do_rescale = do_rescale
+        self._vision_do_normalize = do_normalize
+
+    def set_fast_preprocess(self, enabled: bool) -> None:
+        self.fast_preprocess_enabled = bool(enabled)
+
+    def _vision_device_and_dtype(self) -> tuple[torch.device, torch.dtype]:
+        param = next(self.vision.parameters())
+        return param.device, self.cfg.dtype
+
+    def _fast_preprocess_pixel_values(
+        self,
+        chunk: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        pixel_values = chunk.to(device=device, dtype=torch.float32, non_blocking=True)
+        if self._vision_do_rescale:
+            pixel_values = pixel_values * self._vision_rescale_factor
+        if self._vision_do_normalize:
+            pixel_values = (pixel_values - self._vision_image_mean) / self._vision_image_std
+        return pixel_values.to(dtype=dtype)
+
     def _forward_vision(self, chunk_cpu: torch.Tensor) -> torch.Tensor:
         # chunk_cpu: [N, C, H, W] (likely uint8 or float32 on CPU)
-        
-        device = self.vision.device
-        dtype = self.cfg.dtype
-        
+
+        device, dtype = self._vision_device_and_dtype()
+
         with torch.no_grad():
-            # Run processor on the chunk (it handles moving to tensor/normalization)
-            # We assume chunk_cpu is proper input for the processor.
-            proc = self.vision_processor(
-                images=chunk_cpu,
-                return_tensors="pt",
-                data_format="channels_first",
-                do_resize=False, 
-                do_center_crop=False
-            )
-            pixel_values = proc["pixel_values"].to(device=device, dtype=dtype)
-            
+            if self.fast_preprocess_enabled:
+                pixel_values = self._fast_preprocess_pixel_values(
+                    chunk_cpu,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                # Run processor on the chunk (it handles moving to tensor/normalization)
+                # We assume chunk_cpu is proper input for the processor.
+                proc = self.vision_processor(
+                    images=chunk_cpu,
+                    return_tensors="pt",
+                    data_format="channels_first",
+                    do_resize=False,
+                    do_center_crop=False
+                )
+                pixel_values = proc["pixel_values"].to(device=device, dtype=dtype)
+
             # Run ViT (Frozen)
             vis_out = self.vision(pixel_values=pixel_values).last_hidden_state
-        
+
         return vis_out
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -571,39 +622,43 @@ class GameAudioEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.model = DacModel.from_pretrained("descript/dac_24khz")
+        self.model = EncodecModel.from_pretrained("facebook/encodec_24khz")
         self.model.to(dtype=cfg.dtype)
 
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
 
-        self.output_dim = 256 #trust me bro
+        self.encoder_hidden_size = int(self.model.config.hidden_size)
+        # Keep the external feature dimension stable so existing audio_proj
+        # checkpoint weights remain loadable for finetuning old runs.
+        self.output_dim = 256
+        self.output_proj = nn.Linear(self.encoder_hidden_size, self.output_dim, dtype=cfg.dtype)
+
+    def _normalize_audio(self, chunk: torch.Tensor) -> torch.Tensor:
+        if not getattr(self.model.config, "normalize", False):
+            return chunk
+        scale = chunk.pow(2).mean(dim=-1, keepdim=True).sqrt() + 1e-8
+        return chunk / scale
 
     def forward(self, audio: torch.Tensor, target_frames: int) -> torch.Tensor:
         """
         audio: [B, P, C=2, S]
         """
         B, P, C, S = audio.shape
-        flat_audio = audio.reshape(B * P * C, 1, S)
-        N = flat_audio.shape[0]
-        chunk_size = self.cfg.audio_chunk_size
-        feat_chunks = []
+        encoder_dtype = self.output_proj.weight.dtype
+        encoder_device = self.output_proj.weight.device
+        flat_audio = audio.reshape(B * P * C, 1, S).to(device=encoder_device, dtype=encoder_dtype)
         with torch.no_grad():
-            for i in range(0, N, chunk_size):
-                chunk = flat_audio[i : i + chunk_size]  # [n, 1, S]
-                feats = self.model.encode(chunk).projected_latents  # [n, 1024, Time]
-                feat_chunks.append(feats)
-                del feats, chunk
+            normalized = self._normalize_audio(flat_audio)
+            features = self.model.encoder(normalized)  # [B*P*C, H, Time]
 
-        features = torch.cat(feat_chunks, dim=0)  # [B*P*C, 1024, Time]
-        del feat_chunks
-
-        aligned = F.adaptive_avg_pool1d(features, target_frames)  # [B*P*C, 1024, T]
-        aligned = aligned.permute(0, 2, 1)                        # [B*P*C, T, 1024]
-        out = aligned.view(B, P, C, target_frames, -1)            # [B, P, C, T, H]
-        out = out.permute(0, 3, 1, 2, 4)                          # [B, T, P, C, H]
-        out = out.to(dtype=self.cfg.dtype) # to bf16
+        aligned = F.adaptive_avg_pool1d(features, target_frames)  # [B*P*C, H, T]
+        aligned = aligned.permute(0, 2, 1)                        # [B*P*C, T, H]
+        projected = self.output_proj(aligned)                     # [B*P*C, T, 256]
+        out = projected.view(B, P, C, target_frames, -1)         # [B, P, C, T, H]
+        out = out.permute(0, 3, 1, 2, 4)                         # [B, T, P, C, H]
+        out = out.to(dtype=self.cfg.dtype)
         return out
 
 

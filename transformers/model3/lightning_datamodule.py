@@ -29,6 +29,8 @@ class CS2DataModule(pl.LightningDataModule):
              self.ds_root = DatasetRoot(self.global_cfg.dataset)
         if self.train_ds is None:
             self.train_ds = self.ds_root.build_dataset("train")
+        self.ds_root.store.close_all()
+        self.train_ds.lmdb_envs = {}
         
         return DataLoader(
             self.train_ds,
@@ -45,6 +47,8 @@ class CS2DataModule(pl.LightningDataModule):
              self.ds_root = DatasetRoot(self.global_cfg.dataset)
         if self.val_ds is None:
              self.val_ds = self.ds_root.build_dataset("val")
+        self.ds_root.store.close_all()
+        self.val_ds.lmdb_envs = {}
         
         return DataLoader(
             self.val_ds,

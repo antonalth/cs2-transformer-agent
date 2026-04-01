@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-window-frames", type=int, default=None)
     parser.add_argument("--browser-fps", type=float, default=2.0)
     parser.add_argument("--recording-fps", type=float, default=10.0)
+    parser.add_argument("--disable-fast-vision-preprocess", action="store_true")
     parser.add_argument("--insecure", action="store_true")
     return parser.parse_args()
 
@@ -45,6 +46,7 @@ def main() -> None:
         cache_window_frames=args.cache_window_frames,
         browser_fps=args.browser_fps,
         recording_fps=args.recording_fps,
+        enable_fast_vision_preprocess=not args.disable_fast_vision_preprocess,
     )
     runtime = Model3InferenceRuntime(cfg)
     app = create_app(runtime)
