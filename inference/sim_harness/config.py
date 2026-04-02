@@ -41,15 +41,22 @@ class ServerConfig:
         "/home/server/steam-lib/steamapps/common/Counter-Strike Global Offensive/"
         "game/csgo/addons/counterstrikesharp/plugins/Cs2SimHarness/cs2-sim-harness.json"
     )
+    plugin_state_path: str = (
+        "/home/server/steam-lib/steamapps/common/Counter-Strike Global Offensive/"
+        "game/csgo/addons/counterstrikesharp/plugins/Cs2SimHarness/cs2-sim-state.json"
+    )
     connect_address: str = "127.0.0.1:27015"
     console_toggle_key: str = "grave"
     console_toggle_with_shift: bool = True
     connect_command_template: str = "connect {address}"
     connect_submit_key: str = "enter"
     console_close_key: str = "esc"
+    pause_command: str = "css_sim_freeze"
+    resume_command: str = "css_sim_unfreeze"
     connect_open_delay_s: float = 0.2
     connect_keystroke_delay_s: float = 0.012
     connect_post_enter_delay_s: float = 0.75
+    plugin_state_refresh_delay_s: float = 0.15
     log_lines: int = 200
 
 

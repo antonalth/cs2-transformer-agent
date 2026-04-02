@@ -129,6 +129,20 @@ class ServerWorker:
             "scenarios": scenarios,
         }
 
+    async def plugin_state(self, *, refresh: bool = True) -> dict:
+        path = self.harness.server.plugin_state_path.strip()
+        if not path:
+            raise RuntimeError("server plugin_state_path is empty")
+        if refresh:
+            await self.send_command("css_sim_write_state")
+            await asyncio.sleep(max(0.0, float(self.harness.server.plugin_state_refresh_delay_s)))
+        data = await asyncio.to_thread(read_json_via_runas, self.harness, self.harness.server.user, path)
+        return {
+            "ok": True,
+            "path": path,
+            "state": data,
+        }
+
     async def run_scenario_command(self, scenario_name: str, *, op: str) -> dict:
         if op not in {"reset", "apply"}:
             raise RuntimeError(f"unsupported scenario op: {op}")

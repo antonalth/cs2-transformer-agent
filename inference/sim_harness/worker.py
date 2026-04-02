@@ -7,7 +7,7 @@ import asyncio
 from .agent_rpc import request_audio, request_frame, request_frame_packet, request_status, request_stop, send_input
 from .config import HarnessConfig, SlotConfig
 from .models import DiscoveredEndpoint, SlotSnapshot, SlotStatus
-from .process_control import launch_slot_session, tmux_kill_session
+from .process_control import cleanup_slot_processes, launch_slot_session, tmux_kill_session
 
 
 class SlotWorker:
@@ -111,6 +111,7 @@ class SlotWorker:
                 except Exception:
                     pass
                 await asyncio.to_thread(tmux_kill_session, self.slot.tmux_session)
+                await asyncio.to_thread(cleanup_slot_processes, self.harness, self.slot)
                 self.endpoint = None
                 self.status = SlotStatus.STOPPED
                 self.error = None

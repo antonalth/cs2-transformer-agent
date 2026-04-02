@@ -43,9 +43,7 @@ class RemoteHarnessClient:
         self.close()
 
     def get_slots(self) -> list[dict[str, Any]]:
-        response = self._client.get("/api/slots")
-        response.raise_for_status()
-        return response.json()
+        return self.get_json("/api/slots")
 
     def get_observation(self) -> HarnessObservation:
         response = self._client.get("/api/model/observation.bin")
@@ -53,9 +51,17 @@ class RemoteHarnessClient:
         return decode_observation(response.content)
 
     def send_actions(self, actions: dict[str, list[dict[str, Any]] | dict[str, Any]]) -> dict[str, Any]:
-        response = self._client.post("/api/model/actions", json={"actions": actions})
+        return self.post_json("/api/model/actions", {"actions": actions})["results"]
+
+    def get_json(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
+        response = self._client.get(path, params=params)
         response.raise_for_status()
-        return response.json()["results"]
+        return response.json()
+
+    def post_json(self, path: str, payload: dict[str, Any] | None = None) -> Any:
+        response = self._client.post(path, json=payload or {})
+        response.raise_for_status()
+        return response.json()
 
 
 @dataclass(slots=True)

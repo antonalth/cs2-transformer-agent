@@ -59,6 +59,7 @@ INDEX_HTML = """<!doctype html>
     .decision-title { font-size: 14px; margin: 0 0 8px 0; }
     .decision-line { margin: 4px 0; color: #c8d8df; font-size: 12px; }
     .decision-line strong { color: #eef3f5; }
+    .status-box { background: #0c1013; border: 1px solid #334049; padding: 12px; margin-bottom: 14px; }
   </style>
 </head>
 <body>
@@ -119,6 +120,12 @@ INDEX_HTML = """<!doctype html>
         <label>mouse scale
           <input id="mouse-scale" type="number" min="0" step="0.05" value="1.0">
         </label>
+        <label>mouse scale x
+          <input id="mouse-scale-x" type="number" step="0.05" value="1.0">
+        </label>
+        <label>mouse scale y
+          <input id="mouse-scale-y" type="number" step="0.05" value="1.0">
+        </label>
         <label>mouse temperature
           <input id="mouse-temperature" type="number" min="0.01" step="0.05" value="1.0">
         </label>
@@ -130,9 +137,14 @@ INDEX_HTML = """<!doctype html>
         </label>
       </div>
       <button onclick="applyActionDecode()">apply decode</button>
+      <button onclick="calibrateMouse()">calibrate mouse</button>
     </div>
     <div class="row">
       <div>
+      <div class="status-box">
+        <h2 class="decision-title">Mouse Calibration</h2>
+        <pre id="calibration-status">no calibration run yet</pre>
+      </div>
       <div id="decision-path" class="decision-box">
         <h2 class="decision-title">Selected Path</h2>
         <div class="decision-line">no decoded actions yet</div>
@@ -156,6 +168,8 @@ INDEX_HTML = """<!doctype html>
       'keyboard-threshold',
       'mouse-zero-bias',
       'mouse-scale',
+      'mouse-scale-x',
+      'mouse-scale-y',
       'mouse-temperature',
       'mouse-top-k',
       'mouse-deadzone',
@@ -211,10 +225,13 @@ INDEX_HTML = """<!doctype html>
       if (decode.keyboard_threshold !== undefined) syncInputValue('keyboard-threshold', decode.keyboard_threshold);
       if (decode.mouse_zero_bias !== undefined) syncInputValue('mouse-zero-bias', decode.mouse_zero_bias);
       if (decode.mouse_scale !== undefined) syncInputValue('mouse-scale', decode.mouse_scale);
+      if (decode.mouse_scale_x !== undefined) syncInputValue('mouse-scale-x', decode.mouse_scale_x);
+      if (decode.mouse_scale_y !== undefined) syncInputValue('mouse-scale-y', decode.mouse_scale_y);
       if (decode.mouse_temperature !== undefined) syncInputValue('mouse-temperature', decode.mouse_temperature);
       if (decode.mouse_top_k !== undefined) syncInputValue('mouse-top-k', decode.mouse_top_k);
       if (decode.mouse_deadzone !== undefined) syncInputValue('mouse-deadzone', decode.mouse_deadzone);
       syncInputValue('cache-window', data.cache_window_frames ?? '');
+      renderCalibration(data.calibration || {});
     }
 
     function fmtProb(value) {
@@ -558,6 +575,8 @@ INDEX_HTML = """<!doctype html>
         'keyboard-threshold',
         'mouse-zero-bias',
         'mouse-scale',
+        'mouse-scale-x',
+        'mouse-scale-y',
         'mouse-temperature',
         'mouse-top-k',
         'mouse-deadzone',
@@ -566,10 +585,28 @@ INDEX_HTML = """<!doctype html>
         keyboard_threshold: Number(document.getElementById('keyboard-threshold').value || '0.12'),
         mouse_zero_bias: Number(document.getElementById('mouse-zero-bias').value || '0'),
         mouse_scale: Number(document.getElementById('mouse-scale').value || '1'),
+        mouse_scale_x: Number(document.getElementById('mouse-scale-x').value || '1'),
+        mouse_scale_y: Number(document.getElementById('mouse-scale-y').value || '1'),
         mouse_temperature: Number(document.getElementById('mouse-temperature').value || '1'),
         mouse_top_k: Number(document.getElementById('mouse-top-k').value || '1'),
         mouse_deadzone: Number(document.getElementById('mouse-deadzone').value || '0.35'),
       });
+      await refreshLogits();
+    }
+
+    function renderCalibration(data) {
+      const el = document.getElementById('calibration-status');
+      if (!el) return;
+      if (!data || (!data.running && !data.updated_at && !data.last_error && !data.last_result)) {
+        el.textContent = 'no calibration run yet';
+        return;
+      }
+      el.textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function calibrateMouse() {
+      const result = await post('/api/calibrate_mouse');
+      renderCalibration(result.calibration || result);
       await refreshLogits();
     }
 
@@ -679,6 +716,14 @@ def create_app(runtime: Model3InferenceRuntime) -> FastAPI:
             return {"ok": True, "action_decode": updated}
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/calibrate_mouse")
+    async def calibrate_mouse():
+        try:
+            result = await runtime.calibrate_mouse()
+            return {"ok": True, "calibration": result}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/record/start")
     async def record_start():

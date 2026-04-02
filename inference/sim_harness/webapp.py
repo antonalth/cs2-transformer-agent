@@ -137,6 +137,8 @@ INDEX_HTML = """<!doctype html>
           <button onclick="serverAct('start')">start</button>
           <button onclick="serverAct('restart')">restart</button>
           <button onclick="serverAct('stop')">stop</button>
+          <button onclick="serverAct('pause')">freeze</button>
+          <button onclick="serverAct('resume')">unfreeze</button>
           <button onclick="refreshServerLogs()">refresh logs</button>
         </div>
         <div class="mono server-summary" id="server-summary">loading...</div>
@@ -1303,6 +1305,20 @@ def create_app(config_path: str | Path = "sim_harness.toml"):
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/server/pause")
+    async def pause_server():
+        try:
+            return JSONResponse(await supervisor.pause_server())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/resume")
+    async def resume_server():
+        try:
+            return JSONResponse(await supervisor.resume_server())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/server/command")
     async def server_command(payload: dict):
         try:
@@ -1323,6 +1339,14 @@ def create_app(config_path: str | Path = "sim_harness.toml"):
     async def server_scenarios():
         try:
             return JSONResponse(await supervisor.list_server_scenarios())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/server/plugin-state")
+    async def server_plugin_state(payload: dict | None = None):
+        try:
+            refresh = True if payload is None else bool(payload.get("refresh", True))
+            return JSONResponse(await supervisor.server_plugin_state(refresh=refresh))
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

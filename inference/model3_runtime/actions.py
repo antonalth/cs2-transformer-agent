@@ -92,6 +92,8 @@ class ActionDecodeConfig:
     keyboard_threshold: float = 0.12
     mouse_deadzone: float = 0.35
     mouse_scale: float = 1.0
+    mouse_scale_x: float = 1.0
+    mouse_scale_y: float = 1.0
     max_mouse_delta: float = 30.0
     mouse_zero_bias: float = 0.0
     mouse_temperature: float = 1.0
@@ -227,7 +229,8 @@ class ModelActionDecoder:
                 bins=int(model_cfg.mouse_bins_count),
             ).item()
         )
-        delta *= float(self.cfg.mouse_scale)
+        axis_scale = float(self.cfg.mouse_scale_x if axis_name == "mouse_x" else self.cfg.mouse_scale_y)
+        delta *= float(self.cfg.mouse_scale) * axis_scale
         delta = max(-self.cfg.max_mouse_delta, min(self.cfg.max_mouse_delta, delta))
 
         trace = {

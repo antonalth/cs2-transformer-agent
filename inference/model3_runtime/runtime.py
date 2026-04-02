@@ -47,6 +47,15 @@ class RuntimeStateView:
     recording: dict[str, Any]
     last_actions: dict[str, list[dict[str, Any]]]
     last_action_summaries: dict[str, dict[str, Any]]
+    calibration: dict[str, Any]
+
+
+@dataclass(slots=True)
+class MouseCalibrationView:
+    running: bool = False
+    updated_at: float = 0.0
+    last_error: str = ""
+    last_result: dict[str, Any] = field(default_factory=dict)
 
 
 ROUND_STATE_LABELS = ("freeze", "live", "plant", "t_win", "ct_win")
@@ -121,6 +130,38 @@ def _top_categories(labels: list[str], probabilities: list[float], limit: int = 
         reverse=True,
     )
     return ranked[:limit]
+
+
+def _unwrap_delta_degrees(delta: float) -> float:
+    value = float(delta)
+    while value <= -180.0:
+        value += 360.0
+    while value > 180.0:
+        value -= 360.0
+    return value
+
+
+def _fit_linear_axis(samples: list[tuple[float, float]]) -> dict[str, float]:
+    if len(samples) < 2:
+        raise RuntimeError("need at least two calibration samples")
+    xs = [float(x) for x, _ in samples]
+    ys = [float(y) for _, y in samples]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if abs(denom) < 1e-9:
+        raise RuntimeError("calibration samples are degenerate")
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    intercept = mean_y - (slope * mean_x)
+    residuals = [y - ((slope * x) + intercept) for x, y in samples]
+    mean_abs_error = sum(abs(value) for value in residuals) / len(residuals)
+    max_abs_error = max(abs(value) for value in residuals)
+    return {
+        "slope": slope,
+        "intercept": intercept,
+        "mean_abs_error": mean_abs_error,
+        "max_abs_error": max_abs_error,
+    }
 
 
 def _binary_panel(head_name: str, logit_value: float, model_cfg: object) -> dict[str, Any]:
@@ -242,6 +283,7 @@ class Model3InferenceRuntime:
         self._latest_action_summaries: dict[str, Any] = {}
         self._latest_composite_jpeg: bytes | None = None
         self._metrics = RuntimeMetrics()
+        self._mouse_calibration = MouseCalibrationView(updated_at=time.time())
         self._ar_state = self.loaded_model.backbone.init_autoregressive_state(
             max_cache_frames=cfg.cache_window_frames
         )
@@ -353,6 +395,10 @@ class Model3InferenceRuntime:
                 cfg.mouse_deadzone = float(payload["mouse_deadzone"])
             if "mouse_scale" in payload:
                 cfg.mouse_scale = float(payload["mouse_scale"])
+            if "mouse_scale_x" in payload:
+                cfg.mouse_scale_x = float(payload["mouse_scale_x"])
+            if "mouse_scale_y" in payload:
+                cfg.mouse_scale_y = float(payload["mouse_scale_y"])
             if "max_mouse_delta" in payload:
                 cfg.max_mouse_delta = float(payload["max_mouse_delta"])
             if "mouse_zero_bias" in payload:
@@ -408,6 +454,7 @@ class Model3InferenceRuntime:
                     slot_name: summary.to_dict()
                     for slot_name, summary in self._latest_action_summaries.items()
                 },
+                calibration=asdict(self._mouse_calibration),
             )
 
     async def latest_logits(self, player_index: int) -> dict[str, Any]:
@@ -453,6 +500,263 @@ class Model3InferenceRuntime:
                 else {},
                 "panels": panels,
             }
+
+    async def calibrate_mouse(self) -> dict[str, Any]:
+        async with self._lock:
+            if self._mouse_calibration.running:
+                raise RuntimeError("mouse calibration is already running")
+            was_running = self._running
+            self._mouse_calibration.running = True
+            self._mouse_calibration.last_error = ""
+            self._mouse_calibration.updated_at = time.time()
+
+        await self.pause()
+        client = RemoteHarnessClient(
+            base_url=self.cfg.harness_url,
+            verify_ssl=self.cfg.verify_ssl,
+            timeout_s=10.0,
+        )
+        try:
+            result = await self._run_mouse_calibration(client)
+            async with self._lock:
+                self.cfg.action_decode.mouse_scale_x = float(result["recommended_mouse_scale_x"])
+                self.cfg.action_decode.mouse_scale_y = float(result["recommended_mouse_scale_y"])
+                result["applied_action_decode"] = asdict(self.cfg.action_decode)
+                self._mouse_calibration.last_result = result
+                self._mouse_calibration.last_error = ""
+                self._mouse_calibration.updated_at = time.time()
+            if was_running:
+                await self.start()
+            return result
+        except Exception as exc:
+            async with self._lock:
+                self._mouse_calibration.last_error = str(exc)
+                self._mouse_calibration.updated_at = time.time()
+            raise
+        finally:
+            client.close()
+            async with self._lock:
+                self._mouse_calibration.running = False
+                self._mouse_calibration.updated_at = time.time()
+
+    async def _run_mouse_calibration(self, client: RemoteHarnessClient) -> dict[str, Any]:
+        slot_name = self.cfg.slot_names[0]
+        slots = await asyncio.to_thread(client.get_slots)
+        slot_snapshot = next((slot for slot in slots if slot.get("name") == slot_name), None)
+        if slot_snapshot is None:
+            raise RuntimeError(f"slot {slot_name} is not present in the harness")
+        if slot_snapshot.get("status") != "ready":
+            raise RuntimeError(f"slot {slot_name} is not ready for calibration")
+
+        await self._post_server_command(client, "css_sim_unfreeze", allow_error=True)
+        try:
+            await self._post_server_command(client, "css_sim_reset")
+            await asyncio.sleep(1.5)
+
+            state = await self._fetch_plugin_state(client, refresh=True)
+            player = self._select_calibration_player(state)
+            baseline_pitch = float(player["pitch"])
+            baseline_yaw = float(player["yaw"])
+            if abs(baseline_pitch) > 10.0:
+                await self._post_server_command(
+                    client,
+                    f"css_sim_set_view {0.0:.3f} {baseline_yaw:.3f}",
+                )
+                await asyncio.sleep(0.15)
+
+            await self._post_server_command(client, "css_sim_freeze bots")
+            await asyncio.sleep(0.15)
+            state = await self._fetch_plugin_state(client, refresh=True)
+            player = self._select_calibration_player(state)
+            baseline_pitch = float(player["pitch"])
+            baseline_yaw = float(player["yaw"])
+
+            axis_inputs = [8.0, -8.0, 16.0, -16.0, 32.0, -32.0, 48.0, -48.0, 64.0, -64.0, 96.0, -96.0]
+            yaw_trials = await self._collect_mouse_axis_trials(
+                client,
+                slot_name=slot_name,
+                axis_name="x",
+                values=axis_inputs * 2,
+            )
+            pitch_trials = await self._collect_mouse_axis_trials(
+                client,
+                slot_name=slot_name,
+                axis_name="y",
+                values=axis_inputs * 2,
+            )
+
+            yaw_fit = _fit_linear_axis([(float(item["input"]), float(item["delta_yaw"])) for item in yaw_trials])
+            pitch_fit = _fit_linear_axis([(float(item["input"]), float(item["delta_pitch"])) for item in pitch_trials])
+
+            yaw_slope = float(yaw_fit["slope"])
+            pitch_slope = float(pitch_fit["slope"])
+            if abs(yaw_slope) < 1e-5:
+                raise RuntimeError("yaw calibration slope was too close to zero")
+            if abs(pitch_slope) < 1e-5:
+                raise RuntimeError("pitch calibration slope was too close to zero")
+
+            global_scale = float(self.cfg.action_decode.mouse_scale)
+            recommended_scale_x = 1.0 / (global_scale * yaw_slope)
+            recommended_scale_y = 1.0 / (global_scale * pitch_slope)
+
+            sequence_results = await self._run_mouse_sequence_validation(
+                client,
+                slot_name=slot_name,
+                yaw_fit=yaw_fit,
+                pitch_fit=pitch_fit,
+            )
+            final_state = await self._fetch_plugin_state(client, refresh=True)
+            final_player = self._select_calibration_player(final_state)
+            return {
+                "slot_name": slot_name,
+                "player_name": str(final_player["name"]),
+                "freeze_mode": final_state.get("freezeMode", ""),
+                "recommended_mouse_scale_x": recommended_scale_x,
+                "recommended_mouse_scale_y": recommended_scale_y,
+                "global_mouse_scale": global_scale,
+                "yaw_fit": yaw_fit,
+                "pitch_fit": pitch_fit,
+                "yaw_trials": yaw_trials,
+                "pitch_trials": pitch_trials,
+                "sequence_results": sequence_results,
+                "player_state": final_player,
+            }
+        finally:
+            await self._post_server_command(client, "css_sim_unfreeze", allow_error=True)
+
+    async def _post_server_command(
+        self,
+        client: RemoteHarnessClient,
+        command: str,
+        *,
+        allow_error: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(client.post_json, "/api/server/command", {"command": command})
+        except Exception:
+            if allow_error:
+                return {"ok": False, "command": command}
+            raise
+
+    async def _fetch_plugin_state(self, client: RemoteHarnessClient, *, refresh: bool) -> dict[str, Any]:
+        response = await asyncio.to_thread(client.post_json, "/api/server/plugin-state", {"refresh": refresh})
+        state = response.get("state")
+        if not isinstance(state, dict):
+            raise RuntimeError("server plugin state response was invalid")
+        return state
+
+    @staticmethod
+    def _select_calibration_player(state: dict[str, Any]) -> dict[str, Any]:
+        players = state.get("players", [])
+        if not isinstance(players, list):
+            raise RuntimeError("server plugin state did not contain a player list")
+        humans = [
+            player
+            for player in players
+            if isinstance(player, dict)
+            and bool(player.get("connected"))
+            and not bool(player.get("isBot"))
+            and bool(player.get("alive"))
+            and str(player.get("team", "")) in {"ct", "t"}
+        ]
+        if len(humans) != 1:
+            raise RuntimeError(f"expected exactly one alive human player for calibration, found {len(humans)}")
+        return humans[0]
+
+    async def _collect_mouse_axis_trials(
+        self,
+        client: RemoteHarnessClient,
+        *,
+        slot_name: str,
+        axis_name: str,
+        values: list[float],
+    ) -> list[dict[str, Any]]:
+        trials: list[dict[str, Any]] = []
+        for value in values:
+            before = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            dx = float(value) if axis_name == "x" else 0.0
+            dy = float(value) if axis_name == "y" else 0.0
+            await asyncio.to_thread(client.send_actions, {slot_name: [{"t": "mouse_rel", "dx": dx, "dy": dy}]})
+            await asyncio.sleep(0.12)
+            after = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            trials.append(
+                {
+                    "axis": axis_name,
+                    "input": float(value),
+                    "before_pitch": float(before["pitch"]),
+                    "before_yaw": float(before["yaw"]),
+                    "after_pitch": float(after["pitch"]),
+                    "after_yaw": float(after["yaw"]),
+                    "delta_pitch": float(after["pitch"]) - float(before["pitch"]),
+                    "delta_yaw": _unwrap_delta_degrees(float(after["yaw"]) - float(before["yaw"])),
+                }
+            )
+            await asyncio.sleep(0.05)
+        return trials
+
+    async def _run_mouse_sequence_validation(
+        self,
+        client: RemoteHarnessClient,
+        *,
+        slot_name: str,
+        yaw_fit: dict[str, float],
+        pitch_fit: dict[str, float],
+    ) -> list[dict[str, Any]]:
+        sequences = [
+            {
+                "label": "yaw_small_chain",
+                "events": [{"dx": 12.0, "dy": 0.0}] * 8,
+            },
+            {
+                "label": "yaw_mixed_chain",
+                "events": [
+                    {"dx": 24.0, "dy": 0.0},
+                    {"dx": -8.0, "dy": 0.0},
+                    {"dx": 16.0, "dy": 0.0},
+                    {"dx": -4.0, "dy": 0.0},
+                ],
+            },
+            {
+                "label": "pitch_small_chain",
+                "events": [{"dx": 0.0, "dy": 10.0}] * 6,
+            },
+            {
+                "label": "pitch_mixed_chain",
+                "events": [
+                    {"dx": 0.0, "dy": 20.0},
+                    {"dx": 0.0, "dy": -8.0},
+                    {"dx": 0.0, "dy": 12.0},
+                    {"dx": 0.0, "dy": -4.0},
+                ],
+            },
+        ]
+
+        results: list[dict[str, Any]] = []
+        for sequence in sequences:
+            before = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            for event in sequence["events"]:
+                await asyncio.to_thread(client.send_actions, {slot_name: [{"t": "mouse_rel", "dx": event["dx"], "dy": event["dy"]}]})
+                await asyncio.sleep(max(0.03, float(self.cfg.poll_interval_s)))
+            await asyncio.sleep(0.12)
+            after = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+
+            measured_yaw = _unwrap_delta_degrees(float(after["yaw"]) - float(before["yaw"]))
+            measured_pitch = float(after["pitch"]) - float(before["pitch"])
+            predicted_yaw = sum((yaw_fit["slope"] * event["dx"]) + yaw_fit["intercept"] for event in sequence["events"])
+            predicted_pitch = sum((pitch_fit["slope"] * event["dy"]) + pitch_fit["intercept"] for event in sequence["events"])
+            results.append(
+                {
+                    "label": sequence["label"],
+                    "events": sequence["events"],
+                    "predicted_yaw": predicted_yaw,
+                    "measured_yaw": measured_yaw,
+                    "yaw_error": measured_yaw - predicted_yaw,
+                    "predicted_pitch": predicted_pitch,
+                    "measured_pitch": measured_pitch,
+                    "pitch_error": measured_pitch - predicted_pitch,
+                }
+            )
+        return results
 
     async def _run_loop(self) -> None:
         if self._http_client is not None:

@@ -159,8 +159,27 @@ class HarnessSupervisor:
     async def send_server_command(self, command: str) -> dict:
         return await self.server.send_command(command)
 
+    async def pause_server(self) -> dict:
+        command = self.config.server.pause_command.strip()
+        if not command:
+            raise RuntimeError("server pause_command is empty")
+        result = await self.server.send_command(command)
+        result["operation"] = "pause"
+        return result
+
+    async def resume_server(self) -> dict:
+        command = self.config.server.resume_command.strip()
+        if not command:
+            raise RuntimeError("server resume_command is empty")
+        result = await self.server.send_command(command)
+        result["operation"] = "resume"
+        return result
+
     async def list_server_scenarios(self) -> dict:
         return await self.server.list_scenarios()
+
+    async def server_plugin_state(self, *, refresh: bool = True) -> dict:
+        return await self.server.plugin_state(refresh=refresh)
 
     async def run_server_scenario(self, scenario_name: str, *, op: str) -> dict:
         return await self.server.run_scenario_command(scenario_name, op=op)
