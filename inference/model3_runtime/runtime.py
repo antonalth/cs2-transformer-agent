@@ -554,7 +554,7 @@ class Model3InferenceRuntime:
             await asyncio.sleep(1.5)
 
             state = await self._fetch_plugin_state(client, refresh=True)
-            player = self._select_calibration_player(state)
+            player = self._select_calibration_player(state, slot_name=slot_name)
             baseline_pitch = float(player["pitch"])
             baseline_yaw = float(player["yaw"])
             if abs(baseline_pitch) > 10.0:
@@ -567,7 +567,7 @@ class Model3InferenceRuntime:
             await self._post_server_command(client, "css_sim_freeze bots")
             await asyncio.sleep(0.15)
             state = await self._fetch_plugin_state(client, refresh=True)
-            player = self._select_calibration_player(state)
+            player = self._select_calibration_player(state, slot_name=slot_name)
             baseline_pitch = float(player["pitch"])
             baseline_yaw = float(player["yaw"])
 
@@ -606,7 +606,7 @@ class Model3InferenceRuntime:
                 pitch_fit=pitch_fit,
             )
             final_state = await self._fetch_plugin_state(client, refresh=True)
-            final_player = self._select_calibration_player(final_state)
+            final_player = self._select_calibration_player(final_state, slot_name=slot_name)
             return {
                 "slot_name": slot_name,
                 "player_name": str(final_player["name"]),
@@ -646,22 +646,69 @@ class Model3InferenceRuntime:
         return state
 
     @staticmethod
-    def _select_calibration_player(state: dict[str, Any]) -> dict[str, Any]:
-        players = state.get("players", [])
+    def _state_value(payload: dict[str, Any], *names: str, default: Any = None) -> Any:
+        for name in names:
+            if name in payload:
+                return payload[name]
+        return default
+
+    @classmethod
+    def _normalize_player_state(cls, player: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "slot": cls._state_value(player, "slot", "Slot", default=-1),
+            "name": str(cls._state_value(player, "name", "Name", default="")),
+            "isBot": bool(cls._state_value(player, "isBot", "IsBot", default=False)),
+            "connected": bool(cls._state_value(player, "connected", "Connected", default=False)),
+            "alive": bool(cls._state_value(player, "alive", "Alive", default=False)),
+            "frozen": bool(cls._state_value(player, "frozen", "Frozen", default=False)),
+            "team": str(cls._state_value(player, "team", "Team", default="")),
+            "pitch": float(cls._state_value(player, "pitch", "Pitch", default=0.0)),
+            "yaw": float(cls._state_value(player, "yaw", "Yaw", default=0.0)),
+            "roll": float(cls._state_value(player, "roll", "Roll", default=0.0)),
+            "originX": float(cls._state_value(player, "originX", "OriginX", default=0.0)),
+            "originY": float(cls._state_value(player, "originY", "OriginY", default=0.0)),
+            "originZ": float(cls._state_value(player, "originZ", "OriginZ", default=0.0)),
+        }
+
+    @classmethod
+    def _select_calibration_player(cls, state: dict[str, Any], *, slot_name: str) -> dict[str, Any]:
+        players = cls._state_value(state, "players", "Players", default=[])
         if not isinstance(players, list):
             raise RuntimeError("server plugin state did not contain a player list")
         humans = [
-            player
+            cls._normalize_player_state(player)
             for player in players
             if isinstance(player, dict)
-            and bool(player.get("connected"))
-            and not bool(player.get("isBot"))
-            and bool(player.get("alive"))
-            and str(player.get("team", "")) in {"ct", "t"}
+            and bool(cls._state_value(player, "connected", "Connected", default=False))
+            and not bool(cls._state_value(player, "isBot", "IsBot", default=False))
+            and bool(cls._state_value(player, "alive", "Alive", default=False))
+            and str(cls._state_value(player, "team", "Team", default="")) in {"ct", "t"}
         ]
-        if len(humans) != 1:
-            raise RuntimeError(f"expected exactly one alive human player for calibration, found {len(humans)}")
-        return humans[0]
+
+        if not humans:
+            raise RuntimeError("expected at least one alive human player for calibration, found 0")
+
+        preferred_names = {slot_name.lower()}
+        suffix = slot_name[5:] if slot_name.lower().startswith("steam") else ""
+        preferred_slot: int | None = None
+        if suffix.isdigit():
+            preferred_names.add(f"agent{suffix}")
+            preferred_slot = int(suffix) - 1
+
+        for player in humans:
+            if player["name"].lower() in preferred_names:
+                return player
+
+        if preferred_slot is not None:
+            for player in humans:
+                if int(player["slot"]) == preferred_slot:
+                    return player
+
+        if len(humans) == 1:
+            return humans[0]
+
+        available = ", ".join(f"{player['name']}@slot{player['slot']}" for player in humans)
+        raise RuntimeError(f"unable to identify calibration player for {slot_name}; available humans: {available}")
 
     async def _collect_mouse_axis_trials(
         self,
@@ -673,12 +720,18 @@ class Model3InferenceRuntime:
     ) -> list[dict[str, Any]]:
         trials: list[dict[str, Any]] = []
         for value in values:
-            before = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            before = self._select_calibration_player(
+                await self._fetch_plugin_state(client, refresh=True),
+                slot_name=slot_name,
+            )
             dx = float(value) if axis_name == "x" else 0.0
             dy = float(value) if axis_name == "y" else 0.0
             await asyncio.to_thread(client.send_actions, {slot_name: [{"t": "mouse_rel", "dx": dx, "dy": dy}]})
             await asyncio.sleep(0.12)
-            after = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            after = self._select_calibration_player(
+                await self._fetch_plugin_state(client, refresh=True),
+                slot_name=slot_name,
+            )
             trials.append(
                 {
                     "axis": axis_name,
@@ -733,12 +786,18 @@ class Model3InferenceRuntime:
 
         results: list[dict[str, Any]] = []
         for sequence in sequences:
-            before = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            before = self._select_calibration_player(
+                await self._fetch_plugin_state(client, refresh=True),
+                slot_name=slot_name,
+            )
             for event in sequence["events"]:
                 await asyncio.to_thread(client.send_actions, {slot_name: [{"t": "mouse_rel", "dx": event["dx"], "dy": event["dy"]}]})
                 await asyncio.sleep(max(0.03, float(self.cfg.poll_interval_s)))
             await asyncio.sleep(0.12)
-            after = self._select_calibration_player(await self._fetch_plugin_state(client, refresh=True))
+            after = self._select_calibration_player(
+                await self._fetch_plugin_state(client, refresh=True),
+                slot_name=slot_name,
+            )
 
             measured_yaw = _unwrap_delta_degrees(float(after["yaw"]) - float(before["yaw"]))
             measured_pitch = float(after["pitch"]) - float(before["pitch"])
