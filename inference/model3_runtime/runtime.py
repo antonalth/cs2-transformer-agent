@@ -11,7 +11,7 @@ import torch
 from ..sim_harness.model3_helpers import observation_to_model3_batch
 from ..sim_harness.remote_client import RemoteHarnessClient, RemoteHarnessStreamClient
 from ..sim_harness.remote_protocol import HarnessObservation
-from .actions import ModelActionDecoder
+from .actions import KEYBOARD_ONLY_ACTIONS, ModelActionDecoder, keyboard_action_labels, mu_law_decode
 from .checkpoint import LoadedModel3, load_model3_checkpoint
 from .config import Model3RuntimeConfig
 from .overlay import RuntimeOverlayRenderer
@@ -47,6 +47,167 @@ class RuntimeStateView:
     recording: dict[str, Any]
     last_actions: dict[str, list[dict[str, Any]]]
     last_action_summaries: dict[str, dict[str, Any]]
+
+
+ROUND_STATE_LABELS = ("freeze", "live", "plant", "t_win", "ct_win")
+POSITION_MIN = -4096.0
+POSITION_MAX = 4096.0
+
+
+def _format_axis_value(value: float) -> str:
+    if abs(value) >= 100:
+        return f"{value:.0f}"
+    if abs(value) >= 10:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+
+def _linear_axis_labels(min_value: float, max_value: float, count: int) -> list[str]:
+    if count <= 1:
+        return [_format_axis_value(min_value)]
+    step = (max_value - min_value) / float(count - 1)
+    return [_format_axis_value(min_value + (step * idx)) for idx in range(count)]
+
+
+def _index_axis_labels(count: int, *, prefix: str = "") -> list[str]:
+    return [f"{prefix}{idx}" for idx in range(count)]
+
+
+def _mouse_axis_labels(model_cfg: object) -> list[str]:
+    bins = int(model_cfg.mouse_bins_count)
+    indices = torch.arange(bins)
+    decoded = mu_law_decode(
+        indices,
+        mu=float(model_cfg.mouse_mu),
+        max_val=float(model_cfg.mouse_max),
+        bins=bins,
+    )
+    return [_format_axis_value(float(value)) for value in decoded.tolist()]
+
+
+def _head_axis_labels(head_name: str, count: int, model_cfg: object) -> list[str]:
+    if head_name == "keyboard_logits":
+        return keyboard_action_labels(count)
+    if head_name in {"mouse_x", "mouse_y"}:
+        return _mouse_axis_labels(model_cfg)
+    if head_name in {"health_logits", "armor_logits"}:
+        return _linear_axis_labels(0.0, 100.0, count)
+    if head_name == "money_logits":
+        return _linear_axis_labels(0.0, 16000.0, count)
+    if head_name in {"player_pos_x", "player_pos_y", "player_pos_z", "enemy_pos_x", "enemy_pos_y", "enemy_pos_z"}:
+        return _linear_axis_labels(POSITION_MIN, POSITION_MAX, count)
+    if head_name == "round_state_logits":
+        return list(ROUND_STATE_LABELS[:count])
+    if head_name == "round_num_logits":
+        return _index_axis_labels(count)
+    if head_name in {"team_alive_logits", "enemy_alive_logits"}:
+        return _index_axis_labels(count)
+    if head_name == "eco_purchase_logits":
+        return ["no", "yes"]
+    if head_name == "active_weapon_logits":
+        return _index_axis_labels(count, prefix="weapon ")
+    if head_name == "eco_buy_logits":
+        return _index_axis_labels(count, prefix="item ")
+    return _index_axis_labels(count)
+
+
+def _top_categories(labels: list[str], probabilities: list[float], limit: int = 5) -> list[dict[str, Any]]:
+    ranked = sorted(
+        (
+            {"label": str(label), "probability": float(probability), "index": int(idx)}
+            for idx, (label, probability) in enumerate(zip(labels, probabilities))
+        ),
+        key=lambda item: item["probability"],
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def _binary_panel(head_name: str, logit_value: float, model_cfg: object) -> dict[str, Any]:
+    yes_probability = float(torch.sigmoid(torch.tensor(logit_value)).item())
+    probabilities = [1.0 - yes_probability, yes_probability]
+    labels = _head_axis_labels(head_name, 2, model_cfg)
+    predicted_index = int(yes_probability >= 0.5)
+    full_categories = [
+        {
+            "label": str(label),
+            "probability": float(probability),
+            "index": int(idx),
+        }
+        for idx, (label, probability) in enumerate(zip(labels, probabilities))
+    ]
+    return {
+        "head_name": head_name,
+        "kind": "binary",
+        "representation": "sigmoid",
+        "x_labels": labels,
+        "probabilities": probabilities,
+        "raw_logits": [0.0, float(logit_value)],
+        "predicted_index": predicted_index,
+        "predicted_label": labels[predicted_index],
+        "predicted_probability": float(probabilities[predicted_index]),
+        "top_categories": _top_categories(labels, probabilities, limit=2),
+        "full_categories": full_categories,
+    }
+
+
+def _categorical_panel(head_name: str, values: torch.Tensor, model_cfg: object) -> dict[str, Any]:
+    probabilities = torch.softmax(values, dim=0)
+    labels = _head_axis_labels(head_name, int(values.numel()), model_cfg)
+    predicted_index = int(torch.argmax(probabilities).item())
+    probs_list = [float(value) for value in probabilities.tolist()]
+    full_categories = [
+        {
+            "label": str(label),
+            "probability": float(probability),
+            "index": int(idx),
+        }
+        for idx, (label, probability) in enumerate(zip(labels, probs_list))
+    ]
+    return {
+        "head_name": head_name,
+        "kind": "categorical",
+        "representation": "softmax",
+        "x_labels": labels,
+        "probabilities": probs_list,
+        "raw_logits": [float(value) for value in values.tolist()],
+        "predicted_index": predicted_index,
+        "predicted_label": labels[predicted_index],
+        "predicted_probability": float(probs_list[predicted_index]),
+        "top_categories": _top_categories(labels, probs_list),
+        "full_categories": full_categories,
+    }
+
+
+def _keyboard_panel(values: torch.Tensor, keyboard_threshold: float) -> dict[str, Any]:
+    probabilities = torch.sigmoid(values)
+    probs_list = [float(value) for value in probabilities.tolist()]
+    labels = keyboard_action_labels(len(probs_list))
+    active_actions = [
+        label
+        for label, probability in zip(labels, probs_list)
+        if probability >= keyboard_threshold
+    ]
+    full_categories = [
+        {
+            "label": str(label),
+            "probability": float(probability),
+            "index": int(idx),
+        }
+        for idx, (label, probability) in enumerate(zip(labels, probs_list))
+    ]
+    return {
+        "head_name": "keyboard_logits",
+        "kind": "bernoulli",
+        "representation": "sigmoid",
+        "x_labels": labels,
+        "probabilities": probs_list,
+        "raw_logits": [float(value) for value in values.tolist()],
+        "active_actions": active_actions,
+        "threshold": float(keyboard_threshold),
+        "top_categories": _top_categories(labels, probs_list),
+        "full_categories": full_categories,
+    }
 
 
 class Model3InferenceRuntime:
@@ -183,6 +344,25 @@ class Model3InferenceRuntime:
         if was_connected:
             await self.disconnect()
 
+    async def set_action_decode_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._lock:
+            cfg = self.cfg.action_decode
+            if "keyboard_threshold" in payload:
+                cfg.keyboard_threshold = float(payload["keyboard_threshold"])
+            if "mouse_deadzone" in payload:
+                cfg.mouse_deadzone = float(payload["mouse_deadzone"])
+            if "mouse_scale" in payload:
+                cfg.mouse_scale = float(payload["mouse_scale"])
+            if "max_mouse_delta" in payload:
+                cfg.max_mouse_delta = float(payload["max_mouse_delta"])
+            if "mouse_zero_bias" in payload:
+                cfg.mouse_zero_bias = float(payload["mouse_zero_bias"])
+            if "mouse_temperature" in payload:
+                cfg.mouse_temperature = max(1e-4, float(payload["mouse_temperature"]))
+            if "mouse_top_k" in payload:
+                cfg.mouse_top_k = max(1, int(payload["mouse_top_k"]))
+            return asdict(cfg)
+
     async def start_recording(self, path: str | None = None) -> str:
         async with self._lock:
             recording_path = self.recorder.start(path)
@@ -217,6 +397,7 @@ class Model3InferenceRuntime:
                 checkpoint_path=self.loaded_model.checkpoint_path,
                 runtime_options={
                     "fast_vision_preprocess": bool(self.loaded_model.backbone.video.fast_preprocess_enabled),
+                    "action_decode": asdict(self.cfg.action_decode),
                 },
                 cache_window_frames=self.cfg.cache_window_frames,
                 cache=cache,
@@ -236,15 +417,42 @@ class Model3InferenceRuntime:
             if not 0 <= player_index < len(self.cfg.slot_names):
                 raise IndexError(f"player_index must be in [0, {len(self.cfg.slot_names) - 1}]")
 
-            logits: dict[str, Any] = {}
+            panels: list[dict[str, Any]] = []
+            model_cfg = self.loaded_model.global_cfg.model
+            player_name = self.cfg.slot_names[player_index]
             for head_name, tensor in self._latest_prediction.items():
                 if tensor.ndim < 4:
                     continue
+                if head_name in {"enemy_pos_x", "enemy_pos_y", "enemy_pos_z"} and tensor.shape[2] == 5:
+                    for enemy_index in range(5):
+                        values = tensor[0, 0, enemy_index].detach().float().cpu().view(-1)
+                        panel = _categorical_panel(f"{head_name}[enemy {enemy_index}]", values, model_cfg)
+                        panels.append(panel)
+                    continue
+                selected: torch.Tensor | None = None
                 if tensor.shape[2] == len(self.cfg.slot_names):
-                    logits[head_name] = tensor[0, 0, player_index].tolist()
+                    selected = tensor[0, 0, player_index]
                 elif tensor.shape[2] == 1:
-                    logits[head_name] = tensor[0, 0, 0].tolist()
-            return logits
+                    selected = tensor[0, 0, 0]
+                if selected is None:
+                    continue
+
+                values = selected.detach().float().cpu().view(-1)
+                if head_name == "keyboard_logits":
+                    panels.append(_keyboard_panel(values, float(self.cfg.action_decode.keyboard_threshold)))
+                elif values.numel() == 1:
+                    panels.append(_binary_panel(head_name, float(values[0].item()), model_cfg))
+                else:
+                    panels.append(_categorical_panel(head_name, values, model_cfg))
+            return {
+                "player_index": int(player_index),
+                "player_name": player_name,
+                "action_decode": asdict(self.cfg.action_decode),
+                "action_summary": self._latest_action_summaries[player_name].to_dict()
+                if player_name in self._latest_action_summaries
+                else {},
+                "panels": panels,
+            }
 
     async def _run_loop(self) -> None:
         if self._http_client is not None:

@@ -43,6 +43,15 @@ KEYBOARD_ONLY_ACTIONS = [
     "SWITCH_5",
 ]
 
+
+def keyboard_action_labels(count: int) -> list[str]:
+    labels = list(KEYBOARD_ONLY_ACTIONS)
+    if count <= len(labels):
+        return labels[:count]
+    extra = [f"UNUSED_KEYBOARD_{idx}" for idx in range(len(labels), count)]
+    return labels + extra
+
+
 KEY_ACTION_TO_KEY = {
     "IN_JUMP": "space",
     "IN_DUCK": "lctrl",
@@ -80,10 +89,13 @@ def mu_law_decode(y: torch.Tensor, mu: float = 255.0, max_val: float = 30.0, bin
 
 @dataclass(slots=True)
 class ActionDecodeConfig:
-    keyboard_threshold: float = 0.5
+    keyboard_threshold: float = 0.12
     mouse_deadzone: float = 0.35
     mouse_scale: float = 1.0
     max_mouse_delta: float = 30.0
+    mouse_zero_bias: float = 0.0
+    mouse_temperature: float = 1.0
+    mouse_top_k: int = 1
 
 
 @dataclass(slots=True)
@@ -95,6 +107,7 @@ class SlotActionSummary:
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
     emitted_events: list[dict[str, Any]] = field(default_factory=list)
+    decision_trace: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +118,7 @@ class SlotActionSummary:
             "mouse_dx": self.mouse_dx,
             "mouse_dy": self.mouse_dy,
             "emitted_events": list(self.emitted_events),
+            "decision_trace": dict(self.decision_trace),
         }
 
 
@@ -114,6 +128,129 @@ class ModelActionDecoder:
         self.slot_names = list(slot_names)
         self._held_keys = {slot: set() for slot in self.slot_names}
         self._held_buttons = {slot: set() for slot in self.slot_names}
+
+    @staticmethod
+    def _resolve_contrary_actions(
+        probabilities: dict[str, float],
+        active_actions: set[str],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        contrary_pairs = (
+            ("IN_FORWARD", "IN_BACK"),
+            ("IN_MOVELEFT", "IN_MOVERIGHT"),
+            ("IN_TURNLEFT", "IN_TURNRIGHT"),
+        )
+        dropped: list[dict[str, Any]] = []
+        resolved = set(active_actions)
+        for left, right in contrary_pairs:
+            if left not in resolved or right not in resolved:
+                continue
+            left_prob = float(probabilities.get(left, 0.0))
+            right_prob = float(probabilities.get(right, 0.0))
+            if left_prob >= right_prob:
+                loser, winner = right, left
+                loser_prob, winner_prob = right_prob, left_prob
+            else:
+                loser, winner = left, right
+                loser_prob, winner_prob = left_prob, right_prob
+            resolved.discard(loser)
+            dropped.append(
+                {
+                    "winner": winner,
+                    "winner_probability": winner_prob,
+                    "dropped": loser,
+                    "dropped_probability": loser_prob,
+                }
+            )
+        return sorted(resolved), dropped
+
+    def _decode_keyboard(self, logits: torch.Tensor) -> tuple[list[str], dict[str, Any]]:
+        probabilities = torch.sigmoid(logits)
+        probs_list = [float(value) for value in probabilities.tolist()]
+        labels = keyboard_action_labels(len(probs_list))
+        action_probs = {
+            label: prob
+            for label, prob in zip(labels, probs_list)
+        }
+        threshold = float(self.cfg.keyboard_threshold)
+        threshold_hits = {
+            action
+            for action, prob in action_probs.items()
+            if prob >= threshold
+        }
+        resolved_actions, dropped_contrary = self._resolve_contrary_actions(action_probs, threshold_hits)
+        trace = {
+            "threshold": threshold,
+            "labels": labels,
+            "threshold_hits": [
+                {"action": action, "probability": float(action_probs[action])}
+                for action in sorted(threshold_hits)
+            ],
+            "contrary_resolutions": dropped_contrary,
+            "selected_actions": list(resolved_actions),
+        }
+        return resolved_actions, trace
+
+    def _decode_mouse(
+        self,
+        logits: torch.Tensor,
+        *,
+        axis_name: str,
+        model_cfg: object,
+    ) -> tuple[float, int, dict[str, Any]]:
+        adjusted_logits = logits.detach().float().clone()
+        zero_bin_index = int((adjusted_logits.numel() - 1) // 2)
+        zero_bias = float(self.cfg.mouse_zero_bias)
+        if adjusted_logits.numel() > 0:
+            adjusted_logits[zero_bin_index] -= zero_bias
+
+        temperature = max(1e-4, float(self.cfg.mouse_temperature))
+        sampling_logits = adjusted_logits / temperature
+        probabilities = torch.softmax(sampling_logits, dim=0)
+
+        top_k = max(1, min(int(self.cfg.mouse_top_k), int(probabilities.numel())))
+        top_probs, top_indices = torch.topk(probabilities, k=top_k)
+        renorm_probs = top_probs / top_probs.sum().clamp(min=1e-8)
+
+        if top_k == 1:
+            selected_rank = 0
+        else:
+            selected_rank = int(torch.multinomial(renorm_probs, num_samples=1).item())
+        selected_bin = int(top_indices[selected_rank].item())
+        selected_probability = float(probabilities[selected_bin].item())
+        sampled_probability = float(renorm_probs[selected_rank].item())
+
+        delta = float(
+            mu_law_decode(
+                torch.tensor(selected_bin),
+                mu=float(model_cfg.mouse_mu),
+                max_val=float(model_cfg.mouse_max),
+                bins=int(model_cfg.mouse_bins_count),
+            ).item()
+        )
+        delta *= float(self.cfg.mouse_scale)
+        delta = max(-self.cfg.max_mouse_delta, min(self.cfg.max_mouse_delta, delta))
+
+        trace = {
+            "axis": axis_name,
+            "zero_bin_index": zero_bin_index,
+            "zero_bin_probability": float(probabilities[zero_bin_index].item()),
+            "zero_bias": zero_bias,
+            "temperature": temperature,
+            "top_k": top_k,
+            "selected_bin": selected_bin,
+            "selected_probability": selected_probability,
+            "sampled_probability_within_top_k": sampled_probability,
+            "selected_delta": delta,
+            "top_k_candidates": [
+                {
+                    "bin_index": int(index.item()),
+                    "probability": float(prob.item()),
+                    "sampling_weight": float(weight.item()),
+                }
+                for index, prob, weight in zip(top_indices, top_probs, renorm_probs)
+            ],
+        }
+        return delta, selected_bin, trace
 
     def decode(
         self,
@@ -130,12 +267,7 @@ class ModelActionDecoder:
         summaries: dict[str, SlotActionSummary] = {}
 
         for slot_idx, slot_name in enumerate(self.slot_names):
-            kb_probs = torch.sigmoid(keyboard_logits[slot_idx])
-            active_actions = [
-                KEYBOARD_ONLY_ACTIONS[action_idx]
-                for action_idx, prob in enumerate(kb_probs.tolist())
-                if prob >= self.cfg.keyboard_threshold
-            ]
+            active_actions, keyboard_trace = self._decode_keyboard(keyboard_logits[slot_idx])
             desired_keys = {KEY_ACTION_TO_KEY[action] for action in active_actions if action in KEY_ACTION_TO_KEY}
             desired_buttons = {KEY_ACTION_TO_BUTTON[action] for action in active_actions if action in KEY_ACTION_TO_BUTTON}
 
@@ -155,28 +287,16 @@ class ModelActionDecoder:
                 slot_events.append({"t": "mouse_btn", "button": button, "down": True})
             self._held_buttons[slot_name] = set(desired_buttons)
 
-            mouse_bin_x = torch.argmax(mouse_x[slot_idx]).view(())
-            mouse_bin_y = torch.argmax(mouse_y[slot_idx]).view(())
-            dx = float(
-                mu_law_decode(
-                    mouse_bin_x,
-                    mu=float(model_cfg.mouse_mu),
-                    max_val=float(model_cfg.mouse_max),
-                    bins=int(model_cfg.mouse_bins_count),
-                ).item()
+            dx, mouse_bin_x, mouse_trace_x = self._decode_mouse(
+                mouse_x[slot_idx],
+                axis_name="mouse_x",
+                model_cfg=model_cfg,
             )
-            dy = float(
-                mu_law_decode(
-                    mouse_bin_y,
-                    mu=float(model_cfg.mouse_mu),
-                    max_val=float(model_cfg.mouse_max),
-                    bins=int(model_cfg.mouse_bins_count),
-                ).item()
+            dy, mouse_bin_y, mouse_trace_y = self._decode_mouse(
+                mouse_y[slot_idx],
+                axis_name="mouse_y",
+                model_cfg=model_cfg,
             )
-            dx *= float(self.cfg.mouse_scale)
-            dy *= float(self.cfg.mouse_scale)
-            dx = max(-self.cfg.max_mouse_delta, min(self.cfg.max_mouse_delta, dx))
-            dy = max(-self.cfg.max_mouse_delta, min(self.cfg.max_mouse_delta, dy))
 
             if abs(dx) >= self.cfg.mouse_deadzone or abs(dy) >= self.cfg.mouse_deadzone:
                 slot_events.append({"t": "mouse_rel", "dx": dx, "dy": dy})
@@ -192,6 +312,19 @@ class ModelActionDecoder:
                 mouse_dx=dx,
                 mouse_dy=dy,
                 emitted_events=list(slot_events),
+                decision_trace={
+                    "keyboard": keyboard_trace,
+                    "mouse_x": mouse_trace_x,
+                    "mouse_y": mouse_trace_y,
+                    "mouse_deadzone": float(self.cfg.mouse_deadzone),
+                    "mouse_event_emitted": bool(
+                        abs(dx) >= self.cfg.mouse_deadzone or abs(dy) >= self.cfg.mouse_deadzone
+                    ),
+                    "selected_mouse_bins": {
+                        "mouse_x": int(mouse_bin_x),
+                        "mouse_y": int(mouse_bin_y),
+                    },
+                },
             )
 
         return actions, summaries
