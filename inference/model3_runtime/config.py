@@ -21,6 +21,9 @@ class Model3RuntimeConfig:
     cache_window_frames: int | None = None
     videos_dir: str = "./videos"
     browser_fps: float = 2.0
-    recording_fps: float = 10.0
+    recording_fps: float = 30.0
+    capture_video_fps: float = 30.0
+    capture_video_crf: int = 28
+    settings_path: str = "./videos/runtime_settings.json"
     enable_fast_vision_preprocess: bool = True
     action_decode: ActionDecodeConfig = field(default_factory=ActionDecodeConfig)
