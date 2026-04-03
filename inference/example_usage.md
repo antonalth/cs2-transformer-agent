@@ -10,5 +10,6 @@ $ docker exec -it cs2-model-training-dev-1 bash -lc '
       --data-root dataset0 \
       --device cuda \
       --port 8080 \
-      --insecure
+      --insecure \
+      --transport stream
   '

@@ -90,11 +90,11 @@ def mu_law_decode(y: torch.Tensor, mu: float = 255.0, max_val: float = 30.0, bin
 @dataclass(slots=True)
 class ActionDecodeConfig:
     keyboard_threshold: float = 0.12
+    keyboard_thresholds: dict[str, float] = field(default_factory=dict)
     mouse_deadzone: float = 0.35
     mouse_scale: float = 1.0
     mouse_scale_x: float = 1.0
     mouse_scale_y: float = 1.0
-    max_mouse_delta: float = 30.0
     mouse_zero_bias: float = 0.0
     mouse_temperature: float = 1.0
     mouse_top_k: int = 1
@@ -130,6 +130,12 @@ class ModelActionDecoder:
         self.slot_names = list(slot_names)
         self._held_keys = {slot: set() for slot in self.slot_names}
         self._held_buttons = {slot: set() for slot in self.slot_names}
+
+    def _keyboard_threshold_for(self, action: str) -> float:
+        override = self.cfg.keyboard_thresholds.get(action)
+        if override is None:
+            return float(self.cfg.keyboard_threshold)
+        return float(override)
 
     @staticmethod
     def _resolve_contrary_actions(
@@ -173,18 +179,26 @@ class ModelActionDecoder:
             label: prob
             for label, prob in zip(labels, probs_list)
         }
-        threshold = float(self.cfg.keyboard_threshold)
+        thresholds = {
+            action: self._keyboard_threshold_for(action)
+            for action in labels
+        }
         threshold_hits = {
             action
             for action, prob in action_probs.items()
-            if prob >= threshold
+            if prob >= thresholds[action]
         }
         resolved_actions, dropped_contrary = self._resolve_contrary_actions(action_probs, threshold_hits)
         trace = {
-            "threshold": threshold,
+            "threshold": float(self.cfg.keyboard_threshold),
+            "thresholds": thresholds,
             "labels": labels,
             "threshold_hits": [
-                {"action": action, "probability": float(action_probs[action])}
+                {
+                    "action": action,
+                    "probability": float(action_probs[action]),
+                    "threshold": float(thresholds[action]),
+                }
                 for action in sorted(threshold_hits)
             ],
             "contrary_resolutions": dropped_contrary,
@@ -221,7 +235,7 @@ class ModelActionDecoder:
         selected_probability = float(probabilities[selected_bin].item())
         sampled_probability = float(renorm_probs[selected_rank].item())
 
-        delta = float(
+        raw_delta = float(
             mu_law_decode(
                 torch.tensor(selected_bin),
                 mu=float(model_cfg.mouse_mu),
@@ -230,8 +244,7 @@ class ModelActionDecoder:
             ).item()
         )
         axis_scale = float(self.cfg.mouse_scale_x if axis_name == "mouse_x" else self.cfg.mouse_scale_y)
-        delta *= float(self.cfg.mouse_scale) * axis_scale
-        delta = max(-self.cfg.max_mouse_delta, min(self.cfg.max_mouse_delta, delta))
+        delta = raw_delta * float(self.cfg.mouse_scale) * axis_scale
 
         trace = {
             "axis": axis_name,
@@ -243,6 +256,8 @@ class ModelActionDecoder:
             "selected_bin": selected_bin,
             "selected_probability": selected_probability,
             "sampled_probability_within_top_k": sampled_probability,
+            "selected_raw_delta": raw_delta,
+            "selected_output_delta": delta,
             "selected_delta": delta,
             "top_k_candidates": [
                 {
@@ -301,7 +316,10 @@ class ModelActionDecoder:
                 model_cfg=model_cfg,
             )
 
-            if abs(dx) >= self.cfg.mouse_deadzone or abs(dy) >= self.cfg.mouse_deadzone:
+            raw_dx = float(mouse_trace_x.get("selected_raw_delta", 0.0))
+            raw_dy = float(mouse_trace_y.get("selected_raw_delta", 0.0))
+            mouse_event_emitted = abs(raw_dx) >= self.cfg.mouse_deadzone or abs(raw_dy) >= self.cfg.mouse_deadzone
+            if mouse_event_emitted:
                 slot_events.append({"t": "mouse_rel", "dx": dx, "dy": dy})
 
             if slot_events:
@@ -320,9 +338,7 @@ class ModelActionDecoder:
                     "mouse_x": mouse_trace_x,
                     "mouse_y": mouse_trace_y,
                     "mouse_deadzone": float(self.cfg.mouse_deadzone),
-                    "mouse_event_emitted": bool(
-                        abs(dx) >= self.cfg.mouse_deadzone or abs(dy) >= self.cfg.mouse_deadzone
-                    ),
+                    "mouse_event_emitted": bool(mouse_event_emitted),
                     "selected_mouse_bins": {
                         "mouse_x": int(mouse_bin_x),
                         "mouse_y": int(mouse_bin_y),

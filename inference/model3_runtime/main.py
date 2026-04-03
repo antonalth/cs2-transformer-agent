@@ -19,7 +19,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--cache-window-frames", type=int, default=None)
     parser.add_argument("--browser-fps", type=float, default=2.0)
-    parser.add_argument("--recording-fps", type=float, default=10.0)
+    parser.add_argument("--recording-fps", type=float, default=30.0)
+    parser.add_argument("--capture-video-fps", type=float, default=30.0)
+    parser.add_argument("--capture-video-crf", type=int, default=28)
+    parser.add_argument("--settings-path", default="./videos/runtime_settings.json")
     parser.add_argument("--disable-fast-vision-preprocess", action="store_true")
     parser.add_argument("--insecure", action="store_true")
     return parser.parse_args()
@@ -46,6 +49,9 @@ def main() -> None:
         cache_window_frames=args.cache_window_frames,
         browser_fps=args.browser_fps,
         recording_fps=args.recording_fps,
+        capture_video_fps=args.capture_video_fps,
+        capture_video_crf=args.capture_video_crf,
+        settings_path=args.settings_path,
         enable_fast_vision_preprocess=not args.disable_fast_vision_preprocess,
     )
     runtime = Model3InferenceRuntime(cfg)
