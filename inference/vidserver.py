@@ -100,6 +100,17 @@ class LibeiInjector:
             raise
 
     @staticmethod
+    def _capability_names(caps) -> list[str]:
+        names = []
+        for cap in caps:
+            name = getattr(cap, "name", None)
+            if name:
+                names.append(str(name))
+            else:
+                names.append(str(cap))
+        return sorted(names)
+
+    @staticmethod
     def _event_type_value(ev) -> int:
         return ei.libei.event_get_type(ev._cobject)
 
@@ -133,15 +144,22 @@ class LibeiInjector:
             elif et == ei.EventType.DEVICE_ADDED.value:
                 dev = ev.device
                 caps = set(dev.capabilities)
+                print(f"[libei] device added caps={self._capability_names(caps)}")
+                started = False
                 if ei.DeviceCapability.KEYBOARD in caps and self.keyboard is None:
                     self.keyboard = dev
                     self.keyboard.start_emulating()
+                    started = True
                 if ei.DeviceCapability.POINTER_ABSOLUTE in caps and self.pointer_abs is None:
                     self.pointer_abs = dev
-                    self.pointer_abs.start_emulating()
-                elif ei.DeviceCapability.POINTER in caps and self.pointer_rel is None:
+                    if not started:
+                        self.pointer_abs.start_emulating()
+                        started = True
+                if ei.DeviceCapability.POINTER in caps and self.pointer_rel is None:
                     self.pointer_rel = dev
-                    self.pointer_rel.start_emulating()
+                    if not started:
+                        self.pointer_rel.start_emulating()
+                        started = True
             elif et == ei.EventType.DEVICE_RESUMED.value:
                 if ev.device is not None:
                     ev.device.start_emulating()
@@ -151,6 +169,10 @@ class LibeiInjector:
         while time.time() < deadline:
             self._drain(0.2)
             if self.keyboard and (self.pointer_abs or self.pointer_rel):
+                print(
+                    f"[libei] ready keyboard={self.keyboard is not None} "
+                    f"pointer_abs={self.pointer_abs is not None} pointer_rel={self.pointer_rel is not None}"
+                )
                 return
         raise RuntimeError("Timed out waiting for libei keyboard/pointer devices")
 
