@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import math
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -112,9 +113,7 @@ DECODER_MOUSE_METRICS = ("balanced_accuracy", "f1")
 
 @dataclass(slots=True)
 class DecoderCalibrationSettings:
-    max_games: int = 4
     max_samples: int = 8
-    samples_per_game: int = 2
     frames_per_sample: int = 128
     keyboard_metric: str = "cost_weighted_accuracy"
     keyboard_false_positive_cost: float = 1.0
@@ -686,12 +685,8 @@ class Model3InferenceRuntime:
     @staticmethod
     def _normalize_decoder_calibration_ui_settings(payload: dict[str, Any]) -> DecoderCalibrationSettings:
         settings = DecoderCalibrationSettings()
-        if "max_games" in payload:
-            settings.max_games = max(1, int(payload["max_games"]))
         if "max_samples" in payload:
             settings.max_samples = max(1, int(payload["max_samples"]))
-        if "samples_per_game" in payload:
-            settings.samples_per_game = max(1, int(payload["samples_per_game"]))
         if "frames_per_sample" in payload:
             settings.frames_per_sample = max(8, int(payload["frames_per_sample"]))
         if "keyboard_metric" in payload:
@@ -1118,9 +1113,7 @@ class Model3InferenceRuntime:
 
     async def _run_decoder_calibration(self, payload: dict[str, Any]) -> dict[str, Any]:
         defaults = self._ui_settings.decoder_calibration
-        max_games = max(1, int(payload.get("max_games", defaults.max_games)))
         max_samples = max(1, int(payload.get("max_samples", defaults.max_samples)))
-        samples_per_game = max(1, int(payload.get("samples_per_game", defaults.samples_per_game)))
         frames_per_sample = max(8, int(payload.get("frames_per_sample", defaults.frames_per_sample)))
         keyboard_metric = str(payload.get("keyboard_metric", defaults.keyboard_metric)).strip()
         if keyboard_metric not in DECODER_KEYBOARD_METRICS:
@@ -1158,9 +1151,7 @@ class Model3InferenceRuntime:
 
         val_ds, selected_indices, sample_labels = await asyncio.to_thread(
             self._build_decoder_calibration_dataset,
-            max_games,
             max_samples,
-            samples_per_game,
             frames_per_sample,
         )
         mouse_candidates = self._decoder_mouse_candidate_grid()
@@ -1250,9 +1241,7 @@ class Model3InferenceRuntime:
 
     def _build_decoder_calibration_dataset(
         self,
-        max_games: int,
         max_samples: int,
-        samples_per_game: int,
         frames_per_sample: int,
     ) -> tuple[Any, list[int], list[str]]:
         ensure_model3_import_path()
@@ -1268,20 +1257,17 @@ class Model3InferenceRuntime:
         ds_root = DatasetRoot(dataset_cfg)
         val_ds = ds_root.build_dataset("val")
 
-        selected_indices: list[int] = []
+        population_size = len(val_ds.samples)
+        if population_size <= 0:
+            raise RuntimeError("decoder calibration validation dataset is empty")
+        selected_count = min(max_samples, population_size)
+        rng = random.Random(0)
+        selected_indices = rng.sample(range(population_size), k=selected_count)
         sample_labels: list[str] = []
-        per_game_counts: dict[str, int] = {}
-        for idx, sample in enumerate(val_ds.samples):
+        for idx in selected_indices:
+            sample = val_ds.samples[idx]
             game_name = str(sample.round.game.demo_name)
-            if game_name not in per_game_counts and len(per_game_counts) >= max_games:
-                continue
-            if per_game_counts.get(game_name, 0) >= samples_per_game:
-                continue
-            per_game_counts[game_name] = per_game_counts.get(game_name, 0) + 1
-            selected_indices.append(idx)
             sample_labels.append(f"{game_name}:round{sample.round.round_num}:frame{sample.start_frame}")
-            if len(selected_indices) >= max_samples:
-                break
         if not selected_indices:
             raise RuntimeError("decoder calibration could not find validation samples")
         return val_ds, selected_indices, sample_labels

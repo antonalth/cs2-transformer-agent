@@ -168,14 +168,8 @@ INDEX_HTML = """<!doctype html>
       <div class="status-box">
         <h2 class="decision-title">Decoder Calibration</h2>
         <div class="settings-grid">
-          <label>max games
-            <input id="decoder-cal-max-games" type="number" min="1" step="1" value="4">
-          </label>
           <label>max samples
             <input id="decoder-cal-max-samples" type="number" min="1" step="1" value="8">
-          </label>
-          <label>samples / game
-            <input id="decoder-cal-samples-per-game" type="number" min="1" step="1" value="2">
           </label>
           <label>frames / sample
             <input id="decoder-cal-frames-per-sample" type="number" min="8" step="8" value="128">
@@ -305,9 +299,7 @@ INDEX_HTML = """<!doctype html>
       'refresh-fps',
       'player-index',
       'capture-player-index',
-      'decoder-cal-max-games',
       'decoder-cal-max-samples',
-      'decoder-cal-samples-per-game',
       'decoder-cal-frames-per-sample',
       'decoder-cal-keyboard-fp-cost',
       'decoder-cal-keyboard-fn-cost',
@@ -434,9 +426,7 @@ INDEX_HTML = """<!doctype html>
 
     function collectUiSettingsPayload() {
       const decoderCalibration = {
-        max_games: Number(document.getElementById('decoder-cal-max-games').value || '4'),
         max_samples: Number(document.getElementById('decoder-cal-max-samples').value || '8'),
-        samples_per_game: Number(document.getElementById('decoder-cal-samples-per-game').value || '2'),
         frames_per_sample: Number(document.getElementById('decoder-cal-frames-per-sample').value || '128'),
         keyboard_metric: document.getElementById('decoder-cal-keyboard-metric').value || 'cost_weighted_accuracy',
         keyboard_false_positive_cost: Number(document.getElementById('decoder-cal-keyboard-fp-cost').value || '1.0'),
@@ -549,9 +539,7 @@ INDEX_HTML = """<!doctype html>
       if (uiSettings.player_index !== undefined) syncInputValue('player-index', uiSettings.player_index);
       if (uiSettings.capture_player_index !== undefined) syncInputValue('capture-player-index', uiSettings.capture_player_index);
       const decoderSettings = uiSettings.decoder_calibration || {};
-      if (decoderSettings.max_games !== undefined) syncInputValue('decoder-cal-max-games', decoderSettings.max_games);
       if (decoderSettings.max_samples !== undefined) syncInputValue('decoder-cal-max-samples', decoderSettings.max_samples);
-      if (decoderSettings.samples_per_game !== undefined) syncInputValue('decoder-cal-samples-per-game', decoderSettings.samples_per_game);
       if (decoderSettings.frames_per_sample !== undefined) syncInputValue('decoder-cal-frames-per-sample', decoderSettings.frames_per_sample);
       if (decoderSettings.keyboard_false_positive_cost !== undefined) syncInputValue('decoder-cal-keyboard-fp-cost', decoderSettings.keyboard_false_positive_cost);
       if (decoderSettings.keyboard_false_negative_cost !== undefined) syncInputValue('decoder-cal-keyboard-fn-cost', decoderSettings.keyboard_false_negative_cost);
