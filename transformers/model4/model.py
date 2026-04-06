@@ -547,6 +547,7 @@ class GamePredictorBackbone(nn.Module):
         prev_mouse_x_bin: Optional[torch.Tensor],
         prev_mouse_y_bin: Optional[torch.Tensor],
         prev_eco_buy_idx: Optional[torch.Tensor],
+        prev_action_sos_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sos = self._sos_seed((B, T), device)
         if (
@@ -559,6 +560,12 @@ class GamePredictorBackbone(nn.Module):
         seeds = self._action_seed(prev_keyboard_mask, prev_mouse_x_bin, prev_mouse_y_bin, prev_eco_buy_idx)
         seeds = seeds.to(dtype=self.cfg.dtype)
         seeds[:, 0, :] = sos[:, 0, :]
+        if prev_action_sos_mask is not None:
+            mask = prev_action_sos_mask.to(device=device, dtype=torch.bool)
+            if mask.shape != (B, T):
+                raise ValueError(f"prev_action_sos_mask must have shape {(B, T)}, got {tuple(mask.shape)}")
+            mask[:, 0] = True
+            seeds = torch.where(mask.unsqueeze(-1), sos, seeds)
         return seeds
 
     def _predict_from_hidden(self, hidden: torch.Tensor, B: int, T: int) -> dict[str, torch.Tensor]:
@@ -630,6 +637,7 @@ class GamePredictorBackbone(nn.Module):
         prev_mouse_x_bin: Optional[torch.Tensor] = None,
         prev_mouse_y_bin: Optional[torch.Tensor] = None,
         prev_eco_buy_idx: Optional[torch.Tensor] = None,
+        prev_action_sos_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         context, B, T = self._prepare_context(images, audio)
         seeds = self._build_training_seeds(
@@ -640,6 +648,7 @@ class GamePredictorBackbone(nn.Module):
             prev_mouse_x_bin=prev_mouse_x_bin,
             prev_mouse_y_bin=prev_mouse_y_bin,
             prev_eco_buy_idx=prev_eco_buy_idx,
+            prev_action_sos_mask=prev_action_sos_mask,
         )
         latent = self.cross(seeds.view(B * T, 1, -1), context.view(B * T, context.shape[2], context.shape[3]))
         token_sequence = latent.view(B, T, self.cfg.llama_hidden_size)

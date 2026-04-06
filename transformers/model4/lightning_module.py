@@ -108,6 +108,36 @@ class CS2PredictorModule(pl.LightningModule):
             "prev_eco_buy_idx": prev_eco_buy_idx,
         }
 
+    def _sample_prev_action_sos_mask(self, truth: GroundTruth) -> torch.Tensor:
+        B, T = truth.keyboard_mask.shape
+        p = float(self.global_cfg.train.teacher_forcing_sos_dropout)
+        num_windows = int(getattr(self.global_cfg.train, "teacher_forcing_sos_windows", 0))
+        window_frac = float(getattr(self.global_cfg.train, "teacher_forcing_sos_window_frac", 0.0))
+        if p <= 0.0:
+            mask = torch.zeros(B, T, dtype=torch.bool, device=truth.keyboard_mask.device)
+        elif p >= 1.0:
+            mask = torch.ones(B, T, dtype=torch.bool, device=truth.keyboard_mask.device)
+        else:
+            mask = torch.rand(B, T, device=truth.keyboard_mask.device) < p
+
+        if num_windows > 0 and window_frac > 0.0 and T > 0:
+            window_len = max(1, int(round(T * window_frac)))
+            window_len = min(window_len, T)
+            max_start = T - window_len
+            for b in range(B):
+                for _ in range(num_windows):
+                    start = 0
+                    if max_start > 0:
+                        start = int(torch.randint(0, max_start + 1, (1,), device=truth.keyboard_mask.device).item())
+                    mask[b, start : start + window_len] = True
+
+        if p <= 0.0 and not (num_windows > 0 and window_frac > 0.0):
+            return mask
+        if p >= 1.0:
+            mask[:, :] = True
+        mask[:, 0] = True
+        return mask
+
     def forward(self, images, audio, **kwargs):
         return self.model(images, audio, **kwargs)
 
@@ -121,6 +151,7 @@ class CS2PredictorModule(pl.LightningModule):
         batch.truth = recursive_apply_to_floats(batch.truth, lambda t: t.to(dtype=self.target_dtype))
 
         prev_actions = self._teacher_forced_prev_actions(batch.truth)
+        prev_actions["prev_action_sos_mask"] = self._sample_prev_action_sos_mask(batch.truth)
         preds_dict = self(batch.images, batch.audio, **prev_actions)
         preds = ModelPrediction(**preds_dict)
         

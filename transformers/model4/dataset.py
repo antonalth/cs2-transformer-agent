@@ -103,11 +103,12 @@ class Round:
     team: str
     start_tick: int
     end_tick: int
-    pov_video: List[str]
-    pov_audio: List[str]
+    pov_video: List[Optional[str]]
+    pov_audio: List[Optional[str]]
     pov_start_ticks: List[int]
     pov_end_ticks: List[int]
     pov_player_names: List[str]
+    pov_available: List[bool]
 
     @property
     def frame_count(self) -> int:
@@ -199,6 +200,8 @@ class Epoch(torch.utils.data.Dataset):
 
     def _decode_video(self, sample: RoundSample) -> torch.Tensor:
         pov = sample.round.pov_video[sample.player_idx]
+        if pov is None:
+            raise FileNotFoundError(f"Missing POV video for player_idx={sample.player_idx} in round {sample.round.round_num}")
         decoder = VideoDecoder(pov, device=self.config.epoch_video_decoding_device, dimension_order="NCHW")
         frames = decoder.get_frames_in_range(sample.start_frame, sample.start_frame + sample.length_frames).data
         del decoder
@@ -208,7 +211,10 @@ class Epoch(torch.utils.data.Dataset):
         window_secs = sample.length_frames / FRAME_RATE
         target_samples = int(round(window_secs * self.config.audio_sample_rate))
 
-        decoder = AudioDecoder(sample.round.pov_audio[sample.player_idx], sample_rate=int(self.config.audio_sample_rate))
+        audio_path = sample.round.pov_audio[sample.player_idx]
+        if audio_path is None:
+            raise FileNotFoundError(f"Missing POV audio for player_idx={sample.player_idx} in round {sample.round.round_num}")
+        decoder = AudioDecoder(audio_path, sample_rate=int(self.config.audio_sample_rate))
         try:
             waveform = decoder.get_samples_played_in_range(
                 start_seconds=sample.start_time,
@@ -418,16 +424,41 @@ class DatasetRoot:
 
             videos = [_resolve(path) for path in round_info["pov_videos"]]
             audio = [_resolve(path) for path in round_info["pov_audio"]]
-            if not all(os.path.exists(path) for path in videos + audio):
+            pov_available: List[bool] = []
+            kept_videos: List[Optional[str]] = []
+            kept_audio: List[Optional[str]] = []
+            pov_meta: List[Dict[str, Any]] = []
+            missing_players: List[int] = []
+
+            for player_idx, (video_path, audio_path) in enumerate(zip(videos, audio)):
+                video_exists = os.path.exists(video_path)
+                audio_exists = os.path.exists(audio_path)
+                available = video_exists and audio_exists
+                pov_available.append(available)
+                kept_videos.append(video_path if available else None)
+                kept_audio.append(audio_path if available else None)
+                meta_source = video_path if video_exists else audio_path
+                pov_meta.append(self._parse_recording_filename(meta_source))
+                if not available:
+                    missing_players.append(player_idx)
+
+            if not any(pov_available):
                 if self.config.warn_skip:
                     logging.warning(
-                        "Skipping %s/%s: missing media file.",
+                        "Skipping %s/%s: all player media files missing.",
                         game.demo_name,
                         round_info["round_num"],
                     )
                 continue
+            if missing_players and self.config.warn_skip:
+                logging.warning(
+                    "Keeping %s/%s with %d missing players: %s",
+                    game.demo_name,
+                    round_info["round_num"],
+                    len(missing_players),
+                    ",".join(str(idx) for idx in missing_players),
+                )
 
-            pov_meta = [self._parse_recording_filename(path) for path in videos]
             game.rounds.append(
                 Round(
                     game=game,
@@ -435,11 +466,12 @@ class DatasetRoot:
                     team=str(round_info["team"]).upper(),
                     start_tick=int(round_info["start_tick"]),
                     end_tick=int(round_info["end_tick"]),
-                    pov_video=videos,
-                    pov_audio=audio,
+                    pov_video=kept_videos,
+                    pov_audio=kept_audio,
                     pov_start_ticks=[meta["start_tick"] for meta in pov_meta],
                     pov_end_ticks=[meta["stop_tick"] for meta in pov_meta],
                     pov_player_names=[meta["player_name"] for meta in pov_meta],
+                    pov_available=pov_available,
                 )
             )
 
@@ -452,6 +484,8 @@ class DatasetRoot:
         for game in games:
             for round_info in game.rounds:
                 for player_idx in range(5):
+                    if not round_info.pov_available[player_idx]:
+                        continue
                     player_start_tick = max(round_info.start_tick, int(round_info.pov_start_ticks[player_idx]))
                     player_end_tick = min(round_info.end_tick, int(round_info.pov_end_ticks[player_idx]))
                     player_frame_count = ticks_to_framecount(player_start_tick, player_end_tick)
