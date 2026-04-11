@@ -145,17 +145,20 @@ class CS2PredictorModule(pl.LightningModule):
         # Override to handle dataclasses
         return recursive_to_device(batch, device)
 
+    def _run_loss_dict(self, batch: TrainingSample, *, use_sos_mask: bool) -> dict[str, torch.Tensor]:
+        prev_actions = self._teacher_forced_prev_actions(batch.truth)
+        if use_sos_mask:
+            prev_actions["prev_action_sos_mask"] = self._sample_prev_action_sos_mask(batch.truth)
+        preds_dict = self(batch.images, batch.audio, **prev_actions)
+        preds = ModelPrediction(**preds_dict)
+        return self.criterion(preds, batch.truth)
+
     def training_step(self, batch: TrainingSample, batch_idx: int):
         # Cast Truth to target dtype (BF16/FP16) explicitly
         # This was done manually in train_fsdp.py
         batch.truth = recursive_apply_to_floats(batch.truth, lambda t: t.to(dtype=self.target_dtype))
 
-        prev_actions = self._teacher_forced_prev_actions(batch.truth)
-        prev_actions["prev_action_sos_mask"] = self._sample_prev_action_sos_mask(batch.truth)
-        preds_dict = self(batch.images, batch.audio, **prev_actions)
-        preds = ModelPrediction(**preds_dict)
-        
-        loss_dict = self.criterion(preds, batch.truth)
+        loss_dict = self._run_loss_dict(batch, use_sos_mask=True)
         loss = loss_dict["total"]
         
         # Logging
@@ -169,17 +172,21 @@ class CS2PredictorModule(pl.LightningModule):
     def validation_step(self, batch: TrainingSample, batch_idx: int):
         batch.truth = recursive_apply_to_floats(batch.truth, lambda t: t.to(dtype=self.target_dtype))
 
-        prev_actions = self._teacher_forced_prev_actions(batch.truth)
-        preds_dict = self(batch.images, batch.audio, **prev_actions)
-        preds = ModelPrediction(**preds_dict)
-        
-        loss_dict = self.criterion(preds, batch.truth)
-        loss = loss_dict["total"]
-        
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        for k, v in loss_dict.items():
-            if k != "total":
-                self.log(f"val/loss_{k}", v, on_step=False, on_epoch=True, sync_dist=True)
+        with torch.no_grad():
+            loss_dict = self._run_loss_dict(batch, use_sos_mask=False)
+            loss = loss_dict["total"]
+            
+            self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            for k, v in loss_dict.items():
+                if k != "total":
+                    self.log(f"val/loss_{k}", v, on_step=False, on_epoch=True, sync_dist=True)
+
+            masked_loss_dict = self._run_loss_dict(batch, use_sos_mask=True)
+            masked_loss = masked_loss_dict["total"]
+            self.log("val_masked/loss", masked_loss, on_step=False, on_epoch=True, sync_dist=True)
+            for k, v in masked_loss_dict.items():
+                if k != "total":
+                    self.log(f"val_masked/loss_{k}", v, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
         # Weight decay splitting
