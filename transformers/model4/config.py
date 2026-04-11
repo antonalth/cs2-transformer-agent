@@ -102,9 +102,13 @@ class TrainConfig:
     warmup_steps: int = 200
     min_lr_ratio: float = 0.01
     clip_grad_norm: float = 1.0
+    training_mode: str = "teacher_forced"
     teacher_forcing_sos_dropout: float = 0.9
     teacher_forcing_sos_windows: int = 2
     teacher_forcing_sos_window_frac: float = 0.15
+    autoregressive_sampler: str = "dummy"
+    autoregressive_disable_backbone_gradient_checkpointing: bool = True
+    autoregressive_log_validation: bool = True
 
     save_every: int = 1
     checkpoint_every_n_steps: int = 1400

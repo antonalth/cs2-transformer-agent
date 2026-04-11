@@ -7,7 +7,7 @@ from dataclasses import fields, is_dataclass
 from typing import Any, Dict
 
 from config import GlobalConfig
-from model import GamePredictorBackbone, ModelPrediction
+from model import DummyActionSampler, GamePredictorBackbone, ModelPrediction
 from model_loss import ModelLoss, mu_law_encode
 from dataset import TrainingSample, GroundTruth
 
@@ -62,12 +62,28 @@ class CS2PredictorModule(pl.LightningModule):
         self.global_cfg = global_cfg
         self.model = GamePredictorBackbone(global_cfg.model)
         self.criterion = ModelLoss(global_cfg)
+        self.autoregressive_sampler = self._build_autoregressive_sampler()
         
         # We need to manually handle dtype casting for Truth if mixed precision is used
         # PL handles model params and inputs mostly, but our GroundTruth structure might need help
         # Map config string to torch dtype
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
         self.target_dtype = dtype_map.get(global_cfg.train.mixed_precision, torch.float32)
+        self.training_mode = getattr(global_cfg.train, "training_mode", "teacher_forced")
+        if self.training_mode not in {"teacher_forced", "autoregressive"}:
+            raise ValueError(f"Unsupported training_mode: {self.training_mode}")
+        if (
+            self.training_mode == "autoregressive"
+            and global_cfg.train.autoregressive_disable_backbone_gradient_checkpointing
+            and getattr(self.model.backbone, "is_gradient_checkpointing", False)
+        ):
+            self.model.backbone.gradient_checkpointing_disable()
+
+    def _build_autoregressive_sampler(self):
+        sampler_name = getattr(self.global_cfg.train, "autoregressive_sampler", "dummy")
+        if sampler_name == "dummy":
+            return DummyActionSampler(self.global_cfg.model)
+        raise ValueError(f"Unsupported autoregressive_sampler: {sampler_name}")
 
     def _teacher_forced_prev_actions(self, truth: GroundTruth) -> Dict[str, torch.Tensor]:
         B, T = truth.keyboard_mask.shape
@@ -153,12 +169,40 @@ class CS2PredictorModule(pl.LightningModule):
         preds = ModelPrediction(**preds_dict)
         return self.criterion(preds, batch.truth)
 
+    def _run_autoregressive_loss_dict(self, batch: TrainingSample) -> dict[str, torch.Tensor]:
+        context, B, T = self.model.prepare_context(batch.images, batch.audio)
+        state = self.model.init_autoregressive_state(max_cache_frames=T)
+        predictions: Dict[str, list[torch.Tensor]] = {
+            "mouse_x": [],
+            "mouse_y": [],
+            "keyboard_logits": [],
+            "eco_buy_logits": [],
+            "eco_purchase_logits": [],
+        }
+
+        for t in range(T):
+            pred_t, state = self.model.forward_step_from_context(
+                context[:, t],
+                state=state,
+                max_cache_frames=T,
+                sampler=self.autoregressive_sampler,
+                update_state=True,
+            )
+            for key, value in pred_t.items():
+                predictions[key].append(value)
+
+        preds = ModelPrediction(**{key: torch.cat(values, dim=1) for key, values in predictions.items()})
+        return self.criterion(preds, batch.truth)
+
     def training_step(self, batch: TrainingSample, batch_idx: int):
         # Cast Truth to target dtype (BF16/FP16) explicitly
         # This was done manually in train_fsdp.py
         batch.truth = recursive_apply_to_floats(batch.truth, lambda t: t.to(dtype=self.target_dtype))
 
-        loss_dict = self._run_loss_dict(batch, use_sos_mask=True)
+        if self.training_mode == "autoregressive":
+            loss_dict = self._run_autoregressive_loss_dict(batch)
+        else:
+            loss_dict = self._run_loss_dict(batch, use_sos_mask=True)
         loss = loss_dict["total"]
         
         # Logging
@@ -187,6 +231,14 @@ class CS2PredictorModule(pl.LightningModule):
             for k, v in masked_loss_dict.items():
                 if k != "total":
                     self.log(f"val_masked/loss_{k}", v, on_step=False, on_epoch=True, sync_dist=True)
+
+            if self.training_mode == "autoregressive" and self.global_cfg.train.autoregressive_log_validation:
+                ar_loss_dict = self._run_autoregressive_loss_dict(batch)
+                ar_loss = ar_loss_dict["total"]
+                self.log("val_ar/loss", ar_loss, on_step=False, on_epoch=True, sync_dist=True)
+                for k, v in ar_loss_dict.items():
+                    if k != "total":
+                        self.log(f"val_ar/loss_{k}", v, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
         # Weight decay splitting

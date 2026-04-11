@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--grad_accumulation_steps", type=int, default=None)
+    parser.add_argument("--training_mode", choices=["teacher_forced", "autoregressive"], default=None)
+    parser.add_argument("--autoregressive_sampler", choices=["dummy"], default=None)
     parser.add_argument("--perceiver_pos_embedding", choices=["none", "sincos", "learned"], default=None)
     parser.add_argument(
         "--enable_losses",
@@ -299,6 +301,10 @@ def main():
         global_cfg.train.batch_size = args.batch_size
     if args.grad_accumulation_steps is not None:
         global_cfg.train.grad_accumulation_steps = args.grad_accumulation_steps
+    if args.training_mode is not None:
+        global_cfg.train.training_mode = args.training_mode
+    if args.autoregressive_sampler is not None:
+        global_cfg.train.autoregressive_sampler = args.autoregressive_sampler
     if args.perceiver_pos_embedding is not None:
         global_cfg.model.perceiver_pos_embedding = args.perceiver_pos_embedding
     apply_loss_overrides(global_cfg, args.enable_losses, args.disable_losses)

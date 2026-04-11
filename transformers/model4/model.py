@@ -18,7 +18,7 @@ limitations under the License.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
 import torch
 import torch.nn as nn
@@ -82,6 +82,50 @@ class ModelPrediction:
     keyboard_logits: torch.Tensor    # [B, T, keyboard_dim]
     eco_buy_logits: torch.Tensor     # [B, T, eco_dim]
     eco_purchase_logits: torch.Tensor # [B, T, 1]
+
+
+@dataclass
+class SampledActionFeedback:
+    keyboard_mask: torch.Tensor  # [B]
+    mouse_x_bin: torch.Tensor    # [B]
+    mouse_y_bin: torch.Tensor    # [B]
+    eco_buy_idx: torch.Tensor    # [B]
+
+
+class ActionSampler(Protocol):
+    def sample(self, prediction: dict[str, torch.Tensor]) -> SampledActionFeedback:
+        ...
+
+
+class DummyActionSampler:
+    def __init__(self, cfg: ModelConfig):
+        self.cfg = cfg
+
+    def sample(self, prediction: dict[str, torch.Tensor]) -> SampledActionFeedback:
+        keyboard_logits = prediction["keyboard_logits"][:, -1, :]
+        mouse_x = prediction["mouse_x"][:, -1, :]
+        mouse_y = prediction["mouse_y"][:, -1, :]
+        eco_buy = prediction["eco_buy_logits"][:, -1, :]
+        eco_purchase = prediction["eco_purchase_logits"][:, -1, 0]
+
+        keyboard_bits = (torch.sigmoid(keyboard_logits) >= 0.5).to(torch.int64)
+        bit_weights = (2 ** torch.arange(self.cfg.keyboard_dim, device=keyboard_bits.device, dtype=torch.int64)).view(1, -1)
+        keyboard_mask = (keyboard_bits * bit_weights).sum(dim=-1)
+
+        mouse_x_bin = torch.argmax(mouse_x, dim=-1)
+        mouse_y_bin = torch.argmax(mouse_y, dim=-1)
+
+        predicted_buy = torch.argmax(eco_buy, dim=-1)
+        no_buy = torch.full_like(predicted_buy, self.cfg.eco_dim)
+        did_buy = torch.sigmoid(eco_purchase) >= 0.5
+        eco_buy_idx = torch.where(did_buy, predicted_buy, no_buy)
+
+        return SampledActionFeedback(
+            keyboard_mask=keyboard_mask.detach(),
+            mouse_x_bin=mouse_x_bin.detach(),
+            mouse_y_bin=mouse_y_bin.detach(),
+            eco_buy_idx=eco_buy_idx.detach(),
+        )
 
 
 class RollingDynamicCache(DynamicCache):
@@ -507,6 +551,7 @@ class GamePredictorBackbone(nn.Module):
             self.backbone.gradient_checkpointing_enable()
 
         self.heads = ModelOutputHeads(cfg)
+        self.default_action_sampler = DummyActionSampler(cfg)
 
     def _prepare_context(self, images: torch.Tensor, audio: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         B, T = images.shape[:2]
@@ -515,6 +560,9 @@ class GamePredictorBackbone(nn.Module):
         audio_features = self.audio_proj(audio_features)
         context = torch.cat([video_features, audio_features], dim=2)
         return context, B, T
+
+    def prepare_context(self, images: torch.Tensor, audio: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+        return self._prepare_context(images, audio)
 
     def _keyboard_embedding(self, keyboard_mask: torch.Tensor) -> torch.Tensor:
         bits = torch.arange(self.cfg.keyboard_dim, device=keyboard_mask.device, dtype=torch.long)
@@ -613,21 +661,65 @@ class GamePredictorBackbone(nn.Module):
             state.prev_eco_buy_idx.to(device=device),
         )
 
-    def _update_state_actions(self, prediction: dict[str, torch.Tensor], state: AutoregressiveState) -> None:
-        keyboard_logits = prediction["keyboard_logits"][:, -1, :]
-        mouse_x = prediction["mouse_x"][:, -1, :]
-        mouse_y = prediction["mouse_y"][:, -1, :]
-        eco_buy = prediction["eco_buy_logits"][:, -1, :]
-        eco_purchase = prediction["eco_purchase_logits"][:, -1, 0]
-        keyboard_mask = (torch.sigmoid(keyboard_logits) >= 0.5).to(torch.int64)
-        bits = (2 ** torch.arange(self.cfg.keyboard_dim, device=keyboard_mask.device, dtype=torch.int64)).view(1, -1)
-        state.prev_keyboard_mask = (keyboard_mask * bits).sum(dim=-1)
-        state.prev_mouse_x_bin = torch.argmax(mouse_x, dim=-1)
-        state.prev_mouse_y_bin = torch.argmax(mouse_y, dim=-1)
-        no_buy = torch.full_like(torch.argmax(eco_buy, dim=-1), self.cfg.eco_dim)
-        predicted_buy = torch.argmax(eco_buy, dim=-1)
-        did_buy = torch.sigmoid(eco_purchase) >= 0.5
-        state.prev_eco_buy_idx = torch.where(did_buy, predicted_buy, no_buy)
+    def _set_state_feedback(self, state: AutoregressiveState, feedback: SampledActionFeedback) -> None:
+        state.prev_keyboard_mask = feedback.keyboard_mask
+        state.prev_mouse_x_bin = feedback.mouse_x_bin
+        state.prev_mouse_y_bin = feedback.mouse_y_bin
+        state.prev_eco_buy_idx = feedback.eco_buy_idx
+
+    def _update_state_actions(
+        self,
+        prediction: dict[str, torch.Tensor],
+        state: AutoregressiveState,
+        *,
+        sampler: Optional[ActionSampler] = None,
+    ) -> SampledActionFeedback:
+        feedback = (sampler or self.default_action_sampler).sample(prediction)
+        self._set_state_feedback(state, feedback)
+        return feedback
+
+    def _llama_forward_from_latent(
+        self,
+        latent: torch.Tensor,
+        *,
+        state: Optional[AutoregressiveState] = None,
+        total_frames_processed: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[AutoregressiveState]]:
+        B, T = latent.shape[:2]
+        if use_cache:
+            if state is None:
+                state = self.init_autoregressive_state()
+            self._ensure_state_batch(state, B)
+            self._crop_cache(state)
+            cache_position = torch.arange(
+                total_frames_processed,
+                total_frames_processed + T,
+                device=latent.device,
+                dtype=torch.long,
+            )
+            if state.cache is None:
+                state.cache = RollingDynamicCache(config=self.backbone.config)
+            llama_out = self.backbone(
+                inputs_embeds=latent,
+                past_key_values=state.cache,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+            state.cache = llama_out.past_key_values
+            state.total_frames_processed += T
+            self._crop_cache(state)
+            return llama_out.last_hidden_state, state
+
+        hidden = self.backbone(inputs_embeds=latent).last_hidden_state
+        return hidden, state
+
+    def _latent_from_seed_and_context(self, seed: torch.Tensor, context_t: torch.Tensor) -> torch.Tensor:
+        if context_t.ndim == 4:
+            if context_t.shape[1] != 1:
+                raise ValueError(f"context_t with 4 dims must have shape [B,1,N,D], got {tuple(context_t.shape)}")
+            context_t = context_t[:, 0]
+        return self.cross(seed.view(seed.shape[0], 1, -1), context_t)
 
     def forward(
         self,
@@ -652,8 +744,80 @@ class GamePredictorBackbone(nn.Module):
         )
         latent = self.cross(seeds.view(B * T, 1, -1), context.view(B * T, context.shape[2], context.shape[3]))
         token_sequence = latent.view(B, T, self.cfg.llama_hidden_size)
-        hidden = self.backbone(inputs_embeds=token_sequence).last_hidden_state
+        hidden, _ = self._llama_forward_from_latent(token_sequence, use_cache=False)
         return self._predict_from_hidden(hidden, B, T)
+
+    def forward_from_context(
+        self,
+        context: torch.Tensor,
+        *,
+        prev_keyboard_mask: Optional[torch.Tensor] = None,
+        prev_mouse_x_bin: Optional[torch.Tensor] = None,
+        prev_mouse_y_bin: Optional[torch.Tensor] = None,
+        prev_eco_buy_idx: Optional[torch.Tensor] = None,
+        prev_action_sos_mask: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        B, T = context.shape[:2]
+        seeds = self._build_training_seeds(
+            B,
+            T,
+            context.device,
+            prev_keyboard_mask=prev_keyboard_mask,
+            prev_mouse_x_bin=prev_mouse_x_bin,
+            prev_mouse_y_bin=prev_mouse_y_bin,
+            prev_eco_buy_idx=prev_eco_buy_idx,
+            prev_action_sos_mask=prev_action_sos_mask,
+        )
+        latent = self.cross(seeds.view(B * T, 1, -1), context.view(B * T, context.shape[2], context.shape[3]))
+        token_sequence = latent.view(B, T, self.cfg.llama_hidden_size)
+        hidden, _ = self._llama_forward_from_latent(token_sequence, use_cache=False)
+        return self._predict_from_hidden(hidden, B, T)
+
+    def forward_step_from_context(
+        self,
+        context_t: torch.Tensor,
+        state: Optional[AutoregressiveState] = None,
+        *,
+        max_cache_frames: Optional[int] = None,
+        prev_keyboard_mask: Optional[torch.Tensor] = None,
+        prev_mouse_x_bin: Optional[torch.Tensor] = None,
+        prev_mouse_y_bin: Optional[torch.Tensor] = None,
+        prev_eco_buy_idx: Optional[torch.Tensor] = None,
+        sampler: Optional[ActionSampler] = None,
+        update_state: bool = True,
+    ) -> tuple[dict[str, torch.Tensor], AutoregressiveState]:
+        if context_t.ndim == 4 and context_t.shape[1] != 1:
+            raise ValueError(f"forward_step_from_context expects [B,N,D] or [B,1,N,D], got {tuple(context_t.shape)}")
+        B = context_t.shape[0]
+        if state is None:
+            state = self.init_autoregressive_state(max_cache_frames=max_cache_frames)
+        elif max_cache_frames is not None:
+            state.max_cache_frames = max_cache_frames
+
+        self._ensure_state_batch(state, B)
+        self._crop_cache(state)
+
+        if (
+            prev_keyboard_mask is not None
+            and prev_mouse_x_bin is not None
+            and prev_mouse_y_bin is not None
+            and prev_eco_buy_idx is not None
+        ):
+            seed = self._action_seed(prev_keyboard_mask, prev_mouse_x_bin, prev_mouse_y_bin, prev_eco_buy_idx)
+        else:
+            seed = self._state_seed(state, B, context_t.device)
+
+        latent = self._latent_from_seed_and_context(seed, context_t)
+        hidden, state = self._llama_forward_from_latent(
+            latent,
+            state=state,
+            total_frames_processed=state.total_frames_processed,
+            use_cache=True,
+        )
+        prediction = self._predict_from_hidden(hidden, B, 1)
+        if update_state:
+            self._update_state_actions(prediction, state, sampler=sampler)
+        return prediction, state
 
     def forward_step(
         self,
@@ -671,44 +835,12 @@ class GamePredictorBackbone(nn.Module):
             raise ValueError(f"forward_step expects T=1, got T={images.shape[1]}")
 
         context, B, T = self._prepare_context(images, audio)
-        if state is None:
-            state = self.init_autoregressive_state(max_cache_frames=max_cache_frames)
-        elif max_cache_frames is not None:
-            state.max_cache_frames = max_cache_frames
-
-        self._ensure_state_batch(state, B)
-        self._crop_cache(state)
-
-        if (
-            prev_keyboard_mask is not None
-            and prev_mouse_x_bin is not None
-            and prev_mouse_y_bin is not None
-            and prev_eco_buy_idx is not None
-        ):
-            seed = self._action_seed(prev_keyboard_mask, prev_mouse_x_bin, prev_mouse_y_bin, prev_eco_buy_idx)
-        else:
-            seed = self._state_seed(state, B, context.device)
-
-        latent = self.cross(seed.view(B, 1, -1), context[:, 0])
-
-        cache_position = torch.arange(
-            state.total_frames_processed,
-            state.total_frames_processed + T,
-            device=context.device,
-            dtype=torch.long,
+        return self.forward_step_from_context(
+            context[:, 0],
+            state=state,
+            max_cache_frames=max_cache_frames,
+            prev_keyboard_mask=prev_keyboard_mask,
+            prev_mouse_x_bin=prev_mouse_x_bin,
+            prev_mouse_y_bin=prev_mouse_y_bin,
+            prev_eco_buy_idx=prev_eco_buy_idx,
         )
-        if state.cache is None:
-            state.cache = RollingDynamicCache(config=self.backbone.config)
-        llama_out = self.backbone(
-            inputs_embeds=latent,
-            past_key_values=state.cache,
-            cache_position=cache_position,
-            use_cache=True,
-        )
-        state.cache = llama_out.past_key_values
-        state.total_frames_processed += T
-        self._crop_cache(state)
-
-        prediction = self._predict_from_hidden(llama_out.last_hidden_state, B, T)
-        self._update_state_actions(prediction, state)
-        return prediction, state
